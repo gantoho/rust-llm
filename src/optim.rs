@@ -55,12 +55,23 @@ pub struct AdamW {
 
 impl AdamW {
     pub fn new(lr: f32, params: Vec<Tensor>, weight_decay: f32) -> Self {
+        Self::new_with_betas(lr, params, weight_decay, 0.9, 0.999)
+    }
+
+    /// 可自定义 beta1 / beta2 的构造器（小 batch 或特殊场景需要调优时使用）
+    pub fn new_with_betas(
+        lr: f32,
+        params: Vec<Tensor>,
+        weight_decay: f32,
+        beta1: f32,
+        beta2: f32,
+    ) -> Self {
         let m = params.iter().map(|p| vec![0.0f32; p.numel()]).collect();
         let v = params.iter().map(|p| vec![0.0f32; p.numel()]).collect();
         AdamW {
             lr,
-            beta1: 0.9,
-            beta2: 0.999,
+            beta1,
+            beta2,
             eps: 1e-8,
             weight_decay,
             t: 0,
@@ -77,9 +88,8 @@ impl AdamW {
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
 
         for (i, p) in self.params.iter().enumerate() {
-            let g = p.grad();
-            let d = p.data();
-            let mut updated = vec![0.0f32; d.len()];
+            let g = p.grad.borrow();
+            let mut d = p.data.borrow_mut();
             for j in 0..d.len() {
                 let gv = g[j];
                 // 1. 更新动量
@@ -91,9 +101,8 @@ impl AdamW {
                 // 3. 更新：θ -= lr * m_hat/(√v_hat + eps) + lr * wd * θ（权重衰减解耦）
                 let step = self.lr * m_hat / (v_hat.sqrt() + self.eps);
                 let decay = self.lr * self.weight_decay * d[j];
-                updated[j] = d[j] - step - decay;
+                d[j] = d[j] - step - decay;
             }
-            p.set_data(updated);
         }
     }
 

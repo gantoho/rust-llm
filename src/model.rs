@@ -118,7 +118,6 @@ pub struct GPT {
     tok_emb: Embedding,
     blocks: Vec<TransformerBlock>,
     ln_f: LayerNorm,
-    lm_head: Linear, // [D, vocab]
 }
 
 impl GPT {
@@ -133,7 +132,6 @@ impl GPT {
             tok_emb: Embedding::new(vocab_size, n_embd, rng),
             blocks,
             ln_f: LayerNorm::new(n_embd, 1e-5),
-            lm_head: Linear::new(n_embd, vocab_size, rng),
         }
     }
 
@@ -183,10 +181,10 @@ impl GPT {
             x = block.forward(&x, &mask, cache, base);
         }
 
-        // 5. 最终归一化 + 输出头
+        // 5. 最终归一化 + 输出头（权重绑定：lm_head 复用 tok_emb.table 的转置）
         let x = self.ln_f.forward(&x);
         let x = x.reshape(vec![b * t, d]);
-        self.lm_head.forward(&x)
+        x.matmul(&self.tok_emb.table.transpose())
     }
 
     /// 推理用的缓存集合：每层一个
@@ -246,8 +244,6 @@ impl GPT {
         }
         ps.push(("ln_f.gamma".to_string(), self.ln_f.gamma.clone()));
         ps.push(("ln_f.beta".to_string(), self.ln_f.beta.clone()));
-        ps.push(("lm_head.weight".to_string(), self.lm_head.weight.clone()));
-        ps.push(("lm_head.bias".to_string(), self.lm_head.bias.clone()));
         ps
     }
 }
@@ -259,7 +255,6 @@ impl Module for GPT {
             ps.extend(block.parameters());
         }
         ps.extend(self.ln_f.parameters());
-        ps.extend(self.lm_head.parameters());
         ps
     }
 }

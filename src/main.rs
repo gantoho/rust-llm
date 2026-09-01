@@ -1,4 +1,4 @@
-//! 从零实现大语言模型（纯 Rust，不依赖深度学习框架）
+﻿//! 从零实现大语言模型（纯 Rust，不依赖深度学习框架）
 //!
 //! 用法（cli 子命令）：
 //! - `cargo run --release -- train    --config config.json [--resume checkpoints/latest.ckpt]`
@@ -266,7 +266,7 @@ fn demo_xor() {
         opt.zero_grad();
 
         if step % 200 == 0 {
-            println!("  step {:>4} | loss {:.4}", step, loss.data()[0]);
+            println!("  step {:>4} | loss {:.4}", step, loss.item());
         }
     }
 

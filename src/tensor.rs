@@ -173,6 +173,12 @@ impl Tensor {
         self.data.borrow().clone()
     }
 
+    /// 读取标量值（0 维张量专用，避免克隆整个 Vec）
+    pub fn item(&self) -> f32 {
+        assert_eq!(self.numel(), 1, "item() 只适用于单元素张量");
+        self.data.borrow()[0]
+    }
+
     pub fn set_data(&self, new_data: Vec<f32>) {
         let mut d = self.data.borrow_mut();
         assert_eq!(d.len(), new_data.len(), "set_data 长度不一致");
@@ -184,6 +190,7 @@ impl Tensor {
     }
 
     /// 覆盖梯度（梯度裁剪用）
+    #[allow(dead_code)] // clip_grad_norm 已改用 borrow_mut 原位操作
     pub fn grad_set(&self, new_grad: Vec<f32>) {
         let mut g = self.grad.borrow_mut();
         assert_eq!(g.len(), new_grad.len(), "grad_set 长度不一致");
@@ -249,7 +256,8 @@ impl Tensor {
         flat
     }
 
-    /// reshape：不改变元素顺序，梯度按 1:1 传回
+    /// reshape：不改变元素顺序，梯度按 1:1 传回。
+    /// 共享底层数据 Rc（不克隆 Vec），只分配新的梯度缓冲。
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
         let numel: usize = new_shape.iter().product();
         assert_eq!(
@@ -259,7 +267,14 @@ impl Tensor {
             self.shape,
             new_shape
         );
-        let mut result = Tensor::new(self.data.borrow().clone(), new_shape, self.requires_grad);
+        let mut result = Tensor {
+            data: self.data.clone(), // Rc 共享，不克隆 Vec
+            shape: new_shape,
+            grad: Rc::new(RefCell::new(vec![0.0; numel])),
+            requires_grad: self.requires_grad,
+            parents: Rc::new(vec![self.clone()]),
+            backward: None,
+        };
         if self.requires_grad {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -382,7 +397,7 @@ impl Tensor {
     }
 
     pub fn div(&self, other: &Tensor) -> Tensor {
-        self.binary(other, |a, b| a / b, |a, b| (1.0 / b, -a / (b * b)))
+        self.binary(other, |a, b| a / b, |a, b| { let s = b + 1e-8; (1.0 / s, -a / (s * s)) })
     }
 
     /// 通用逐元素二元运算（含广播）+ 反向传播
@@ -635,6 +650,7 @@ impl Tensor {
     }
 
     /// log：c = ln(x)，∂x = g / x
+    #[allow(dead_code)] // cross_entropy 已改用 log_softmax_last_dim
     pub fn log(&self) -> Tensor {
         let sd = self.data.borrow();
         let data: Vec<f32> = sd.iter().map(|&a| a.ln()).collect();
@@ -650,7 +666,7 @@ impl Tensor {
                 let sd_b = sd.borrow();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
-                    sgm[i] += g[i] / sd_b[i];
+                    sgm[i] += g[i] / (sd_b[i] + 1e-8);
                 }
             }));
         }
@@ -987,6 +1003,67 @@ impl Tensor {
         result
     }
 
+    /// log_softmax（数值稳定版，最后一维）。
+    ///
+    /// 等价于 `softmax_last_dim().log()`，但用 log-sum-exp 技巧避免 `log(0) = -inf`。
+    ///
+    /// 公式：`log_softmax(x_i) = x_i - max - log(Σ exp(x_j - max))`
+    ///
+    /// 反向：`grad_input_i = grad_output_i - softmax(x_i) · Σ grad_output_j`
+    /// （比 softmax+log 的链式法则更简洁，不需存储中间的 softmax 结果乘以 log 的梯度）
+    #[allow(dead_code)]
+    pub fn log_softmax_last_dim(&self) -> Tensor {
+        assert!(self.rank() >= 1, "log_softmax 至少需要 1 维");
+        let (rows, d) = (
+            self.numel() / self.shape[self.rank() - 1],
+            self.shape[self.rank() - 1],
+        );
+        let sd = self.data.borrow();
+        let mut out_data = vec![0.0f32; rows * d];
+        // 存 softmax 值（反向需要）
+        let mut softmax_data = vec![0.0f32; rows * d];
+        for r in 0..rows {
+            let mut maxv = f32::NEG_INFINITY;
+            for j in 0..d {
+                maxv = maxv.max(sd[r * d + j]);
+            }
+            let mut sum_exp = 0.0f32;
+            for j in 0..d {
+                let e = (sd[r * d + j] - maxv).exp();
+                softmax_data[r * d + j] = e;
+                sum_exp += e;
+            }
+            let log_sum = sum_exp.ln();
+            for j in 0..d {
+                softmax_data[r * d + j] /= sum_exp; // 归一化为 softmax 概率
+                out_data[r * d + j] = sd[r * d + j] - maxv - log_sum;
+            }
+        }
+        drop(sd);
+
+        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
+        if self.requires_grad {
+            let rg = result.grad.clone();
+            let sg = self.grad.clone();
+            let softmax_data = softmax_data; // move into closure
+            result.parents = Rc::new(vec![self.clone()]);
+            result.backward = Some(Rc::new(move || {
+                let g = rg.borrow();
+                let mut sgm = sg.borrow_mut();
+                for r in 0..rows {
+                    let mut dot = 0.0;
+                    for j in 0..d {
+                        dot += g[r * d + j];
+                    }
+                    for i in 0..d {
+                        sgm[r * d + i] += g[r * d + i] - softmax_data[r * d + i] * dot;
+                    }
+                }
+            }));
+        }
+        result
+    }
+
     // ---------- 索引运算 ----------
 
     /// 按行索引取值：table [V, D]，indices [N] -> out [N, D]。
@@ -1137,6 +1214,31 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-6);
         assert!((d[0] - 0.0900).abs() < 1e-3);
         assert!((d[2] - 0.6652).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_log_softmax() {
+        // log_softmax 应等价于 log(softmax(x))
+        let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let ls = x.log_softmax_last_dim();
+        let s = x.softmax_last_dim();
+        let log_s = s.log();
+        let d1 = ls.data();
+        let d2 = log_s.data();
+        for (a, b) in d1.iter().zip(d2.iter()) {
+            assert!((a - b).abs() < 1e-5, "log_softmax vs log(softmax): {} vs {}", a, b);
+        }
+        // 反向梯度也应一致
+        let loss1 = ls.sum();
+        loss1.backward();
+        let g1 = x.grad();
+        x.zero_grad();
+        let loss2 = log_s.sum();
+        loss2.backward();
+        let g2 = x.grad();
+        for (a, b) in g1.iter().zip(g2.iter()) {
+            assert!((a - b).abs() < 1e-2, "梯度不一致: {} vs {}", a, b);
+        }
     }
 
     #[test]

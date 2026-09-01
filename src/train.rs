@@ -1,4 +1,4 @@
-//! 训练循环与学习率调度（第 13、20 课）
+﻿//! 训练循环与学习率调度（第 13、20 课）
 //!
 //! 训练 GPT 的完整骨架：
 //! 1. 采样一个 batch
@@ -77,18 +77,16 @@ impl LRScheduler {
 pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
     let mut total = 0.0f32;
     for p in params {
-        let g = p.grad();
-        for &v in &g {
-            total += v * v;
-        }
+        let g = p.grad.borrow();
+        total += g.iter().map(|v| v * v).sum::<f32>();
     }
     let norm = total.sqrt();
     if norm > max_norm {
         let scale = max_norm / norm;
         for p in params {
-            let g = p.grad();
-            let scaled: Vec<f32> = g.iter().map(|&v| v * scale).collect();
-            p.grad_set(scaled);
+            for v in p.grad.borrow_mut().iter_mut() {
+                *v *= scale;
+            }
         }
     }
 }
@@ -103,7 +101,7 @@ pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut 
         let (x, y) = loader.eval_batch(rng);
         let logits = model.forward(&x, loader.batch_size(), loader.block_size(), None);
         let loss = cross_entropy_loss(&logits, &y);
-        total += loss.data()[0];
+        total += loss.item();
     }
     total / eval_iters as f32
 }
@@ -217,7 +215,7 @@ pub fn train_gpt(
                     "step {:>5} | lr {:.6} | train_loss {:.4} | val_loss {:.4} | ppl {:.2}",
                     step + 1,
                     scheduler.lr(),
-                    loss.data()[0],
+                    loss.item(),
                     v,
                     p
                 ),
@@ -225,12 +223,12 @@ pub fn train_gpt(
                     "step {:>5} | lr {:.6} | train_loss {:.4}",
                     step + 1,
                     scheduler.lr(),
-                    loss.data()[0]
+                    loss.item()
                 ),
                 _ => unreachable!(),
             }
         }
-        final_loss = loss.data()[0];
+        final_loss = loss.item();
     }
 
     if let Some(dir) = out_dir {

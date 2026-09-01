@@ -4,7 +4,6 @@
 //! - MSE：回归任务（预测连续数值）
 //! - CrossEntropy：分类任务（预测属于哪个类别，LLM 用它）
 
-use crate::layers::softmax;
 use crate::tensor::Tensor;
 
 /// 均方误差：loss = mean((pred - target)²)
@@ -22,11 +21,10 @@ pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
 /// - logits: [B, D] 未归一化的分数
 /// - targets: [B] 每个样本的真实类别下标
 ///
-/// 公式：loss = -mean( log softmax(logits)[i, targets[i]] )
+/// 公式：loss = -mean( log_softmax(logits)[i, targets[i]] )
 ///
-/// 原理（第 6 课详解）：
-/// 我们希望模型给正确类别分配接近 1 的概率。
-/// softmax 把分数变成概率，log 后取负——正确类概率越高，loss 越低。
+/// 实现使用 log-sum-exp 技巧（`log_softmax_last_dim`），
+/// 避免先算 softmax（可能下溢到 0）再取 log（log(0) = -inf）的问题。
 pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     assert_eq!(logits.rank(), 2, "交叉熵的 logits 应为 [B, D]");
     let (b, d) = (logits.shape()[0], logits.shape()[1]);
@@ -39,10 +37,8 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     }
     let oh = Tensor::from_vec(onehot, vec![b, d]);
 
-    // log_softmax(logits)，再用 one-hot 取出每个样本正确类别的 log 概率
-    let log_probs = softmax(logits).log();
-    // 每个样本的 loss = -sum(onehot * log_probs)（只有正确类别位置非 0）
-    // 再对所有样本取平均
+    // log_softmax（数值稳定）→ 用 one-hot 取出正确类别的 log 概率 → 取负求均值
+    let log_probs = logits.log_softmax_last_dim();
     log_probs
         .mul(&oh)
         .sum_last_dim()

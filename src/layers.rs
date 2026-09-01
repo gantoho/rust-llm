@@ -29,12 +29,9 @@ impl Linear {
         let w: Vec<f32> = (0..in_features * out_features)
             .map(|_| rng.randn() * std)
             .collect();
-        let b: Vec<f32> = (0..out_features)
-            .map(|_| rng.randn() * std)
-            .collect();
         Linear {
             weight: Tensor::param(w, vec![in_features, out_features]),
-            bias: Tensor::param(b, vec![out_features]),
+            bias: Tensor::param(vec![0.0; out_features], vec![out_features]),
         }
     }
 
@@ -163,6 +160,7 @@ pub fn tanh(x: &Tensor) -> Tensor {
 }
 
 /// Softmax：把一组数变成概率分布（和为 1，都为正）
+#[allow(dead_code)] // 基础 API；训练中使用 log_softmax_last_dim 更稳定
 pub fn softmax(x: &Tensor) -> Tensor {
     x.softmax_last_dim()
 }
