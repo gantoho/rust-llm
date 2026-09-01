@@ -1,8 +1,9 @@
-# 第 18 课：KV Cache —— 让逐 token 生成不再重复计算
+﻿# 第 18 课：KV Cache —— 让逐 token 生成不再重复计算
 
-> 代码位置：[src/model.rs](file:///d:/Code/Rust/llm_from_scratch/src/model.rs)（`KVCache` / `MultiHeadAttention` / `GPT::forward`）
-> 代码位置：[src/sample.rs](file:///d:/Code/Rust/llm_from_scratch/src/sample.rs)（`generate`）
-> 演示入口：[src/main.rs](file:///d:/Code/Rust/llm_from_scratch/src/main.rs)（演示 3：生成 1 / 生成 2）
+> 代码位置：[src/attention.rs](src/attention.rs)（`KVCache` / `MultiHeadAttention`）
+> 代码位置：[src/model.rs](src/model.rs)（`GPT::forward`）
+> 代码位置：[src/sample.rs](src/sample.rs)（`generate`）
+> 演示入口：[src/main.rs](src/main.rs)（演示 3：生成 1 / 生成 2）
 
 ---
 

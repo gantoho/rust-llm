@@ -1,9 +1,9 @@
-# 第 16 课：训练小 GPT —— 看 loss 从 4.06 一路降到 0.34
+﻿# 第 16 课：训练小 GPT —— 看 loss 从 4.06 一路降到 0.34
 
-> 代码位置：[src/main.rs](file:///d:/Code/Rust/llm_from_scratch/src/main.rs)（`demo_gpt`）
-> 代码位置：[src/train.rs](file:///d:/Code/Rust/llm_from_scratch/src/train.rs)（`train_gpt` / `LRScheduler` / `clip_grad_norm`）
-> 代码位置：[src/data.rs](file:///d:/Code/Rust/llm_from_scratch/src/data.rs)（`CORPUS` / `DataLoader`）
-> 代码位置：[src/sample.rs](file:///d:/Code/Rust/llm_from_scratch/src/sample.rs)（`generate` / `sample_token`）
+> 代码位置：[src/main.rs](src/main.rs)（`demo_gpt`）
+> 代码位置：[src/train.rs](src/train.rs)（`train_gpt` / `LRScheduler` / `clip_grad_norm`）
+> 代码位置：[src/data.rs](src/data.rs)（`CORPUS` / `DataLoader`）
+> 代码位置：[src/sample.rs](src/sample.rs)（`generate` / `sample_token`）
 
 ---
 

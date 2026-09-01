@@ -1,8 +1,8 @@
-# 第 17 课：AdamW 优化器 —— 给梯度下降装上"惯性"和"自适应步长"
+﻿# 第 17 课：AdamW 优化器 —— 给梯度下降装上"惯性"和"自适应步长"
 
-> 代码位置：[src/optim.rs](file:///d:/Code/Rust/llm_from_scratch/src/optim.rs)（`SGD` / `AdamW`）
-> 代码位置：[src/train.rs](file:///d:/Code/Rust/llm_from_scratch/src/train.rs)（`train_gpt` 中 AdamW 的用法）
-> 演示入口：[src/main.rs](file:///d:/Code/Rust/llm_from_scratch/src/main.rs)（演示 3：训练小 GPT）
+> 代码位置：[src/optim.rs](src/optim.rs)（`SGD` / `AdamW`）
+> 代码位置：[src/train.rs](src/train.rs)（`train_gpt` 中 AdamW 的用法）
+> 演示入口：[src/main.rs](src/main.rs)（演示 3：训练小 GPT）
 
 ---
 

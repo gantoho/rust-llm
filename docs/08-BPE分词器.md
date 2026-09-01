@@ -1,8 +1,8 @@
-# 第 8 课：BPE 分词器 —— 让模型"读懂"文字
+﻿# 第 8 课：BPE 分词器 —— 让模型"读懂"文字
 
-> 代码位置：[src/tokenizer.rs](file:///d:/Code/Rust/llm_from_scratch/src/tokenizer.rs)
-> 演示入口：[src/main.rs](file:///d:/Code/Rust/llm_from_scratch/src/main.rs)（`demo_bpe`）
-> 语料：[src/data.rs](file:///d:/Code/Rust/llm_from_scratch/src/data.rs)（`CORPUS`）
+> 代码位置：[src/tokenizer.rs](src/tokenizer.rs)
+> 演示入口：[src/main.rs](src/main.rs)（`demo_bpe`）
+> 语料：[src/data.rs](src/data.rs)（`CORPUS`）
 
 ---
 

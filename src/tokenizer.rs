@@ -26,11 +26,7 @@ impl CharTokenizer {
                 chars.push(c);
             }
         }
-        let stoi = chars
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (c, i))
-            .collect();
+        let stoi = chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
         CharTokenizer { chars, stoi }
     }
 
@@ -128,29 +124,24 @@ impl BPETokenizer {
 
     /// 文本 -> token id 序列
     ///
-    /// 贪心合并：反复寻找"当前 ids 中存在且合并规则下标最小"的 pair 进行合并。
-    /// 越早合并的规则优先级越高（它对应的新符号 id 更小）。
+    /// 贪心合并（GPT-2 的标准实现）：按优先级从高到低，对每条合并规则在序列上
+    /// 做一趟扫描替换。复杂度 O(len × 合并数)，大语料也能秒级完成。
     pub fn encode(&self, text: &str) -> Vec<usize> {
         let mut ids: Vec<u16> = text.as_bytes().iter().map(|&b| b as u16).collect();
-        loop {
-            // 找到 ids 中优先级最高（merge 下标最小）的可合并 pair
-            let mut best_merge: Option<usize> = None; // merge 下标
-            let mut pos = 0;
-            for i in 0..ids.len().saturating_sub(1) {
-                let pair = (ids[i], ids[i + 1]);
-                if let Some(idx) = self.merges.iter().position(|&m| m == pair) {
-                    if best_merge.map_or(true, |b| idx < b) {
-                        best_merge = Some(idx);
-                        pos = i;
-                    }
+        for (idx, &(a, b)) in self.merges.iter().enumerate() {
+            let new_id = (256 + idx) as u16;
+            let mut out: Vec<u16> = Vec::with_capacity(ids.len());
+            let mut i = 0;
+            while i < ids.len() {
+                if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
+                    out.push(new_id);
+                    i += 2;
+                } else {
+                    out.push(ids[i]);
+                    i += 1;
                 }
             }
-            let Some(idx) = best_merge else {
-                break;
-            };
-            let new_id = (256 + idx) as u16;
-            ids[pos] = new_id;
-            ids.remove(pos + 1);
+            ids = out;
         }
         ids.into_iter().map(|x| x as usize).collect()
     }
@@ -164,6 +155,69 @@ impl BPETokenizer {
         String::from_utf8_lossy(&bytes).to_string()
     }
 }
+
+// ==================== 统一分词器接口（配置可切换） ====================
+
+/// 统一的分词器：`"char"` 用 [`CharTokenizer`]，`"bpe"` 用 [`BPETokenizer`]。
+///
+/// 上层（数据加载 / 训练 / 采样）只依赖这一个接口，不关心具体实现。
+/// 注意：`encode` 出来的 id 空间由具体实现决定，两者互不通用。
+pub enum Tokenizer {
+    Char(CharTokenizer),
+    Bpe(BPETokenizer),
+}
+
+impl Tokenizer {
+    /// 字符级分词器：词表来自语料中出现的所有字符
+    pub fn char(text: &str) -> Self {
+        Tokenizer::Char(CharTokenizer::new(text))
+    }
+
+    /// BPE 分词器：在语料上训练，目标词表大小 = 256 + 合并次数
+    pub fn bpe(text: &str, target_vocab: usize) -> Self {
+        Tokenizer::Bpe(BPETokenizer::train(text, target_vocab))
+    }
+
+    /// 按名称构造：`"char"` / `"bpe"`，其余报错
+    pub fn from_name(name: &str, corpus: &str, bpe_vocab: usize) -> Self {
+        match name {
+            "char" => Tokenizer::char(corpus),
+            "bpe" => Tokenizer::bpe(corpus, bpe_vocab),
+            other => panic!("未知分词器类型 '{}'（可选：char / bpe）", other),
+        }
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            Tokenizer::Char(t) => t.vocab_size(),
+            Tokenizer::Bpe(t) => t.vocab_size(),
+        }
+    }
+
+    pub fn encode(&self, text: &str) -> Vec<usize> {
+        match self {
+            Tokenizer::Char(t) => t.encode(text),
+            Tokenizer::Bpe(t) => t.encode(text),
+        }
+    }
+
+    pub fn decode(&self, ids: &[usize]) -> String {
+        match self {
+            Tokenizer::Char(t) => t.decode(ids),
+            Tokenizer::Bpe(t) => t.decode(ids),
+        }
+    }
+
+    /// 类型名（打印用）："char" / "bpe"
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Tokenizer::Char(_) => "char",
+            Tokenizer::Bpe(_) => "bpe",
+        }
+    }
+}
+
+// ==================== 测试 ====================
 
 #[cfg(test)]
 mod tests {
@@ -187,6 +241,10 @@ mod tests {
         assert_eq!(tok.decode(&ids), text);
         // "low" 应该被合并成一个 token（最高频）
         let ids_low = tok.encode("low");
-        assert!(ids_low.len() <= 3, "high-frequency 子词应被压缩，实际 {} 个 token", ids_low.len());
+        assert!(
+            ids_low.len() <= 3,
+            "high-frequency 子词应被压缩，实际 {} 个 token",
+            ids_low.len()
+        );
     }
 }

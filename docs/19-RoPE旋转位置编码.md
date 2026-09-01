@@ -1,8 +1,8 @@
-# 第 19 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
+﻿# 第 19 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
 
-> 代码位置：[src/tensor.rs](file:///d:/Code/Rust/llm_from_scratch/src/tensor.rs)（`rotary` 方法、"旋转位置编码（第 19 课）"小节、`test_rotary` 测试）
-> 配套代码：[src/model.rs](file:///d:/Code/Rust/llm_from_scratch/src/model.rs)（第 18 课 KV cache、第 11 课正弦编码 `sinusoidal_positions`）
-> 配套文档：[docs/11-位置编码与归一化.md](file:///d:/Code/Rust/llm_from_scratch/docs/11-位置编码与归一化.md)
+> 代码位置：[src/rope.rs](src/rope.rs)（`rotary` 方法 + `test_rotary` / `test_rotary_grad_exact` 测试）
+> 配套代码：[src/attention.rs](src/attention.rs)（RoPE 接入 `MultiHeadAttention`）
+> 配套文档：[docs/11-位置编码与归一化.md](docs/11-位置编码与归一化.md)
 
 ---
 

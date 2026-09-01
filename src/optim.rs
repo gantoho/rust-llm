@@ -34,7 +34,7 @@ impl SGD {
     }
 }
 
-/// AdamW（Adam + 权重衰减解耦）
+/// SGD（第 2 课）AdamW（Adam + 权重衰减解耦）
 ///
 /// 核心思想：
 /// 1. 一阶动量 m：梯度的指数移动平均（记住"方向"，像小球下坡的惯性）
@@ -101,5 +101,23 @@ impl AdamW {
         for p in &self.params {
             p.zero_grad();
         }
+    }
+
+    /// 导出优化器状态（checkpoint 用）：(步数 t, 一阶动量 m, 二阶动量 v)
+    pub fn state(&self) -> (usize, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        (self.t, self.m.clone(), self.v.clone())
+    }
+
+    /// 恢复优化器状态（resume 用），长度必须与参数一致
+    pub fn restore_state(&mut self, t: usize, m: Vec<Vec<f32>>, v: Vec<Vec<f32>>) {
+        assert_eq!(m.len(), self.params.len(), "动量 m 的参数数量不匹配");
+        assert_eq!(v.len(), self.params.len(), "动量 v 的参数数量不匹配");
+        for (i, p) in self.params.iter().enumerate() {
+            assert_eq!(m[i].len(), p.numel(), "参数 {} 的动量长度不匹配", i);
+            assert_eq!(v[i].len(), p.numel(), "参数 {} 的二阶动量长度不匹配", i);
+        }
+        self.t = t;
+        self.m = m;
+        self.v = v;
     }
 }

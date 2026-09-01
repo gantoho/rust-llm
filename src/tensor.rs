@@ -1,4 +1,4 @@
-//! 张量库：Tensor + 自动微分（第 1-4 课）
+//! 张量库（第 1-4 课）
 //!
 //! 功能清单：
 //! - 构造：from_vec / param / zeros / ones
@@ -9,10 +9,11 @@
 //! - 矩阵：matmul（2D 与 3D 批量）
 //! - 归约：sum / sum_last_dim / softmax_last_dim
 //! - 索引：gather_rows（Embedding 用）
-//! - 自动微分：backward / zero_grad
+//!
+//! 自动微分（backward）见 `src/autograd.rs`，
+//! 旋转位置编码（rotary）见 `src/rope.rs`。
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 
 /// 反向函数类型：无参数、无返回值，通过闭包捕获的 Rc 句柄直接读写各节点的梯度
@@ -25,16 +26,16 @@ type BackwardFn = Rc<dyn Fn()>;
 /// - `RefCell` 允许在运行时借用可变
 #[derive(Clone)]
 pub struct Tensor {
-    data: Rc<RefCell<Vec<f32>>>,
-    shape: Vec<usize>,
-    grad: Rc<RefCell<Vec<f32>>>,
-    requires_grad: bool,
+    pub(crate) data: Rc<RefCell<Vec<f32>>>,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) grad: Rc<RefCell<Vec<f32>>>,
+    pub(crate) requires_grad: bool,
     /// 父节点列表。
     /// 注意：用 `Rc<Vec<_>>` 而不是 `Vec<Tensor>`——
     /// 若直接存 Vec，`derive(Clone)` 会递归深拷贝整棵祖先计算图，
     /// 深层图上每次建节点都是 O(图深) 的灾难。用 Rc 共享后克隆是 O(1)。
-    parents: Rc<Vec<Tensor>>,
-    backward: Option<BackwardFn>,
+    pub(crate) parents: Rc<Vec<Tensor>>,
+    pub(crate) backward: Option<BackwardFn>,
 }
 
 // ==================== 广播工具（第 3 课） ====================
@@ -45,8 +46,16 @@ fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let n = a.len().max(b.len());
     let mut out = vec![1usize; n];
     for i in 0..n {
-        let da = if i + a.len() >= n { a[i + a.len() - n] } else { 1 };
-        let db = if i + b.len() >= n { b[i + b.len() - n] } else { 1 };
+        let da = if i + a.len() >= n {
+            a[i + a.len() - n]
+        } else {
+            1
+        };
+        let db = if i + b.len() >= n {
+            b[i + b.len() - n]
+        } else {
+            1
+        };
         if da == db {
             out[i] = da;
         } else if da == 1 {
@@ -97,7 +106,7 @@ pub fn broadcast_data(src: &[f32], src_shape: &[usize], target_shape: &[usize]) 
 impl Tensor {
     // ---------- 构造 ----------
 
-    fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
+    pub(crate) fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
         let len = data.len();
         Tensor {
             data: Rc::new(RefCell::new(data)),
@@ -219,7 +228,12 @@ impl Tensor {
         assert_eq!(index.len(), self.rank(), "索引维度与张量维度不一致");
         let mut flat = 0;
         for (i, &idx) in index.iter().enumerate() {
-            assert!(idx < self.shape[i], "索引越界：{:?} 超出形状 {:?}", index, self.shape);
+            assert!(
+                idx < self.shape[i],
+                "索引越界：{:?} 超出形状 {:?}",
+                index,
+                self.shape
+            );
             flat = flat * self.shape[i] + idx;
         }
         flat
@@ -257,7 +271,10 @@ impl Tensor {
         assert_eq!(dims.len(), self.rank(), "permute 必须提供所有维度");
         let mut seen = vec![false; self.rank()];
         for &d in dims {
-            assert!(d < self.rank() && !seen[d], "permute 维度必须是不重复的排列");
+            assert!(
+                d < self.rank() && !seen[d],
+                "permute 维度必须是不重复的排列"
+            );
             seen[d] = true;
         }
         let new_shape: Vec<usize> = dims.iter().map(|&d| self.shape[d]).collect();
@@ -317,14 +334,25 @@ impl Tensor {
     // ---------- 逐元素运算（支持广播） ----------
 
     /// 内部工具：判断是否同形状；不同则计算广播 map
-    fn broadcast_plan(&self, other: &Tensor) -> (Vec<usize>, Option<Vec<usize>>, Option<Vec<usize>>) {
+    fn broadcast_plan(
+        &self,
+        other: &Tensor,
+    ) -> (Vec<usize>, Option<Vec<usize>>, Option<Vec<usize>>) {
         if self.shape == other.shape {
             (self.shape.clone(), None, None)
         } else {
             let target = broadcast_shapes(&self.shape, &other.shape)
                 .unwrap_or_else(|| panic!("形状无法广播：{:?} vs {:?}", self.shape, other.shape));
-            let map_a = if self.shape == target { None } else { Some(broadcast_map(&target, &self.shape)) };
-            let map_b = if other.shape == target { None } else { Some(broadcast_map(&target, &other.shape)) };
+            let map_a = if self.shape == target {
+                None
+            } else {
+                Some(broadcast_map(&target, &self.shape))
+            };
+            let map_b = if other.shape == target {
+                None
+            } else {
+                Some(broadcast_map(&target, &other.shape))
+            };
             (target, map_a, map_b)
         }
     }
@@ -492,7 +520,10 @@ impl Tensor {
     pub fn relu(&self) -> Tensor {
         let sd = self.data.borrow();
         let data = sd.iter().map(|&a| a.max(0.0)).collect();
-        let mask: Vec<f32> = sd.iter().map(|&a| if a > 0.0 { 1.0 } else { 0.0 }).collect();
+        let mask: Vec<f32> = sd
+            .iter()
+            .map(|&a| if a > 0.0 { 1.0 } else { 0.0 })
+            .collect();
         drop(sd);
         let mut result = self.unary(data, self.shape.clone());
         if self.requires_grad {
@@ -748,7 +779,11 @@ impl Tensor {
     fn matmul_2d(&self, other: &Tensor) -> Tensor {
         let (m, k1) = (self.shape[0], self.shape[1]);
         let (k2, n) = (other.shape[0], other.shape[1]);
-        assert_eq!(k1, k2, "矩阵乘法维度不匹配：{:?} x {:?}", self.shape, other.shape);
+        assert_eq!(
+            k1, k2,
+            "矩阵乘法维度不匹配：{:?} x {:?}",
+            self.shape, other.shape
+        );
 
         let sd = self.data.borrow();
         let od = other.data.borrow();
@@ -850,7 +885,10 @@ impl Tensor {
     /// 反向：梯度广播回最后一维
     pub fn sum_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "sum_last_dim 需要至少 1 维");
-        let (pre, d) = (self.numel() / self.shape[self.rank() - 1], self.shape[self.rank() - 1]);
+        let (pre, d) = (
+            self.numel() / self.shape[self.rank() - 1],
+            self.shape[self.rank() - 1],
+        );
         let sd = self.data.borrow();
         let mut out_data = vec![0.0f32; pre];
         for p in 0..pre {
@@ -889,7 +927,10 @@ impl Tensor {
     /// 反向公式：∂x_i = s_i * (g_i - Σ_j g_j * s_j)
     pub fn softmax_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "softmax_last_dim 需要至少 1 维");
-        let (rows, d) = (self.numel() / self.shape[self.rank() - 1], self.shape[self.rank() - 1]);
+        let (rows, d) = (
+            self.numel() / self.shape[self.rank() - 1],
+            self.shape[self.rank() - 1],
+        );
         let sd = self.data.borrow();
         let mut out_data = vec![0.0f32; rows * d];
         // 先存 softmax 结果（反向需要）
@@ -972,97 +1013,7 @@ impl Tensor {
         result
     }
 
-    // ---------- 旋转位置编码（第 19 课） ----------
-
-    /// RoPE 旋转位置编码。
-    ///
-    /// 对最后一维按"旋转"方式注入位置信息：把 d 分成 d/2 对 (x_{2i}, x_{2i+1})，
-    /// 每对绕原点旋转角度 θ_i = pos / 10000^(2i/d)：
-    ///
-    ///   x'_{2i}   = x_{2i}·cosθ_i - x_{2i+1}·sinθ_i
-    ///   x'_{2i+1} = x_{2i}·sinθ_i + x_{2i+1}·cosθ_i
-    ///
-    /// 性质：
-    /// - 旋转是正交变换 → 不改变向量范数，数值稳定
-    /// - 点积只与"位置差"有关 → 天然编码相对位置（相比正弦编码的优势）
-    /// - 只作用于 Q/K（加在 attention 之前），与 KV cache 天然兼容
-    ///
-    /// 反向：每个 pair 的旋转矩阵正交，梯度用其转置（即负角度旋转）回传。
-    pub fn rotary(&self, positions: &[usize]) -> Tensor {
-        assert_eq!(self.rank(), 2, "rotary 输入应为 [rows, D]");
-        assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
-        let (rows, d) = (self.shape[0], self.shape[1]);
-        assert_eq!(d % 2, 0, "最后一维必须为偶数才能两两配对旋转");
-
-        let sd = self.data.borrow();
-        let mut out_data = vec![0.0f32; rows * d];
-        for r in 0..rows {
-            let pos = positions[r] as f32;
-            for i in 0..d / 2 {
-                let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);
-                let (c, s) = (theta.cos(), theta.sin());
-                let (a, b) = (sd[r * d + 2 * i], sd[r * d + 2 * i + 1]);
-                out_data[r * d + 2 * i] = a * c - b * s;
-                out_data[r * d + 2 * i + 1] = a * s + b * c;
-            }
-        }
-        drop(sd);
-        let positions_vec = positions.to_vec();
-
-        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
-            let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for r in 0..rows {
-                    let pos = positions_vec[r] as f32;
-                    for i in 0..d / 2 {
-                        let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);
-                        let (c, s) = (theta.cos(), theta.sin());
-                        let (ga, gb) = (g[r * d + 2 * i], g[r * d + 2 * i + 1]);
-                        // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
-                        sgm[r * d + 2 * i] += ga * c + gb * s;
-                        sgm[r * d + 2 * i + 1] += -ga * s + gb * c;
-                    }
-                }
-            }));
-        }
-        result
-    }
-
-    // ---------- 自动微分核心 ----------
-
-    pub fn backward(&self) {
-        assert_eq!(self.rank(), 0, "backward() 只支持标量（0 维）输出，当前形状 {:?}", self.shape);
-        {
-            let mut g = self.grad.borrow_mut();
-            g[0] = 1.0;
-        }
-
-        fn dfs(t: &Tensor, order: &mut Vec<Tensor>, visited: &mut HashSet<usize>) {
-            let key = Rc::as_ptr(&t.data) as usize;
-            if !visited.insert(key) {
-                return;
-            }
-            for p in t.parents.iter() {
-                dfs(p, order, visited);
-            }
-            order.push(t.clone());
-        }
-
-        let mut order = Vec::new();
-        let mut visited = HashSet::new();
-        dfs(self, &mut order, &mut visited);
-
-        for t in order.iter().rev() {
-            if let Some(b) = &t.backward {
-                b();
-            }
-        }
-    }
+    // ---------- 自动微分核心（实现见 autograd.rs） ----------
 }
 
 impl std::fmt::Display for Tensor {
@@ -1197,45 +1148,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rotary() {
-        // 1. 旋转是正交变换：范数不变
-        let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 6]);
-        let r = x.rotary(&[3]);
-        let orig_norm: f32 = x.data().iter().map(|v| v * v).sum();
-        let rot_norm: f32 = r.data().iter().map(|v| v * v).sum();
-        assert!((orig_norm - rot_norm).abs() < 1e-3, "范数应守恒：{} vs {}", orig_norm, rot_norm);
-
-        // 2. pos=0 时所有角度为 0，等于恒等变换
-        let x2 = Tensor::param(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]);
-        let r2 = x2.rotary(&[0]);
-        assert!((r2.data()[0] - 1.0).abs() < 1e-5);
-        assert!((r2.data()[3] - 4.0).abs() < 1e-5);
-
-        // 3. 梯度：sum 的梯度是单位向量，经正交矩阵回传后范数不变（= 元素数）
-        let x3 = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 6]);
-        let loss = x3.rotary(&[2]).sum();
-        loss.backward();
-        let g: Vec<f32> = x3.grad();
-        assert!((g.iter().map(|v| v * v).sum::<f32>() - 6.0).abs() < 1e-3, "梯度范数应为 6");
-    }
-
-    #[test]
-    fn test_rotary_grad_exact() {
-        // pos=1、i=0 时 θ=1 rad，逐元素验证梯度 = R(θ)ᵀ·g（g 为全 1）
-        // 前向 o_a = a·c - b·s, o_b = a·s + b·c
-        // 反向 grad_a = g_a·c + g_b·s, grad_b = -g_a·s + g_b·c
-        let x = Tensor::param(vec![1.0, 2.0], vec![1, 2]);
-        let loss = x.rotary(&[1]).sum();
-        loss.backward();
-        let (c, s) = (1f32.cos(), 1f32.sin());
-        let (ga, gb) = (c + s, -s + c);
-        assert!((x.grad()[0] - ga).abs() < 1e-5, "grad[0] = {}", x.grad()[0]);
-        assert!((x.grad()[1] - gb).abs() < 1e-5, "grad[1] = {}", x.grad()[1]);
-    }
-
-    #[test]
     fn test_linear_regression_converges() {
-        let x_aug = Tensor::from_vec(vec![1.0, 1.0, 2.0, 1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 1.0], vec![5, 2]);
+        let x_aug = Tensor::from_vec(
+            vec![1.0, 1.0, 2.0, 1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 1.0],
+            vec![5, 2],
+        );
         let y_true = Tensor::from_vec(vec![3.0, 5.0, 7.0, 9.0, 11.0], vec![5, 1]);
         let w = Tensor::param(vec![0.0, 0.0], vec![2, 1]);
         let lr = 0.001;

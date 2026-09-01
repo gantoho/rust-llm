@@ -1,6 +1,6 @@
-# 第 7 课：第一个 MLP —— 教会神经网络算 XOR
+﻿# 第 7 课：第一个 MLP —— 教会神经网络算 XOR
 
-> 代码位置：[src/main.rs](file:///d:/Code/Rust/llm_from_scratch/src/main.rs)（`demo_xor` 函数）
+> 代码位置：[src/main.rs](src/main.rs)（`demo_xor` 函数）
 > 前置知识：第 5 课 Linear / 激活函数、第 6 课 CrossEntropy / SGD
 
 ---

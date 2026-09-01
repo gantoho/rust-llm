@@ -10,7 +10,7 @@
 
 use crate::model::GPT;
 use crate::rng::Rng;
-use crate::tokenizer::CharTokenizer;
+use crate::tokenizer::Tokenizer;
 
 /// 从 logits 分布中采样一个 token
 pub fn sample_token(
@@ -21,10 +21,7 @@ pub fn sample_token(
     rng: &mut Rng,
 ) -> usize {
     // 1. 除以 temperature 缩放
-    let scaled: Vec<f32> = logits
-        .iter()
-        .map(|&l| l / temperature.max(1e-5))
-        .collect();
+    let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature.max(1e-5)).collect();
 
     // 2. 按分数从高到低排序
     let mut items: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &v)| (i, v)).collect();
@@ -36,7 +33,10 @@ pub fn sample_token(
     }
 
     // 4. softmax 得到概率
-    let max = items.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+    let max = items
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = items.iter().map(|(_, v)| (*v - max).exp()).collect();
     let sum: f32 = probs.iter().sum();
     for p in probs.iter_mut() {
@@ -80,7 +80,7 @@ pub fn sample_token(
 /// - use_kv_cache: 是否使用 KV cache 加速（第 18 课）
 pub fn generate(
     model: &GPT,
-    tokenizer: &CharTokenizer,
+    tokenizer: &Tokenizer,
     prompt: &str,
     max_new: usize,
     temperature: f32,

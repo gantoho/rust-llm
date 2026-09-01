@@ -29,7 +29,9 @@ impl Linear {
         let w: Vec<f32> = (0..in_features * out_features)
             .map(|_| rng.uniform(-bound, bound))
             .collect();
-        let b: Vec<f32> = (0..out_features).map(|_| rng.uniform(-bound, bound)).collect();
+        let b: Vec<f32> = (0..out_features)
+            .map(|_| rng.uniform(-bound, bound))
+            .collect();
         Linear {
             weight: Tensor::param(w, vec![in_features, out_features]),
             bias: Tensor::param(b, vec![out_features]),

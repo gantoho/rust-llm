@@ -1,8 +1,9 @@
 # 第 12 课：完整 GPT 模型 —— 把积木拼成能预测下一个词的模型
 
-> 代码位置：[src/model.rs](file:///d:/Code/Rust/llm_from_scratch/src/model.rs)（`GPTConfig` / `GPT` / `TransformerBlock` / `MultiHeadAttention`）
-> 代码位置：[src/layers.rs](file:///d:/Code/Rust/llm_from_scratch/src/layers.rs)（`Embedding` / `Linear` / `LayerNorm` / `gelu`）
-> 演示入口：[src/main.rs](file:///d:/Code/Rust/llm_from_scratch/src/main.rs)（演示 3：训练小 GPT 并生成文本）
+> 代码位置：[src/model.rs](src/model.rs)（`GPTConfig` / `GPT` / `TransformerBlock`）
+> 代码位置：[src/attention.rs](src/attention.rs)（`MultiHeadAttention` / `KVCache`）
+> 代码位置：[src/layers.rs](src/layers.rs)（`Embedding` / `Linear` / `LayerNorm` / `gelu`）
+> 演示入口：[src/main.rs](src/main.rs)（演示 3：训练小 GPT 并生成文本）
 
 ---
 
