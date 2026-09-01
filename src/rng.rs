@@ -36,6 +36,7 @@ impl Rng {
     }
 
     /// 生成 [lo, hi) 的均匀浮点数
+    #[allow(dead_code)] // 基础随机数 API（权重初始化等场景）
     pub fn uniform(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.next_f32()
     }

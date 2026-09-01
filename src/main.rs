@@ -29,7 +29,7 @@ mod train;
 use cli::{Cli, Cmd};
 use config::Config;
 use data::{CORPUS, DataLoader};
-use layers::{Linear, relu};
+use layers::{Linear, tanh};
 use loss::cross_entropy_loss;
 use model::{GPT, GPTConfig};
 use module::Module;
@@ -236,7 +236,7 @@ fn run_demo() {
 /// 演示 1（第 7 课）：用 MLP 学会 XOR 异或
 ///
 /// XOR 是经典的"神经网络必须非线性"案例：
-/// 单层线性模型学不会（数据线性不可分），加一层 ReLU 就能学会。
+/// 单层线性模型学不会（数据线性不可分），加一层 Tanh 就能学会。
 fn demo_xor() {
     println!("=== 演示 1：MLP 学习 XOR（第 7 课）===");
     let mut rng = Rng::new(42);
@@ -245,7 +245,7 @@ fn demo_xor() {
     let x_data = Tensor::from_vec(vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], vec![4, 2]);
     let y_targets = vec![0usize, 1, 1, 0]; // XOR 真值表
 
-    // 网络：2 -> 4 (ReLU) -> 2（两个输出：0 和 1 的分数）
+    // 网络：2 -> 4 (Tanh) -> 2（两个输出：0 和 1 的分数）
     let fc1 = Linear::new(2, 4, &mut rng);
     let fc2 = Linear::new(4, 2, &mut rng);
     let params: Vec<Tensor> = {
@@ -256,8 +256,8 @@ fn demo_xor() {
     let opt = SGD::new(0.5, params);
 
     for step in 0..1000 {
-        // 前向：relu(x @ W1 + b1) @ W2 + b2
-        let h = relu(&fc1.forward(&x_data));
+        // 前向：tanh(x @ W1 + b1) @ W2 + b2
+        let h = tanh(&fc1.forward(&x_data));
         let logits = fc2.forward(&h);
         let loss = cross_entropy_loss(&logits, &y_targets);
 
@@ -271,7 +271,7 @@ fn demo_xor() {
     }
 
     // 验证正确率
-    let h = relu(&fc1.forward(&x_data));
+    let h = tanh(&fc1.forward(&x_data));
     let logits = fc2.forward(&h);
     let data = logits.data();
     let mut correct = 0;

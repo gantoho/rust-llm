@@ -20,7 +20,7 @@ use crate::config::TrainConfig;
 use crate::data::DataLoader;
 use crate::loss::cross_entropy_loss;
 use crate::model::GPT;
-use crate::module::Module;
+use crate::module::{Module, zero_grad_all};
 use crate::optim::AdamW;
 use crate::rng::Rng;
 use crate::tensor::Tensor;
@@ -97,6 +97,7 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
 ///
 /// `eval_iters` 批的平均，调用方用固定种子的 Rng 可保证结果可复现。
 pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut Rng) -> f32 {
+    zero_grad_all(model); // 评估前清零梯度，避免残留影响
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
         let (x, y) = loader.eval_batch(rng);

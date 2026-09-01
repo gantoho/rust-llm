@@ -24,6 +24,7 @@ impl KVCache {
         KVCache { k: None, v: None }
     }
 
+    #[allow(dead_code)] // 多轮生成时重置缓存
     pub fn reset(&mut self) {
         self.k = None;
         self.v = None;

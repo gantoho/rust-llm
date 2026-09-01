@@ -23,14 +23,14 @@ pub struct Linear {
 
 impl Linear {
     /// 创建线性层。
-    /// 权重用 xavier/kaiming 均匀分布初始化（值域 ±1/√in，保证激活方差稳定）。
+    /// 权重用 Xavier 正态分布初始化（std = √(2/(in+out))，保证前向/反向方差稳定）。
     pub fn new(in_features: usize, out_features: usize, rng: &mut Rng) -> Self {
-        let bound = 1.0 / (in_features as f32).sqrt();
+        let std = (2.0 / (in_features + out_features) as f32).sqrt();
         let w: Vec<f32> = (0..in_features * out_features)
-            .map(|_| rng.uniform(-bound, bound))
+            .map(|_| rng.randn() * std)
             .collect();
         let b: Vec<f32> = (0..out_features)
-            .map(|_| rng.uniform(-bound, bound))
+            .map(|_| rng.randn() * std)
             .collect();
         Linear {
             weight: Tensor::param(w, vec![in_features, out_features]),
@@ -121,11 +121,11 @@ pub struct Embedding {
 }
 
 impl Embedding {
-    /// 创建嵌入表，用小随机数初始化
+    /// 创建嵌入表，用正态分布 N(0, 0.02) 初始化
     pub fn new(vocab_size: usize, d_model: usize, rng: &mut Rng) -> Self {
-        let bound = 0.02;
+        let std = 0.02;
         let data: Vec<f32> = (0..vocab_size * d_model)
-            .map(|_| rng.uniform(-bound, bound))
+            .map(|_| rng.randn() * std)
             .collect();
         Embedding {
             table: Tensor::param(data, vec![vocab_size, d_model]),
@@ -147,6 +147,7 @@ impl Module for Embedding {
 // ---------- 激活函数（第 5 课） ----------
 
 /// ReLU：max(0, x)，简单、计算快、缓解梯度消失
+#[allow(dead_code)] // 基础激活函数 API（测试 test_relu_grad 已验证）
 pub fn relu(x: &Tensor) -> Tensor {
     x.relu()
 }

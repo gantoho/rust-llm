@@ -96,6 +96,7 @@ fn broadcast_map(target: &[usize], src: &[usize]) -> Vec<usize> {
 }
 
 /// 把一个"小形状"的向量广播扩展成"大形状"的向量（纯数据工具，KV cache 用）
+#[allow(dead_code)] // 广播工具 API（二元运算内部已内联处理）
 pub fn broadcast_data(src: &[f32], src_shape: &[usize], target_shape: &[usize]) -> Vec<f32> {
     let map = broadcast_map(target_shape, src_shape);
     map.iter().map(|&i| src[i]).collect()
@@ -140,23 +141,27 @@ impl Tensor {
     }
 
     /// 全 0 张量
+    #[allow(dead_code)]
     pub fn zeros(shape: Vec<usize>) -> Self {
         let numel: usize = shape.iter().product();
         Tensor::new(vec![0.0; numel], shape, false)
     }
 
     /// 全 1 张量
+    #[allow(dead_code)]
     pub fn ones(shape: Vec<usize>) -> Self {
         let numel: usize = shape.iter().product();
         Tensor::new(vec![1.0; numel], shape, false)
     }
 
     /// 标量张量
+    #[allow(dead_code)]
     pub fn scalar(v: f32) -> Self {
         Tensor::new(vec![v], vec![], false)
     }
 
     /// 用指定值填充
+    #[allow(dead_code)]
     pub fn fill(shape: Vec<usize>, value: f32) -> Self {
         let numel: usize = shape.iter().product();
         Tensor::new(vec![value; numel], shape, false)
@@ -196,6 +201,7 @@ impl Tensor {
         &self.shape
     }
 
+    #[allow(dead_code)]
     pub fn requires_grad(&self) -> bool {
         self.requires_grad
     }
@@ -208,15 +214,18 @@ impl Tensor {
         self.shape.iter().product()
     }
 
+    #[allow(dead_code)]
     pub fn dim(&self, index: usize) -> usize {
         self.shape[index]
     }
 
     /// 读取元素（只读，破坏计算图语义，仅供调试）
+    #[allow(dead_code)]
     pub fn get(&self, index: &[usize]) -> f32 {
         self.data.borrow()[self.flat_index(index)]
     }
 
+    #[allow(dead_code)]
     pub fn set(&mut self, index: &[usize], value: f32) {
         let flat = self.flat_index(index);
         self.data.borrow_mut()[flat] = value;
@@ -224,6 +233,7 @@ impl Tensor {
 
     // ---------- 形状工具 ----------
 
+    #[allow(dead_code)]
     fn flat_index(&self, index: &[usize]) -> usize {
         assert_eq!(index.len(), self.rank(), "索引维度与张量维度不一致");
         let mut flat = 0;
@@ -326,6 +336,7 @@ impl Tensor {
     }
 
     /// 2 维转置（permute([1,0]) 的特例）
+    #[allow(dead_code)]
     pub fn transpose(&self) -> Tensor {
         assert_eq!(self.rank(), 2, "transpose 只支持 2 维");
         self.permute(&[1, 0])
@@ -542,6 +553,7 @@ impl Tensor {
     }
 
     /// tanh：c = tanh(x)，∂x = g * (1 - c²)
+    #[allow(dead_code)]
     pub fn tanh(&self) -> Tensor {
         let sd = self.data.borrow();
         let data: Vec<f32> = sd.iter().map(|&a| a.tanh()).collect();
@@ -601,6 +613,7 @@ impl Tensor {
     }
 
     /// exp：c = e^x，∂x = g * c
+    #[allow(dead_code)]
     pub fn exp(&self) -> Tensor {
         let sd = self.data.borrow();
         let data: Vec<f32> = sd.iter().map(|&a| a.exp()).collect();
@@ -1149,16 +1162,17 @@ mod tests {
 
     #[test]
     fn test_linear_regression_converges() {
+        use crate::loss::mse_loss;
         let x_aug = Tensor::from_vec(
             vec![1.0, 1.0, 2.0, 1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 1.0],
             vec![5, 2],
         );
         let y_true = Tensor::from_vec(vec![3.0, 5.0, 7.0, 9.0, 11.0], vec![5, 1]);
         let w = Tensor::param(vec![0.0, 0.0], vec![2, 1]);
-        let lr = 0.001;
+        let lr = 0.005; // mse_loss 取均值，梯度更小，lr 相应放大
         for _ in 0..5000 {
             let pred = x_aug.matmul(&w);
-            let loss = pred.sub(&y_true).mul(&pred.sub(&y_true)).sum();
+            let loss = mse_loss(&pred, &y_true);
             loss.backward();
             let gw = w.grad();
             w.set_data(vec![w.data()[0] - lr * gw[0], w.data()[1] - lr * gw[1]]);

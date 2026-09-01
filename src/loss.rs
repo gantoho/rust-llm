@@ -4,9 +4,11 @@
 //! - MSE：回归任务（预测连续数值）
 //! - CrossEntropy：分类任务（预测属于哪个类别，LLM 用它）
 
+use crate::layers::softmax;
 use crate::tensor::Tensor;
 
 /// 均方误差：loss = mean((pred - target)²)
+#[allow(dead_code)] // 回归任务损失函数 API（测试 test_linear_regression_converges 已验证）
 pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
     pred.sub(target)
         .pow(2.0)
@@ -38,7 +40,7 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     let oh = Tensor::from_vec(onehot, vec![b, d]);
 
     // log_softmax(logits)，再用 one-hot 取出每个样本正确类别的 log 概率
-    let log_probs = logits.softmax_last_dim().log();
+    let log_probs = softmax(logits).log();
     // 每个样本的 loss = -sum(onehot * log_probs)（只有正确类别位置非 0）
     // 再对所有样本取平均
     log_probs
