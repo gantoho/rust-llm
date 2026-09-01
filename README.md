@@ -2,7 +2,8 @@
 
 > **深度学习算法全部纯手写**：不使用任何深度学习框架（如 tch-rs / candle / burn），
 > 从零手写张量、自动微分、神经网络层、Transformer 架构。
-> 仅引入少量**工具库**（serde_json 做配置/序列化、clap 做命令行、windows-sys 修控制台编码），不参与任何算法实现。
+> 仅引入少量**工具库**（serde_json 做配置/序列化、clap 做命令行、windows-sys 修控制台编码、
+> 可选的 wgpu 做 GPU 计算后端），它们都不参与任何算法实现。
 >
 > 每个实现步骤都配套一篇中文教程文档（见 `docs/`），边写代码边学原理。
 
@@ -35,6 +36,7 @@
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / demo |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64* 伪随机数发生器 |
+| GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
 ## 快速开始
 
@@ -53,12 +55,35 @@ cargo run --release -- generate --config config.json --prompt "Alice was" --max-
 # 4. 断点续训（从最近的 checkpoint 继续）
 cargo run --release -- train --config config.json --resume checkpoints/latest.ckpt
 
-# 5. 教学演示（XOR + BPE + 内置语料小 GPT）
+# 5. 教学演示（XOR + BPE + 内置语料小 GPT + GPU 演示）
 cargo run --release -- demo
 
-# 6. 单元测试（17 个：自动微分、广播、softmax、BPE、RoPE、KV cache 一致性等）
+# 6. 单元测试（18 个：自动微分、广播、softmax、BPE、RoPE、KV cache 一致性等）
 cargo test
 ```
+
+### GPU 加速（可选）
+
+默认构建**不启用 GPU**，保持依赖轻量；用 `--features gpu` 开启 wgpu 计算着色器加速：
+
+```bash
+# 开启 GPU 后运行教学演示（第 4 个演示会做 GPU 正确性与性能对比）
+cargo run --release --features gpu -- demo
+
+# 训练 / 推理同样可加 --features gpu
+cargo run --release --features gpu -- train --config config.json
+```
+
+原理与特性：
+
+- **实现**：用 wgpu 计算着色器（WGSL）手写 GPU 算子，支持 NVIDIA 与 Intel 核显
+  （Windows 下走 DX12 / Vulkan，无需额外驱动安装）。
+- **加速范围**：先覆盖热点算子——批量矩阵乘（naive 每线程一元素）、逐元素 scale / add / ReLU；
+  训练与推理中的矩阵乘自动走 GPU。
+- **自动回退**：GPU 初始化失败、形状超限（workgroup 超出 65535）或任何一次调用出错时，
+  自动回退 CPU 计算，**不影响正确性**。`cargo run -- demo` 会打印 `未检测到可用 GPU，已回退 CPU`。
+- **提示**：首次在 Windows 上运行，GPU 驱动会写 DX 着色器缓存（如 `NVIDIA DXCache`、`D3DSCache`），
+  若程序运行环境限制了这些目录的访问（例如沙箱），请放行或直接在普通终端中运行。
 
 ### 配置说明（`config.json`）
 
@@ -95,19 +120,22 @@ cargo test
 
 ### 演示内容（`cargo run --release -- demo`）
 
-`main.rs` 依次运行三个演示，验证各阶段成果：
+`main.rs` 依次运行四个演示，验证各阶段成果：
 
 1. **MLP 学习 XOR**（第 7 课）：验证神经网络 + 反向传播正确，训练后正确率 4/4（100%）。
 2. **BPE 分词器**（第 8 课）：在示例语料上训练字节对编码词表（400 个 token），演示编码/解码往返。
 3. **训练小 GPT 并生成文本**（第 12-20 课）：在 669 字符的英文小故事上训练 600 步，
    loss 从约 3.7 降到约 0.17，随后用 temperature=0.8 / top-k=10 / top-p=0.9 生成文本，
    并分别演示"无 KV cache"与"带 KV cache"两种推理方式（位置编码为第 19 课的 RoPE）。
+4. **GPU 加速对比**（第 21 课，仅 `--features gpu`）：打印设备信息，验证批量矩阵乘
+   CPU vs GPU 数值一致性（最大误差），实测 512×512 矩阵乘加速比，并校验逐元素算子
+   scale / relu / add。无可用 GPU 时自动回退 CPU 并提示。
 
 ## 目录结构
 
 ```
 llm_from_scratch/
-├── Cargo.toml          # 依赖：仅工具库（serde_json / clap / windows-sys）
+├── Cargo.toml          # 依赖：仅工具库（serde_json / clap / windows-sys）+ 可选 wgpu
 ├── README.md           # 本文件
 ├── config.json         # 训练配置（模型超参 + 训练参数）
 ├── data/               # 示例语料（data/alice.txt：公版《爱丽丝梦游仙境》）
@@ -119,6 +147,7 @@ llm_from_scratch/
 │   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、18-19 课）
 │   ├── autograd.rs     # 自动微分：backward + 拓扑排序（第 2 课）
 │   ├── tensor.rs       # 张量运算（第 1、3-4 课）
+│   ├── gpu.rs          # GPU 计算后端（第 21 课，--features gpu）：WGSL 计算着色器
 │   ├── rope.rs         # RoPE 旋转位置编码（第 19 课）
 │   ├── rng.rs          # 随机数（第 5 课）
 │   ├── layers.rs       # 网络层（第 5、11 课）
@@ -130,7 +159,7 @@ llm_from_scratch/
 │   ├── data.rs         # 数据集（第 14 课）
 │   ├── train.rs        # 训练循环与学习率调度（第 13、20 课）
 │   └── sample.rs       # 推理与采样（第 15 课）
-└── docs/               # 20 课教程文档（00-学习计划 + 01~20 各课）
+└── docs/               # 21 课教程文档（00-学习计划 + 01~21 各课）
 ```
 
 ## 学习路线
@@ -158,6 +187,15 @@ llm_from_scratch/
   大语料会卡死。改为 GPT-2 风格的"按规则优先级单趟扫描替换"（O(len×合并数)），174KB 语料秒级编码。
 - **Windows 控制台**：默认 GBK 代码页会让中文输出乱码，程序启动时用 `SetConsoleOutputCP(65001)`
   切到 UTF-8（通过 windows-sys 实现）。
+- **WGSL 变量遮蔽**：matmul 着色器里 `let b = ...` 会把全局 storage 数组 `b` 遮蔽成 u32，
+  再写 `b[...]` 就变成"对 u32 索引"，naga 报 `Invalid access into expression`——局部变量不要与全局资源同名。
+- **WGSL uniform 数组对齐**：uniform 地址空间中数组 stride 必须 16 字节对齐，`array<u32,4>` 会被摊成 64 字节；
+  改用 4 个独立 u32 字段（共 16 字节）传参即可。
+- **wgpu 30 API 变更**：`PipelineLayoutDescriptor` 已无 `push_constant_ranges`（改 `immediate_size`）、
+  `bind_group_layouts` 元素是 `Option<&BindGroupLayout>`、`PollType::Wait` 是带字段的 struct variant、
+  `get_mapped_range()` 返回 `Result`、`ComputePipelineDescriptor` 需 `cache` 字段。
+- **绑定编号**：多个计算入口共用同一 module 时，storage 绑定声明（binding 0/1/2/3）是全局的；
+  scale/relu 只用其中 3 个，创建 bind group 时要显式指定与 layout 一致的 binding 编号（0/2/3），不能从 0 连续排。
 
 ## 后续方向
 

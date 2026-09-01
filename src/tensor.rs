@@ -102,11 +102,33 @@ pub fn broadcast_data(src: &[f32], src_shape: &[usize], target_shape: &[usize]) 
     map.iter().map(|&i| src[i]).collect()
 }
 
+/// 矩阵乘数据计算（GPU 优先，失败自动回退 CPU）。
+/// 行优先存储：out[B,M,N] = a[B,M,K] @ b[B,K,N]；batch=1 时即普通 2D 矩阵乘。
+fn matmul_data(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, batch: usize) -> Vec<f32> {
+    #[cfg(feature = "gpu")]
+    if let Some(v) = crate::gpu::matmul(a, b, m, k, n, batch) {
+        return v;
+    }
+    let mut out = vec![0.0f32; batch * m * n];
+    for bi in 0..batch {
+        let (oa, ob, oo) = (bi * m * k, bi * k * n, bi * m * n);
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0;
+                for kk in 0..k {
+                    s += a[oa + i * k + kk] * b[ob + kk * n + j];
+                }
+                out[oo + i * n + j] = s;
+            }
+        }
+    }
+    out
+}
+
 // ==================== Tensor ====================
 
 impl Tensor {
     // ---------- 构造 ----------
-
     pub(crate) fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
         let len = data.len();
         Tensor {
@@ -726,18 +748,7 @@ impl Tensor {
 
         let sd = self.data.borrow();
         let od = other.data.borrow();
-        let mut out_data = vec![0.0f32; b * m * n];
-        for bi in 0..b {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut s = 0.0;
-                    for k in 0..k1 {
-                        s += sd[(bi * m + i) * k1 + k] * od[(bi * k1 + k) * n + j];
-                    }
-                    out_data[(bi * m + i) * n + j] = s;
-                }
-            }
-        }
+        let out_data = matmul_data(&sd, &od, m, k1, n, b);
         drop(sd);
         drop(od);
 
@@ -816,16 +827,7 @@ impl Tensor {
 
         let sd = self.data.borrow();
         let od = other.data.borrow();
-        let mut out_data = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0;
-                for k in 0..k1 {
-                    s += sd[i * k1 + k] * od[k * n + j];
-                }
-                out_data[i * n + j] = s;
-            }
-        }
+        let out_data = matmul_data(&sd, &od, m, k1, n, 1);
         drop(sd);
         drop(od);
 

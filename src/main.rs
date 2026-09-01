@@ -1,4 +1,4 @@
-﻿//! 从零实现大语言模型（纯 Rust，不依赖深度学习框架）
+//! 从零实现大语言模型（纯 Rust，不依赖深度学习框架）
 //!
 //! 用法（cli 子命令）：
 //! - `cargo run --release -- train    --config config.json [--resume checkpoints/latest.ckpt]`
@@ -14,6 +14,8 @@ mod checkpoint;
 mod cli;
 mod config;
 mod data;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod layers;
 mod loss;
 mod model;
@@ -41,6 +43,8 @@ use tokenizer::{BPETokenizer, CharTokenizer, Tokenizer};
 
 fn main() {
     init_console_utf8();
+    #[cfg(feature = "gpu")]
+    gpu::init();
     let cli = Cli::parse_args();
     match cli.cmd {
         Cmd::Train { config, resume } => cmd_train(&config, resume.as_deref()),
@@ -231,6 +235,8 @@ fn run_demo() {
     demo_xor();
     demo_bpe();
     demo_gpt();
+    #[cfg(feature = "gpu")]
+    demo_gpu();
 }
 
 /// 演示 1（第 7 课）：用 MLP 学会 XOR 异或
@@ -359,4 +365,87 @@ fn demo_gpt() {
     );
     println!("  {}", out2);
     println!("\n  （KV cache 只改计算方式、不改生成分布，两者应高度一致）");
+}
+
+/// 演示 4（第 21 课）：GPU 加速（wgpu 计算着色器）
+///
+/// 仅 `--features gpu` 时编译。验证 GPU 算子正确性并对比性能；
+/// 训练/推理中的矩阵乘已自动走 GPU，失败时静默回退 CPU。
+#[cfg(feature = "gpu")]
+fn demo_gpu() {
+    println!("=== 演示 4：GPU 加速（wgpu 计算着色器）===");
+    if !gpu::is_available() {
+        println!("  未检测到可用 GPU，已回退 CPU（训练/推理不受影响）\n");
+        return;
+    }
+    println!("  GPU: {}（{}）", gpu::name(), gpu::backend());
+
+    let mut rng = Rng::new(7);
+
+    // 1. 正确性：批量矩阵乘 CPU vs GPU
+    let (m, k, n, batch) = (32usize, 24, 40, 8);
+    let a: Vec<f32> = (0..batch * m * k).map(|_| rng.randn()).collect();
+    let b: Vec<f32> = (0..batch * k * n).map(|_| rng.randn()).collect();
+    let cpu = naive_matmul(&a, &b, m, k, n, batch);
+    let gpu_out = gpu::matmul(&a, &b, m, k, n, batch).unwrap();
+    let max_err = cpu
+        .iter()
+        .zip(&gpu_out)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "  批量矩阵乘 [{}x{}]@[{}x{}] x{}：CPU vs GPU 最大误差 {:.2e}",
+        m, k, k, n, batch, max_err
+    );
+
+    // 2. 性能对比：512x512 矩阵乘
+    let (m, k, n) = (512usize, 512, 512);
+    let a: Vec<f32> = (0..m * k).map(|_| rng.randn()).collect();
+    let b: Vec<f32> = (0..k * n).map(|_| rng.randn()).collect();
+    let t0 = std::time::Instant::now();
+    let _ = naive_matmul(&a, &b, m, k, n, 1);
+    let t_cpu = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let _ = gpu::matmul(&a, &b, m, k, n, 1).unwrap();
+    let t_gpu = t1.elapsed();
+    let speedup = t_cpu.as_secs_f64() / t_gpu.as_secs_f64().max(1e-9);
+    println!(
+        "  512x512 矩阵乘：CPU {:.1}ms vs GPU {:.1}ms（快 {:.1}x）",
+        t_cpu.as_secs_f64() * 1000.0,
+        t_gpu.as_secs_f64() * 1000.0,
+        speedup
+    );
+
+    // 3. 逐元素算子（scale / relu / add）验证
+    let x: Vec<f32> = (0..1024).map(|_| rng.randn()).collect();
+    let y: Vec<f32> = (0..1024).map(|_| rng.randn()).collect();
+    let s = gpu::scale(&x, 2.0).unwrap();
+    let r = gpu::relu(&x).unwrap();
+    let z = gpu::add(&x, &y).unwrap();
+    let ok = s.iter().zip(&x).all(|(a, b)| (a - b * 2.0).abs() < 1e-4)
+        && r.iter().zip(&x).all(|(a, b)| (*a - b.max(0.0)).abs() < 1e-5)
+        && z.iter().zip(&x).zip(&y).all(|((a, b), c)| (a - (b + c)).abs() < 1e-4);
+    println!(
+        "  逐元素算子（scale/relu/add）验证：{}",
+        if ok { "通过" } else { "失败" }
+    );
+    println!("  （训练/推理中 matmul 已自动走 GPU，失败自动回退 CPU）\n");
+}
+
+/// 朴素 CPU 批量矩阵乘（仅用于 GPU 正确性/性能对比）
+#[cfg(feature = "gpu")]
+fn naive_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, batch: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * m * n];
+    for bi in 0..batch {
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0;
+                for kk in 0..k {
+                    s += a[(bi * m + i) * k + kk] * b[(bi * k + kk) * n + j];
+                }
+                out[(bi * m + i) * n + j] = s;
+            }
+        }
+    }
+    out
 }
