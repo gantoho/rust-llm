@@ -263,7 +263,7 @@ pub fn decode(&self, ids: &[usize]) -> String {
 ## 9. 运行与测试
 
 ```bash
-cargo test   # 15 个测试全部通过，其中 tokenizer 的 2 个验证了编解码互逆
+cargo test   # 全部测试通过
 cargo run    # 演示 2（BPE）：词表 400（256 + 144 次合并）；"Red" -> [82, 101, 100]；"the garden" -> 2 个 token
 ```
 

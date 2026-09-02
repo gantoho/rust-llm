@@ -17,7 +17,7 @@
   验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
-### 包含的功能（对应 20 课）
+### 包含的功能（对应 21 课）
 
 | 模块 | 文件 | 内容 |
 |------|------|------|
@@ -58,7 +58,7 @@ cargo run --release -- train --config config.json --resume checkpoints/latest.ck
 # 5. 教学演示（XOR + BPE + 内置语料小 GPT + GPU 演示）
 cargo run --release -- demo
 
-# 6. 单元测试（18 个：自动微分、广播、softmax、BPE、RoPE、KV cache 一致性等）
+# 6. 单元测试（21 个：自动微分、广播、softmax、BPE、RoPE、KV cache 一致性等）
 cargo test
 ```
 

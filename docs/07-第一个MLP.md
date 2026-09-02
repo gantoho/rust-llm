@@ -75,7 +75,7 @@ let fc2 = Linear::new(4, 2, &mut rng);   // 隐藏层 4 维 → 输出 2 维
 结构图：
 
 ```
-x [4,2] ─► fc1 (2→4) ─► ReLU ─► h [4,4] ─► fc2 (4→2) ─► logits [4,2]
+x [4,2] ─► fc1 (2→4) ─► Tanh ─► h [4,4] ─► fc2 (4→2) ─► logits [4,2]
 ```
 
 - 输出层是 **2 个神经元**：第 0 个是"类别 0 的分数"，第 1 个是"类别 1 的分数"
@@ -100,8 +100,8 @@ let opt = SGD::new(0.5, params);
 
 ```rust
 for step in 0..1000 {
-    // 前向：relu(x @ W1 + b1) @ W2 + b2
-    let h = relu(&fc1.forward(&x_data));
+    // 前向：tanh(x @ W1 + b1) @ W2 + b2
+    let h = tanh(&fc1.forward(&x_data));
     let logits = fc2.forward(&h);
     let loss = cross_entropy_loss(&logits, &y_targets);
 
