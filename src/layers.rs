@@ -42,7 +42,8 @@ impl Linear {
         let x = match x.rank() {
             2 => x.clone(),
             3 => x.reshape(vec![x.shape()[0] * x.shape()[1], x.shape()[2]]),
-            _ => panic!("Linear 输入必须为 2D 或 3D"),
+            // 公开库 API：维度不合法给可读错误（带实际维度信息）
+            r => panic!("Linear 输入必须为 2D 或 3D，实际是 {r}D（形状 {:?}）", x.shape()),
         };
         // y = x @ W + b（b 是 [out]，与 [B, out] 广播相加）
         let y = x.matmul(&self.weight).add(&self.bias);
@@ -55,6 +56,14 @@ impl Linear {
         } else {
             y
         }
+    }
+
+    /// 带名字的参数（checkpoint 保存/恢复用）：`{prefix}.weight` / `{prefix}.bias`
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        vec![
+            (format!("{prefix}.weight"), self.weight.clone()),
+            (format!("{prefix}.bias"), self.bias.clone()),
+        ]
     }
 }
 
@@ -88,20 +97,16 @@ impl LayerNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        let d = x.shape()[x.rank() - 1];
-        // 均值 μ：[..., 1]（保持维度，方便广播）
-        let mean = x.sum_last_dim().mul_scalar(1.0 / d as f32);
-        // 中心化
-        let centered = x.sub(&mean);
-        // 方差 σ²：中心化后平方再取均值
-        let var = centered
-            .mul(&centered)
-            .sum_last_dim()
-            .mul_scalar(1.0 / d as f32);
-        // 归一化
-        let norm = centered.div(&var.add_scalar(self.eps).sqrt());
-        // 缩放平移（γ、β 是 [d]，广播到 [..., d]）
-        norm.mul(&self.gamma).add(&self.beta)
+        // 融合实现（一个算子完成 11 个基础算子的前向+反向），见 Tensor::layernorm
+        x.layernorm(&self.gamma, &self.beta, self.eps)
+    }
+
+    /// 带名字的参数：`{prefix}.gamma` / `{prefix}.beta`
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        vec![
+            (format!("{prefix}.gamma"), self.gamma.clone()),
+            (format!("{prefix}.beta"), self.beta.clone()),
+        ]
     }
 }
 
@@ -133,6 +138,11 @@ impl Embedding {
     pub fn forward(&self, ids: &[usize]) -> Tensor {
         self.table.gather_rows(ids)
     }
+
+    /// 带名字的参数：`{prefix}.table`
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        vec![(format!("{prefix}.table"), self.table.clone())]
+    }
 }
 
 impl Module for Embedding {
@@ -143,12 +153,6 @@ impl Module for Embedding {
 
 // ---------- 激活函数（第 5 课） ----------
 
-/// ReLU：max(0, x)，简单、计算快、缓解梯度消失
-#[allow(dead_code)] // 基础激活函数 API（测试 test_relu_grad 已验证）
-pub fn relu(x: &Tensor) -> Tensor {
-    x.relu()
-}
-
 /// GELU：GPT 系列的默认激活，用 tanh 近似，比 ReLU 更平滑
 pub fn gelu(x: &Tensor) -> Tensor {
     x.gelu()
@@ -157,10 +161,4 @@ pub fn gelu(x: &Tensor) -> Tensor {
 /// Tanh：S 型，输出 (-1, 1)
 pub fn tanh(x: &Tensor) -> Tensor {
     x.tanh()
-}
-
-/// Softmax：把一组数变成概率分布（和为 1，都为正）
-#[allow(dead_code)] // 基础 API；训练中使用 log_softmax_last_dim 更稳定
-pub fn softmax(x: &Tensor) -> Tensor {
-    x.softmax_last_dim()
 }

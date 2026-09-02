@@ -1,15 +1,15 @@
 {
   "model": {
     "vocab_size": 0,
-    "n_embd": 128,
-    "n_head": 4,
+    "n_embd": 256,
+    "n_head": 8,
     "n_layer": 4,
-    "block_size": 64
+    "block_size": 128
   },
   "train": {
     "seed": 42,
-    "batch_size": 8,
-    "steps": 2000,
+    "batch_size": 16,
+    "steps": 50,
     "max_lr": 6e-4,
     "min_lr": 6e-5,
     "warmup_steps": 50,

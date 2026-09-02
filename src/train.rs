@@ -1,4 +1,4 @@
-﻿//! 训练循环与学习率调度（第 13、20 课）
+//! 训练循环与学习率调度（第 13、20 课）
 //!
 //! 训练 GPT 的完整骨架：
 //! 1. 采样一个 batch
@@ -21,7 +21,7 @@ use crate::data::DataLoader;
 use crate::loss::cross_entropy_loss;
 use crate::model::GPT;
 use crate::module::{Module, zero_grad_all};
-use crate::optim::AdamW;
+use crate::optim::{AdamW, Optimizer};
 use crate::rng::Rng;
 use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
@@ -155,27 +155,60 @@ pub fn train_gpt(
 
     let mut eval_rng = Rng::new(cfg.seed); // 固定种子，评估结果可复现
     let mut final_loss = f32::INFINITY;
+    let diag_t0 = std::time::Instant::now(); // [诊断] 每步耗时
+    // [诊断] 分段计时累计（forward / backward / opt / 采样+杂项）
+    let (mut s_fw, mut s_bw, mut s_opt, mut s_misc) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for step in start_step..cfg.steps {
+        let s_t0 = std::time::Instant::now();
         // 1. 采样 batch
         let (x, y) = loader.sample_batch(rng);
 
         // 2. 前向 + 损失
         let logits = model.forward(&x, batch_size, block_size, None);
         let loss = cross_entropy_loss(&logits, &y);
+        s_fw += s_t0.elapsed().as_secs_f64();
 
         // 3. 反向
         loss.backward();
+        s_bw += s_t0.elapsed().as_secs_f64();
 
         // 4. 梯度裁剪
         clip_grad_norm(&params, cfg.grad_clip);
 
         // 5. 更新参数（设置当前学习率）
-        opt.lr = scheduler.lr();
+        let cur_lr = scheduler.lr(); // 先取当前步的学习率（scheduler.step() 之后会变成下一步的）
+        opt.lr = cur_lr;
         opt.step();
+        s_opt += s_t0.elapsed().as_secs_f64();
 
         // 6. 清零梯度
         opt.zero_grad();
         scheduler.step();
+        s_misc += s_t0.elapsed().as_secs_f64() - (s_fw + s_bw + s_opt);
+
+        // [诊断] 每步打印耗时与 GPU/CPU 分流
+        if (step + 1) % 1 == 0 {
+            let n = (step + 1) as f64;
+            println!(
+                "[diag] step {} | 平均 {:.3}s/步 | fw {:.2}s | bw {:.2}s | opt {:.2}s | 其他 {:.2}s",
+                step + 1,
+                diag_t0.elapsed().as_secs_f64() / n,
+                s_fw,
+                s_bw,
+                s_opt,
+                s_misc
+            );
+            #[cfg(feature = "gpu")]
+            {
+                let (g, c) = crate::gpu::stats();
+                println!(
+                    "[diag]   matmul GPU {} / CPU {} | GPU {:.1} 次/步",
+                    g,
+                    c,
+                    g as f64 / n
+                );
+            }
+        }
 
         // 周期性评估 + 存 checkpoint
         let last = step + 1 == cfg.steps;
@@ -185,11 +218,10 @@ pub fn train_gpt(
             } else {
                 None
             };
-            let ppl = val_loss.map(|l| l.exp());
-            if let Some(v) = val_loss {
-                if v < best_val_loss {
-                    best_val_loss = v;
-                }
+            // 仅在本次验证 loss 严格更优时刷新 best（同时避免用 f32 相等比较）
+            let is_best = val_loss.is_some_and(|v| v < best_val_loss);
+            if is_best {
+                best_val_loss = val_loss.unwrap();
             }
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(dir).expect("创建 checkpoint 目录失败");
@@ -200,7 +232,7 @@ pub fn train_gpt(
                     step + 1,
                     best_val_loss,
                 );
-                if val_loss == Some(best_val_loss) && best_val_loss.is_finite() {
+                if is_best && best_val_loss.is_finite() {
                     checkpoint::save(
                         &format!("{dir}/best.ckpt"),
                         model,
@@ -210,22 +242,21 @@ pub fn train_gpt(
                     );
                 }
             }
-            match (val_loss, ppl) {
-                (Some(v), Some(p)) => println!(
+            match val_loss {
+                Some(v) => println!(
                     "step {:>5} | lr {:.6} | train_loss {:.4} | val_loss {:.4} | ppl {:.2}",
                     step + 1,
-                    scheduler.lr(),
+                    cur_lr,
                     loss.item(),
                     v,
-                    p
+                    v.exp()
                 ),
-                (None, _) => println!(
+                None => println!(
                     "step {:>5} | lr {:.6} | train_loss {:.4}",
                     step + 1,
-                    scheduler.lr(),
+                    cur_lr,
                     loss.item()
                 ),
-                _ => unreachable!(),
             }
         }
         final_loss = loss.item();
@@ -240,6 +271,13 @@ pub fn train_gpt(
             best_val_loss,
         );
         println!("训练完成，checkpoint 已保存到 {dir}/（latest / best / final）");
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let (gpu_calls, cpu_calls) = crate::gpu::stats();
+        println!(
+            "matmul 分流统计：GPU {gpu_calls} 次 / CPU {cpu_calls} 次（小矩阵走 CPU 更划算，GPU 只负责足够大的矩阵乘）"
+        );
     }
     if best_val_loss.is_finite() {
         best_val_loss

@@ -12,7 +12,7 @@
 本项目是一个**教学性质**的深度学习项目，目标是让你理解大语言模型（LLM）的底层原理：
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
-- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 6 个阶段、20 课，从张量一路写到可生成文本的小 GPT。
+- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 6 个阶段、21 课，从张量一路写到可生成文本的小 GPT。
 - **工程化完整**：CLI 子命令（train / eval / generate / demo）、外部语料、train/val 划分、
   验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
@@ -35,7 +35,7 @@
 | 配置 | `src/config.rs` | `config.json`：模型超参 + 训练参数（serde 序列化） |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / demo |
-| 随机数 | `src/rng.rs` | 自实现 xorshift64* 伪随机数发生器 |
+| 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
 ## 快速开始
@@ -78,10 +78,21 @@ cargo run --release --features gpu -- train --config config.json
 
 - **实现**：用 wgpu 计算着色器（WGSL）手写 GPU 算子，支持 NVIDIA 与 Intel 核显
   （Windows 下走 DX12 / Vulkan，无需额外驱动安装）。
-- **加速范围**：先覆盖热点算子——批量矩阵乘（naive 每线程一元素）、逐元素 scale / add / ReLU；
-  训练与推理中的矩阵乘自动走 GPU。
+- **加速范围**：先覆盖热点算子——批量矩阵乘（tiled 16×16 共享内存实现）、逐元素
+  scale / add / ReLU；训练与推理中的矩阵乘自动走 GPU。
+- **分流策略（利用率优化）**：每个矩阵乘按规模分流——FLOPs（`2·m·k·n·batch`）低于
+  `MATMUL_MIN_FLOPS`（默认 200_000）的**微型矩阵**（如注意力的 scores / attn·v）直接走 CPU，
+  因为 GPU 一次 dispatch 的固定开销（上传/调度/同步/下载）超过计算本身；只有足够大的矩阵
+  （QKV 投影、MLP、512×512 基准）才真正上 GPU。GPU 侧做了 **buffer 池化 + 参数 buffer 复用**，
+  不再每次调用新建 GPU 对象，固定开销大幅降低。训练结束时（`--features gpu`）会打印
+  `matmul 分流统计：GPU x 次 / CPU y 次`，方便观察利用率。内置小模型（n_embd=64）矩阵普遍偏小，
+  GPU 收益有限；调大 `config.json` 的 `n_embd` / `block_size` / `batch_size` 后大矩阵（QKV/MLP）
+  会走上 GPU。注意：教学实现中每个矩阵乘仍**串行同步取回**（一次一算子），低端 GPU（如 MX150）
+  上每步多次 GPU 调用会累积固定开销，大模型训练依然偏慢——这是"教学优先"的架构取舍。
 - **自动回退**：GPU 初始化失败、形状超限（workgroup 超出 65535）或任何一次调用出错时，
-  自动回退 CPU 计算，**不影响正确性**。`cargo run -- demo` 会打印 `未检测到可用 GPU，已回退 CPU`。
+  自动回退 CPU 计算，**不影响正确性**。`cargo run --features gpu -- demo` 在无可用 GPU 时会打印
+  `未检测到可用 GPU，已回退 CPU`；有 GPU 时演示 4 末尾会打印
+  `（训练/推理中 matmul 已自动走 GPU，失败自动回退 CPU）`。
 - **提示**：首次在 Windows 上运行，GPU 驱动会写 DX 着色器缓存（如 `NVIDIA DXCache`、`D3DSCache`），
   若程序运行环境限制了这些目录的访问（例如沙箱），请放行或直接在普通终端中运行。
 
@@ -124,8 +135,8 @@ cargo run --release --features gpu -- train --config config.json
 
 1. **MLP 学习 XOR**（第 7 课）：验证神经网络 + 反向传播正确，训练后正确率 4/4（100%）。
 2. **BPE 分词器**（第 8 课）：在示例语料上训练字节对编码词表（400 个 token），演示编码/解码往返。
-3. **训练小 GPT 并生成文本**（第 12-20 课）：在 669 字符的英文小故事上训练 600 步，
-   loss 从约 3.7 降到约 0.17，随后用 temperature=0.8 / top-k=10 / top-p=0.9 生成文本，
+3. **训练小 GPT 并生成文本**（第 12-21 课）：在 669 字符的英文小故事上训练 600 步，
+   loss 从约 1.46 降到约 0.16，随后用 temperature=0.8 / top-k=10 / top-p=0.9 生成文本，
    并分别演示"无 KV cache"与"带 KV cache"两种推理方式（位置编码为第 19 课的 RoPE）。
 4. **GPU 加速对比**（第 21 课，仅 `--features gpu`）：打印设备信息，验证批量矩阵乘
    CPU vs GPU 数值一致性（最大误差），实测 512×512 矩阵乘加速比，并校验逐元素算子
@@ -169,7 +180,7 @@ llm_from_scratch/
 3. 自己动手改代码、跑实验，验证理解；
 4. 完成每课末尾的"动手练习"。
 
-> 推荐从 [docs/00-学习计划.md](docs/00-学习计划.md) 开始，按顺序阅读 01→20 课。
+> 推荐从 [docs/00-学习计划.md](docs/00-学习计划.md) 开始，按顺序阅读 01→21 课。
 
 ## 实现要点与踩坑记录
 

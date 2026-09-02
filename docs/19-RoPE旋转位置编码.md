@@ -1,6 +1,6 @@
-﻿# 第 19 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
+# 第 19 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
 
-> 代码位置：[src/rope.rs](src/rope.rs)（`rotary` 方法 + `test_rotary` / `test_rotary_grad_exact` 测试）
+> 代码位置：[src/rope.rs](src/rope.rs)（`rotary_pair` 生产入口 + `rotary` 测试用 + `test_rotary` / `test_rotary_grad_exact` 测试）
 > 配套代码：[src/attention.rs](src/attention.rs)（RoPE 接入 `MultiHeadAttention`）
 > 配套文档：[docs/11-位置编码与归一化.md](docs/11-位置编码与归一化.md)
 
@@ -13,7 +13,7 @@
 3. 为什么说旋转是**正交变换**？范数不变这个性质重要在哪？
 4. 为什么 RoPE 的点积只与"位置差"有关？相比正弦编码强在哪？
 5. 为什么 RoPE 和 KV cache 是"天生一对"？推理时为什么只需要旋转新 token？
-6. `src/tensor.rs` 里 `rotary` 的前向、反向具体怎么实现？`test_rotary` 测了什么？
+6. `src/rope.rs` 里 `rotary_pair` 的前向、反向具体怎么实现？`test_rotary` 测了什么？
 
 ---
 
@@ -192,7 +192,7 @@ q_m · k_n = Σ_i  q_{2i}ᵀ · R((n-m)·θ_i) · k_{2i}    只依赖 n - m
 
 ## 6. 与 KV cache 天然兼容：只旋转新 token
 
-回顾第 18 课的 KV cache 推理流程（`src/sample.rs` 的 `generate` + `src/model.rs` 的 `KVCache`）：
+回顾第 18 课的 KV cache 推理流程（`src/sample.rs` 的 `generate` + `src/attention.rs` 的 `KVCache`）：
 
 - 第一次：把整个 prompt 喂给模型，算出所有位置的 K/V 存入缓存；
 - 之后每步：**只前向最新 1 个 token**，历史的 K/V 直接从缓存取。
@@ -203,15 +203,19 @@ RoPE 和这个流程是无缝衔接的：
 新 token 的绝对位置 = 缓存长度 base + 它在当前窗口里的下标 j
 ```
 
-在 `GPT::forward` 里，`positions` 本来就是这么构造的（第 18 课的代码）：
+`base`（已缓存的位置数）由 `GPT::forward` 算出来传给每层（第 18 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
 
 ```rust
-let base = kv_cache.as_ref().map(|c| c.first().map(|k| k.seq_len()).unwrap_or(0)).unwrap_or(0);
+// src/model.rs（GPT::forward）：base = 缓存长度
+let base = kv_cache
+    .as_ref()
+    .map(|c| c.first().map(|k| k.seq_len()).unwrap_or(0))
+    .unwrap_or(0);
+
+// src/attention.rs（MultiHeadAttention::forward）：batch 内每个样本位置相同，重复 b 次
 let mut positions = Vec::with_capacity(b * t);
 for _ in 0..b {
-    for j in 0..t {
-        positions.push(base + j);
-    }
+    positions.extend(base..base + t);
 }
 ```
 
@@ -231,44 +235,62 @@ for _ in 0..b {
 
 ---
 
-## 7. 前向实现讲解：`rotary`
+## 7. 前向实现讲解：cos/sin 表 + 查表旋转
 
-`src/tensor.rs` 第 19 课小节里只有一个公开方法：
+`src/rope.rs` 把实现拆成三层：先一次性**预计算** cos/sin 表，再用表**查表旋转**，Q/K 共用同一张表：
 
 ```rust
-pub fn rotary(&self, positions: &[usize]) -> Tensor {
-    assert_eq!(self.rank(), 2, "rotary 输入应为 [rows, D]");
-    assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
-    let (rows, d) = (self.shape[0], self.shape[1]);
-    assert_eq!(d % 2, 0, "最后一维必须为偶数才能两两配对旋转");
-
-    let sd = self.data.borrow();
-    let mut out_data = vec![0.0f32; rows * d];
+/// 预计算每个 (位置, 对偶下标) 的 cos/sin 表，长度 rows × (D/2)。
+/// 同一批 positions 的三角只算一次：前向、反向、Q/K 复用。
+fn build_cos_sin_tab(positions: &[usize], d: usize) -> (Vec<f32>, Vec<f32>) {
+    let rows = positions.len();
+    let mut c_tab = vec![0.0f32; rows * (d / 2)];
+    let mut s_tab = vec![0.0f32; rows * (d / 2)];
     for r in 0..rows {
         let pos = positions[r] as f32;
         for i in 0..d / 2 {
             let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);
-            let (c, s) = (theta.cos(), theta.sin());
+            c_tab[r * (d / 2) + i] = theta.cos();
+            s_tab[r * (d / 2) + i] = theta.sin();
+        }
+    }
+    (c_tab, s_tab)
+}
+
+/// 用现成的 cos/sin 表旋转一个张量（[rows, D]），每对元素按公式旋转。
+fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
+    let (rows, d) = (x.shape[0], x.shape[1]);
+    let sd = x.data.borrow();
+    let mut out_data = vec![0.0f32; rows * d];
+    for r in 0..rows {
+        for i in 0..d / 2 {
+            let (c, s) = (c_tab[r * (d / 2) + i], s_tab[r * (d / 2) + i]);
             let (a, b) = (sd[r * d + 2 * i], sd[r * d + 2 * i + 1]);
             out_data[r * d + 2 * i] = a * c - b * s;
             out_data[r * d + 2 * i + 1] = a * s + b * c;
         }
     }
     drop(sd);
-    let positions_vec = positions.to_vec();
-
-    let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
-    if self.requires_grad {
-        let rg = result.grad.clone();
-        let sg = self.grad.clone();
-        result.parents = Rc::new(vec![self.clone()]);
-        result.backward = Some(Rc::new(move || {
-            // ...（第 8 节讲）
-        }));
-    }
+    // ...（反向闭包查同一张表、按 R(θ)ᵀ 回传，见第 8 节）
     result
 }
 ```
+
+对外只暴露两个入口——`rotary`（旋转单个张量，仅供测试）和 `rotary_pair`（一次建表同时旋转 Q/K）：
+
+```rust
+pub fn rotary_pair(&self, other: &Tensor, positions: &[usize]) -> (Tensor, Tensor) {
+    let d = self.shape[1];
+    let (c_tab, s_tab) = build_cos_sin_tab(positions, d);
+    (
+        rotate_with_tab(self, &c_tab, &s_tab),
+        rotate_with_tab(other, &c_tab, &s_tab),
+    )
+}
+```
+
+> 为什么要"先建表再查表"？注意力里 Q 和 K 的 `positions` 完全相同，三角函数的 `cos/sin` 只要算一遍；
+> 前向算一遍、反向闭包再查一遍——相比"每次旋转现场重算三角"，批量训练能省下可观的重复计算。
 
 逐行对照公式：
 
@@ -285,10 +307,10 @@ pub fn rotary(&self, positions: &[usize]) -> Tensor {
 
 几个值得注意的设计点：
 
-1. **三重循环的次序**：外层按行 `r`、内层按对 `i`，把"取出 a、b → 旋转 → 写回"一气呵成，每对只算一次三角函数。
+1. **三重循环的次序**：建表时外层按行 `r`、内层按对 `i`，`cos/sin` 每个 `(r, i)` 只算一次；旋转时同样两层循环，但只做查表乘加，不再碰任何三角函数。
 2. **`drop(sd)`**：读完输入数据后立刻释放借用，之后才创建结果张量和反向闭包——避免闭包捕获时和 `self.data` 的借用纠缠。
 3. **`requires_grad` 分支**：如果输入不需要梯度（比如纯推理），就直接返回普通结果，不建 `parents`/`backward`，省下计算图的维护开销。这和第 18 课 KV cache 推理时"纯数据拼接、无梯度"的思路一致。
-4. **反向里三角函数重算**：反向闭包为了"自包含"（只捕获 `positions_vec`、`rg`、`sg` 这几个 Rc），重新算了一遍 `theta/cos/sin`。代价可忽略，好处是闭包不依赖前向的中间量。
+4. **反向闭包查同一张表**：反向闭包为了"自包含"（只捕获 `ct`/`st` 两份表拷贝 + `rg`/`sg` 两个 Rc），直接查表取值，**不再重算 `theta/cos/sin`**。代价是闭包多持有两张表，好处是前向建的三角表被完整复用。
 
 ---
 
@@ -319,7 +341,7 @@ pub fn rotary(&self, positions: &[usize]) -> Tensor {
 
 ### 8.2 代码实际怎么写的（已按正确形式实现）
 
-`src/tensor.rs` 里反向闭包的循环体是：
+`src/rope.rs` 里 `rotate_with_tab` 反向闭包的循环体是（`c`/`s` 直接查 `ct`/`st` 表）：
 
 ```rust
 let (ga, gb) = (g[r * d + 2 * i], g[r * d + 2 * i + 1]);
@@ -335,14 +357,14 @@ sgm[r * d + 2 * i + 1] += -ga * s + gb * c;
 > 只校验范数的测试发现不了。所以测试要"既测范数、又测方向"（见第 9 节 `test_rotary_grad_exact`）。
 > 本仓库初版实现确实写反过，已修复并补了逐元素断言。
 
-对训练的影响：`rotary` 目前还没有被 `src/model.rs` 的注意力调用（模型仍用正弦编码 `pos_emb`），
-函数本身已就绪、测试全绿，接入注意力即可用。
+对训练的影响：本课已经把 RoPE 接进了 `MultiHeadAttention`（`src/attention.rs`），训练和 KV cache 推理都用它。
+`GPT` 已不再有 `pos_emb` 字段，位置信息完全由注意力内部旋转 Q/K 提供（见第 10 节）。
 
 ---
 
 ## 9. `test_rotary` 测试讲解
 
-测试在 `src/tensor.rs` 的 `mod tests` 里，共三个断言，分别验证三件事：
+测试在 `src/rope.rs` 的 `mod tests` 里，共三个断言，分别验证三件事：
 
 ```rust
 #[test]
@@ -412,7 +434,7 @@ V 是"被加权的内容"，不需要带位置信息。所以标准做法是：*
 
 ### 10.2 接入点：`MultiHeadAttention::forward`
 
-在 `src/model.rs` 的 `MultiHeadAttention::forward` 里，Q/K/V 投影出来后是这样的：
+在 `src/attention.rs` 的 `MultiHeadAttention::forward` 里，Q/K/V 投影出来后是这样的：
 
 ```rust
 let q = self.c_q.forward(x).reshape(vec![b, t, d]); // [B, T, D]
@@ -427,40 +449,40 @@ RoPE 有两个可选的接入时机：
 | 拆头之前 | `q/k` 是 `[B, T, D]` | 把整个 batch 展平成 `[B*T, D]` 一次旋转，代码最省事 |
 | 拆头之后 | 每个头是 `[T, head_dim]` | 逐头旋转，更贴近"每头各转各的"的原始论文写法 |
 
-我们的 `rotary` 接口（输入 `[rows, D]` + 每行的 `positions`）两种都支持，只要最后一维是偶数即可——
+我们的 `rotary_pair` 接口（输入 `[rows, D]` + 每行的 `positions`）两种都支持，只要最后一维是偶数即可——
 `GPTConfig::tiny` 里 `n_embd=64`、`head_dim=16`，都满足。
 
-### 10.3 最小接入示意
+### 10.3 实际接入方式（本仓库已接入）
 
-> 以下为**示意代码**（当前仓库的 `src/model.rs` 尚未接入 RoPE，模型仍在用第 11 课的正弦编码 `pos_emb`）。
-> 接入思路：把 `MultiHeadAttention::forward` 加上 `base`（缓存长度）参数，在 KV cache 拼接**之前**旋转 Q/K。
+`src/attention.rs` 里，Q/K 投影之后、KV cache 拼接**之前**旋转：
 
 ```rust
-// 示意：在 MultiHeadAttention::forward 内，拆头前对 Q/K 应用 RoPE
-// base 来自 GPT::forward（缓存长度），每个 batch 里 T 个位置是 base, base+1, ..., base+t-1
-let mut pos_rows = Vec::with_capacity(b * t);
+// 位置：Q/K 投影之后、KV cache append 之前
+let mut positions = Vec::with_capacity(b * t);
 for _ in 0..b {
-    pos_rows.extend((base..base + t).map(|p| p as usize));
+    positions.extend(base..base + t);
 }
-
-// 先旋转，再进 KV cache / 拆头
-let q = q.reshape(vec![b * t, d]).rotary(&pos_rows).reshape(vec![b, t, d]);
-let k = k.reshape(vec![b * t, d]).rotary(&pos_rows).reshape(vec![b, t, d]);
-
+// Q/K 用同一批 positions，一次建表同时旋转（三角函数只算一遍）
+let (q, k) = q
+    .reshape(vec![b * t, d])
+    .rotary_pair(&k.reshape(vec![b * t, d]), &positions);
+let (q, k) = (
+    q.reshape(vec![b, t, d]),
+    k.reshape(vec![b, t, d]),
+);
 // 之后照旧：cache.append(&k, &v)（缓存里存的就是旋转后的 K）
 ```
 
 要点：
 
-1. **`positions` 长度必须等于行数**（`rotary` 里 `assert_eq!(self.shape[0], positions.len())`），这里行数是 `b*t`，所以 batch 内每个样本的同一列位置相同、要重复 `b` 次。
+1. **`positions` 长度必须等于行数**（`rotary_pair` 里 `assert_eq!(self.shape[0], positions.len())`），这里行数是 `b*t`，所以 batch 内每个样本的同一列位置相同、要重复 `b` 次。
 2. **旋转发生在 append 之前**：缓存里存的是"已旋转的 K"，历史 K 直接复用，符合第 6 节的兼容性约定。
 3. **Q 没有缓存**（推理时 Q 永远只有新 token 一个），所以 Q 总是用当前位置旋转，天然正确。
-4. 由于 K/V 已旋转并缓存，接入后**推理模式（KV cache）和训练模式行为一致**，不会像正弦编码那样需要区分两套位置逻辑。
-5. `rotary` 的反向已按 `R(θ)ᵀ` 实现并通过 `test_rotary_grad_exact` 逐元素验证，接入后无需再改。
+4. 由于 K/V 已旋转并缓存，**推理模式（KV cache）和训练模式行为一致**，不会像正弦编码那样需要区分两套位置逻辑。这一点有专门的测试守着（`src/model.rs` 的 `test_kv_cache_matches_full_forward`）。
+5. `rotary_pair` 的反向按 `R(θ)ᵀ` 实现并通过 `test_rotary_grad_exact` 逐元素验证。
 
-> 替换还是叠加？可以二选一：
-> - **替换**：删掉 `GPT::forward` 里的 `pos_emb`（`sinusoidal_positions` 不再使用），位置信息完全由 RoPE 提供；
-> - **叠加**：保留 `pos_emb` 再加 RoPE，两套位置信号并存（一般没必要，且会稀释 RoPE 的相对位置特性）。
+> 替换还是叠加？本仓库选了**替换**：`GPT` 结构体里没有 `pos_emb` 字段（第 11 课的正弦编码在接入 RoPE 后已删除），
+> 位置信息完全由注意力内部旋转 Q/K 提供。叠加方案（保留 `pos_emb` 再加 RoPE）一般没必要，且会稀释 RoPE 的相对位置特性。
 
 ---
 
@@ -470,12 +492,12 @@ let k = k.reshape(vec![b * t, d]).rotary(&pos_rows).reshape(vec![b, t, d]);
    （提示：`θ₀ = 1/10000^0 = 1` rad，`cos1 ≈ 0.5403, sin1 ≈ 0.8415`），再用 `x.rotary(&[1])` 验证。
 2. **验证梯度方向**：`rotary` 的反向已修复为 `R(θ)ᵀ`（见第 8.2 节）。自己动手把测试改成"正角度旋转"的错误版本，
    跑 `test_rotary` 和 `test_rotary_grad_exact`，观察只有后者能发现错误——体会"既测范数、又测方向"的价值。
-3. **接入注意力**：按第 10.3 节的示意，把 RoPE 接入 `src/model.rs` 的 `MultiHeadAttention`（替换正弦编码），
-   `cargo run` 训练并对比 loss 曲线与生成效果。注意需要先把 `base` 传入 `MultiHeadAttention::forward`。
+3. **对照实际接入**：对照 10.3 节的代码，在 `src/attention.rs` 里找到 RoPE 的接入位置。
+   试着把 `rotary_pair` 改成"先 `rotary` 转 Q、再 `rotary` 转 K"（各自建表），跑 `cargo test` 确认结果一致——体会 `rotary_pair` 一次建表省下的重复计算。
 4. **验证相对位置性质**：写一个测试——取同一个 `q`，在位置 `m` 旋转；取同一个 `k`，在位置 `n` 旋转，
    断言 `q_m · k_n` 只和 `n - m` 有关（对固定的位置差 `d`，换不同的 `m` 结果应相同）。这正是第 5 节推导的代码验证。
 5. **思考外推**：把 `block_size` 从 32 改成 64 重新训练，再让模型生成超过训练长度的文本，
-   观察 RoPE（接入后）和正弦编码谁退化得更慢，想想为什么。
+   观察 RoPE 的输出质量在训练长度之外如何退化，想想为什么（角度随位置线性增长，训练长度之外照样失效）。
 6. **思考**：为什么 `θ_i = pos / 10000^(2i/d)` 里的 `10000` 和 `d` 与正弦编码一模一样？
    如果把它改成 `10` 会怎样？（提示：所有维度频率变高，近距离区分更敏感、远距离更早"打满"一圈。）
 
@@ -489,8 +511,8 @@ let k = k.reshape(vec![b * t, d]).rotary(&pos_rows).reshape(vec![b, t, d]);
 - 旋转是**正交变换**：`R(θ)ᵀR(θ) = I`，范数不变 → 数值稳定、不破坏 LayerNorm。
 - **相对位置性质**：`q_m · k_n = qᵀR((n-m)θ)k`，点积只与位置差 `n - m` 有关——位置被"编死"进了打分公式。
 - 与 **KV cache 天然兼容**：新 token 按 `base + j` 旋转自己的 Q/K，历史 K 已旋转、直接复用。
-- `src/tensor.rs` 的 `rotary`：前向三重循环逐对旋转；反向按正交矩阵的转置 `R(θ)ᵀ` 回传（已修复并通过 `test_rotary_grad_exact` 验证）。
+- `src/rope.rs` 的实现分三层：`build_cos_sin_tab` 预计算 cos/sin 表 → `rotate_with_tab` 查表旋转 → `rotary_pair` 一次建表同时旋转 Q/K；反向按正交矩阵的转置 `R(θ)ᵀ` 回传（已修复并通过 `test_rotary_grad_exact` 验证）。
 - `test_rotary` 三个断言分别验证：正交性（范数不变）、`pos=0` 恒等、梯度范数守恒；`test_rotary_grad_exact` 逐元素验证梯度方向。
-- 接入方式：在 `MultiHeadAttention` 拆头前对 Q/K 旋转（只转 Q/K、不转 V），当前仓库尚未接入，作为练习。
+- 实际接入：在 `MultiHeadAttention` 拆头前、KV cache append 之前对 Q/K 旋转（只转 Q/K、不转 V），已完成接入；`GPT` 已无 `pos_emb` 字段（第 11 课正弦编码被替换）。
 
 - 下一课（第 20 课）：收尾——学习率调度（warmup + cosine decay）与整个项目的总结回顾！

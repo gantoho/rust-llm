@@ -71,6 +71,27 @@ impl Config {
     pub fn load(path: &str) -> Config {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("无法读取配置文件 {path}: {e}"));
-        serde_json::from_str(&text).unwrap_or_else(|e| panic!("解析配置文件 {path} 失败: {e}"))
+        let cfg: Config = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("解析配置文件 {path} 失败: {e}"));
+        cfg.validate();
+        cfg
+    }
+
+    /// 校验训练参数，防止除零/下溢等运行时 panic。
+    /// 配置来自用户手写的 JSON，必须在这里拦截非法值。
+    pub fn validate(&self) {
+        let t = &self.train;
+        assert!(t.steps >= 1, "train.steps 必须 >= 1");
+        assert!(t.batch_size >= 1, "train.batch_size 必须 >= 1");
+        assert!(t.eval_every >= 1, "train.eval_every 必须 >= 1（用于取模求余）");
+        assert!(t.eval_iters >= 1, "train.eval_iters 必须 >= 1（用于求平均）");
+        assert!(
+            t.warmup_steps <= t.steps,
+            "train.warmup_steps（{}）不能大于 train.steps（{}）",
+            t.warmup_steps,
+            t.steps
+        );
+        assert!(t.max_lr > 0.0, "train.max_lr 必须 > 0");
+        assert!(t.min_lr >= 0.0, "train.min_lr 不能为负");
     }
 }

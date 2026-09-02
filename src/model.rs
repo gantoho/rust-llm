@@ -20,6 +20,11 @@ use crate::rng::Rng;
 use crate::tensor::Tensor;
 use serde::{Deserialize, Serialize};
 
+/// LayerNorm 数值稳定常数（防止方差为 0 时除零）
+const LN_EPS: f32 = 1e-5;
+/// MLP 隐藏层放大系数（GPT-2 风格：输入维度的 4 倍）
+const MLP_RATIO: usize = 4;
+
 /// 模型配置（`config.json` 里可调，缺省字段用 [`GPTConfig::default`]）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -45,14 +50,11 @@ impl Default for GPTConfig {
 }
 
 impl GPTConfig {
-    /// 一个小配置，适合学习演示
+    /// 一个小配置，适合学习演示（其余字段与 Default 一致）
     pub fn tiny(vocab_size: usize) -> Self {
         GPTConfig {
             vocab_size,
-            n_embd: 64,
-            n_head: 4,
-            n_layer: 2,
-            block_size: 32,
+            ..Default::default()
         }
     }
 }
@@ -73,12 +75,22 @@ struct TransformerBlock {
 impl TransformerBlock {
     fn new(cfg: &GPTConfig, rng: &mut Rng) -> Self {
         TransformerBlock {
-            ln1: LayerNorm::new(cfg.n_embd, 1e-5),
+            ln1: LayerNorm::new(cfg.n_embd, LN_EPS),
             attn: MultiHeadAttention::new(cfg.n_embd, cfg.n_head, rng),
-            ln2: LayerNorm::new(cfg.n_embd, 1e-5),
-            mlp_linear1: Linear::new(cfg.n_embd, 4 * cfg.n_embd, rng),
-            mlp_linear2: Linear::new(4 * cfg.n_embd, cfg.n_embd, rng),
+            ln2: LayerNorm::new(cfg.n_embd, LN_EPS),
+            mlp_linear1: Linear::new(cfg.n_embd, MLP_RATIO * cfg.n_embd, rng),
+            mlp_linear2: Linear::new(MLP_RATIO * cfg.n_embd, cfg.n_embd, rng),
         }
+    }
+
+    /// 带名字的参数（checkpoint 用）：`{prefix}.ln1/attn/ln2/mlp_linear1/mlp_linear2.*`
+    fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        let mut ps = self.ln1.named_parameters(&format!("{prefix}.ln1"));
+        ps.extend(self.attn.named_parameters(&format!("{prefix}.attn")));
+        ps.extend(self.ln2.named_parameters(&format!("{prefix}.ln2")));
+        ps.extend(self.mlp_linear1.named_parameters(&format!("{prefix}.mlp_linear1")));
+        ps.extend(self.mlp_linear2.named_parameters(&format!("{prefix}.mlp_linear2")));
+        ps
     }
 
     fn forward(
@@ -88,16 +100,40 @@ impl TransformerBlock {
         kv_cache: Option<&mut KVCache>,
         base: usize,
     ) -> Tensor {
+        // [诊断] block 内部分段计时（仅前 2 次调用）
+        static BLK_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let blk_diag = BLK_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2;
+        let blk_t0 = std::time::Instant::now();
         // 注意力子层 + 残差连接
+        let ln1_out = self.ln1.forward(x);
+        let t_ln1 = blk_t0.elapsed();
         let h = self
             .attn
-            .forward(&self.ln1.forward(x), mask, kv_cache, base);
+            .forward(&ln1_out, mask, kv_cache, base);
+        let t_attn = blk_t0.elapsed();
         let x = x.add(&h);
+        let t_add1 = blk_t0.elapsed();
         // 前馈子层 + 残差连接
         let h = self.ln2.forward(&x);
+        let t_ln2 = blk_t0.elapsed();
         let h = gelu(&self.mlp_linear1.forward(&h));
+        let t_mlp1 = blk_t0.elapsed();
         let h = self.mlp_linear2.forward(&h);
-        x.add(&h)
+        let t_mlp2 = blk_t0.elapsed();
+        let out = x.add(&h);
+        if blk_diag {
+            println!(
+                "[diag-blk] ln1 {:.1} | attn {:.1} | res1 {:.1} | ln2 {:.1} | mlp1+gelu {:.1} | mlp2 {:.1} | 总 {:.1} ms",
+                t_ln1.as_secs_f64() * 1000.0,
+                (t_attn - t_ln1).as_secs_f64() * 1000.0,
+                (t_add1 - t_attn).as_secs_f64() * 1000.0,
+                (t_ln2 - t_add1).as_secs_f64() * 1000.0,
+                (t_mlp1 - t_ln2).as_secs_f64() * 1000.0,
+                (t_mlp2 - t_mlp1).as_secs_f64() * 1000.0,
+                blk_t0.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        out
     }
 }
 
@@ -131,7 +167,7 @@ impl GPT {
             cfg,
             tok_emb: Embedding::new(vocab_size, n_embd, rng),
             blocks,
-            ln_f: LayerNorm::new(n_embd, 1e-5),
+            ln_f: LayerNorm::new(n_embd, LN_EPS),
         }
     }
 
@@ -151,6 +187,11 @@ impl GPT {
     ) -> Tensor {
         let d = self.cfg.n_embd;
         assert_eq!(idx.len(), b * t, "输入 id 数量必须等于 b*t");
+
+        // [诊断] forward 分段计时（仅前 2 次调用）
+        static FW_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let fw_diag = FW_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2;
+        let fw_t0 = std::time::Instant::now();
 
         // 1. token embedding
         let x = self.tok_emb.forward(idx).reshape(vec![b, t, d]);
@@ -173,18 +214,37 @@ impl GPT {
             }
         }
         let mask = Tensor::from_vec(mask_data, vec![t, t_total]);
+        let t_emb_mask = fw_t0.elapsed();
 
         // 4. 逐层过 Transformer Block
         let mut x = x;
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = kv_cache.as_mut().map(|c| &mut c[i]);
+            let t_blk = std::time::Instant::now();
             x = block.forward(&x, &mask, cache, base);
+            if fw_diag {
+                println!(
+                    "[diag-fw] block {i}: {:.1}ms",
+                    t_blk.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
+        let t_after_blocks = fw_t0.elapsed();
 
         // 5. 最终归一化 + 输出头（权重绑定：lm_head 复用 tok_emb.table 的转置）
         let x = self.ln_f.forward(&x);
         let x = x.reshape(vec![b * t, d]);
-        x.matmul(&self.tok_emb.table.transpose())
+        let out = x.matmul(&self.tok_emb.table.transpose());
+        if fw_diag {
+            println!(
+                "[diag-fw] emb+mask {:.1}ms | blocks 共 {:.1}ms | ln_f+lm_head {:.1}ms | forward 总 {:.1}ms",
+                t_emb_mask.as_secs_f64() * 1000.0,
+                (t_after_blocks - t_emb_mask).as_secs_f64() * 1000.0,
+                (fw_t0.elapsed() - t_after_blocks).as_secs_f64() * 1000.0,
+                fw_t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        out
     }
 
     /// 推理用的缓存集合：每层一个
@@ -193,57 +253,15 @@ impl GPT {
     }
 
     /// 带名字的参数列表（checkpoint 保存/恢复用）。
-    /// 名字形如 `blocks.0.attn.c_q.weight`，顺序与 [`Module::parameters`] 完全一致。
+    /// 名字形如 `blocks.0.attn.c_q.weight`。
+    /// 名字由各层的 `named_parameters(prefix)` 递归生成，与 `Module::parameters` 的
+    /// 结构保持一致（同一层只枚举一次，避免两处手工维护失同步）。
     pub fn named_parameters(&self) -> Vec<(String, Tensor)> {
-        let mut ps = vec![("tok_emb.table".to_string(), self.tok_emb.table.clone())];
+        let mut ps = self.tok_emb.named_parameters("tok_emb");
         for (i, block) in self.blocks.iter().enumerate() {
-            let p = format!("blocks.{i}");
-            ps.push((format!("{p}.ln1.gamma"), block.ln1.gamma.clone()));
-            ps.push((format!("{p}.ln1.beta"), block.ln1.beta.clone()));
-            ps.push((
-                format!("{p}.attn.c_q.weight"),
-                block.attn.c_q.weight.clone(),
-            ));
-            ps.push((format!("{p}.attn.c_q.bias"), block.attn.c_q.bias.clone()));
-            ps.push((
-                format!("{p}.attn.c_k.weight"),
-                block.attn.c_k.weight.clone(),
-            ));
-            ps.push((format!("{p}.attn.c_k.bias"), block.attn.c_k.bias.clone()));
-            ps.push((
-                format!("{p}.attn.c_v.weight"),
-                block.attn.c_v.weight.clone(),
-            ));
-            ps.push((format!("{p}.attn.c_v.bias"), block.attn.c_v.bias.clone()));
-            ps.push((
-                format!("{p}.attn.c_proj.weight"),
-                block.attn.c_proj.weight.clone(),
-            ));
-            ps.push((
-                format!("{p}.attn.c_proj.bias"),
-                block.attn.c_proj.bias.clone(),
-            ));
-            ps.push((format!("{p}.ln2.gamma"), block.ln2.gamma.clone()));
-            ps.push((format!("{p}.ln2.beta"), block.ln2.beta.clone()));
-            ps.push((
-                format!("{p}.mlp_linear1.weight"),
-                block.mlp_linear1.weight.clone(),
-            ));
-            ps.push((
-                format!("{p}.mlp_linear1.bias"),
-                block.mlp_linear1.bias.clone(),
-            ));
-            ps.push((
-                format!("{p}.mlp_linear2.weight"),
-                block.mlp_linear2.weight.clone(),
-            ));
-            ps.push((
-                format!("{p}.mlp_linear2.bias"),
-                block.mlp_linear2.bias.clone(),
-            ));
+            ps.extend(block.named_parameters(&format!("blocks.{i}")));
         }
-        ps.push(("ln_f.gamma".to_string(), self.ln_f.gamma.clone()));
-        ps.push(("ln_f.beta".to_string(), self.ln_f.beta.clone()));
+        ps.extend(self.ln_f.named_parameters("ln_f"));
         ps
     }
 }

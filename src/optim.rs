@@ -6,7 +6,26 @@
 
 use crate::tensor::Tensor;
 
-/// 随机梯度下降（SGD）
+/// 优化器统一接口（第 17 课）
+///
+/// - `step()`：用当前梯度更新一次参数（SGD / AdamW 各自实现）
+/// - `zero_grad()`：清零所有参数梯度（默认实现相同，这里只写一份）
+pub trait Optimizer {
+    /// 返回被优化的参数列表
+    fn params(&self) -> &[Tensor];
+
+    /// 用当前梯度更新一次参数（SGD / AdamW 各自实现）
+    fn step(&mut self);
+
+    /// 清零所有参数的梯度（两种优化器共用同一实现）
+    fn zero_grad(&self) {
+        for p in self.params() {
+            p.zero_grad();
+        }
+    }
+}
+
+/// 随机梯度下降（SGD，第 6 课）
 pub struct SGD {
     lr: f32,
     params: Vec<Tensor>,
@@ -16,25 +35,26 @@ impl SGD {
     pub fn new(lr: f32, params: Vec<Tensor>) -> Self {
         SGD { lr, params }
     }
+}
 
-    /// 更新一步：θ = θ - lr * g
-    pub fn step(&self) {
-        for p in &self.params {
-            let g = p.grad();
-            let d = p.data();
-            let updated: Vec<f32> = d.iter().zip(&g).map(|(v, g)| v - self.lr * g).collect();
-            p.set_data(updated);
-        }
+impl Optimizer for SGD {
+    fn params(&self) -> &[Tensor] {
+        &self.params
     }
 
-    pub fn zero_grad(&self) {
+    /// 更新一步：θ = θ - lr * g（原位更新，避免每次克隆整份数据）
+    fn step(&mut self) {
         for p in &self.params {
-            p.zero_grad();
+            let g = p.grad.borrow();
+            let mut d = p.data.borrow_mut();
+            for j in 0..d.len() {
+                d[j] -= self.lr * g[j];
+            }
         }
     }
 }
 
-/// SGD（第 2 课）AdamW（Adam + 权重衰减解耦）
+/// AdamW（Adam + 权重衰减解耦，第 17 课）
 ///
 /// 核心思想：
 /// 1. 一阶动量 m：梯度的指数移动平均（记住"方向"，像小球下坡的惯性）
@@ -45,6 +65,7 @@ pub struct AdamW {
     pub lr: f32,
     beta1: f32,
     beta2: f32,
+    /// 数值稳定常数：√v_hat + eps 防止除以 0
     eps: f32,
     weight_decay: f32,
     t: usize,
@@ -81,37 +102,6 @@ impl AdamW {
         }
     }
 
-    pub fn step(&mut self) {
-        self.t += 1;
-        // 偏差修正系数（训练初期 t 小，修正大）
-        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
-        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
-
-        for (i, p) in self.params.iter().enumerate() {
-            let g = p.grad.borrow();
-            let mut d = p.data.borrow_mut();
-            for j in 0..d.len() {
-                let gv = g[j];
-                // 1. 更新动量
-                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * gv;
-                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * gv * gv;
-                // 2. 偏差修正
-                let m_hat = self.m[i][j] / bc1;
-                let v_hat = self.v[i][j] / bc2;
-                // 3. 更新：θ -= lr * m_hat/(√v_hat + eps) + lr * wd * θ（权重衰减解耦）
-                let step = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                let decay = self.lr * self.weight_decay * d[j];
-                d[j] = d[j] - step - decay;
-            }
-        }
-    }
-
-    pub fn zero_grad(&self) {
-        for p in &self.params {
-            p.zero_grad();
-        }
-    }
-
     /// 导出优化器状态（checkpoint 用）：(步数 t, 一阶动量 m, 二阶动量 v)
     pub fn state(&self) -> (usize, Vec<Vec<f32>>, Vec<Vec<f32>>) {
         (self.t, self.m.clone(), self.v.clone())
@@ -128,5 +118,32 @@ impl AdamW {
         self.t = t;
         self.m = m;
         self.v = v;
+    }
+}
+
+impl Optimizer for AdamW {
+    fn params(&self) -> &[Tensor] {
+        &self.params
+    }
+
+    fn step(&mut self) {
+        self.t += 1;
+        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+
+        for (i, p) in self.params.iter().enumerate() {
+            let g = p.grad.borrow();
+            let mut d = p.data.borrow_mut();
+            for j in 0..d.len() {
+                let gv = g[j];
+                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * gv;
+                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * gv * gv;
+                let m_hat = self.m[i][j] / bc1;
+                let v_hat = self.v[i][j] / bc2;
+                let step = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                let decay = self.lr * self.weight_decay * d[j];
+                d[j] = d[j] - step - decay;
+            }
+        }
     }
 }

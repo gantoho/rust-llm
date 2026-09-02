@@ -20,7 +20,7 @@ pub fn sample_token(
     top_p: f32,
     rng: &mut Rng,
 ) -> usize {
-    // 1. 除以 temperature 缩放
+    // 1. 除以 temperature 缩放（1e-5 是温度下限，防止 0 除）
     let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature.max(1e-5)).collect();
 
     // 2. 按分数从高到低排序
@@ -91,11 +91,15 @@ pub fn generate(
 ) -> String {
     let block_size = model.cfg.block_size;
     let mut ids = tokenizer.encode(prompt);
-    let mut cache = model.new_kv_cache();
+    if ids.is_empty() {
+        ids.push(0); // 空 prompt：先喂一个 token，避免 0 长度上下文导致下标下溢
+    }
+    // 仅在使用 KV cache 时才分配缓存，全量模式不浪费内存
+    let mut cache = use_kv_cache.then(|| model.new_kv_cache());
 
     for _ in 0..max_new {
         // KV cache 模式：上下文总长达到 block_size 就停（缓存无法像全量模式那样截断历史）
-        if use_kv_cache && cache[0].seq_len() >= block_size {
+        if cache.as_ref().is_some_and(|c| c[0].seq_len() >= block_size) {
             break;
         }
         // 只保留最近的 block_size 个 token（全量模式需要）
@@ -105,10 +109,11 @@ pub fn generate(
         let logits = if use_kv_cache {
             // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
             // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-            if cache[0].seq_len() == 0 {
-                model.forward(ctx, 1, ctx.len(), Some(&mut cache))
+            let c = cache.as_mut().unwrap();
+            if c[0].seq_len() == 0 {
+                model.forward(ctx, 1, ctx.len(), Some(c))
             } else {
-                model.forward(&ids[ids.len() - 1..], 1, 1, Some(&mut cache))
+                model.forward(&ids[ids.len() - 1..], 1, 1, Some(c))
             }
         } else {
             // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）

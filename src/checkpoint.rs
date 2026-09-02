@@ -68,21 +68,30 @@ pub fn save(path: &str, model: &GPT, opt: &AdamW, step: usize, best_val_loss: f3
     let json = serde_json::to_vec(&header).expect("序列化 checkpoint 头失败");
 
     let mut f = File::create(path).unwrap_or_else(|e| panic!("无法创建 checkpoint {path}: {e}"));
-    f.write_all(MAGIC).unwrap();
-    f.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
-    f.write_all(&json).unwrap();
+    let write = |r: std::io::Result<()>| {
+        r.unwrap_or_else(|e| panic!("写入 checkpoint {path} 失败: {e}"))
+    };
+    write(f.write_all(MAGIC));
+    write(f.write_all(&(json.len() as u32).to_le_bytes()));
+    write(f.write_all(&json));
     for (_, t) in &named {
         for v in t.data() {
-            f.write_all(&v.to_le_bytes()).unwrap();
+            write(f.write_all(&v.to_le_bytes()));
         }
     }
 }
 
 /// 只读取 checkpoint 头（模型配置、步数、best loss），不加载参数。
 /// 用于 eval / generate 先按 checkpoint 里的配置构造模型。
+/// 只读头部 + JSON，不读参数数据，大模型下也能秒开。
 pub fn load_header(path: &str) -> Checkpoint {
-    let (ckpt, _metas, _bytes, _opt) = read_file(path);
-    ckpt
+    let mut f = File::open(path).unwrap_or_else(|e| panic!("无法打开 checkpoint {path}: {e}"));
+    let (h, _) = read_head(&mut f, path);
+    Checkpoint {
+        step: h.step,
+        best_val_loss: h.best_val_loss,
+        model: h.model,
+    }
 }
 
 /// 只加载参数，不涉及优化器（eval / generate 用）。
@@ -102,7 +111,30 @@ pub fn load_with_opt(path: &str, model: &GPT, opt: &mut AdamW) -> Checkpoint {
     ckpt
 }
 
-/// 读取并解析整个 checkpoint 文件
+/// 从文件流读取并解析 checkpoint 头部（魔数 + JSON 头），返回 (header, json 长度)。
+/// 用 `read_exact` 而非切片索引，文件过短/损坏时给出可读错误而非越界 panic。
+fn read_head(f: &mut File, path: &str) -> (CkptHeader, usize) {
+    let mut magic = [0u8; 7];
+    f.read_exact(&mut magic)
+        .unwrap_or_else(|e| panic!("读取 {path} 头部失败（文件过短或损坏）: {e}"));
+    assert_eq!(
+        &magic,
+        MAGIC,
+        "checkpoint 魔数不匹配：{path} 不是本项目的 checkpoint"
+    );
+    let mut len_buf = [0u8; 4];
+    f.read_exact(&mut len_buf)
+        .unwrap_or_else(|e| panic!("读取 {path} 头长度失败（文件过短或损坏）: {e}"));
+    let json_len = u32::from_le_bytes(len_buf) as usize;
+    let mut json = vec![0u8; json_len];
+    f.read_exact(&mut json)
+        .unwrap_or_else(|e| panic!("读取 {path} JSON 头失败（文件过短或损坏）: {e}"));
+    let header: CkptHeader = serde_json::from_slice(&json)
+        .unwrap_or_else(|e| panic!("解析 checkpoint 头失败: {e}"));
+    (header, json_len)
+}
+
+/// 读取并解析整个 checkpoint 文件（头部 + 参数数据）
 fn read_file(
     path: &str,
 ) -> (
@@ -111,20 +143,8 @@ fn read_file(
     Vec<u8>,
     Option<(usize, Vec<Vec<f32>>, Vec<Vec<f32>>)>,
 ) {
-    let mut buf = Vec::new();
-    File::open(path)
-        .unwrap_or_else(|e| panic!("无法打开 checkpoint {path}: {e}"))
-        .read_to_end(&mut buf)
-        .unwrap();
-
-    assert_eq!(
-        &buf[..7],
-        MAGIC,
-        "checkpoint 魔数不匹配：{path} 不是本项目的 checkpoint"
-    );
-    let json_len = u32::from_le_bytes(buf[7..11].try_into().unwrap()) as usize;
-    let header: CkptHeader = serde_json::from_slice(&buf[11..11 + json_len])
-        .unwrap_or_else(|e| panic!("解析 checkpoint 头失败: {e}"));
+    let mut f = File::open(path).unwrap_or_else(|e| panic!("无法打开 checkpoint {path}: {e}"));
+    let (header, _json_len) = read_head(&mut f, path);
 
     let ckpt = Checkpoint {
         step: header.step,
@@ -133,19 +153,21 @@ fn read_file(
     };
     let opt = Some((header.opt_t, header.opt_m, header.opt_v));
 
-    // 校验参数数据总长度
-    let pos = 11 + json_len;
+    // 读取并校验参数数据总长度
+    let mut data = Vec::new();
+    f.read_to_end(&mut data)
+        .unwrap_or_else(|e| panic!("读取 {path} 参数数据失败: {e}"));
     let total: usize = header
         .params
         .iter()
         .map(|m| m.shape.iter().product::<usize>())
         .sum();
     assert_eq!(
-        buf.len() - pos,
+        data.len(),
         total * 4,
         "checkpoint 参数数据长度不匹配（文件可能损坏）"
     );
-    (ckpt, header.params, buf[pos..].to_vec(), opt)
+    (ckpt, header.params, data, opt)
 }
 
 /// 按名字、形状把参数数据写回模型

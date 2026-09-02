@@ -1,4 +1,4 @@
-﻿# 第 18 课：KV Cache —— 让逐 token 生成不再重复计算
+# 第 18 课：KV Cache —— 让逐 token 生成不再重复计算
 
 > 代码位置：[src/attention.rs](src/attention.rs)（`KVCache` / `MultiHeadAttention`）
 > 代码位置：[src/model.rs](src/model.rs)（`GPT::forward`）
@@ -324,9 +324,9 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 
 | 原因 | 说明 |
 |------|------|
-| 位置编码表不够长 | `pos_emb` 是 `[block_size=32, D]` 的常数表，第 33 个位置没有编码可用 |
+| 训练长度之外是外推区 | RoPE 对任意位置都能算出旋转角（没有"位置表"可言），但模型训练时只见过位置 `0..32`，超出后是**外推区**（第 19 课讲过），注意力分数可能畸变，输出质量断崖下跌 |
 | 缓存无法"截断" | 全量模式可以用 `ids.len().saturating_sub(block_size)` 把窗口滑到最近 32 个 token；而 `KVCache` 只会 append、不会丢弃最早的位置（当前实现没有"弹掉开头"的操作） |
-| 因果掩码越界 | `t_total = t + base` 一旦超过 block_size，位置编码 gather_rows 就会越界 |
+| 上下文窗口硬上限 | `block_size` 是模型的设计上下文长度（每个训练样本最长 32 个位置），`generate` 用 `cache[0].seq_len() >= block_size` 把生成长度锁在训练见过的最长窗口内，不越界 |
 
 对比全量模式的生成 1：prompt "Once upon a" = 12 个 token，每步窗口都滑到最近 32 个，所以 80 个新 token 全部生成完（`Once upon a to his friend, the wise old owl. One day, Red found a wold of colors and turned`）。
 
@@ -351,6 +351,6 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 - `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`GPT::forward` 用 `base` 修正位置编码与因果掩码
 - 流程对比：首次前向整个 prompt 填缓存 → 之后每步只前向 1 个 token；全量模式则是每步重算整个窗口
 - 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致
-- 缓存模式只拼不丢，上下文达到 `block_size=32` 必须停止（位置编码表到头 + 无法截断历史），真实输出里生成 2 止步于 32 个 token
+- 缓存模式只拼不丢，上下文达到 `block_size=32` 必须停止（训练长度外是 RoPE 外推区 + 缓存无法截断历史），真实输出里生成 2 止步于 32 个 token
 
 - 下一课：换掉正弦位置编码，用 RoPE（旋转位置编码）让位置信息融入注意力计算。

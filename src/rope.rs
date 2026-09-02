@@ -9,11 +9,86 @@
 //! - 两个向量的点积只与"位置差"有关 → 天然编码相对位置
 //! - 旋转是正交变换 → 不改变向量范数，数值稳定
 //!
-//! 用法：在注意力层内部，对 Q/K 做 `rotary(positions)`，V 不转。
+//! 用法：在注意力层内部，对 Q/K 做 `rotary_pair(positions)` 一次旋转两者，V 不转。
 
 use std::rc::Rc;
 
+use rayon::prelude::*;
 use crate::tensor::Tensor;
+
+/// 预计算每个 (位置, 对偶下标) 的 cos/sin 表，长度 rows × (D/2)。
+/// 同一批 positions 的三角只算一次：前向、反向、Q/K 复用。
+///
+/// 关键优化：`10000^(2i/D)` 只与 i 有关，先算一遍 128 个频率，
+/// 再对每个位置做 `theta = pos / freq[i]` 求 cos/sin——
+/// 原来在行内循环里重复计算 powf，rows=2048 时要算 26 万次 powf（约 30ms）。
+fn build_cos_sin_tab(positions: &[usize], d: usize) -> (Vec<f32>, Vec<f32>) {
+    let rows = positions.len();
+    let half = d / 2;
+    let mut c_tab = vec![0.0f32; rows * half];
+    let mut s_tab = vec![0.0f32; rows * half];
+    let mut freq = vec![0.0f32; half];
+    for i in 0..half {
+        freq[i] = 10000f32.powf((2 * i) as f32 / d as f32);
+    }
+    for r in 0..rows {
+        let pos = positions[r] as f32;
+        for i in 0..half {
+            let theta = pos / freq[i];
+            c_tab[r * half + i] = theta.cos();
+            s_tab[r * half + i] = theta.sin();
+        }
+    }
+    (c_tab, s_tab)
+}
+
+/// 用现成的 cos/sin 表旋转一个张量（[rows, D]）。
+/// 反向用旋转矩阵的转置 R(θ)ᵀ 回传梯度，闭包直接查表。
+fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
+    let (rows, d) = (x.shape[0], x.shape[1]);
+    let sd = x.data.borrow();
+    let sd_ref: &[f32] = &sd;
+    let mut out_data = vec![0.0f32; rows * d];
+    let half = d / 2;
+    // 并行：每行旋转独立，行间无依赖
+    out_data
+        .par_chunks_mut(d)
+        .enumerate()
+        .for_each(|(r, out_row)| {
+            let base = r * d;
+            let ct_base = r * half;
+            for i in 0..half {
+                let (c, s) = (c_tab[ct_base + i], s_tab[ct_base + i]);
+                let (a, b) = (sd_ref[base + 2 * i], sd_ref[base + 2 * i + 1]);
+                out_row[2 * i] = a * c - b * s;
+                out_row[2 * i + 1] = a * s + b * c;
+            }
+        });
+    drop(sd);
+
+    let mut result = Tensor::new(out_data, x.shape.clone(), x.requires_grad);
+    if x.requires_grad {
+        let rg = result.grad.clone();
+        let sg = x.grad.clone();
+        let ct = c_tab.to_vec();
+        let st = s_tab.to_vec();
+        result.parents = Rc::new(vec![x.clone()]);
+        result.backward = Some(Rc::new(move || {
+            let g = rg.borrow();
+            let mut sgm = sg.borrow_mut();
+            for r in 0..rows {
+                for i in 0..d / 2 {
+                    let (c, s) = (ct[r * (d / 2) + i], st[r * (d / 2) + i]);
+                    let (ga, gb) = (g[r * d + 2 * i], g[r * d + 2 * i + 1]);
+                    // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
+                    sgm[r * d + 2 * i] += ga * c + gb * s;
+                    sgm[r * d + 2 * i + 1] += -ga * s + gb * c;
+                }
+            }
+        }));
+    }
+    result
+}
 
 impl Tensor {
     /// RoPE 旋转位置编码：把位置信息揉进向量的每一对相邻元素。
@@ -32,49 +107,31 @@ impl Tensor {
     /// grad_a = ga·cos(θ) + gb·sin(θ)
     /// grad_b = -ga·sin(θ) + gb·cos(θ)
     /// ```
+    /// 仅供测试使用；生产代码（attention）用 `rotary_pair` 一次旋转 Q/K。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn rotary(&self, positions: &[usize]) -> Tensor {
         assert_eq!(self.rank(), 2, "rotary 输入应为 [rows, D]");
         assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
-        let (rows, d) = (self.shape[0], self.shape[1]);
+        let d = self.shape[1];
         assert_eq!(d % 2, 0, "最后一维必须为偶数才能两两配对旋转");
+        let (c_tab, s_tab) = build_cos_sin_tab(positions, d);
+        rotate_with_tab(self, &c_tab, &s_tab)
+    }
 
-        let sd = self.data.borrow();
-        let mut out_data = vec![0.0f32; rows * d];
-        for r in 0..rows {
-            let pos = positions[r] as f32;
-            for i in 0..d / 2 {
-                let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);
-                let (c, s) = (theta.cos(), theta.sin());
-                let (a, b) = (sd[r * d + 2 * i], sd[r * d + 2 * i + 1]);
-                out_data[r * d + 2 * i] = a * c - b * s;
-                out_data[r * d + 2 * i + 1] = a * s + b * c;
-            }
-        }
-        drop(sd);
-        let positions_vec = positions.to_vec();
-
-        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
-            let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for r in 0..rows {
-                    let pos = positions_vec[r] as f32;
-                    for i in 0..d / 2 {
-                        let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);
-                        let (c, s) = (theta.cos(), theta.sin());
-                        let (ga, gb) = (g[r * d + 2 * i], g[r * d + 2 * i + 1]);
-                        // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
-                        sgm[r * d + 2 * i] += ga * c + gb * s;
-                        sgm[r * d + 2 * i + 1] += -ga * s + gb * c;
-                    }
-                }
-            }));
-        }
-        result
+    /// 一次建表同时旋转 Q 和 K（两者 positions 相同，三角函数只算一遍）。
+    /// 返回 `(rotated_q, rotated_k)`。
+    pub fn rotary_pair(
+        &self,
+        other: &Tensor,
+        positions: &[usize],
+    ) -> (Tensor, Tensor) {
+        debug_assert_eq!(self.shape[0], other.shape[0], "Q/K 行数必须一致");
+        let d = self.shape[1];
+        let (c_tab, s_tab) = build_cos_sin_tab(positions, d);
+        (
+            rotate_with_tab(self, &c_tab, &s_tab),
+            rotate_with_tab(other, &c_tab, &s_tab),
+        )
     }
 }
 

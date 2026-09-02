@@ -48,7 +48,16 @@ impl CharTokenizer {
 
     /// id 序列 -> 文本
     pub fn decode(&self, ids: &[usize]) -> String {
-        ids.iter().map(|&i| self.chars[i]).collect()
+        ids.iter()
+            .map(|&i| {
+                self.chars
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!("decode 遇到越界 token id {i}（词表大小 {}）", self.chars.len())
+                    })
+            })
+            .collect()
     }
 }
 
@@ -150,7 +159,11 @@ impl BPETokenizer {
     pub fn decode(&self, ids: &[usize]) -> String {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
-            bytes.extend_from_slice(&self.vocab[id]);
+            let tok = self
+                .vocab
+                .get(id)
+                .unwrap_or_else(|| panic!("decode 遇到越界 token id {id}（词表大小 {}）", self.vocab.len()));
+            bytes.extend_from_slice(tok);
         }
         String::from_utf8_lossy(&bytes).to_string()
     }

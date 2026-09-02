@@ -10,55 +10,62 @@ use crate::layers::Linear;
 use crate::module::Module;
 use crate::rng::Rng;
 use crate::tensor::Tensor;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// KV 缓存（第 18 课）：
 /// 生成第 N 个 token 时，前 N-1 个 token 的 K、V 不需要重算。
-/// 把每个注意力层的 K、V 存起来，每次只算新 token 的 K、V 并拼接。
+/// 把每个注意力层的 K、V 存起来，每次只算新 token 的 K、V 并追加。
+///
+/// 内部直接持有 `Vec<f32>` 缓存，append 时只把新块 extend 到末尾，
+/// 避免"每步克隆整段历史再拼接"的 O(T²) 开销。
 pub struct KVCache {
-    k: Option<Tensor>, // [1, T, D]
-    v: Option<Tensor>,
+    k: Rc<RefCell<Vec<f32>>>, // 行优先 [1, T, D] 展平
+    v: Rc<RefCell<Vec<f32>>>,
+    len: usize, // 已缓存的位置数 T
+    d: usize,   // 隐藏维 D，第一次 append 时确定
 }
 
 impl KVCache {
     pub fn new() -> Self {
-        KVCache { k: None, v: None }
+        KVCache {
+            k: Rc::new(RefCell::new(Vec::new())),
+            v: Rc::new(RefCell::new(Vec::new())),
+            len: 0,
+            d: 0,
+        }
     }
 
     #[allow(dead_code)] // 多轮生成时重置缓存
     pub fn reset(&mut self) {
-        self.k = None;
-        self.v = None;
+        self.k.borrow_mut().clear();
+        self.v.borrow_mut().clear();
+        self.len = 0;
+        self.d = 0;
     }
 
     /// 当前已缓存的位置数
     pub fn seq_len(&self) -> usize {
-        self.k.as_ref().map(|t| t.shape()[1]).unwrap_or(0)
+        self.len
     }
 
-    /// 把新的 k/v 拼到缓存后面（纯数据拼接，推理时无梯度）
-    fn append_data(prev: &Option<Tensor>, cur: &Tensor) -> Tensor {
-        match prev {
-            Some(p) => {
-                let mut all = p.data();
-                all.extend(cur.data());
-                let d = cur.shape()[2];
-                Tensor::from_vec(all, vec![1, p.shape()[1] + 1, d])
-            }
-            None => cur.clone(),
-        }
-    }
-
+    /// 把新的 k/v 追加到缓存末尾（只拷贝新块，不复制历史数据）
     pub fn append(&mut self, k: &Tensor, v: &Tensor) {
-        self.k = Some(Self::append_data(&self.k, k));
-        self.v = Some(Self::append_data(&self.v, v));
+        assert_eq!(k.shape(), v.shape(), "K/V 形状必须一致");
+        assert_eq!(k.rank(), 3, "K/V 必须为 3D [1, T, D]，实际 {:?}", k.shape());
+        self.d = k.shape()[2];
+        self.k.borrow_mut().extend(k.data());
+        self.v.borrow_mut().extend(v.data());
+        self.len += k.shape()[1];
     }
 
-    pub fn k(&self) -> Option<Tensor> {
-        self.k.clone()
+    /// 返回完整缓存张量 [1, T, D]（注意力打分需要读全量历史，这里克隆一次）
+    pub fn k(&self) -> Tensor {
+        Tensor::from_vec(self.k.borrow().clone(), vec![1, self.len, self.d])
     }
 
-    pub fn v(&self) -> Option<Tensor> {
-        self.v.clone()
+    pub fn v(&self) -> Tensor {
+        Tensor::from_vec(self.v.borrow().clone(), vec![1, self.len, self.d])
     }
 }
 
@@ -105,10 +112,16 @@ impl MultiHeadAttention {
         let head_dim = d / self.n_head;
         assert_eq!(head_dim * self.n_head, d, "n_embd 必须能被 n_head 整除");
 
+        // [诊断] attention 内部分段计时（仅前 2 次调用）
+        static ATT_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let att_diag = ATT_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2;
+        let att_t0 = std::time::Instant::now();
+
         // 1. 投影得到 Q、K、V（Linear 输出是 2D [B*T, D]，恢复成 3D）
         let q = self.c_q.forward(x).reshape(vec![b, t, d]); // [B, T, D]
         let k = self.c_k.forward(x).reshape(vec![b, t, d]);
         let v = self.c_v.forward(x).reshape(vec![b, t, d]);
+        let t_proj = att_t0.elapsed();
 
         // 2. RoPE（第 19 课）：按绝对位置旋转 Q/K，V 保持原样。
         //    - 位置信息只参与打分 q·k，所以只转 Q/K 不转 V
@@ -118,20 +131,21 @@ impl MultiHeadAttention {
         for _ in 0..b {
             positions.extend(base..base + t);
         }
-        let q = q
+        // Q/K 用同一批 positions，一次性建 cos/sin 表同时旋转（三角函数只算一遍）
+        let (q, k) = q
             .reshape(vec![b * t, d])
-            .rotary(&positions)
-            .reshape(vec![b, t, d]);
-        let k = k
-            .reshape(vec![b * t, d])
-            .rotary(&positions)
-            .reshape(vec![b, t, d]);
+            .rotary_pair(&k.reshape(vec![b * t, d]), &positions);
+        let (q, k) = (
+            q.reshape(vec![b, t, d]),
+            k.reshape(vec![b, t, d]),
+        );
+        let t_rope = att_t0.elapsed();
 
-        // 3. KV cache：拼接历史的 K/V（只影响 K、V 的长度）
+        // 3. KV cache：追加历史的 K/V（只影响 K、V 的长度）
         let (k, v) = match kv_cache {
             Some(cache) => {
                 cache.append(&k, &v);
-                (cache.k().unwrap(), cache.v().unwrap())
+                (cache.k(), cache.v())
             }
             None => (k, v),
         };
@@ -153,25 +167,52 @@ impl MultiHeadAttention {
             .reshape(vec![b * self.n_head, t_total, head_dim]);
 
         // 5. 注意力分数：scores = Q·Kᵀ / √d_k
+        //    把缩放提前到 q（[B*H, T, Dh]）而不是 scores（[B*H, T, T_total]）：
+        //    元素数少 T/Dh 倍，前向与反向都省一次大数组逐元素扫描。
         let scale = 1.0 / (head_dim as f32).sqrt();
         let kt = k.permute(&[0, 2, 1]); // [B*H, head_dim, T_total]
-        let scores = q.matmul(&kt).mul_scalar(scale); // [B*H, T, T_total]
+        let scores = q.mul_scalar(scale).matmul(&kt); // [B*H, T, T_total]
+        let t_scores = att_t0.elapsed();
 
-        // 6. 因果掩码：把"未来位置"变成 -inf，softmax 后概率为 0
-        let scores = scores.add(mask);
-
-        // 7. softmax 得到注意力权重，加权求和
-        let attn = scores.softmax_last_dim(); // [B*H, T, T_total]
+        // 6+7. 因果掩码 + softmax（融合实现：一个算子替代 add+softmax 两个算子）
+        let attn = scores.masked_softmax(mask); // [B*H, T, T_total]
+        let t_softmax = att_t0.elapsed();
         let out = attn.matmul(&v); // [B*H, T, head_dim]
+        let t_attnv = att_t0.elapsed();
 
         // 8. 合并头回 [B, T, D]
         let out = out
             .reshape(vec![b, self.n_head, t, head_dim])
             .permute(&[0, 2, 1, 3])
             .reshape(vec![b, t, d]);
+        let t_merge = att_t0.elapsed();
 
         // 9. 输出投影
-        self.c_proj.forward(&out)
+        let out = self.c_proj.forward(&out);
+        if att_diag {
+            let t_total = att_t0.elapsed();
+            println!(
+                "[diag-att] 投影 {:.1} | rope {:.1} | 拆头+scores {:.1} | mask+softmax {:.1} | attn·v {:.1} | 合头 {:.1} | c_proj {:.1} | 总 {:.1} ms",
+                t_proj.as_secs_f64() * 1000.0,
+                (t_rope - t_proj).as_secs_f64() * 1000.0,
+                (t_scores - t_rope).as_secs_f64() * 1000.0,
+                (t_softmax - t_scores).as_secs_f64() * 1000.0,
+                (t_attnv - t_softmax).as_secs_f64() * 1000.0,
+                (t_merge - t_attnv).as_secs_f64() * 1000.0,
+                (t_total - t_merge).as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+            );
+        }
+        out
+    }
+
+    /// 带名字的参数（checkpoint 用）：`{prefix}.c_q/c_k/c_v/c_proj.*`
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        let mut ps = self.c_q.named_parameters(&format!("{prefix}.c_q"));
+        ps.extend(self.c_k.named_parameters(&format!("{prefix}.c_k")));
+        ps.extend(self.c_v.named_parameters(&format!("{prefix}.c_v")));
+        ps.extend(self.c_proj.named_parameters(&format!("{prefix}.c_proj")));
+        ps
     }
 }
 

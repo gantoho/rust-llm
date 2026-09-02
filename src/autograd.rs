@@ -21,7 +21,9 @@ impl Tensor {
     /// 3. 每个闭包把"输出的梯度"按链式法则加到"输入的梯度"上
     ///
     /// 拓扑排序用 DFS 实现：递归访问所有父节点，回溯时把自己加入列表。
-    /// 用 `Rc::as_ptr` 去重，同一张量不会被处理两次。
+    /// 用 `Rc::as_ptr(&t.grad)` 去重：`grad` 是每个计算节点独有的 Rc，
+    /// 同一张量不会被处理两次。注意不能用 `data` 指针判重——
+    /// `reshape` 等视图运算与输入共享 `data`，会误把父节点跳过导致梯度截断。
     pub fn backward(&self) {
         assert_eq!(
             self.rank(),
@@ -35,7 +37,7 @@ impl Tensor {
         }
 
         fn dfs(t: &Tensor, order: &mut Vec<Tensor>, visited: &mut HashSet<usize>) {
-            let key = Rc::as_ptr(&t.data) as usize;
+            let key = Rc::as_ptr(&t.grad) as usize;
             if !visited.insert(key) {
                 return;
             }

@@ -35,7 +35,7 @@ use layers::{Linear, tanh};
 use loss::cross_entropy_loss;
 use model::{GPT, GPTConfig};
 use module::Module;
-use optim::SGD;
+use optim::{Optimizer, SGD};
 use rng::Rng;
 use sample::generate;
 use tensor::Tensor;
@@ -111,6 +111,12 @@ fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: u
 fn cmd_train(config_path: &str, resume: Option<&str>) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
+    #[cfg(feature = "gpu")]
+    if gpu::is_available() {
+        println!("GPU: {}（{}）", gpu::name(), gpu::backend());
+    } else {
+        println!("未检测到可用 GPU，本次训练走 CPU");
+    }
 
     let train_text = read_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
@@ -259,7 +265,7 @@ fn demo_xor() {
         ps.extend(fc2.parameters());
         ps
     };
-    let opt = SGD::new(0.5, params);
+    let mut opt = SGD::new(0.5, params);
 
     for step in 0..1000 {
         // 前向：tanh(x @ W1 + b1) @ W2 + b2
@@ -387,7 +393,7 @@ fn demo_gpu() {
     let a: Vec<f32> = (0..batch * m * k).map(|_| rng.randn()).collect();
     let b: Vec<f32> = (0..batch * k * n).map(|_| rng.randn()).collect();
     let cpu = naive_matmul(&a, &b, m, k, n, batch);
-    let gpu_out = gpu::matmul(&a, &b, m, k, n, batch).unwrap();
+    let gpu_out = gpu::matmul(&a, &b, m, k, n, batch, false, false).unwrap();
     let max_err = cpu
         .iter()
         .zip(&gpu_out)
@@ -406,7 +412,7 @@ fn demo_gpu() {
     let _ = naive_matmul(&a, &b, m, k, n, 1);
     let t_cpu = t0.elapsed();
     let t1 = std::time::Instant::now();
-    let _ = gpu::matmul(&a, &b, m, k, n, 1).unwrap();
+    let _ = gpu::matmul(&a, &b, m, k, n, 1, false, false).unwrap();
     let t_gpu = t1.elapsed();
     let speedup = t_cpu.as_secs_f64() / t_gpu.as_secs_f64().max(1e-9);
     println!(

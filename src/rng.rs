@@ -52,6 +52,7 @@ impl Rng {
 
     /// 从一个范围内随机选一个整数下标（用于采样）
     pub fn choice(&mut self, n: usize) -> usize {
+        assert!(n > 0, "choice 的范围必须大于 0");
         (self.next_u64() % n as u64) as usize
     }
 }

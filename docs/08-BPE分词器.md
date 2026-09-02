@@ -1,4 +1,4 @@
-﻿# 第 8 课：BPE 分词器 —— 让模型"读懂"文字
+# 第 8 课：BPE 分词器 —— 让模型"读懂"文字
 
 > 代码位置：[src/tokenizer.rs](src/tokenizer.rs)
 > 演示入口：[src/main.rs](src/main.rs)（`demo_bpe`）
@@ -71,9 +71,18 @@ pub fn encode(&self, text: &str) -> Vec<usize> {
         .collect()
 }
 
-// id 序列 -> 文本（按 id 反查字符）
+// id 序列 -> 文本（按 id 反查字符，越界 id 带下标 panic 提示）
 pub fn decode(&self, ids: &[usize]) -> String {
-    ids.iter().map(|&i| self.chars[i]).collect()
+    ids.iter()
+        .map(|&i| {
+            self.chars
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!("decode 遇到越界 token id {i}（词表大小 {}）", self.chars.len())
+                })
+        })
+        .collect()
 }
 ```
 
@@ -178,28 +187,25 @@ while vocab.len() < target_vocab {
 
 ## 6. BPE 编码：encode()
 
-编码 = 对新文本执行**同样的贪心合并**。但合并顺序必须和训练时一致：训练时越早合并的规则优先级越高（它对应的 token id 更小）。
+编码 = 对新文本执行**同样的合并**。但合并顺序必须和训练时一致：训练时越早合并的规则优先级越高（它对应的 token id 更小）。
 
 ```rust
 pub fn encode(&self, text: &str) -> Vec<usize> {
     let mut ids: Vec<u16> = text.as_bytes().iter().map(|&b| b as u16).collect();
-    loop {
-        // 找到 ids 中优先级最高（merge 下标最小）的可合并 pair
-        let mut best_merge: Option<usize> = None;
-        let mut pos = 0;
-        for i in 0..ids.len().saturating_sub(1) {
-            let pair = (ids[i], ids[i + 1]);
-            if let Some(idx) = self.merges.iter().position(|&m| m == pair) {
-                if best_merge.map_or(true, |b| idx < b) {
-                    best_merge = Some(idx);
-                    pos = i;
-                }
+    for (idx, &(a, b)) in self.merges.iter().enumerate() {
+        let new_id = (256 + idx) as u16;
+        let mut out: Vec<u16> = Vec::with_capacity(ids.len());
+        let mut i = 0;
+        while i < ids.len() {
+            if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
+                out.push(new_id);
+                i += 2;
+            } else {
+                out.push(ids[i]);
+                i += 1;
             }
         }
-        let Some(idx) = best_merge else { break; };
-        let new_id = (256 + idx) as u16;
-        ids[pos] = new_id;
-        ids.remove(pos + 1);
+        ids = out;
     }
     ids.into_iter().map(|x| x as usize).collect()
 }
@@ -207,12 +213,12 @@ pub fn encode(&self, text: &str) -> Vec<usize> {
 
 要点：
 
-- 每次找**当前序列里可合并且 merge 下标最小**的 pair，替换后重新找，直到没有可合并的 pair
+- **按规则优先级单趟扫描**（GPT-2 的标准实现）：从 `merges[0]` 到 `merges[最后]`，每条规则在序列上扫一遍，能合并就替换成它对应的新 token。复杂度 O(len × 合并数)，大语料也能秒级完成（若"每次只合并一个 pair 并全量重扫"是 O(n²×m)，174KB 语料会卡死）
 - `new_id = 256 + idx`：merge 下标 idx 直接映射成 token id——因为训练时第 idx 次合并恰好产生 id `256 + idx`
 - 字节 id（0~255）直接复用训练时的字节 → id 映射
 - 演示里 `"the garden"` 编码后只有 **2 个 token**（"the" 和 " garden" 都被压缩成了单个 token）
 
-以 `"lowest"` 为例走一遍：字节 `[l,o,w,e,s,t]` → 合并 `(l,o)` → `[256,w,e,s,t]` → 合并 `(256,w)` → `[257,e,s,t]` → 继续合并 `(e,s)`、`(s,t)`……最终 6 个字节被压成 3 个 token（单元测试要求 `"low"` 编码后不超过 3 个 token）。
+以 `"lowest"` 为例走一遍：字节 `[l,o,w,e,s,t]` → 应用规则 0（假设是 `(l,o)`）→ `[256,w,e,s,t]` → 应用规则 1（`(256,w)`）→ `[257,e,s,t]` → 继续应用 `(e,s)`、`(s,t)` 对应规则……最终 6 个字节被压成 3 个 token（单元测试要求 `"low"` 编码后不超过 3 个 token）。
 
 ---
 
@@ -224,14 +230,19 @@ pub fn encode(&self, text: &str) -> Vec<usize> {
 pub fn decode(&self, ids: &[usize]) -> String {
     let mut bytes: Vec<u8> = Vec::new();
     for &id in ids {
-        bytes.extend_from_slice(&self.vocab[id]);
+        let tok = self
+            .vocab
+            .get(id)
+            .unwrap_or_else(|| panic!("decode 遇到越界 token id {id}（词表大小 {}）", self.vocab.len()));
+        bytes.extend_from_slice(tok);
     }
     String::from_utf8_lossy(&bytes).to_string()
 }
 ```
 
 - `vocab[id]`：id → 字节序列（0~255 是单字节，256+ 是合并出来的多字节序列）
-- `String::from_utf8_lossy`：万一拼出非法 UTF-8，用替换字符 `�` 顶替而不是 panic——**decode 永不失败**
+- 越界 id 用 `vocab.get(id)` 拦截：带下标信息的 panic 提示（decode 也会因传入非法 id 报错，不再是"永不失败"）
+- `String::from_utf8_lossy`：万一拼出非法 UTF-8，用替换字符 `�` 顶替而不是 panic
 
 > 完整闭环：`decode(encode("lowest new")) == "lowest new"`（单元测试 `test_bpe_roundtrip` 验证）。
 
@@ -242,7 +253,7 @@ pub fn decode(&self, ids: &[usize]) -> String {
 | 操作 | 一句话 | 关键代码 | 产物/结果 |
 |------|--------|---------|-----------|
 | 训练 train | 从语料学合并规则 | 统计 pair → 合并最高频 → 替换（循环至目标词表大小） | `merges`（规则）+ `vocab`（字节序列）|
-| 编码 encode | 对新文本按规则贪心合并 | 反复找 merge 下标最小的可合并 pair 并替换 | 一串 token id |
+| 编码 encode | 对新文本按规则贪心合并 | 按规则优先级（merges 顺序）单趟扫描替换 | 一串 token id |
 | 解码 decode | id → 字节序列拼接 | `vocab[id]` 逐个拼接 + `from_utf8_lossy` | 还原的文本 |
 
 三者关系：**编码必须复现训练时的合并顺序**，解码只是查表，所以编码、解码天然互逆，`decode(encode(x)) == x`。
