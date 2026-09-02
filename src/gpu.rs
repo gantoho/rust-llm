@@ -250,8 +250,17 @@ pub struct GpuContext {
 static GPU: OnceLock<Option<GpuContext>> = OnceLock::new();
 
 /// 初始化 GPU 后端（幂等）。失败时静默置为不可用，后续自动走 CPU。
+///
+/// 在独立线程（8 MB 栈）中初始化 wgpu，避免 Intel/Vulkan 驱动的栈缓冲区溢出。
 pub fn init() {
-    let _ = GPU.set(create());
+    let ctx = std::thread::Builder::new()
+        .name("gpu-init".into())
+        .stack_size(8 * 1024 * 1024) // 8 MB 栈，避免驱动栈溢出
+        .spawn(create)
+        .ok()
+        .and_then(|h| h.join().ok())
+        .flatten();
+    let _ = GPU.set(ctx);
 }
 
 /// GPU 是否可用
@@ -342,8 +351,14 @@ pub fn softmax_mask_backward(g: &[f32], p: &[f32], rows: usize, d: usize) -> Opt
 // ---------------- 内部实现 ----------------
 
 fn create() -> Option<GpuContext> {
+    // 优先 DX12（Windows 原生更稳定），Vulkan 回退；Intel 核显 Vulkan 驱动有栈溢出 bug
+    let backends = if cfg!(windows) {
+        wgpu::Backends::DX12
+    } else {
+        wgpu::Backends::PRIMARY
+    };
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         flags: wgpu::InstanceFlags::default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         backend_options: wgpu::BackendOptions::default(),

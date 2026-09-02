@@ -36,20 +36,32 @@ impl Tensor {
             g[0] = 1.0;
         }
 
-        fn dfs(t: &Tensor, order: &mut Vec<Tensor>, visited: &mut HashSet<usize>) {
-            let key = Rc::as_ptr(&t.grad) as usize;
-            if !visited.insert(key) {
-                return;
-            }
-            for p in t.parents.iter() {
-                dfs(p, order, visited);
-            }
-            order.push(t.clone());
+        // 迭代式 DFS 拓扑排序（避免递归栈溢出，深层计算图可能有数千节点）。
+        // 三色标记法：白色=未访问、灰色=在栈中（正在展开子节点）、黑色=已完成。
+        // 用栈模拟递归：每个元素 (node, child_index) 表示"该节点的第 child_index 个子节点待访问"。
+        let mut order: Vec<Tensor> = Vec::new();
+        let mut visited: HashSet<usize> = HashSet::new();
+        // 栈元素：(节点, 下一个待展开的子节点索引)
+        let mut stack: Vec<(Tensor, usize)> = Vec::new();
+
+        let key = Rc::as_ptr(&self.grad) as usize;
+        if visited.insert(key) {
+            stack.push((self.clone(), 0));
         }
 
-        let mut order = Vec::new();
-        let mut visited = HashSet::new();
-        dfs(self, &mut order, &mut visited);
+        while let Some((node, idx)) = stack.last_mut() {
+            if *idx < node.parents.len() {
+                let child = node.parents[*idx].clone();
+                *idx += 1;
+                let child_key = Rc::as_ptr(&child.grad) as usize;
+                if visited.insert(child_key) {
+                    stack.push((child, 0));
+                }
+            } else {
+                let (node, _) = stack.pop().unwrap();
+                order.push(node);
+            }
+        }
 
         for t in order.iter().rev() {
             if let Some(b) = &t.backward {

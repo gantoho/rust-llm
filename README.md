@@ -72,6 +72,9 @@ cargo run --release --features gpu -- demo
 
 # 训练 / 推理同样可加 --features gpu
 cargo run --release --features gpu -- train --config config.json
+
+# 推理时可加 --features gpu
+cargo run --release --features gpu -- generate --config config.json --prompt "Alice was" --max-new 100
 ```
 
 原理与特性：
