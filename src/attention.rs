@@ -69,7 +69,7 @@ impl KVCache {
     }
 }
 
-/// 多头注意力（第 9-10 课）
+/// 多头注意力（第 9-10 课）+ Grouped Query Attention（GQA）
 ///
 /// 流程：
 /// 1. 输入 x 经过 Q/K/V 三个线性投影
@@ -77,22 +77,35 @@ impl KVCache {
 /// 3. 拆成多个头，计算 scores = Q·Kᵀ / √d_k
 /// 4. 加因果掩码（屏蔽未来位置），softmax 得到注意力权重
 /// 5. 加权求和 V，合并头，输出投影
+///
+/// GQA（Grouped Query Attention）：n_kv_head < n_head 时，多个 Q head 共享 K/V head。
+/// - n_kv_head = n_head：标准 MHA
+/// - n_kv_head = 1：Multi-Query Attention（MQA）
+/// - 1 < n_kv_head < n_head：GQA（LLaMA 2/3、Mistral 使用）
 pub struct MultiHeadAttention {
     pub c_q: Linear,
     pub c_k: Linear,
     pub c_v: Linear,
     pub c_proj: Linear,
     pub n_head: usize,
+    pub n_kv_head: usize,
+    n_rep: usize, // n_head / n_kv_head
 }
 
 impl MultiHeadAttention {
-    pub fn new(n_embd: usize, n_head: usize, rng: &mut Rng) -> Self {
+    pub fn new(n_embd: usize, n_head: usize, n_kv_head: usize, rng: &mut Rng) -> Self {
+        let n_kv = if n_kv_head == 0 { n_head } else { n_kv_head };
+        assert!(n_head % n_kv == 0, "n_head 必须能被 n_kv_head 整除");
+        let head_dim = n_embd / n_head;
+        let kv_dim = n_kv * head_dim;
         MultiHeadAttention {
             c_q: Linear::new(n_embd, n_embd, rng),
-            c_k: Linear::new(n_embd, n_embd, rng),
-            c_v: Linear::new(n_embd, n_embd, rng),
+            c_k: Linear::new(n_embd, kv_dim, rng),
+            c_v: Linear::new(n_embd, kv_dim, rng),
             c_proj: Linear::new(n_embd, n_embd, rng),
             n_head,
+            n_kv_head: n_kv,
+            n_rep: n_head / n_kv,
         }
     }
 
@@ -117,31 +130,28 @@ impl MultiHeadAttention {
         let att_diag = ATT_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2;
         let att_t0 = std::time::Instant::now();
 
-        // 1. 投影得到 Q、K、V（Linear 输出是 2D [B*T, D]，恢复成 3D）
+        // 1. 投影得到 Q、K、V
         let q = self.c_q.forward(x).reshape(vec![b, t, d]); // [B, T, D]
-        let k = self.c_k.forward(x).reshape(vec![b, t, d]);
-        let v = self.c_v.forward(x).reshape(vec![b, t, d]);
+        let kv_dim = self.n_kv_head * head_dim;
+        let k = self.c_k.forward(x).reshape(vec![b, t, kv_dim]); // [B, T, kv_dim]
+        let v = self.c_v.forward(x).reshape(vec![b, t, kv_dim]);
         let t_proj = att_t0.elapsed();
 
-        // 2. RoPE（第 19 课）：按绝对位置旋转 Q/K，V 保持原样。
-        //    - 位置信息只参与打分 q·k，所以只转 Q/K 不转 V
-        //    - 必须在 KV cache append 之前旋转：缓存里存的是"已旋转的 K"，历史 K 直接复用
-        //    - 新 token 的绝对位置 = base + 窗口内下标 j（batch 内每个样本位置相同，重复 b 次）
+        // 2. RoPE：Q/K 按 head_dim 旋转（GQA 时 K 只有 n_kv_head 个头）
         let mut positions = Vec::with_capacity(b * t);
         for _ in 0..b {
             positions.extend(base..base + t);
         }
-        // Q/K 用同一批 positions，一次性建 cos/sin 表同时旋转（三角函数只算一遍）
         let (q, k) = q
             .reshape(vec![b * t, d])
-            .rotary_pair(&k.reshape(vec![b * t, d]), &positions);
+            .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions);
         let (q, k) = (
             q.reshape(vec![b, t, d]),
-            k.reshape(vec![b, t, d]),
+            k.reshape(vec![b, t, kv_dim]),
         );
         let t_rope = att_t0.elapsed();
 
-        // 3. KV cache：追加历史的 K/V（只影响 K、V 的长度）
+        // 3. KV cache
         let (k, v) = match kv_cache {
             Some(cache) => {
                 cache.append(&k, &v);
@@ -151,20 +161,29 @@ impl MultiHeadAttention {
         };
         let t_total = k.shape()[1];
 
-        // 4. 拆头：[B, T, D] -> [B*H, T, head_dim]
-        //    （先 reshape 出 H 维，再 permute 把 H 提到第 2 维）
+        // 4. 拆头 + GQA repeat
+        //    Q: [B, T, n_head, head_dim] -> [B*n_head, T, head_dim]
+        //    K/V: [B, T_total, n_kv_head, head_dim] -> repeat -> [B*n_head, T_total, head_dim]
         let q = q
             .reshape(vec![b, t, self.n_head, head_dim])
             .permute(&[0, 2, 1, 3])
             .reshape(vec![b * self.n_head, t, head_dim]);
+
         let k = k
-            .reshape(vec![b, t_total, self.n_head, head_dim])
+            .reshape(vec![b, t_total, self.n_kv_head, head_dim])
             .permute(&[0, 2, 1, 3])
-            .reshape(vec![b * self.n_head, t_total, head_dim]);
+            .reshape(vec![b * self.n_kv_head, t_total, head_dim]);
         let v = v
-            .reshape(vec![b, t_total, self.n_head, head_dim])
+            .reshape(vec![b, t_total, self.n_kv_head, head_dim])
             .permute(&[0, 2, 1, 3])
-            .reshape(vec![b * self.n_head, t_total, head_dim]);
+            .reshape(vec![b * self.n_kv_head, t_total, head_dim]);
+
+        // GQA：如果 n_kv_head < n_head，把 K/V 的每个头重复 n_rep 次
+        let (k, v) = if self.n_rep > 1 {
+            (repeat_kv(&k, self.n_rep), repeat_kv(&v, self.n_rep))
+        } else {
+            (k, v)
+        };
 
         // 5. 注意力分数：scores = Q·Kᵀ / √d_k
         //    把缩放提前到 q（[B*H, T, Dh]）而不是 scores（[B*H, T, T_total]）：
@@ -224,4 +243,31 @@ impl Module for MultiHeadAttention {
         ps.extend(self.c_proj.parameters());
         ps
     }
+}
+
+/// GQA 辅助函数：把 KV 头重复 n_rep 次。
+///
+/// 输入 x: [B*n_kv_head, T, head_dim]
+/// 输出:   [B*n_head, T, head_dim]
+///
+/// 例如 n_kv_head=2, n_rep=4 时：
+/// [head0, head1] -> [head0, head0, head0, head0, head1, head1, head1, head1]
+fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
+    if n_rep == 1 {
+        return x.clone();
+    }
+    let shape = x.shape();
+    assert_eq!(shape.len(), 3, "repeat_kv 输入必须为 3D");
+    let (batch_kv, t, head_dim) = (shape[0], shape[1], shape[2]);
+    let batch = batch_kv * n_rep;
+    let xd = x.data();
+    let mut out = vec![0.0f32; batch * t * head_dim];
+    for b in 0..batch_kv {
+        let src = &xd[b * t * head_dim..(b + 1) * t * head_dim];
+        for r in 0..n_rep {
+            let dst_start = (b * n_rep + r) * t * head_dim;
+            out[dst_start..dst_start + t * head_dim].copy_from_slice(src);
+        }
+    }
+    Tensor::from_vec(out, vec![batch, t, head_dim])
 }

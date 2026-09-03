@@ -74,17 +74,23 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
         let st = s_tab.to_vec();
         result.parents = Rc::new(vec![x.clone()]);
         result.backward = Some(Rc::new(move || {
-            let g = rg.borrow();
+            // 先把梯度拷出 RefCell，再并行写回（Ref<Vec<f32>> 不是 Sync）
+            let g_local: Vec<f32> = rg.borrow().to_vec();
             let mut sgm = sg.borrow_mut();
-            for r in 0..rows {
-                for i in 0..d / 2 {
-                    let (c, s) = (ct[r * (d / 2) + i], st[r * (d / 2) + i]);
-                    let (ga, gb) = (g[r * d + 2 * i], g[r * d + 2 * i + 1]);
-                    // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
-                    sgm[r * d + 2 * i] += ga * c + gb * s;
-                    sgm[r * d + 2 * i + 1] += -ga * s + gb * c;
-                }
-            }
+            // 并行：每行独立计算梯度，行间无依赖（与前向一致）
+            sgm.par_chunks_mut(d)
+                .enumerate()
+                .for_each(|(r, sgm_row)| {
+                    let g_base = r * d;
+                    let ct_base = r * (d / 2);
+                    for i in 0..d / 2 {
+                        let (c, s) = (ct[ct_base + i], st[ct_base + i]);
+                        let (ga, gb) = (g_local[g_base + 2 * i], g_local[g_base + 2 * i + 1]);
+                        // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
+                        sgm_row[2 * i] += ga * c + gb * s;
+                        sgm_row[2 * i + 1] += -ga * s + gb * c;
+                    }
+                });
         }));
     }
     result

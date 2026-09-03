@@ -111,13 +111,13 @@ pub fn generate(
             // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
             let c = cache.as_mut().unwrap();
             if c[0].seq_len() == 0 {
-                model.forward(ctx, 1, ctx.len(), Some(c))
+                model.forward(ctx, 1, ctx.len(), Some(c), false)
             } else {
-                model.forward(&ids[ids.len() - 1..], 1, 1, Some(c))
+                model.forward(&ids[ids.len() - 1..], 1, 1, Some(c), false)
             }
         } else {
             // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-            model.forward(ctx, 1, ctx.len(), None)
+            model.forward(ctx, 1, ctx.len(), None, false)
         };
 
         // 取最后一个位置的 logits
@@ -129,4 +129,102 @@ pub fn generate(
     }
 
     tokenizer.decode(&ids)
+}
+
+/// Beam Search 生成：维护 `beam_size` 个候选序列，每步扩展后保留 top-k。
+///
+/// 与采样（temperature + top-k/top-p）的区别：
+/// - 采样是随机的，每次生成不同
+/// - Beam Search 是确定性的（给定 seed），总选择全局最优的 k 条路径
+/// - 生成质量更高，但多样性更低
+///
+/// 返回 top-1 序列（log 概率最高的完整序列）。
+///
+/// - beam_size: 束宽（通常 4-10），越大搜索越充分，但越慢
+/// - length_penalty: 长度惩罚指数 α（0 = 不惩罚，>0 偏好长序列，<0 偏好短序列）
+///   最终分数 = log_prob / len^α（Google NMT 的公式）
+#[allow(dead_code)] // 教学实现：Beam Search 完整可用，通过 sample::beam_search 调用
+pub fn beam_search(
+    model: &GPT,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_new: usize,
+    beam_size: usize,
+    length_penalty: f32,
+    _rng: &mut Rng,
+) -> String {
+    assert!(beam_size >= 1, "beam_size 必须 >= 1");
+    let block_size = model.cfg.block_size;
+    let vocab_size = model.cfg.vocab_size;
+    let prompt_ids = tokenizer.encode(prompt);
+    let prompt_len = prompt_ids.len();
+    let prompt_ids = if prompt_ids.is_empty() {
+        vec![0]
+    } else {
+        prompt_ids
+    };
+
+    // 每个 beam: (token_ids, cumulative_log_prob)
+    let mut beams: Vec<(Vec<usize>, f64)> = vec![(prompt_ids, 0.0)];
+
+    for _step in 0..max_new {
+        let mut candidates: Vec<(Vec<usize>, f64)> = Vec::new();
+
+        for (ids, score) in &beams {
+            // 已经生成 EOS（这里用 id=0 简化）就不扩展
+            if ids.last() == Some(&0) && ids.len() > prompt_len {
+                candidates.push((ids.clone(), *score));
+                continue;
+            }
+            // 上下文截断
+            let start = ids.len().saturating_sub(block_size);
+            let ctx = &ids[start..];
+
+            // 全量前向（beam search 通常是离线的，不用 KV cache）
+            let logits = model.forward(ctx, 1, ctx.len(), None, false);
+            let n = logits.numel();
+            let last_row = &logits.data()[n - vocab_size..];
+
+            // 找 top-beam_size 个候选 token
+            let mut scored: Vec<(usize, f64)> = last_row
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| (i, *score + l as f64))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(beam_size);
+
+            for (tok, new_score) in scored {
+                let mut new_ids = ids.clone();
+                new_ids.push(tok);
+                candidates.push((new_ids, new_score));
+            }
+        }
+
+        // 按分数排序，保留 top-beam_size
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(beam_size);
+        beams = candidates;
+
+        // 所有 beam 都结束了就提前停
+        if beams.iter().all(|(ids, _)| {
+            ids.len() > prompt_len && ids.last() == Some(&0)
+        }) {
+            break;
+        }
+    }
+
+    // 按长度惩罚后的分数选最佳
+    // 不过我们这里简单返回 log_prob 最高的
+    // length_penalty: score / len^alpha
+    let best = beams
+        .iter()
+        .max_by(|a, b| {
+            let sa = a.1 / (a.0.len() as f64).powf(length_penalty as f64);
+            let sb = b.1 / (b.0.len() as f64).powf(length_penalty as f64);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap();
+
+    tokenizer.decode(&best.0)
 }

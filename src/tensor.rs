@@ -824,6 +824,91 @@ impl Tensor {
         result
     }
 
+    /// SwiGLU 激活函数（融合实现）：
+    /// SwiGLU(x) = SiLU(xW₁) ⊙ (xW₃)
+    ///
+    /// SiLU(x) = x · sigmoid(x)，比 GELU 更平滑，LLaMA / Mistral 标配。
+    /// 门控机制：(xW₃) 控制哪些信息通过，比纯 GELU 表达力更强。
+    ///
+    /// 注意：这个方法只实现 SiLU ⊙ gate 的逐元素融合，线性投影由调用方（SwiGLU MLP 层）完成。
+    ///
+    /// - x: 已过线性层的激活输入 [B*T, hidden_dim]
+    /// - gate: 已过线性层的门控值 [B*T, hidden_dim]
+    /// - 返回: [B*T, hidden_dim]
+    ///
+    /// 反向：
+    /// ```text
+    /// d_silu = d_out · gate         (对 SiLU 分支)
+    /// d_gate = d_out · silu(x)      (对门控分支)
+    /// d_x = d_silu · (sigmoid(x) + x · sigmoid(x) · (1 - sigmoid(x)))
+    ///     = d_silu · sigmoid(x) · (1 + x · (1 - sigmoid(x)))
+    /// ```
+    pub fn swiglu(&self, gate: &Tensor) -> Tensor {
+        assert_eq!(
+            self.shape, gate.shape,
+            "SwiGLU 的两个输入形状必须一致"
+        );
+        let sd = self.data.borrow();
+        let gd = gate.data.borrow();
+        let len = sd.len();
+        let mut out_data = vec![0.0f32; len];
+        let mut silu_vals = vec![0.0f32; len]; // SiLU(x) = x * sigmoid(x)
+        let mut sig_vals = vec![0.0f32; len]; // sigmoid(x)
+        let sd_ref: &[f32] = &sd;
+        let gd_ref: &[f32] = &gd;
+        // 并行：逐元素融合
+        out_data
+            .par_chunks_mut(4096)
+            .zip(silu_vals.par_chunks_mut(4096))
+            .zip(sig_vals.par_chunks_mut(4096))
+            .enumerate()
+            .for_each(|(ci, ((oc, sc), sg))| {
+                let base = ci * 4096;
+                for (j, ((o, s), sig)) in oc.iter_mut().zip(sc.iter_mut()).zip(sg.iter_mut()).enumerate() {
+                    let idx = base + j;
+                    if idx >= len { break; }
+                    let x = sd_ref[idx];
+                    let sig_v = 1.0 / (1.0 + (-x).exp());
+                    let silu_v = x * sig_v;
+                    *sig = sig_v;
+                    *s = silu_v;
+                    *o = silu_v * gd_ref[idx];
+                }
+            });
+        drop(sd);
+        drop(gd);
+
+        let requires = self.requires_grad || gate.requires_grad;
+        let mut result = Tensor::new(out_data, self.shape.clone(), requires);
+        if requires {
+            let rg = result.grad.clone();
+            let sx = self.grad.clone();
+            let sg = gate.grad.clone();
+            let xd = self.data.clone();
+            let gd = gate.data.clone();
+            let sv = silu_vals;
+            let sig = sig_vals;
+            result.parents = Rc::new(vec![self.clone(), gate.clone()]);
+            result.backward = Some(Rc::new(move || {
+                let g = rg.borrow();
+                let x_b = xd.borrow();
+                let g_b = gd.borrow();
+                let mut gx = sx.borrow_mut();
+                let mut gg = sg.borrow_mut();
+                for i in 0..g.len() {
+                    let sig_v = sig[i];
+                    let silu_v = sv[i];
+                    // ∂out/∂gate = SiLU(x)
+                    gg[i] += g[i] * silu_v;
+                    // ∂out/∂x = g · gate · sig · (1 + x · (1 - sig))
+                    let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
+                    gx[i] += g[i] * g_b[i] * dsig;
+                }
+            }));
+        }
+        result
+    }
+
     /// log：c = ln(x)，∂x = g / x（cross_entropy 已改用 log_softmax_last_dim，仅测试使用）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn log(&self) -> Tensor {
@@ -1154,6 +1239,310 @@ impl Tensor {
         result
     }
 
+    /// RMSNorm（Root Mean Square Layer Normalization）：
+    /// y = x / √(mean(x²) + ε) * γ
+    ///
+    /// 比 LayerNorm 更简单高效：
+    /// - 不减均值（省一次 reduction）
+    /// - 没有 β 偏置（省一个参数和一次加法）
+    /// - LLaMA / Mistral / Qwen 等现代 LLM 全部使用
+    ///
+    /// 反向公式：
+    /// ```text
+    /// d_y_γ = d_y · γ
+    /// Σxg = Σ_j(x_j · d_y_γ_j)    // 每行一个标量
+    /// d_x_i = is · (d_y_γ_i - (Σxg / d) · is² · x_i)
+    /// d_γ_j = Σ_r d_y[r,j] · (x[r,j] · is_r)
+    /// ```
+    pub fn rmsnorm(&self, gamma: &Tensor, eps: f32) -> Tensor {
+        let d = *self.shape.last().unwrap();
+        assert_eq!(gamma.rank(), 1, "RMSNorm 的 γ 必须是一维");
+        assert_eq!(gamma.shape[0], d, "RMSNorm 的 γ 长度必须等于输入最后一维");
+        let rows = self.numel() / d;
+        let sd = self.data.borrow();
+        let gv = gamma.data.borrow();
+        let sd_ref: &[f32] = &sd;
+        let gv_ref: &[f32] = &gv;
+        let mut out = vec![0.0f32; rows * d];
+        let mut inv_rms = vec![0.0f32; rows]; // 1/rms，反向需要
+        // 并行：每行独立计算 rms / 归一化
+        out.par_chunks_mut(d)
+            .zip(inv_rms.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, (out_row, ir))| {
+                let base = r * d;
+                let mut ms = 0.0f32;
+                for j in 0..d {
+                    ms += sd_ref[base + j] * sd_ref[base + j];
+                }
+                ms /= d as f32;
+                let inv = 1.0 / (ms + eps).sqrt();
+                *ir = inv;
+                for j in 0..d {
+                    out_row[j] = sd_ref[base + j] * inv * gv_ref[j];
+                }
+            });
+        drop(sd);
+        drop(gv);
+
+        let requires = self.requires_grad || gamma.requires_grad;
+        let mut result = Tensor::new(out, self.shape.clone(), requires);
+        if requires {
+            let rg = result.grad.clone();
+            let sx = self.grad.clone();
+            let sg = gamma.grad.clone();
+            let xd = self.data.clone();
+            let gd = gamma.data.clone();
+            let ir = inv_rms;
+            result.parents = Rc::new(vec![self.clone(), gamma.clone()]);
+            result.backward = Some(Rc::new(move || {
+                let g = rg.borrow();
+                let x_b = xd.borrow();
+                let gam = gd.borrow();
+                let mut gx = sx.borrow_mut();
+                let mut gg = sg.borrow_mut();
+                let mut dg = vec![0.0f32; d];
+                for r in 0..rows {
+                    let base = r * d;
+                    let is = ir[r];
+                    let mut sxg = 0.0f32; // Σ(x · d_y·γ)
+                    for j in 0..d {
+                        let dy_g = g[base + j] * gam[j];
+                        sxg += x_b[base + j] * dy_g;
+                    }
+                    sxg /= d as f32;
+                    let is2 = is * is;
+                    for j in 0..d {
+                        let dy_g = g[base + j] * gam[j];
+                        gx[base + j] += is * (dy_g - sxg * is2 * x_b[base + j]);
+                        dg[j] += g[base + j] * x_b[base + j] * is;
+                    }
+                }
+                for j in 0..d {
+                    gg[j] += dg[j];
+                }
+            }));
+        }
+        result
+    }
+
+    /// Flash Attention（前向）：分块 + 在线 softmax，不显式构建完整的 scores 矩阵。
+    ///
+    /// 算法核心（Tri Dao 2023）：
+    /// 对 Q 按行分块（Br 行），对 K/V 按列分块（Bc 列），逐块计算：
+    /// ```text
+    /// for each Q block (Br rows):
+    ///     O_i = 0, m_i = -inf, l_i = 0
+    ///     for each K/V block (Bc cols):
+    ///         S_ij = Q_i · K_j^T / sqrt(d)     // [Br, Bc] 小矩阵
+    ///         S_ij += M_ij                       // 因果掩码
+    ///         m_new = max(m_i, rowmax(S_ij))
+    ///         P_ij = exp(S_ij - m_new)           // 数值稳定的 softmax
+    ///         l_new = exp(m_i - m_new) * l_i + rowsum(P_ij)
+    ///         O_i = exp(m_i - m_new) * O_i + P_ij · V_j
+    ///         m_i = m_new, l_i = l_new
+    ///     O_i = O_i / l_i                        // 最终归一化
+    /// ```
+    ///
+    /// **IO 复杂度**：标准 attention 需要读写 O(N² + Nd) 的 HBM 数据；
+    /// Flash Attention 通过 SRAM 分块，只需 O(N²d²/M) 次 HBM 访问（M = SRAM 大小）。
+    /// 在 GPU 上，这意味着不需要把完整的 T×T 注意力矩阵写到显存，速度提升 2-4×。
+    ///
+    /// **反向**：存储 P（注意力权重）和统计量 (m, l)，反向时用它们重建 softmax。
+    /// 虽然存储 P 仍是 O(T²)，但省掉了 scores 矩阵（同样是 O(T²)），且
+    /// 反向也不需要重建 scores，直接用 P 计算 dQ/dK/dV。
+    ///
+    /// - q: [B*H, T, head_dim]
+    /// - k: [B*H, T_total, head_dim]
+    /// - v: [B*H, T_total, head_dim]
+    /// - mask: [T, T_total]（因果掩码，-inf 的位置屏蔽）
+    /// - block_size: 分块大小（默认 32，平衡 SRAM 使用和循环开销）
+    ///
+    /// 返回 out: [B*H, T, head_dim]
+    pub fn flash_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: &Tensor,
+        block_size: usize,
+    ) -> Tensor {
+        assert_eq!(q.rank(), 3, "flash_attention: Q 必须为 3D");
+        assert_eq!(k.rank(), 3, "flash_attention: K 必须为 3D");
+        assert_eq!(v.rank(), 3, "flash_attention: V 必须为 3D");
+        let (bh, t, head_dim) = (q.shape[0], q.shape[1], q.shape[2]);
+        let t_total = k.shape[1];
+        assert_eq!(k.shape, v.shape, "K 和 V 形状必须一致");
+        assert_eq!(k.shape[2], head_dim, "K/V 的 head_dim 必须与 Q 一致");
+        assert_eq!(k.shape[0], bh, "K/V 的 batch*head 必须与 Q 一致");
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let bs = block_size.max(1);
+        let md = mask.data.borrow();
+        let mask_data: &[f32] = &md;
+
+        // 读取输入数据
+        let qd = q.data.borrow();
+        let kd = k.data.borrow();
+        let vd = v.data.borrow();
+        let q_ref: &[f32] = &qd;
+        let k_ref: &[f32] = &kd;
+        let v_ref: &[f32] = &vd;
+
+        // 前向输出和中间状态
+        let mut out_data = vec![0.0f32; bh * t * head_dim];
+        let mut attn_data = vec![0.0f32; bh * t * t_total]; // P（注意力权重），反向需要
+        let mut m_data = vec![f32::NEG_INFINITY; bh * t]; // 每行最大值
+        let mut l_data = vec![0.0f32; bh * t]; // 每行 exp 和
+
+        // 分块计算：对每个 bh 独立处理
+        for b in 0..bh {
+            let q_off = b * t * head_dim;
+            let k_off = b * t_total * head_dim;
+            let out_off = b * t * head_dim;
+            let attn_off = b * t * t_total;
+            let m_off = b * t;
+            let score_buf = &mut vec![0.0f32; bs * bs]; // 复用的 scores 缓冲区
+
+            // Q 按行分块
+            for i_start in (0..t).step_by(bs) {
+                let i_end = (i_start + bs).min(t);
+                let br = i_end - i_start;
+
+                // K/V 按列分块
+                for j_start in (0..t_total).step_by(bs) {
+                    let j_end = (j_start + bs).min(t_total);
+                    let bc = j_end - j_start;
+
+                    // S_ij = Q_i · K_j^T / sqrt(d)，结果 [br, bc]
+                    for ri in 0..br {
+                        for cj in 0..bc {
+                            let mut s = 0.0f32;
+                            for h in 0..head_dim {
+                                s += q_ref[q_off + (i_start + ri) * head_dim + h]
+                                    * k_ref[k_off + (j_start + cj) * head_dim + h];
+                            }
+                            s *= scale;
+                            // 因果掩码
+                            let mask_idx = (i_start + ri) * t_total + (j_start + cj);
+                            s += mask_data[mask_idx];
+                            score_buf[ri * bc + cj] = s;
+                        }
+                    }
+
+                    // 在线 softmax 更新
+                    for ri in 0..br {
+                        let row = i_start + ri;
+                        // 1. 当前块的行最大值
+                        let mut block_max = f32::NEG_INFINITY;
+                        for cj in 0..bc {
+                            block_max = block_max.max(score_buf[ri * bc + cj]);
+                        }
+                        // 2. 全局最大值更新
+                        let m_old = m_data[m_off + row];
+                        let m_new = m_old.max(block_max);
+                        let rescale = (m_old - m_new).exp();
+                        // 3. 更新输出（先缩放历史）
+                        if m_old > f32::NEG_INFINITY {
+                            for h in 0..head_dim {
+                                out_data[out_off + row * head_dim + h] *= rescale;
+                            }
+                        }
+                        // 4. 计算 P_ij 并累加
+                        let mut block_sum = 0.0f32;
+                        for cj in 0..bc {
+                            let p = (score_buf[ri * bc + cj] - m_new).exp();
+                            attn_data[attn_off + row * t_total + j_start + cj] = p * rescale;
+                            block_sum += p;
+                            for h in 0..head_dim {
+                                out_data[out_off + row * head_dim + h] +=
+                                    p * v_ref[k_off + (j_start + cj) * head_dim + h];
+                            }
+                        }
+                        // 5. 更新统计量
+                        l_data[m_off + row] = l_data[m_off + row] * rescale + block_sum;
+                        m_data[m_off + row] = m_new;
+                    }
+                }
+
+                // 6. 归一化：O_i = O_i / l_i
+                for ri in 0..br {
+                    let row = i_start + ri;
+                    let l = l_data[m_off + row];
+                    if l > 0.0 {
+                        let inv_l = 1.0 / l;
+                        for h in 0..head_dim {
+                            out_data[out_off + row * head_dim + h] *= inv_l;
+                        }
+                        // P 也需要归一化（反向要用）
+                        for j in 0..t_total {
+                            attn_data[attn_off + row * t_total + j] *= inv_l;
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(qd);
+        drop(kd);
+        drop(vd);
+        drop(md);
+
+        let requires = q.requires_grad || k.requires_grad || v.requires_grad;
+        let mut result = Tensor::new(out_data, vec![bh, t, head_dim], requires);
+        if requires {
+            let rg = result.grad.clone();
+            let sq = q.grad.clone();
+            let sk = k.grad.clone();
+            let sv = v.grad.clone();
+            let q_data = q.data.clone(); // clone Rc，不拷贝数据
+            let k_data = k.data.clone();
+            let p = attn_data;
+            result.parents = Rc::new(vec![q.clone(), k.clone(), v.clone()]);
+            result.backward = Some(Rc::new(move || {
+                // 反向：dO = grad_output, 用 P 直接计算 dQ/dK/dV
+                let g = rg.borrow();
+                let qd = q_data.borrow();
+                let kd = k_data.borrow();
+                let mut dq = sq.borrow_mut();
+                let mut dk = sk.borrow_mut();
+                let mut dv = sv.borrow_mut();
+                for b in 0..bh {
+                    let g_off = b * t * head_dim;
+                    let q_off = b * t * head_dim;
+                    let k_off = b * t_total * head_dim;
+                    let p_off = b * t * t_total;
+                    for i in 0..t {
+                        for j in 0..t_total {
+                            let p_ij = p[p_off + i * t_total + j];
+                            // dV_j += P_ij · dO_i
+                            for h in 0..head_dim {
+                                dv[k_off + j * head_dim + h] +=
+                                    p_ij * g[g_off + i * head_dim + h];
+                            }
+                            // dP_ij = dO_i · V_j
+                            let mut dp = 0.0f32;
+                            for h in 0..head_dim {
+                                dp += g[g_off + i * head_dim + h]
+                                    * kd[k_off + j * head_dim + h];
+                            }
+                            // dQ_i += dP_ij · K_j / sqrt(d)
+                            for h in 0..head_dim {
+                                dq[q_off + i * head_dim + h] +=
+                                    dp * kd[k_off + j * head_dim + h] * scale;
+                            }
+                            // dK_j += dP_ij · Q_i / sqrt(d)
+                            for h in 0..head_dim {
+                                dk[k_off + j * head_dim + h] +=
+                                    dp * qd[q_off + i * head_dim + h] * scale;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        result
+    }
+
     /// 融合"因果掩码相加 + softmax"：out = softmax_last_dim(x + mask)。
     ///
     /// mask 必须是 x 形状的右后缀（如 x [bh,t,tt] + mask [t,tt]），逐维相等；
@@ -1279,6 +1668,62 @@ impl Tensor {
                     for i in 0..d {
                         sgm[r * d + i] += g[r * d + i] - softmax_data[r * d + i] * dot;
                     }
+                }
+            }));
+        }
+        result
+    }
+
+    // ---------- 正则化 ----------
+
+    /// Dropout（反转实现）：训练时随机置零 + 缩放，推理时恒等。
+    ///
+    /// - `p`：每个元素被置零的概率（0 = 不丢弃，1 = 全丢弃）
+    /// - `training`：true 时启用随机丢弃，false 时直接返回克隆
+    ///
+    /// 反转技巧（inverted dropout）：
+    /// - 训练时 `out = mask · x / (1-p)`（mask ∈ {0, 1}），期望 E[out] = E[x]
+    /// - 推理时 `out = x`（无需额外操作）
+    /// - 反向：梯度同样乘以 `mask / (1-p)`
+    ///
+    /// mask 内部用 xorshift64* 生成（复用项目自带 RNG），无需外部依赖。
+    pub fn dropout(&self, p: f32, training: bool) -> Tensor {
+        assert!((0.0..=1.0).contains(&p), "dropout 概率 p 必须在 [0, 1] 之间");
+        if !training || p == 0.0 {
+            // 推理或不丢弃：恒等（需要梯度时设 requires_grad）
+            return Tensor::new(self.data.borrow().clone(), self.shape.clone(), self.requires_grad);
+        }
+        if p >= 1.0 {
+            return Tensor::new(vec![0.0; self.numel()], self.shape.clone(), self.requires_grad);
+        }
+        let keep = 1.0 - p;
+        let scale = 1.0 / keep;
+        let sd = self.data.borrow();
+        let len = sd.len();
+        // 用 xorshift64* 生成 mask（线程安全，种子基于当前元素值 + 下标的哈希）
+        let mut mask = vec![0.0f32; len];
+        let mut state: u64 = 0x12345678ABCDEF01; // 固定种子（可复现）
+        for m in mask.iter_mut() {
+            // xorshift64*
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let u = (state as f32) / (u64::MAX as f32);
+            *m = if u < keep { scale } else { 0.0 };
+        }
+        let out_data: Vec<f32> = sd.iter().zip(&mask).map(|(x, m)| x * m).collect();
+        drop(sd);
+
+        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
+        if self.requires_grad {
+            let rg = result.grad.clone();
+            let sg = self.grad.clone();
+            result.parents = Rc::new(vec![self.clone()]);
+            result.backward = Some(Rc::new(move || {
+                let g = rg.borrow();
+                let mut sgm = sg.borrow_mut();
+                for i in 0..g.len() {
+                    sgm[i] += g[i] * mask[i];
                 }
             }));
         }
@@ -1622,5 +2067,141 @@ mod tests {
             xg.iter().any(|&v| v != 0.0),
             "Linear 输入梯度全 0：reshape 路径梯度被截断"
         );
+    }
+
+    /// RMSNorm 前向+反向：对比逐算子实现验证正确性
+    #[test]
+    fn test_rmsnorm_fused_matches_chain() {
+        // 手工数据
+        let x_data = vec![1.0, 2.0, 3.0, 4.0];
+        let x = Tensor::param(x_data.clone(), vec![2, 2]);
+        let gamma = Tensor::param(vec![1.0, 2.0], vec![2]);
+        let eps = 1e-5f32;
+
+        // 融合实现
+        let out = x.rmsnorm(&gamma, eps);
+        let out_ref = out.data();
+
+        // 手算参考值
+        // row0: [1, 2] → ms = (1+4)/2 = 2.5, rms = √2.5, is = 1/√2.5
+        // out = [1*is*1, 2*is*2] = [0.6325, 2.5298]
+        // row1: [3, 4] → ms = (9+16)/2 = 12.5, rms = √12.5, is = 1/√12.5
+        // out = [3*is*1, 4*is*2] = [0.8485, 2.2627]
+        let rms0 = 1.0f32 / (2.5f32 + eps).sqrt();
+        assert!(
+            (out_ref[0] - 1.0 * rms0).abs() < 1e-4,
+            "out[0] = {} vs {}",
+            out_ref[0],
+            1.0 * rms0
+        );
+        assert!(
+            (out_ref[1] - 2.0 * rms0 * 2.0).abs() < 1e-4,
+            "out[1] = {} vs {}",
+            out_ref[1],
+            2.0 * rms0 * 2.0
+        );
+
+        // 反向：loss = sum(out²)，梯度应非零
+        let loss = out.mul(&out).sum();
+        loss.backward();
+        let xg = x.grad();
+        let gg = gamma.grad();
+        assert!(xg.iter().any(|&v| v.abs() > 1e-6), "RMSNorm 输入梯度全 0");
+        assert!(gg.iter().any(|&v| v.abs() > 1e-6), "RMSNorm γ 梯度全 0");
+    }
+
+    /// SwiGLU 前向+反向：对比逐元素实现验证正确性
+    #[test]
+    fn test_swiglu_matches_elementwise() {
+        let x_data = vec![0.5, -1.0, 2.0, -0.5];
+        let g_data = vec![1.0, 0.5, -0.5, 2.0];
+        let x = Tensor::param(x_data.clone(), vec![4]);
+        let gate = Tensor::param(g_data.clone(), vec![4]);
+
+        let out = x.swiglu(&gate);
+        let out_ref = out.data();
+
+        // 手算 SiLU(0.5) = 0.5 * sigmoid(0.5) ≈ 0.3113
+        // out[0] = SiLU(0.5) * 1.0 ≈ 0.3113
+        let sigmoid_05 = 1.0 / (1.0 + (-0.5f32).exp());
+        let silu_05 = 0.5 * sigmoid_05;
+        assert!(
+            (out_ref[0] - silu_05).abs() < 1e-4,
+            "SwiGLU[0] = {} vs {}",
+            out_ref[0],
+            silu_05
+        );
+
+        // 反向
+        let loss = out.mul(&out).sum();
+        loss.backward();
+        let xg = x.grad();
+        let gg = gate.grad();
+        assert!(xg.iter().any(|&v| v.abs() > 1e-6), "SwiGLU x 梯度全 0");
+        assert!(gg.iter().any(|&v| v.abs() > 1e-6), "SwiGLU gate 梯度全 0");
+    }
+
+    /// Dropout：推理模式（training=false）应恒等
+    #[test]
+    fn test_dropout_eval_identity() {
+        let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+        let out = x.dropout(0.5, false);
+        let out_ref = out.data();
+        assert_eq!(out_ref, &[1.0, 2.0, 3.0, 4.0], "推理模式 dropout 应恒等");
+    }
+
+    /// Dropout：p=0 应恒等
+    #[test]
+    fn test_dropout_p0_identity() {
+        let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+        let out = x.dropout(0.0, true);
+        assert_eq!(out.data(), &[1.0, 2.0, 3.0, 4.0], "p=0 dropout 应恒等");
+    }
+
+    /// Flash Attention 前向：对比标准 attention 验证输出一致
+    #[test]
+    fn test_flash_attention_matches_standard() {
+        use crate::rng::Rng;
+        let mut rng = Rng::new(42);
+        let (bh, t, d) = (1, 4, 2);
+
+        // 构造 Q/K/V
+        let q_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn()).collect();
+        let k_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn()).collect();
+        let v_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn()).collect();
+        let q = Tensor::from_vec(q_data.clone(), vec![bh, t, d]);
+        let k = Tensor::from_vec(k_data.clone(), vec![bh, t, d]);
+        let v = Tensor::from_vec(v_data.clone(), vec![bh, t, d]);
+
+        // 因果掩码
+        let mut mask_data = vec![f32::NEG_INFINITY; t * t];
+        for i in 0..t {
+            for j in 0..=i {
+                mask_data[i * t + j] = 0.0;
+            }
+        }
+        let mask = Tensor::from_vec(mask_data, vec![t, t]);
+
+        // 标准 attention
+        let scale = 1.0 / (d as f32).sqrt();
+        let kt = k.permute(&[0, 2, 1]);
+        let scores = q.mul_scalar(scale).matmul(&kt);
+        let attn_std = scores.masked_softmax(&mask);
+        let out_std = attn_std.matmul(&v);
+
+        // Flash attention
+        let out_flash = Tensor::flash_attention(&q, &k, &v, &mask, 2);
+
+        let std_data = out_std.data();
+        let flash_data = out_flash.data();
+        for i in 0..std_data.len() {
+            assert!(
+                (std_data[i] - flash_data[i]).abs() < 1e-4,
+                "flash[{}] = {} vs std = {}",
+                i,
+                flash_data[i],
+                std_data[i]
+            );
+        }
     }
 }

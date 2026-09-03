@@ -25,6 +25,9 @@ pub struct TrainConfig {
     pub train_file: String,       // 训练语料文件
     pub val_file: Option<String>, // 验证语料文件；None 时自动从训练文本末尾切 10%
     pub out_dir: String,          // checkpoint 输出目录
+    /// 梯度累积步数：每 accum_steps 步小 batch 才做一次 optimizer.step()。
+    /// 有效 batch_size = batch_size * accum_steps。1 = 不累积（默认）。
+    pub accum_steps: usize,
 }
 
 impl Default for TrainConfig {
@@ -45,6 +48,7 @@ impl Default for TrainConfig {
             train_file: "data/sample.txt".to_string(),
             val_file: None,
             out_dir: "checkpoints".to_string(),
+            accum_steps: 1,
         }
     }
 }

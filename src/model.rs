@@ -14,7 +14,7 @@
 //!   缓存里存的是"已旋转的 K"，历史 K 直接复用
 
 use crate::attention::{KVCache, MultiHeadAttention};
-use crate::layers::{Embedding, LayerNorm, Linear, gelu};
+use crate::layers::{Embedding, MLPEnum, NormLayer};
 use crate::module::Module;
 use crate::rng::Rng;
 use crate::tensor::Tensor;
@@ -22,8 +22,6 @@ use serde::{Deserialize, Serialize};
 
 /// LayerNorm 数值稳定常数（防止方差为 0 时除零）
 const LN_EPS: f32 = 1e-5;
-/// MLP 隐藏层放大系数（GPT-2 风格：输入维度的 4 倍）
-const MLP_RATIO: usize = 4;
 
 /// 模型配置（`config.json` 里可调，缺省字段用 [`GPTConfig::default`]）
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,9 +30,20 @@ pub struct GPTConfig {
     /// 词表大小；0 表示"由分词器决定"（训练时自动填入）
     pub vocab_size: usize,
     pub n_embd: usize,     // 隐藏维度
-    pub n_head: usize,     // 注意力头数
+    pub n_head: usize,     // 注意力头数（Q 的头数）
     pub n_layer: usize,    // Transformer 层数
     pub block_size: usize, // 最大上下文长度
+    // ---- 现代 LLM 扩展 ----
+    /// KV 头数（GQA）：n_kv_head < n_head 时启用 Grouped Query Attention。
+    /// 0 表示与 n_head 相同（标准 Multi-Head Attention）。
+    /// LLaMA 2 70B 用 n_head=64, n_kv_head=8；Mistral 7B 用 n_head=32, n_kv_head=8。
+    pub n_kv_head: usize,
+    /// 是否使用 RMSNorm（true = LLaMA 风格，false = GPT-2 风格 LayerNorm）
+    pub use_rmsnorm: bool,
+    /// 是否使用 SwiGLU MLP（true = LLaMA 风格，false = GPT-2 风格 GELU MLP）
+    pub use_swiglu: bool,
+    /// Dropout 概率（0 = 不丢弃）。用于注意力权重和残差连接。
+    pub dropout: f32,
 }
 
 impl Default for GPTConfig {
@@ -45,6 +54,10 @@ impl Default for GPTConfig {
             n_head: 4,
             n_layer: 2,
             block_size: 32,
+            n_kv_head: 0,
+            use_rmsnorm: false,
+            use_swiglu: false,
+            dropout: 0.0,
         }
     }
 }
@@ -64,32 +77,40 @@ impl GPTConfig {
 /// 结构（GPT-2 风格，pre-norm）：
 ///   x -> LayerNorm -> Attention -> 残差 +
 ///   x -> LayerNorm -> MLP(GELU)  -> 残差 +
+///
+/// 可通过配置切换为 LLaMA 风格：
+///   x -> RMSNorm -> Attention(GQA) -> Dropout -> 残差 +
+///   x -> RMSNorm -> SwiGLU MLP     -> Dropout -> 残差 +
 struct TransformerBlock {
-    ln1: LayerNorm,
+    ln1: NormLayer,
     attn: MultiHeadAttention,
-    ln2: LayerNorm,
-    mlp_linear1: Linear, // [D, 4D]
-    mlp_linear2: Linear, // [4D, D]
+    ln2: NormLayer,
+    mlp: MLPEnum,
+    dropout: f32,
 }
 
 impl TransformerBlock {
     fn new(cfg: &GPTConfig, rng: &mut Rng) -> Self {
+        let mlp = if cfg.use_swiglu {
+            MLPEnum::new_swiglu(cfg.n_embd, rng)
+        } else {
+            MLPEnum::new_gelu(cfg.n_embd, rng)
+        };
         TransformerBlock {
-            ln1: LayerNorm::new(cfg.n_embd, LN_EPS),
-            attn: MultiHeadAttention::new(cfg.n_embd, cfg.n_head, rng),
-            ln2: LayerNorm::new(cfg.n_embd, LN_EPS),
-            mlp_linear1: Linear::new(cfg.n_embd, MLP_RATIO * cfg.n_embd, rng),
-            mlp_linear2: Linear::new(MLP_RATIO * cfg.n_embd, cfg.n_embd, rng),
+            ln1: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
+            attn: MultiHeadAttention::new(cfg.n_embd, cfg.n_head, cfg.n_kv_head, rng),
+            ln2: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
+            mlp,
+            dropout: cfg.dropout,
         }
     }
 
-    /// 带名字的参数（checkpoint 用）：`{prefix}.ln1/attn/ln2/mlp_linear1/mlp_linear2.*`
+    /// 带名字的参数（checkpoint 用）
     fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
         let mut ps = self.ln1.named_parameters(&format!("{prefix}.ln1"));
         ps.extend(self.attn.named_parameters(&format!("{prefix}.attn")));
         ps.extend(self.ln2.named_parameters(&format!("{prefix}.ln2")));
-        ps.extend(self.mlp_linear1.named_parameters(&format!("{prefix}.mlp_linear1")));
-        ps.extend(self.mlp_linear2.named_parameters(&format!("{prefix}.mlp_linear2")));
+        ps.extend(self.mlp.named_parameters(&format!("{prefix}.mlp")));
         ps
     }
 
@@ -99,6 +120,7 @@ impl TransformerBlock {
         mask: &Tensor,
         kv_cache: Option<&mut KVCache>,
         base: usize,
+        training: bool,
     ) -> Tensor {
         // [诊断] block 内部分段计时（仅前 2 次调用）
         static BLK_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -111,25 +133,24 @@ impl TransformerBlock {
             .attn
             .forward(&ln1_out, mask, kv_cache, base);
         let t_attn = blk_t0.elapsed();
+        let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
         let x = x.add(&h);
         let t_add1 = blk_t0.elapsed();
         // 前馈子层 + 残差连接
         let h = self.ln2.forward(&x);
         let t_ln2 = blk_t0.elapsed();
-        let h = gelu(&self.mlp_linear1.forward(&h));
+        let h = self.mlp.forward(&h);
         let t_mlp1 = blk_t0.elapsed();
-        let h = self.mlp_linear2.forward(&h);
-        let t_mlp2 = blk_t0.elapsed();
+        let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
         let out = x.add(&h);
         if blk_diag {
             println!(
-                "[diag-blk] ln1 {:.1} | attn {:.1} | res1 {:.1} | ln2 {:.1} | mlp1+gelu {:.1} | mlp2 {:.1} | 总 {:.1} ms",
+                "[diag-blk] ln1 {:.1} | attn {:.1} | res1 {:.1} | ln2 {:.1} | mlp {:.1} | 总 {:.1} ms",
                 t_ln1.as_secs_f64() * 1000.0,
                 (t_attn - t_ln1).as_secs_f64() * 1000.0,
                 (t_add1 - t_attn).as_secs_f64() * 1000.0,
                 (t_ln2 - t_add1).as_secs_f64() * 1000.0,
                 (t_mlp1 - t_ln2).as_secs_f64() * 1000.0,
-                (t_mlp2 - t_mlp1).as_secs_f64() * 1000.0,
                 blk_t0.elapsed().as_secs_f64() * 1000.0,
             );
         }
@@ -142,8 +163,7 @@ impl Module for TransformerBlock {
         let mut ps = self.ln1.parameters();
         ps.extend(self.attn.parameters());
         ps.extend(self.ln2.parameters());
-        ps.extend(self.mlp_linear1.parameters());
-        ps.extend(self.mlp_linear2.parameters());
+        ps.extend(self.mlp.parameters());
         ps
     }
 }
@@ -153,21 +173,32 @@ pub struct GPT {
     pub cfg: GPTConfig,
     tok_emb: Embedding,
     blocks: Vec<TransformerBlock>,
-    ln_f: LayerNorm,
+    ln_f: NormLayer,
+    /// Dropout 概率（残差/嵌入层用）
+    dropout: f32,
 }
 
 impl GPT {
     pub fn new(cfg: GPTConfig, rng: &mut Rng) -> Self {
+        // GQA 校验
+        let n_kv = if cfg.n_kv_head == 0 { cfg.n_head } else { cfg.n_kv_head };
+        assert!(
+            cfg.n_head % n_kv == 0,
+            "n_head（{}）必须能被 n_kv_head（{}）整除",
+            cfg.n_head,
+            n_kv
+        );
         let n_embd = cfg.n_embd;
         let vocab_size = cfg.vocab_size;
         let blocks = (0..cfg.n_layer)
             .map(|_| TransformerBlock::new(&cfg, rng))
             .collect();
         GPT {
-            cfg,
+            cfg: cfg.clone(),
             tok_emb: Embedding::new(vocab_size, n_embd, rng),
             blocks,
-            ln_f: LayerNorm::new(n_embd, LN_EPS),
+            ln_f: NormLayer::new(n_embd, LN_EPS, cfg.use_rmsnorm),
+            dropout: cfg.dropout,
         }
     }
 
@@ -176,6 +207,7 @@ impl GPT {
     /// - idx: [B*T] 展平的 token id
     /// - b / t：batch 与序列长度
     /// - kv_cache: Some(每层一个缓存) 时启用 KV cache（推理模式）
+    /// - training: 是否在训练模式（影响 dropout）
     ///
     /// 返回 logits：[B*T, vocab_size]（每个位置预测"下一个 token"的分数）
     pub fn forward(
@@ -184,6 +216,7 @@ impl GPT {
         b: usize,
         t: usize,
         mut kv_cache: Option<&mut Vec<KVCache>>,
+        training: bool,
     ) -> Tensor {
         let d = self.cfg.n_embd;
         assert_eq!(idx.len(), b * t, "输入 id 数量必须等于 b*t");
@@ -195,6 +228,7 @@ impl GPT {
 
         // 1. token embedding
         let x = self.tok_emb.forward(idx).reshape(vec![b, t, d]);
+        let x = if self.dropout > 0.0 { x.dropout(self.dropout, training) } else { x };
 
         // 2. 位置信息由 RoPE 提供（在注意力内部旋转 Q/K，见 MultiHeadAttention::forward）。
         //    base = KV cache 模式下已缓存的位置数：新 token 的绝对位置 = base + 窗口内下标 j。
@@ -221,7 +255,7 @@ impl GPT {
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = kv_cache.as_mut().map(|c| &mut c[i]);
             let t_blk = std::time::Instant::now();
-            x = block.forward(&x, &mask, cache, base);
+            x = block.forward(&x, &mask, cache, base, training);
             if fw_diag {
                 println!(
                     "[diag-fw] block {i}: {:.1}ms",
@@ -293,15 +327,15 @@ mod tests {
 
         // KV cache 模式：先喂完整序列填缓存，再只前向 1 个新 token（位置 10）
         let mut cache = model.new_kv_cache();
-        let _ = model.forward(&seq, 1, seq.len(), Some(&mut cache));
+        let _ = model.forward(&seq, 1, seq.len(), Some(&mut cache), false);
         let new_id = 3;
-        let one = model.forward(&[new_id], 1, 1, Some(&mut cache));
+        let one = model.forward(&[new_id], 1, 1, Some(&mut cache), false);
         let last_one = one.data()[one.numel() - v..].to_vec();
 
         // 全量模式：一次前向 [seq..., new_id]（11 个 token），取最后一个位置（位置 10）
         let mut seq2 = seq;
         seq2.push(new_id);
-        let full = model.forward(&seq2, 1, seq2.len(), None);
+        let full = model.forward(&seq2, 1, seq2.len(), None, false);
         let last_full = full.data()[full.numel() - v..].to_vec();
 
         assert!(
