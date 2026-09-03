@@ -1,4 +1,4 @@
-# 第 28 课：LoRA 低秩适配 —— 用 0.1% 的参数微调大模型
+# 第 29 课：LoRA 低秩适配 —— 用 0.1% 的参数微调大模型
 
 > 代码位置：[src/layers.rs](src/layers.rs)（`LoRA` 层、`inject_lora` 辅助函数）
 >

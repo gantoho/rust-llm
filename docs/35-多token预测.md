@@ -1,4 +1,4 @@
-# 第 37 课：多 Token 预测（Multi-Token Prediction）
+# 第 35 课：多 Token 预测（Multi-Token Prediction）
 
 > **本课为前沿技术教程（纯文档，无配套代码实现）。**
 > 与本项目已有代码的关联：MTP 预测头可复用 `src/layers.rs` 的 `Linear` 层；

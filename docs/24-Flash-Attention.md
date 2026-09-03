@@ -1,4 +1,4 @@
-# 第 27 课：Flash Attention —— 分块在线 softmax，GPU 显存救星
+# 第 24 课：Flash Attention —— 分块在线 softmax，GPU 显存救星
 
 > 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::flash_attention` 融合算子）
 >

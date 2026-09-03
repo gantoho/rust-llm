@@ -1,4 +1,4 @@
-# 第 35 课：RAG 检索增强生成（Retrieval-Augmented Generation）
+# 第 37 课：RAG 检索增强生成（Retrieval-Augmented Generation）
 
 > **本课为前沿技术教程（纯文档，无配套代码实现）。**
 > 与本项目已有代码的关联：RAG 的生成阶段可复用 `src/sample.rs` 的 `generate` 函数；

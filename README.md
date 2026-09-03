@@ -12,7 +12,7 @@
 本项目是一个**教学性质**的深度学习项目，目标是让你理解大语言模型（LLM）的底层原理：
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
-- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 8 个阶段、38 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等）。
+- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 9 个阶段、38 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等）。
 - **工程化完整**：CLI 子命令（train / eval / generate / demo）、外部语料、train/val 划分、
   验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **现代 LLM 技术栈**：RMSNorm、SwiGLU、GQA、Flash Attention、LoRA、混合精度、梯度累积、Beam Search。
@@ -687,9 +687,10 @@ llm_from_scratch/
 > | 三、分词器 | 08 | BPE 字节对编码 | ✅ |
 > | 四、Transformer | 09-12 | 注意力、多头、位置编码、GPT | ✅ |
 > | 五、训练与推理 | 13-16 | 训练循环、数据、采样、训练小 GPT | ✅ |
-> | 六、进阶组件 | 17-21 | AdamW、KV Cache、RoPE、学习率调度、GPU | ✅ |
-> | 七、现代技术栈 | 22-30 | RMSNorm、SwiGLU、GQA、Flash Attention、LoRA、AMP 等 | ✅ |
-> | 八、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 📖 |
+> | 六、训练进阶与正则化 | 17-19 | AdamW、学习率调度、Dropout | ✅ |
+> | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA、Flash Attention | ✅ |
+> | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
+> | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 📖 |
 
 ## 代码验证状态
 
@@ -729,13 +730,13 @@ llm_from_scratch/
 
 以下方向已在第 31-38 课教程文档中详细讲解，代码实现可作为进阶练习：
 
-- **MoE 混合专家模型**（第 31 课）：Router 门控 + 多专家稀疏激活，Mixtral / DeepSeek 架构
-- **量化部署**（第 32 课）：INT4/INT8 量化、GPTQ/AWQ，让大模型跑在消费级显卡上
-- **人类对齐**（第 33 课）：RLHF (PPO) / DPO / GRPO，让模型"有用、无害、诚实"
+- **Scaling Laws**（第 31 课）：指导训练资源分配的幂律公式，Chinchilla 最优配比
+- **MoE 混合专家模型**（第 32 课）：Router 门控 + 多专家稀疏激活，Mixtral / DeepSeek 架构
+- **量化部署**（第 33 课）：INT4/INT8 量化、GPTQ/AWQ，让大模型跑在消费级显卡上
 - **推测解码**（第 34 课）：小模型猜 + 大模型验，无损加速推理 2-4×
-- **RAG 检索增强生成**（第 35 课）：向量检索 + LLM 生成，解决知识截止和幻觉问题
-- **Scaling Laws**（第 36 课）：指导训练资源分配的幂律公式，Chinchilla 最优配比
-- **多 Token 预测**（第 37 课）：同时预测未来 K 个 token，提升表征质量
+- **多 Token 预测**（第 35 课）：同时预测未来 K 个 token，提升表征质量
+- **人类对齐**（第 36 课）：RLHF (PPO) / DPO / GRPO，让模型"有用、无害、诚实"
+- **RAG 检索增强生成**（第 37 课）：向量检索 + LLM 生成，解决知识截止和幻觉问题
 - **分布式训练**（第 38 课）：数据并行、ZeRO、张量/流水线并行，训练百亿级模型
 - 长度外推：RoPE 配合 NTK-aware scaling、YaRN 等技巧（见第 19 课文档）
 - 更大的语料与模型规模（`config.json` 可直接调大，CPU 训练需耐心）

@@ -1,4 +1,4 @@
-# 第 18 课：KV Cache —— 让逐 token 生成不再重复计算
+# 第 25 课：KV Cache —— 让逐 token 生成不再重复计算
 
 > 代码位置：[src/attention.rs](src/attention.rs)（`KVCache` / `MultiHeadAttention`）
 > 代码位置：[src/model.rs](src/model.rs)（`GPT::forward`）

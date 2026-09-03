@@ -1,4 +1,4 @@
-# 第 22 课：RMSNorm —— 现代 LLM 的归一化标配
+# 第 21 课：RMSNorm —— 现代 LLM 的归一化标配
 
 > 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::rmsnorm` 融合算子）
 > 代码位置：[src/layers.rs](src/layers.rs)（`RMSNorm` 层、`NormLayer` 枚举）

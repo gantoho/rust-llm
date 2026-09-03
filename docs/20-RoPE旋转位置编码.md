@@ -1,4 +1,4 @@
-# 第 19 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
+# 第 20 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
 
 > 代码位置：[src/rope.rs](src/rope.rs)（`rotary_pair` 生产入口 + `rotary` 测试用 + `test_rotary` / `test_rotary_grad_exact` 测试）
 > 配套代码：[src/attention.rs](src/attention.rs)（RoPE 接入 `MultiHeadAttention`）

@@ -1,4 +1,4 @@
-# 第 33 课：RLHF 与人类对齐（Alignment）
+# 第 36 课：RLHF 与人类对齐（Alignment）
 
 > **本课为前沿技术教程（纯文档，无配套代码实现）。**
 > 与本项目已有代码的关联：SFT 阶段可复用 `src/train.rs` 的训练循环和 `src/loss.rs` 的交叉熵损失；

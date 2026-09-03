@@ -1,4 +1,4 @@
-# 第 23 课：SwiGLU 激活函数 —— LLaMA 的"门控" MLP
+# 第 22 课：SwiGLU 激活函数 —— LLaMA 的"门控" MLP
 
 > 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::swiglu` 融合算子）
 > 代码位置：[src/layers.rs](src/layers.rs)（`SwiGLUMLP` 层、`MLPEnum` 枚举）

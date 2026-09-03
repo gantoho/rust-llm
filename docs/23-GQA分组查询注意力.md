@@ -1,4 +1,4 @@
-# 第 25 课：GQA 分组查询注意力 —— 推理时省显存的利器
+# 第 23 课：GQA 分组查询注意力 —— 推理时省显存的利器
 
 > 代码位置：[src/attention.rs](src/attention.rs)（`MultiHeadAttention` 支持 `n_kv_head`）
 >

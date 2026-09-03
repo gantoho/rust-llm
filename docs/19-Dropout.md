@@ -1,4 +1,4 @@
-# 第 24 课：Dropout —— 训练时的"随机失忆"
+# 第 19 课：Dropout —— 训练时的"随机失忆"
 
 > 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::dropout` 算子）
 > 代码位置：[src/model.rs](src/model.rs)（`TransformerBlock` / `GPT` 中的 dropout 调用）
