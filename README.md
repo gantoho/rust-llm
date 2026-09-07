@@ -7,18 +7,21 @@
 >
 > 每个实现步骤都配套一篇中文教程文档（见 `docs/`），边写代码边学原理。
 
+
+
 ## 项目简介
 
-本项目是一个**教学性质**的深度学习项目，目标是让你理解大语言模型（LLM）的底层原理：
+本项目是一个从零实现的 **GPT 大语言模型**项目，目标是让你理解大语言模型（LLM）的底层原理：
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
-- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 9 个阶段、38 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等）。
-- **工程化完整**：CLI 子命令（train / eval / generate / demo）、外部语料、train/val 划分、
-  验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
-- **现代 LLM 技术栈**：RMSNorm、SwiGLU、GQA、Flash Attention、LoRA、混合精度、梯度累积、Beam Search。
+- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、39 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善。
+- **工程化完整**：CLI 子命令（train / eval / generate / chat / finetune / preset / demo）、
+  外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
+- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、LoRA 微调、混合精度、梯度累积、Beam Search。
+- **真实可用**：支持 LoRA 微调、交互式对话、分词器持久化、训练指标日志、预设模型配置。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
-### 包含的功能（对应 38 课）
+### 包含的功能（对应 39 课）
 
 | 模块 | 文件 | 内容 |
 |------|------|------|
@@ -27,15 +30,15 @@
 | RoPE 位置编码 | `src/rope.rs` | 旋转位置编码：把相对位置揉进 Q/K 向量 |
 | 神经网络层 | `src/layers.rs` | Linear、LayerNorm、**RMSNorm**、Embedding、ReLU/GELU/Tanh、**SwiGLU**、**LoRA** |
 | 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减） |
-| 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），配置可切换 |
+| 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），**save/load 持久化**，配置可切换 |
 | 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、KV Cache、**GQA 分组查询注意力** |
 | GPT 模型 | `src/model.rs` | Transformer Block 堆叠、GPT 整体前向、checkpoint 参数名、**Dropout** |
-| 数据加载 | `src/data.rs` | 外部文本文件、train/val 划分、随机 batch 采样 |
-| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、**混合精度 AMP** |
+| 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样 |
+| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、**混合精度 AMP**、**CSV 指标日志** |
 | 采样 | `src/sample.rs` | temperature / top-k / top-p 采样，KV cache 推理，**Beam Search** |
-| 配置 | `src/config.rs` | `config.json`：模型超参 + 训练参数（serde 序列化） |
+| 配置 | `src/config.rs` | `config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
-| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / demo |
+| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **finetune** / **preset** / demo |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
@@ -52,21 +55,51 @@
 | 多 Token 预测 | `docs/37-多token预测.md` | MTP 训练目标、DeepSeek 实现、与推测解码结合 |
 | 分布式训练 | `docs/38-分布式训练.md` | 数据并行、ZeRO、张量并行、流水线并行、3D 并行、通信原语 |
 
+### 工程化完善教程（第 39 课，代码+文档）
+
+| 主题 | 教程文档 | 内容 |
+|------|---------|------|
+| 工程化完善 | `docs/39-工程化完善.md` | 7 个 CLI 子命令、分词器序列化、预设配置、LoRA 微调工作流、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
+
 ## 快速开始
 
 需要 **Rust 2024 edition** 工具链（Rust 1.85+，建议使用最新的 stable）。
 
 ```bash
-# 最简方式：用默认 config.json 训练 + 生成
+# ═══════════════════════════════════════════
+#  最简方式：训练 + 生成
+# ═══════════════════════════════════════════
 cargo run --release -- train --config config.json
 cargo run --release -- generate --config config.json --prompt "Once upon a" --max-new 100
+
+# ═══════════════════════════════════════════
+#  使用预设配置（推荐）
+# ═══════════════════════════════════════════
+# 生成中等模型配置（LLaMA 风格，~15M 参数）
+cargo run --release -- preset --name medium --output config_medium.json
+cargo run --release -- train --config config_medium.json
+
+# ═══════════════════════════════════════════
+#  交互式对话
+# ═══════════════════════════════════════════
+cargo run --release -- chat --config config.json
+
+# ═══════════════════════════════════════════
+#  LoRA 微调（加载预训练模型，只训练低秩适配层）
+# ═══════════════════════════════════════════
+cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
+
+# ═══════════════════════════════════════════
+#  教学演示（验证所有算法正确性）
+# ═══════════════════════════════════════════
+cargo run --release -- demo
 ```
 
 ---
 
 ## 命令行完整参考
 
-程序提供 4 个子命令：`train` / `eval` / `generate` / `demo`。
+程序提供 7 个子命令：`train` / `eval` / `generate` / `chat` / `finetune` / `preset` / `demo`。
 
 ### 1. `train` —— 训练模型
 
@@ -358,6 +391,16 @@ cargo run --release -- generate --config config.json --ckpt checkpoints/final.ck
 cargo run --release -- generate --config config.json --ckpt /path/to/custom.ckpt --prompt "The key" --max-new 100
 
 # ═══════════════════════════════════════════
+#  Beam Search 生成（确定性，质量更高）
+# ═══════════════════════════════════════════
+
+# Beam Search（beam_size=5），确定性输出，质量优于随机采样
+cargo run --release -- generate --config config.json --prompt "The fox" --beam 5 --max-new 100
+
+# Beam Search + 长度惩罚（偏好长序列）
+cargo run --release -- generate --config config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
+
+# ═══════════════════════════════════════════
 #  GPU 加速生成
 # ═══════════════════════════════════════════
 
@@ -370,7 +413,111 @@ cargo run --release --features gpu -- generate --config config.json --prompt "Th
 
 ---
 
-### 4. `demo` —— 教学演示
+### 4. `chat` —— 交互式对话
+
+```bash
+cargo run --release -- chat [参数]
+```
+
+交互式对话模式：持续输入文本，模型逐个生成回复。输入 `:quit` 退出。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config <路径>` | string | `config.json` | 配置文件路径 |
+| `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--system <文本>` | string | `""` | 系统提示词（在每次输入前附加） |
+| `--temperature <温度>` | float | `0.8` | 采样温度 |
+| `--top-k <数量>` | int | `40` | top-k 采样 |
+| `--top-p <概率>` | float | `0.9` | top-p 采样 |
+| `--max-new <数量>` | int | `200` | 每次生成的最大 token 数 |
+| `--seed <种子>` | int | `42` | 随机种子 |
+
+**示例**：
+
+```bash
+# ── 基础对话 ──
+cargo run --release -- chat --config config.json
+
+# ── 带系统提示的对话 ──
+cargo run --release -- chat --config config.json --system "You are a helpful assistant."
+
+# ── 创意对话（高温采样）──
+cargo run --release -- chat --config config.json --temperature 1.0 --max-new 300
+```
+
+---
+
+### 5. `finetune` —— LoRA 微调
+
+```bash
+cargo run --release -- finetune [参数]
+```
+
+LoRA（Low-Rank Adaptation）微调：加载预训练模型，冻结主参数，只训练低秩适配层。
+可训练参数量极小（通常 < 1%），适合在小数据集上快速适配。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config <路径>` | string | `config.json` | 配置文件路径 |
+| `--pretrained <路径>` | string | 必填 | 预训练模型 checkpoint |
+| `--lora-rank <秩>` | int | `16` | LoRA 秩（低秩维度，通常 4-64） |
+| `--lora-alpha <系数>` | float | `16.0` | LoRA 缩放因子 α（通常 = rank） |
+| `--steps <步数>` | int | `1000` | 微调步数 |
+| `--lr <学习率>` | float | `1e-4` | 微调学习率 |
+
+**示例**：
+
+```bash
+# ── 基础 LoRA 微调 ──
+cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
+
+# ── 自定义 LoRA 参数 ──
+cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt \
+    --lora-rank 32 --lora-alpha 32 --steps 2000 --lr 5e-5
+```
+
+---
+
+### 6. `preset` —— 生成预设配置
+
+```bash
+cargo run --release -- preset [参数]
+```
+
+生成预设的模型配置文件，适合快速开始训练不同规模的模型。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--name <名称>` | string | `small` | 预设名称（small / medium / large） |
+| `--output <路径>` | string | `config.json` | 输出配置文件路径 |
+
+**预设说明**：
+
+| 预设 | 参数量 | 架构 | 适合场景 |
+|------|--------|------|----------|
+| `small` | ~2M | GPT-2 风格（4层，256维） | 学习/演示，CPU 几分钟 |
+| `medium` | ~15M | LLaMA 风格（8层，512维，GQA） | 中等语料，推荐 GPU |
+| `large` | ~85M | LLaMA 风格（12层，768维，GQA） | 较大语料，需要 GPU |
+
+**示例**：
+
+```bash
+# ── 生成小模型配置 ──
+cargo run --release -- preset --name small --output config_small.json
+
+# ── 生成中等模型配置（LLaMA 风格）──
+cargo run --release -- preset --name medium --output config_medium.json
+
+# ── 生成大模型配置 ──
+cargo run --release -- preset --name large --output config_large.json
+
+# ── 然后用生成的配置训练 ──
+cargo run --release -- train --config config_medium.json
+```
+
+---
+
+### 7. `demo` —— 教学演示
 
 ```bash
 cargo run --release -- demo
@@ -401,7 +548,7 @@ cargo run -- demo
 
 ---
 
-### 5. `cargo test` —— 单元测试
+### 8. `cargo test` —— 单元测试
 
 ```bash
 # ── 运行全部测试 ──
@@ -549,10 +696,13 @@ cargo run --features gpu -- demo
     "eval_iters": 20,         // 评估时采样的批数（取平均减少方差）
     "tokenizer": "bpe",       // 分词器类型："char"（字符级）或 "bpe"（字节对编码）
     "bpe_vocab": 512,         // BPE 目标词表大小（= 256 字节 + 合并数）
-    "train_file": "data/alice.txt", // 训练语料文件路径
+    "train_file": "data/alice.txt", // 训练语料文件路径（支持目录路径，自动合并 .txt 文件）
     "val_file": null,         // 验证语料文件路径。null = 自动从训练文本末尾切 10%
     "out_dir": "checkpoints", // checkpoint 输出目录
-    "accum_steps": 1          // 梯度累积步数。有效 batch = batch_size × accum_steps
+    "accum_steps": 1,         // 梯度累积步数。有效 batch = batch_size × accum_steps
+    "tokenizer_file": null,   // 分词器文件路径。null = 从语料训练并保存；Some = 从文件加载
+    "lora": null,             // LoRA 微调配置。null = 不启用；{ "rank": 16, "alpha": 16.0 } = 启用
+    "log_file": null          // 训练指标日志文件路径。null = 不记录；Some = 记录到 CSV
   }
 }
 ```
@@ -571,10 +721,13 @@ cargo run --features gpu -- demo
 | `eval_iters` | int | `20` | 评估时采样多少批取平均（减少随机波动） |
 | `tokenizer` | string | `"bpe"` | `"char"` = 字符级分词；`"bpe"` = 字节对编码 |
 | `bpe_vocab` | int | `512` | BPE 词表大小。仅当 `tokenizer = "bpe"` 时生效 |
-| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本） |
+| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本或目录路径） |
 | `val_file` | string/null | `null` | 验证语料文件。`null` = 自动从训练文本末尾切约 10% |
 | `out_dir` | string | `"checkpoints"` | checkpoint 保存目录（自动创建） |
-| `accum_steps` | int | `1` | 梯度累积步数。每 `accum_steps` 个小 batch 才做一次 optimizer.step()。有效 batch = `batch_size × accum_steps` |
+| `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
+| `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
+| `lora` | object/null | `null` | LoRA 微调配置。`null` = 不启用；`{ "rank": 16, "alpha": 16.0 }` = 启用 LoRA |
+| `log_file` | string/null | `null` | 训练指标日志文件路径。`null` = 不记录；指定路径 = 每步记录 lr/loss/ppl/tok/s 到 CSV |
 
 ### 完整配置示例
 
@@ -668,7 +821,7 @@ llm_from_scratch/
 │   ├── data.rs         # 数据集（第 14 课）
 │   ├── train.rs        # 训练循环与学习率调度（第 13、20 课）
 │   └── sample.rs       # 推理与采样（第 15 课）
-└── docs/               # 38 课教程文档（00-学习计划 + 01~38 各课）
+└── docs/               # 39 课教程文档（00-学习计划 + 01~39 各课）
 ```
 
 ## 学习路线
@@ -691,6 +844,7 @@ llm_from_scratch/
 > | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA、Flash Attention | ✅ |
 > | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
 > | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 📖 |
+> | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、LoRA 微调、交互式对话 | ✅ |
 
 ## 代码验证状态
 
@@ -698,7 +852,8 @@ llm_from_scratch/
 - 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
   RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 4.14→0.16、文本生成正常
-- 已实现但未集成到 demo 的功能：LoRA 注入、Beam Search、AMP 动态损失缩放（均有完整代码和测试）
+- **工程化功能已全部集成**：LoRA 微调（`finetune`）、Beam Search（`generate --beam`）、交互式对话（`chat`）、
+  分词器持久化（`tokenizer.json`）、预设配置（`preset`）、训练指标日志（CSV）
 
 ## 实现要点与踩坑记录
 

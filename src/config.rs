@@ -28,6 +28,22 @@ pub struct TrainConfig {
     /// 梯度累积步数：每 accum_steps 步小 batch 才做一次 optimizer.step()。
     /// 有效 batch_size = batch_size * accum_steps。1 = 不累积（默认）。
     pub accum_steps: usize,
+    /// 分词器文件路径：Some 时从文件加载（跳过训练），None 时从语料训练并保存。
+    /// 训练完成后自动保存到 `{out_dir}/tokenizer.json`。
+    pub tokenizer_file: Option<String>,
+    /// LoRA 微调配置：Some(rank, alpha) 时冻结主模型，只训练 LoRA 层。
+    /// rank 通常 4-64，alpha 通常 = rank。
+    pub lora: Option<LoRAConfig>,
+    /// 训练指标日志文件路径：每步记录 lr/loss/ppl 到 CSV。
+    /// None 时不记录。Some(path) 时记录到指定文件。
+    pub log_file: Option<String>,
+}
+
+/// LoRA 微调配置
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoRAConfig {
+    pub rank: usize,
+    pub alpha: f32,
 }
 
 impl Default for TrainConfig {
@@ -49,6 +65,9 @@ impl Default for TrainConfig {
             val_file: None,
             out_dir: "checkpoints".to_string(),
             accum_steps: 1,
+            tokenizer_file: None,
+            lora: None,
+            log_file: None,
         }
     }
 }
@@ -97,5 +116,133 @@ impl Config {
         );
         assert!(t.max_lr > 0.0, "train.max_lr 必须 > 0");
         assert!(t.min_lr >= 0.0, "train.min_lr 不能为负");
+        if let Some(ref lora) = t.lora {
+            assert!(lora.rank >= 1, "lora.rank 必须 >= 1");
+            assert!(lora.alpha > 0.0, "lora.alpha 必须 > 0");
+        }
+    }
+
+    /// 小模型预设（适合学习/演示，快速验证）
+    ///
+    /// - 4 层 Transformer，隐藏维度 256，8 头注意力
+    /// - 上下文长度 128，BPE 词表 512
+    /// - 约 ~2M 参数，CPU 上几分钟即可完成训练
+    pub fn preset_small() -> Config {
+        Config {
+            model: GPTConfig {
+                vocab_size: 0,
+                n_embd: 256,
+                n_head: 8,
+                n_layer: 4,
+                block_size: 128,
+                ..GPTConfig::default()
+            },
+            train: TrainConfig {
+                steps: 2000,
+                batch_size: 16,
+                max_lr: 6e-4,
+                min_lr: 6e-5,
+                warmup_steps: 100,
+                eval_every: 200,
+                bpe_vocab: 512,
+                tokenizer: "bpe".to_string(),
+                train_file: "data/alice.txt".to_string(),
+                ..TrainConfig::default()
+            },
+        }
+    }
+
+    /// 中等模型预设（适合中等语料，性能与质量平衡）
+    ///
+    /// - 8 层 Transformer，隐藏维度 512，8 头注意力
+    /// - 上下文长度 256，BPE 词表 2048
+    /// - 支持 GQA（4 KV heads）、RMSNorm、SwiGLU（LLaMA 风格）
+    /// - 约 ~15M 参数，GPU 推荐
+    pub fn preset_medium() -> Config {
+        Config {
+            model: GPTConfig {
+                vocab_size: 0,
+                n_embd: 512,
+                n_head: 8,
+                n_layer: 8,
+                block_size: 256,
+                n_kv_head: 4,
+                use_rmsnorm: true,
+                use_swiglu: true,
+                dropout: 0.1,
+            },
+            train: TrainConfig {
+                steps: 10000,
+                batch_size: 32,
+                max_lr: 3e-4,
+                min_lr: 3e-5,
+                warmup_steps: 500,
+                weight_decay: 0.1,
+                eval_every: 500,
+                eval_iters: 50,
+                bpe_vocab: 2048,
+                tokenizer: "bpe".to_string(),
+                accum_steps: 2,
+                ..TrainConfig::default()
+            },
+        }
+    }
+
+    /// 大模型预设（适合较大语料，高质量生成）
+    ///
+    /// - 12 层 Transformer，隐藏维度 768，12 头注意力
+    /// - 上下文长度 512，BPE 词表 4096
+    /// - 支持 GQA（4 KV heads）、RMSNorm、SwiGLU、Dropout
+    /// - 约 ~85M 参数，需要 GPU
+    pub fn preset_large() -> Config {
+        Config {
+            model: GPTConfig {
+                vocab_size: 0,
+                n_embd: 768,
+                n_head: 12,
+                n_layer: 12,
+                block_size: 512,
+                n_kv_head: 4,
+                use_rmsnorm: true,
+                use_swiglu: true,
+                dropout: 0.1,
+            },
+            train: TrainConfig {
+                steps: 50000,
+                batch_size: 32,
+                max_lr: 3e-4,
+                min_lr: 3e-5,
+                warmup_steps: 2000,
+                weight_decay: 0.1,
+                grad_clip: 1.0,
+                eval_every: 1000,
+                eval_iters: 100,
+                bpe_vocab: 4096,
+                tokenizer: "bpe".to_string(),
+                accum_steps: 4,
+                ..TrainConfig::default()
+            },
+        }
+    }
+
+    /// 按名称获取预设配置
+    pub fn from_preset(name: &str) -> Config {
+        match name {
+            "small" => Config::preset_small(),
+            "medium" => Config::preset_medium(),
+            "large" => Config::preset_large(),
+            other => panic!(
+                "未知预设 '{}'（可选：small / medium / large）",
+                other
+            ),
+        }
+    }
+
+    /// 保存配置到 JSON 文件
+    pub fn save(&self, path: &str) {
+        let json = serde_json::to_string_pretty(self)
+            .expect("序列化配置失败");
+        std::fs::write(path, json)
+            .unwrap_or_else(|e| panic!("无法写入配置文件 {path}: {e}"));
     }
 }

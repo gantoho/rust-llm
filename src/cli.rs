@@ -4,6 +4,9 @@
 //! cargo run -- train    --config config.json [--resume checkpoints/latest.ckpt]
 //! cargo run -- eval     --config config.json [--ckpt checkpoints/latest.ckpt]
 //! cargo run -- generate --config config.json [--ckpt ...] [--prompt "Once"] [--max-new 100] ...
+//! cargo run -- chat     --config config.json [--ckpt ...] [--system "..."]
+//! cargo run -- finetune --config config.json --pretrained ckpt [--lora-rank 16]
+//! cargo run -- preset   [--name small] [--output config.json]
 //! cargo run -- demo     # 教学演示（XOR + BPE + 内置语料小 GPT）
 //! ```
 
@@ -12,7 +15,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "llm_from_scratch",
-    about = "从零实现的 GPT 语言模型（算法纯手写）"
+    about = "从零实现的 GPT 语言模型（算法纯手写，零深度学习框架依赖）",
+    long_about = "一个完整的 GPT 语言模型训练与推理框架，全部算法纯 Rust 手写实现。\n\
+                   支持 GPT-2 和 LLaMA 风格架构（RoPE、RMSNorm、SwiGLU、GQA）、\n\
+                   KV Cache 加速推理、LoRA 微调、Beam Search 生成、GPU 加速等。"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -68,6 +74,69 @@ pub enum Cmd {
         /// 禁用 KV cache（每个新 token 都全量前向）
         #[arg(long)]
         no_kv_cache: bool,
+        /// 使用 Beam Search 生成（指定束宽，通常 4-10）
+        #[arg(long)]
+        beam: Option<usize>,
+        /// Beam Search 长度惩罚指数（0=不惩罚，>0 偏好长序列）
+        #[arg(long, default_value_t = 0.6)]
+        length_penalty: f32,
+    },
+    /// 交互式对话模式：持续输入提示词，模型逐个生成回复
+    Chat {
+        /// 配置文件路径
+        #[arg(long, default_value = "config.json")]
+        config: String,
+        /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
+        #[arg(long)]
+        ckpt: Option<String>,
+        /// 系统提示词（可选，会在每次输入前附加）
+        #[arg(long, default_value = "")]
+        system: String,
+        /// 采样温度
+        #[arg(long, default_value_t = 0.8)]
+        temperature: f32,
+        /// top-k 采样
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// top-p 采样
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+        /// 每次生成的最大 token 数
+        #[arg(long, default_value_t = 200)]
+        max_new: usize,
+        /// 随机种子
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+    },
+    /// LoRA 微调：冻结预训练模型，只训练低秩适配层
+    Finetune {
+        /// 配置文件路径
+        #[arg(long, default_value = "config.json")]
+        config: String,
+        /// 预训练模型 checkpoint
+        #[arg(long)]
+        pretrained: String,
+        /// LoRA 秩（低秩维度，通常 4-64）
+        #[arg(long, default_value_t = 16)]
+        lora_rank: usize,
+        /// LoRA 缩放因子 α（通常 = rank）
+        #[arg(long, default_value_t = 16.0)]
+        lora_alpha: f32,
+        /// 微调步数
+        #[arg(long, default_value_t = 1000)]
+        steps: usize,
+        /// 微调学习率
+        #[arg(long, default_value_t = 1e-4)]
+        lr: f32,
+    },
+    /// 生成预设配置文件（small / medium / large）
+    Preset {
+        /// 预设名称
+        #[arg(long, default_value = "small")]
+        name: String,
+        /// 输出配置文件路径
+        #[arg(long, default_value = "config.json")]
+        output: String,
     },
     /// 教学演示：XOR + BPE + 内置语料小 GPT
     Demo,

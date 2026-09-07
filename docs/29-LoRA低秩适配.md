@@ -142,10 +142,42 @@ let optimizer = AdamW::new(trainable, lr=1e-4);
 
 ## 8. 集成状态
 
-`LoRA` 层和 `inject_lora` 辅助函数已完整实现（`layers.rs:330-424`），但当前**未接入**训练循环。
-这是因为 LoRA 需要"先加载预训练模型，再注入 LoRA 微调"的场景，而本项目是从头训练。
-接入方式：在 `cmd_train()` 中加载 checkpoint 后，用 `inject_lora` 替换注意力层的 Q/K/V 投影，
-然后只把 LoRA 参数（A、B）传给优化器。
+`LoRA` 层和 `inject_lora` 辅助函数已完整实现（`layers.rs`），并通过 `finetune` 子命令接入 CLI。
+
+### 8.1 命令行用法
+
+```bash
+# 基础 LoRA 微调（rank=16, alpha=16, 1000 步）
+cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
+
+# 自定义 LoRA 参数
+cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt \
+    --lora-rank 32 --lora-alpha 32 --steps 2000 --lr 5e-5
+```
+
+### 8.2 配置文件方式
+
+也可以在 `config.json` 中配置 LoRA：
+
+```jsonc
+{
+  "train": {
+    "lora": {
+      "rank": 16,
+      "alpha": 16.0
+    }
+  }
+}
+```
+
+### 8.3 工作流程
+
+1. 加载预训练 checkpoint（`--pretrained` 参数）
+2. 冻结主模型所有参数
+3. 注入 LoRA 适配层（Q/K/V 投影）
+4. 只训练 LoRA 参数（A 和 B），学习率通常为 1e-4
+5. 保存 checkpoint（包含 LoRA 参数）
+6. 推理时正常使用（LoRA 增量已融入前向计算）
 
 ---
 

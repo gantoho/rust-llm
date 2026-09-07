@@ -4,6 +4,9 @@
 //! - `cargo run --release -- train    --config config.json [--resume checkpoints/latest.ckpt]`
 //! - `cargo run --release -- eval     --config config.json [--ckpt checkpoints/latest.ckpt]`
 //! - `cargo run --release -- generate --config config.json [--ckpt ...] --prompt "Once" --max-new 100`
+//! - `cargo run --release -- chat     --config config.json [--ckpt ...] [--system "..."]`
+//! - `cargo run --release -- finetune --config config.json --pretrained ckpt [--lora-rank 16]`
+//! - `cargo run --release -- preset   [--name small] [--output config.json]`
 //! - `cargo run --release -- demo`    # 教学演示（XOR / BPE / 内置语料小 GPT）
 //!
 //! 配套教程文档见 `docs/` 目录。
@@ -30,7 +33,7 @@ mod train;
 
 use cli::{Cli, Cmd};
 use config::Config;
-use data::{CORPUS, DataLoader};
+use data::{CORPUS, DataLoader, load_text};
 use layers::{Linear, tanh};
 use loss::cross_entropy_loss;
 use model::{GPT, GPTConfig};
@@ -59,6 +62,8 @@ fn main() {
             top_p,
             seed,
             no_kv_cache,
+            beam,
+            length_penalty,
         } => cmd_generate(
             &config,
             ckpt.as_deref(),
@@ -69,7 +74,37 @@ fn main() {
             top_p,
             seed,
             no_kv_cache,
+            beam,
+            length_penalty,
         ),
+        Cmd::Chat {
+            config,
+            ckpt,
+            system,
+            temperature,
+            top_k,
+            top_p,
+            max_new,
+            seed,
+        } => cmd_chat(
+            &config,
+            ckpt.as_deref(),
+            &system,
+            temperature,
+            top_k,
+            top_p,
+            max_new,
+            seed,
+        ),
+        Cmd::Finetune {
+            config,
+            pretrained,
+            lora_rank,
+            lora_alpha,
+            steps,
+            lr,
+        } => cmd_finetune(&config, &pretrained, lora_rank, lora_alpha, steps, lr),
+        Cmd::Preset { name, output } => cmd_preset(&name, &output),
         Cmd::Demo => run_demo(),
     }
 }
@@ -92,9 +127,16 @@ fn init_console_utf8() {
 fn init_console_utf8() {}
 
 /// 按配置重建分词器（char / bpe）。
+/// 优先从文件加载（如果 tokenizer_file 配置了），否则从语料训练。
 /// `expect_vocab = 0` 表示不校验（训练时词表由分词器决定）。
 fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: usize) -> Tokenizer {
-    let tok = Tokenizer::from_name(&tcfg.tokenizer, train_text, tcfg.bpe_vocab);
+    let tok = if let Some(ref path) = tcfg.tokenizer_file {
+        let loaded = Tokenizer::load(path);
+        println!("已从 {} 加载分词器（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        loaded
+    } else {
+        Tokenizer::from_name(&tcfg.tokenizer, train_text, tcfg.bpe_vocab)
+    };
     if expect_vocab != 0 {
         assert_eq!(
             tok.vocab_size(),
@@ -118,9 +160,17 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
         println!("未检测到可用 GPU，本次训练走 CPU");
     }
 
-    let train_text = read_text(&tcfg.train_file);
+    let train_text = load_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
     let tokenizer = build_tokenizer(tcfg, &train_text, 0); // 训练时词表由分词器决定
+
+    // 训练完成后保存分词器
+    if tcfg.tokenizer_file.is_none() {
+        let tok_path = format!("{}/tokenizer.json", tcfg.out_dir);
+        std::fs::create_dir_all(&tcfg.out_dir).expect("创建 checkpoint 目录失败");
+        tokenizer.save(&tok_path);
+        println!("分词器已保存到 {tok_path}");
+    }
 
     // 词表大小 0 表示"由分词器决定"
     let mut model_cfg = cfg.model.clone();
@@ -158,7 +208,7 @@ fn cmd_eval(config_path: &str, ckpt_path: Option<&str>) {
     };
 
     let ckpt = checkpoint::load_header(&ckpt_path);
-    let train_text = read_text(&tcfg.train_file);
+    let train_text = load_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
     let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
 
@@ -197,6 +247,8 @@ fn cmd_generate(
     top_p: f32,
     seed: u64,
     no_kv_cache: bool,
+    beam: Option<usize>,
+    length_penalty: f32,
 ) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
@@ -206,33 +258,223 @@ fn cmd_generate(
     };
 
     let ckpt = checkpoint::load_header(&ckpt_path);
-    let train_text = read_text(&tcfg.train_file);
+    let train_text = load_text(&tcfg.train_file);
     let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
 
     let mut rng = Rng::new(seed);
     let model = GPT::new(ckpt.model.clone(), &mut rng);
     checkpoint::load_params(&ckpt_path, &model);
 
-    let use_kv_cache = !no_kv_cache;
+    if let Some(beam_size) = beam {
+        // Beam Search 生成
+        println!(
+            "Beam Search 生成（beam_size={} length_penalty={}）：",
+            beam_size, length_penalty
+        );
+        let out = sample::beam_search(
+            &model,
+            &tokenizer,
+            prompt,
+            max_new,
+            beam_size,
+            length_penalty,
+            &mut rng,
+        );
+        println!("{}", out);
+    } else {
+        // 采样生成
+        let use_kv_cache = !no_kv_cache;
+        println!(
+            "生成（temperature={} top-k={} top-p={}，KV cache {}）：",
+            temperature,
+            top_k,
+            top_p,
+            if use_kv_cache { "开" } else { "关" }
+        );
+        let out = generate(
+            &model,
+            &tokenizer,
+            prompt,
+            max_new,
+            temperature,
+            top_k,
+            top_p,
+            use_kv_cache,
+            &mut rng,
+        );
+        println!("{}", out);
+    }
+}
+
+/// 交互式对话模式
+#[allow(clippy::too_many_arguments)]
+fn cmd_chat(
+    config_path: &str,
+    ckpt_path: Option<&str>,
+    system: &str,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    max_new: usize,
+    seed: u64,
+) {
+    let cfg = Config::load(config_path);
+    let tcfg = &cfg.train;
+    let ckpt_path = match ckpt_path {
+        Some(p) => p.to_string(),
+        None => format!("{}/latest.ckpt", tcfg.out_dir),
+    };
+
+    let ckpt = checkpoint::load_header(&ckpt_path);
+    let train_text = load_text(&tcfg.train_file);
+    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
+
+    let mut rng = Rng::new(seed);
+    let model = GPT::new(ckpt.model.clone(), &mut rng);
+    checkpoint::load_params(&ckpt_path, &model);
+
+    println!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
+    println!("参数：temperature={} top-k={} top-p={}", temperature, top_k, top_p);
+    if !system.is_empty() {
+        println!("系统提示：{}", system);
+    }
+    println!("---");
+
+    let mut context_history = if !system.is_empty() {
+        system.to_string()
+    } else {
+        String::new()
+    };
+
+    loop {
+        print!("> ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        let input = input.trim();
+        if input == ":quit" || input == ":exit" || input.is_empty() {
+            break;
+        }
+
+        // 构造 prompt：历史 + 当前输入
+        let prompt = if context_history.is_empty() {
+            input.to_string()
+        } else {
+            format!("{}\n{}", context_history, input)
+        };
+
+        let out = generate(
+            &model,
+            &tokenizer,
+            &prompt,
+            max_new,
+            temperature,
+            top_k,
+            top_p,
+            true, // 始终使用 KV cache 加速
+            &mut rng,
+        );
+
+        // 只打印新生成的部分（去掉 prompt 前缀）
+        let response = if out.len() > prompt.len() {
+            out[prompt.len()..].trim()
+        } else {
+            &out
+        };
+        println!("{}", response);
+
+        // 更新历史上下文（截断到 block_size 以内的字符数）
+        context_history = format!("{}\n{}\n{}", prompt, input, response);
+        let max_chars = model.cfg.block_size * 4; // 粗略估计：平均每个 token ~4 字符
+        if context_history.len() > max_chars {
+            let skip = context_history.len() - max_chars;
+            if let Some(pos) = context_history[skip..].find('\n') {
+                context_history = context_history[skip + pos + 1..].to_string();
+            }
+        }
+    }
+}
+
+/// LoRA 微调：加载预训练模型，冻结主参数，只训练 LoRA 层
+fn cmd_finetune(
+    config_path: &str,
+    pretrained_path: &str,
+    lora_rank: usize,
+    lora_alpha: f32,
+    steps: usize,
+    lr: f32,
+) {
+    let mut cfg = Config::load(config_path);
+    // 设置 LoRA 配置
+    cfg.train.lora = Some(config::LoRAConfig {
+        rank: lora_rank,
+        alpha: lora_alpha,
+    });
+    cfg.train.steps = steps;
+    cfg.train.max_lr = lr;
+    cfg.train.min_lr = lr * 0.1;
+
+    let tcfg = &cfg.train;
     println!(
-        "生成（temperature={} top-k={} top-p={}，KV cache {}）：",
-        temperature,
-        top_k,
-        top_p,
-        if use_kv_cache { "开" } else { "关" }
+        "LoRA 微调：rank={} alpha={} steps={} lr={}",
+        lora_rank, lora_alpha, steps, lr
     );
-    let out = generate(
+
+    let ckpt = checkpoint::load_header(pretrained_path);
+    let train_text = load_text(&tcfg.train_file);
+    let val_text = tcfg.val_file.as_deref().map(read_text);
+    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
+
+    let mut rng = Rng::new(tcfg.seed);
+    let model = GPT::new(ckpt.model.clone(), &mut rng);
+    checkpoint::load_params(pretrained_path, &model);
+
+    // 打印模型信息
+    let total_params: usize = model.parameters().iter().map(|p| p.numel()).sum();
+    let lora_params = 2 * lora_rank * ckpt.model.n_embd * 3; // Q/K/V 各一个 LoRA
+    println!(
+        "模型参数：{}（冻结）| LoRA 参数：{}（可训练，占 {:.1}%）",
+        total_params,
+        lora_params,
+        100.0 * lora_params as f32 / total_params as f32
+    );
+
+    let loader = DataLoader::from_texts(
+        &train_text,
+        val_text.as_deref(),
+        &tokenizer,
+        ckpt.model.block_size,
+        tcfg.batch_size,
+    );
+    train::train_gpt(
         &model,
         &tokenizer,
-        prompt,
-        max_new,
-        temperature,
-        top_k,
-        top_p,
-        use_kv_cache,
+        &loader,
+        tcfg,
+        Some(&tcfg.out_dir),
+        None,
         &mut rng,
     );
-    println!("{}", out);
+}
+
+/// 生成预设配置文件
+fn cmd_preset(name: &str, output: &str) {
+    let cfg = Config::from_preset(name);
+    cfg.save(output);
+    println!("已生成 '{}' 预设配置到 {}", name, output);
+    println!("  模型：n_embd={} n_head={} n_layer={} block_size={}",
+        cfg.model.n_embd, cfg.model.n_head, cfg.model.n_layer, cfg.model.block_size);
+    println!("  训练：steps={} batch_size={} max_lr={}", 
+        cfg.train.steps, cfg.train.batch_size, cfg.train.max_lr);
+    if cfg.model.use_rmsnorm {
+        println!("  架构：LLaMA 风格（RMSNorm + SwiGLU + GQA）");
+    } else {
+        println!("  架构：GPT-2 风格（LayerNorm + GELU + MHA）");
+    }
 }
 
 // ==================== 教学演示（demo 子命令） ====================

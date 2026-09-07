@@ -285,3 +285,28 @@ cargo run    # 演示 2（BPE）：词表 400（256 + 144 次合并）；"Red" -
 - BPE：字节级底座（256 个字节起步，零 OOV）+ 反复合并最高频相邻 pair
 - 训练产出 `merges`（合并规则）和 `vocab`（id → 字节序列）；编码贪心复现合并；解码查表拼接
 - 下一课：token 变成向量之后，怎么让它们"互相看"？——注意力机制！
+
+## 12. 扩展：分词器序列化（第 39 课补充）
+
+训练 BPE 分词器需要遍历整个语料统计频率，大语料可能耗时数十秒。序列化后可以：
+
+```rust
+// 训练后保存
+let tok = BPETokenizer::train(corpus, 2048);
+tok.save("tokenizer.json");
+
+// 下次直接加载（秒级完成）
+let tok = BPETokenizer::load("tokenizer.json");
+```
+
+`config.json` 中通过 `tokenizer_file` 字段控制：
+
+```jsonc
+{
+  "train": {
+    "tokenizer_file": null  // null = 从语料训练并自动保存到 {out_dir}/tokenizer.json
+  }
+}
+```
+
+这保证了训练、评估、生成、对话都使用完全相同的词表。

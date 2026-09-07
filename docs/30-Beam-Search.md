@@ -141,9 +141,30 @@ Beam Search 中每个 beam 的 KV Cache 独立，需要为每个 beam 维护一�
 
 ## 7. 集成状态
 
-`beam_search` 函数已完整实现（`sample.rs:146-229`），但当前**未接入** CLI 的 `generate` 子命令。
-接入方式：在 `cli.rs` 中添加 `--beam-size` 参数，在 `cmd_generate()` 中当 `beam_size > 1` 时
-调用 `sample::beam_search()` 替代 `sample::generate()`。
+`beam_search` 函数已完整实现（`sample.rs`），并通过 `generate` 子命令的 `--beam` 参数接入 CLI。
+
+### 7.1 命令行用法
+
+```bash
+# 基础 Beam Search（beam_size=5）
+cargo run --release -- generate --config config.json --prompt "The fox" --beam 5 --max-new 100
+
+# 带长度惩罚的 Beam Search（偏好长序列）
+cargo run --release -- generate --config config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
+```
+
+### 7.2 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--beam <size>` | int | 无（不指定则用采样） | 束宽，通常 4-10 |
+| `--length-penalty <α>` | float | `0.6` | 长度惩罚指数（Google NMT 推荐 0.6） |
+
+### 7.3 注意事项
+
+- 指定 `--beam` 时，temperature / top-k / top-p 参数无效（Beam Search 是确定性的）
+- Beam Search 每步需计算 beam_size 倍的前向，速度比采样慢
+- 不指定 `--beam` 时默认使用采样生成（temperature + top-k + top-p）
 
 ---
 

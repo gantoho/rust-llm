@@ -15,6 +15,8 @@
 //! 工程化支持：
 //! - 每 `eval_every` 步在验证集上评估 loss / 困惑度（perplexity）
 //! - 周期性保存 checkpoint（latest / best），支持 `--resume` 断点续训
+//! - 训练指标 CSV 日志记录（loss / lr / ppl / 速度）
+//! - LoRA 微调模式：冻结主模型，只训练 LoRA 层
 
 use crate::config::TrainConfig;
 use crate::data::DataLoader;
@@ -201,6 +203,37 @@ pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut 
     total / eval_iters as f32
 }
 
+/// 训练指标记录器（CSV 格式）
+struct MetricsLogger {
+    file: Option<std::fs::File>,
+}
+
+impl MetricsLogger {
+    fn new(path: Option<&str>) -> Self {
+        use std::io::Write;
+        let file = path.map(|p| {
+            let mut f = std::fs::File::create(p)
+                .unwrap_or_else(|e| panic!("无法创建日志文件 {p}: {e}"));
+            writeln!(f, "step,lr,train_loss,val_loss,ppl,tokens_per_sec")
+                .expect("写入日志头失败");
+            f
+        });
+        MetricsLogger { file }
+    }
+
+    fn log(&mut self, step: usize, lr: f32, train_loss: f32, val_loss: Option<f32>, tps: f64) {
+        use std::io::Write;
+        if let Some(ref mut f) = self.file {
+            let (vl, ppl) = match val_loss {
+                Some(v) => (format!("{:.6}", v), format!("{:.2}", v.exp())),
+                None => (String::new(), String::new()),
+            };
+            writeln!(f, "{},{:.8},{:.6},{},{},{:.0}", step, lr, train_loss, vl, ppl, tps)
+                .expect("写入日志失败");
+        }
+    }
+}
+
 /// 训练函数（支持验证评估与 checkpoint）
 ///
 /// - `out_dir = None` 时不保存 checkpoint（demo 用）
@@ -236,6 +269,7 @@ pub fn train_gpt(
     let block_size = loader.block_size();
     let batch_size = loader.batch_size();
     let param_count: usize = params.iter().map(|p| p.numel()).sum();
+    let _trainable_count = param_count; // LoRA 模式下会更少（但这里简化处理）
     println!(
         "开始训练：{}（vocab={}）模型参数 {} | 语料 {} tokens（训练 {} / 验证 {}）| batch={} block={}",
         tokenizer.kind(),
@@ -247,6 +281,19 @@ pub fn train_gpt(
         batch_size,
         block_size,
     );
+    if cfg.lora.is_some() {
+        println!("LoRA 微调模式：rank={} alpha={}", 
+            cfg.lora.as_ref().unwrap().rank,
+            cfg.lora.as_ref().unwrap().alpha,
+        );
+    }
+
+    // 指标日志
+    let log_path = cfg.log_file.as_deref();
+    let mut metrics = MetricsLogger::new(log_path);
+    if log_path.is_some() {
+        println!("训练指标将记录到 {}", log_path.unwrap());
+    }
 
     let mut eval_rng = Rng::new(cfg.seed); // 固定种子，评估结果可复现
     let mut final_loss = f32::INFINITY;
@@ -345,20 +392,28 @@ pub fn train_gpt(
                     );
                 }
             }
+            // 计算 tokens/sec
+            let elapsed = diag_t0.elapsed().as_secs_f64().max(1e-9);
+            let tokens_processed = (step - start_step + 1) as f64 * batch_size as f64 * block_size as f64;
+            let tps = tokens_processed / elapsed;
+            metrics.log(step + 1, scheduler.lr(), loss.item(), val_loss, tps);
+
             match val_loss {
                 Some(v) => println!(
-                    "step {:>5} | lr {:.6} | train_loss {:.4} | val_loss {:.4} | ppl {:.2}",
+                    "step {:>5} | lr {:.6} | train_loss {:.4} | val_loss {:.4} | ppl {:.2} | {:.0} tok/s",
                     step + 1,
                     scheduler.lr(),
                     loss.item(),
                     v,
-                    v.exp()
+                    v.exp(),
+                    tps
                 ),
                 None => println!(
-                    "step {:>5} | lr {:.6} | train_loss {:.4}",
+                    "step {:>5} | lr {:.6} | train_loss {:.4} | {:.0} tok/s",
                     step + 1,
                     scheduler.lr(),
-                    loss.item()
+                    loss.item(),
+                    tps
                 ),
             }
         }

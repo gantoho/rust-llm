@@ -5,8 +5,11 @@
 //! 本模块实现两种：
 //! - `CharTokenizer`：按字符切分（简单直观，适合小模型学习）
 //! - `BPETokenizer`：字节对编码（现代 GPT 的实际方案，能压缩常见词/子词）
+//!
+//! 两种分词器都支持序列化/反序列化（save/load），训练后可持久化，推理时直接加载。
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 
 // ==================== 字符级分词器 ====================
 
@@ -58,6 +61,41 @@ impl CharTokenizer {
                     })
             })
             .collect()
+    }
+
+    /// 保存到文件（JSON 格式）
+    pub fn save(&self, path: &str) {
+        let json = serde_json::json!({
+            "type": "char",
+            "chars": self.chars.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        });
+        let mut f = std::fs::File::create(path)
+            .unwrap_or_else(|e| panic!("无法创建分词器文件 {path}: {e}"));
+        f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes())
+            .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
+    }
+
+    /// 从文件加载
+    pub fn load(path: &str) -> Self {
+        let mut f = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
+        let mut text = String::new();
+        f.read_to_string(&mut text)
+            .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
+        let chars: Vec<char> = json["chars"]
+            .as_array()
+            .expect("分词器文件格式错误：缺少 chars 字段")
+            .iter()
+            .map(|v| {
+                let s = v.as_str().expect("chars 元素应为字符串");
+                assert_eq!(s.len(), s.chars().count(), "chars 元素应为单个字符");
+                s.chars().next().unwrap()
+            })
+            .collect();
+        let stoi = chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        CharTokenizer { chars, stoi }
     }
 }
 
@@ -167,6 +205,52 @@ impl BPETokenizer {
         }
         String::from_utf8_lossy(&bytes).to_string()
     }
+
+    /// 保存到文件（JSON 格式）
+    pub fn save(&self, path: &str) {
+        let json = serde_json::json!({
+            "type": "bpe",
+            "merges": self.merges.iter().map(|(a, b)| vec![*a, *b]).collect::<Vec<_>>(),
+            "vocab": self.vocab.iter().map(|v| v.clone()).collect::<Vec<_>>(),
+        });
+        let mut f = std::fs::File::create(path)
+            .unwrap_or_else(|e| panic!("无法创建分词器文件 {path}: {e}"));
+        f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes())
+            .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
+    }
+
+    /// 从文件加载
+    pub fn load(path: &str) -> Self {
+        let mut f = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
+        let mut text = String::new();
+        f.read_to_string(&mut text)
+            .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
+        let merges: Vec<(u16, u16)> = json["merges"]
+            .as_array()
+            .expect("分词器文件格式错误：缺少 merges 字段")
+            .iter()
+            .map(|v| {
+                let arr = v.as_array().expect("merge 应为数组");
+                (arr[0].as_u64().unwrap() as u16, arr[1].as_u64().unwrap() as u16)
+            })
+            .collect();
+        let vocab: Vec<Vec<u8>> = json["vocab"]
+            .as_array()
+            .expect("分词器文件格式错误：缺少 vocab 字段")
+            .iter()
+            .map(|v| {
+                v.as_array()
+                    .expect("vocab 元素应为数组")
+                    .iter()
+                    .map(|x| x.as_u64().unwrap() as u8)
+                    .collect()
+            })
+            .collect();
+        BPETokenizer { merges, vocab }
+    }
 }
 
 // ==================== 统一分词器接口（配置可切换） ====================
@@ -226,6 +310,33 @@ impl Tokenizer {
         match self {
             Tokenizer::Char(_) => "char",
             Tokenizer::Bpe(_) => "bpe",
+        }
+    }
+
+    /// 保存分词器到文件
+    pub fn save(&self, path: &str) {
+        match self {
+            Tokenizer::Char(t) => t.save(path),
+            Tokenizer::Bpe(t) => t.save(path),
+        }
+    }
+
+    /// 从文件加载分词器（自动识别 char/bpe 类型）
+    pub fn load(path: &str) -> Self {
+        let mut f = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
+        let mut text = String::new();
+        f.read_to_string(&mut text)
+            .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
+        let typ = json["type"]
+            .as_str()
+            .expect("分词器文件格式错误：缺少 type 字段");
+        match typ {
+            "char" => Tokenizer::Char(CharTokenizer::load(path)),
+            "bpe" => Tokenizer::Bpe(BPETokenizer::load(path)),
+            other => panic!("未知分词器类型 '{}'（可选：char / bpe）", other),
         }
     }
 }

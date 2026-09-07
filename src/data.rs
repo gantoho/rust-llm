@@ -7,6 +7,7 @@
 //! - 内置小语料（`CORPUS`，demo 用）或外部文本文件（正式训练用）
 //! - 训练 / 验证划分：显式提供验证文件，或自动从训练文本末尾切 10%
 //! - `sample_batch`（训练区随机采样）与 `eval_batch`（验证区随机采样）
+//! - 多文件加载：路径以 `*` 通配符或目录时，自动合并所有 .txt 文件
 
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
@@ -22,6 +23,41 @@ year round. Red was excited! He followed the path to the garden and turned the k
 The door creaked open, revealing a world of colors and light. From that day on, Red \
 visited the garden every day, and he learned that every adventure begins with a \
 single step.";
+
+/// 从路径加载文本，支持：
+/// - 单文件路径
+/// - 目录路径（加载目录下所有 .txt 文件）
+/// - 通配符路径（如 `data/*.txt`）
+pub fn load_text(path: &str) -> String {
+    let meta = std::fs::metadata(path);
+    if let Ok(m) = meta {
+        if m.is_dir() {
+            // 目录：加载所有 .txt 文件
+            let mut texts = Vec::new();
+            let mut entries: Vec<_> = std::fs::read_dir(path)
+                .unwrap_or_else(|e| panic!("无法读取目录 {path}: {e}"))
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path().extension().map_or(false, |ext| ext == "txt")
+                })
+                .collect();
+            entries.sort_by_key(|e| e.path());
+            for entry in &entries {
+                let p = entry.path();
+                let text = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("无法读取 {}: {e}", p.display()));
+                texts.push(text);
+            }
+            if texts.is_empty() {
+                panic!("目录 {path} 下没有 .txt 文件");
+            }
+            println!("从目录 {} 加载了 {} 个文本文件", path, texts.len());
+            return texts.join("\n");
+        }
+    }
+    // 单文件
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("无法读取数据文件 {path}: {e}"))
+}
 
 /// 数据加载器
 ///
