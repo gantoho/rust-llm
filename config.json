@@ -23,7 +23,7 @@
     "eval_iters": 20,
     "tokenizer": "bpe",
     "bpe_vocab": 512,
-    "train_file": "data/alice.txt",
+    "train_file": "data/corpus/",
     "val_file": null,
     "out_dir": "checkpoints",
     "accum_steps": 1,

@@ -1,0 +1,32 @@
+The Transformer architecture, introduced in the paper "Attention Is All You Need" by Vaswani et al. (2017), revolutionized natural language processing. The key innovation was the self-attention mechanism, which allows the model to weigh the importance of different parts of the input when producing each part of the output.
+
+Self-attention computes a weighted sum of all input representations, where the weights are determined by the compatibility between queries and keys. Formally, for input sequence X, we compute queries Q = XW_Q, keys K = XW_K, and values V = XW_V. The attention output is:
+
+Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
+
+where d_k is the dimension of the keys. The scaling factor sqrt(d_k) prevents the dot products from growing too large in magnitude, which would push the softmax function into regions where it has extremely small gradients.
+
+Multi-head attention extends this by running h attention operations in parallel, each with different learned projections. The outputs are concatenated and linearly transformed:
+
+MultiHead(Q, K, V) = Concat(head_1, ..., head_h) W_O
+
+where head_i = Attention(QW_Q_i, KW_K_i, VW_V_i)
+
+The Transformer encoder consists of N identical layers, each containing a multi-head self-attention sub-layer and a position-wise fully connected feed-forward network. Each sub-layer employs a residual connection followed by layer normalization:
+
+LayerNorm(x + Sublayer(x))
+
+Positional encoding is added to the input embeddings to inject sequence order information. The original paper used sinusoidal functions of different frequencies:
+
+PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+
+The decoder adds encoder-decoder attention layers that attend to the encoder output, and uses masked self-attention to prevent positions from attending to subsequent positions.
+
+The feed-forward network applies two linear transformations with a ReLU activation in between:
+
+FFN(x) = max(0, xW_1 + b_1)W_2 + b_2
+
+Weight tying between the input embedding and the output embedding layers reduces the total parameter count while maintaining performance.
+
+The original Transformer achieved state-of-the-art results on English-to-German and English-to-French translation benchmarks, with significantly less training time than previous architectures. This work laid the foundation for modern large language models including BERT, GPT, and their successors.

@@ -1,0 +1,29 @@
+Interviewer: Can you tell me about yourself and your background?
+Candidate: Sure. I'm a software engineer with five years of experience specializing in backend development. I graduated from MIT with a degree in Computer Science, and I've worked at two tech startups where I designed and implemented scalable microservices architectures.
+
+Interviewer: What programming languages are you most proficient in?
+Candidate: I'm most proficient in Python and Go. I've also worked extensively with Rust for performance-critical applications. In my current role, I use Python for rapid prototyping and data processing, and Go for building high-concurrency services.
+
+Interviewer: Can you describe a challenging technical problem you solved?
+Candidate: At my previous company, we had a database query that was taking 30 seconds to complete, causing timeouts in our API. I analyzed the query execution plan, identified missing indexes, and implemented a caching layer using Redis. This reduced the query time to under 100 milliseconds.
+
+Interviewer: How do you handle disagreements with team members about technical decisions?
+Candidate: I believe in data-driven decisions. When there's a disagreement, I propose that we prototype both approaches and measure their performance, maintainability, and development time. This objective approach usually resolves conflicts and leads to better outcomes.
+
+Interviewer: What's your experience with cloud services?
+Candidate: I've worked extensively with AWS, particularly EC2, S3, Lambda, and RDS. I've also used Terraform for infrastructure as code, which allows us to version control our infrastructure and deploy consistently across environments.
+
+Interviewer: How do you ensure code quality in your projects?
+Candidate: I'm a strong advocate for automated testing. I write unit tests, integration tests, and end-to-end tests. I also use code review processes, static analysis tools, and continuous integration pipelines. In my current team, we maintain 90% code coverage.
+
+Interviewer: Tell me about a time you had to learn a new technology quickly.
+Candidate: Last year, our team decided to migrate from a monolithic architecture to microservices. I had limited experience with Kubernetes, so I spent two weeks studying documentation, taking online courses, and building a proof-of-concept deployment. Within a month, I was leading the migration effort.
+
+Interviewer: How do you stay updated with the latest technology trends?
+Candidate: I regularly read tech blogs, participate in online communities like Stack Overflow and Reddit, attend local meetups, and contribute to open-source projects. I also take online courses to deepen my knowledge in specific areas.
+
+Interviewer: What are your salary expectations?
+Candidate: Based on my research of market rates for this role and my experience level, I'm looking for a salary in the range of $150,000 to $180,000. However, I'm also interested in the total compensation package, including benefits, equity, and growth opportunities.
+
+Interviewer: Do you have any questions for us?
+Candidate: Yes, I'd like to know more about the team I'd be working with and the technical challenges the team is currently facing. I'm also curious about the company's approach to professional development and career growth.

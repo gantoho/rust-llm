@@ -123,6 +123,29 @@ fn init_console_utf8() {
     }
 }
 
+/// 解析 checkpoint 路径：None 时取 out_dir/latest.ckpt
+fn resolve_ckpt<'a>(ckpt: Option<&'a str>, out_dir: &str) -> std::borrow::Cow<'a, str> {
+    match ckpt {
+        Some(p) => std::borrow::Cow::Borrowed(p),
+        None => std::borrow::Cow::Owned(format!("{}/latest.ckpt", out_dir)),
+    }
+}
+
+/// 从 checkpoint 加载模型和分词器的通用辅助函数
+fn load_model_and_tokenizer(
+    ckpt_path: &str,
+    tcfg: &config::TrainConfig,
+    seed: u64,
+) -> (GPT, Tokenizer, checkpoint::Checkpoint) {
+    let ckpt = checkpoint::load_header(ckpt_path);
+    let train_text = load_text(&tcfg.train_file);
+    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
+    let mut rng = Rng::new(seed);
+    let model = GPT::new(ckpt.model.clone(), &mut rng);
+    checkpoint::load_params(ckpt_path, &model);
+    (model, tokenizer, ckpt)
+}
+
 #[cfg(not(windows))]
 fn init_console_utf8() {}
 
@@ -202,19 +225,11 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
 fn cmd_eval(config_path: &str, ckpt_path: Option<&str>) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
-    let ckpt_path = match ckpt_path {
-        Some(p) => p.to_string(),
-        None => format!("{}/latest.ckpt", tcfg.out_dir),
-    };
+    let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed);
 
-    let ckpt = checkpoint::load_header(&ckpt_path);
     let train_text = load_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
-    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
-
-    let mut rng = Rng::new(tcfg.seed);
-    let model = GPT::new(ckpt.model.clone(), &mut rng);
-    checkpoint::load_params(&ckpt_path, &model);
     let loader = DataLoader::from_texts(
         &train_text,
         val_text.as_deref(),
@@ -252,18 +267,9 @@ fn cmd_generate(
 ) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
-    let ckpt_path = match ckpt_path {
-        Some(p) => p.to_string(),
-        None => format!("{}/latest.ckpt", tcfg.out_dir),
-    };
-
-    let ckpt = checkpoint::load_header(&ckpt_path);
-    let train_text = load_text(&tcfg.train_file);
-    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
-
+    let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
+    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed);
     let mut rng = Rng::new(seed);
-    let model = GPT::new(ckpt.model.clone(), &mut rng);
-    checkpoint::load_params(&ckpt_path, &model);
 
     if let Some(beam_size) = beam {
         // Beam Search 生成
@@ -320,18 +326,9 @@ fn cmd_chat(
 ) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
-    let ckpt_path = match ckpt_path {
-        Some(p) => p.to_string(),
-        None => format!("{}/latest.ckpt", tcfg.out_dir),
-    };
-
-    let ckpt = checkpoint::load_header(&ckpt_path);
-    let train_text = load_text(&tcfg.train_file);
-    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
-
+    let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
+    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed);
     let mut rng = Rng::new(seed);
-    let model = GPT::new(ckpt.model.clone(), &mut rng);
-    checkpoint::load_params(&ckpt_path, &model);
 
     println!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
     println!("参数：temperature={} top-k={} top-p={}", temperature, top_k, top_p);
@@ -380,8 +377,11 @@ fn cmd_chat(
         );
 
         // 只打印新生成的部分（去掉 prompt 前缀）
+        // 用 is_char_boundary 确保不在多字节字符中间截断（UTF-8 安全）
         let response = if out.len() > prompt.len() {
-            out[prompt.len()..].trim()
+            let start = prompt.len();
+            let start = if out.is_char_boundary(start) { start } else { start + 1 };
+            out[start..].trim()
         } else {
             &out
         };
@@ -424,14 +424,9 @@ fn cmd_finetune(
         lora_rank, lora_alpha, steps, lr
     );
 
-    let ckpt = checkpoint::load_header(pretrained_path);
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed);
     let train_text = load_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
-    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
-
-    let mut rng = Rng::new(tcfg.seed);
-    let model = GPT::new(ckpt.model.clone(), &mut rng);
-    checkpoint::load_params(pretrained_path, &model);
 
     // 打印模型信息
     let total_params: usize = model.parameters().iter().map(|p| p.numel()).sum();
@@ -443,6 +438,7 @@ fn cmd_finetune(
         100.0 * lora_params as f32 / total_params as f32
     );
 
+    let mut rng = Rng::new(tcfg.seed);
     let loader = DataLoader::from_texts(
         &train_text,
         val_text.as_deref(),

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+A simple HTTP server implementation from scratch.
+Demonstrates socket programming, HTTP protocol basics, and concurrent handling.
+"""
+
+import socket
+import threading
+import os
+import mimetypes
+from datetime import datetime
+from urllib.parse import unquote
+
+class HTTPRequest:
+    """Parse an HTTP request into its components."""
+    
+    def __init__(self, raw_request: bytes):
+        lines = raw_request.decode('utf-8').split('\r\n')
+        if not lines:
+            raise ValueError("Empty request")
+        
+        # Parse request line: METHOD /path HTTP/version
+        request_line = lines[0].split(' ')
+        if len(request_line) != 3:
+            raise ValueError("Invalid request line")
+        
+        self.method = request_line[0]
+        self.path = unquote(request_line[1])
+        self.version = request_line[2]
+        
+        # Parse headers
+        self.headers = {}
+        i = 1
+        while i < len(lines) and lines[i]:
+            key, value = lines[i].split(': ', 1)
+            self.headers[key.lower()] = value
+            i += 1
+        
+        # Parse body (if present)
+        self.body = '\r\n'.join(lines[i+1:]) if i + 1 < len(lines) else ''
+
+class HTTPResponse:
+    """Construct an HTTP response."""
+    
+    STATUS_CODES = {
+        200: 'OK',
+        301: 'Moved Permanently',
+        400: 'Bad Request',
+        403: 'Forbidden',
+        404: 'Not Found',
+        405: 'Method Not Allowed',
+        500: 'Internal Server Error',
+    }
+    
+    def __init__(self, status_code: int = 200):
+        self.status_code = status_code
+        self.headers = {
+            'Server': 'SimpleHTTPServer/1.0',
+            'Date': datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT'),
+        }
+        self.body = b''
+    
+    def set_content(self, content: bytes, content_type: str = 'text/html'):
+        self.body = content
+        self.headers['Content-Type'] = content_type
+        self.headers['Content-Length'] = str(len(content))
+    
+    def to_bytes(self) -> bytes:
+        status_text = self.STATUS_CODES.get(self.status_code, 'Unknown')
+        response_line = f'HTTP/1.1 {self.status_code} {status_text}\r\n'
+        headers = ''.join(f'{k}: {v}\r\n' for k, v in self.headers.items())
+        return (response_line + headers + '\r\n').encode('utf-8') + self.body
+
+class SimpleHTTPServer:
+    """A simple HTTP server that serves static files."""
+    
+    def __init__(self, host: str = '0.0.0.0', port: int = 8080, document_root: str = '.'):
+        self.host = host
+        self.port = port
+        self.document_root = os.path.abspath(document_root)
+    
+    def start(self):
+        """Start the server and listen for connections."""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen(5)
+        
+        print(f'Server running on http://{self.host}:{self.port}')
+        print(f'Serving files from: {self.document_root}')
+        
+        try:
+            while True:
+                client_socket, address = server_socket.accept()
+                thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, address)
+                )
+                thread.daemon = True
+                thread.start()
+        except KeyboardInterrupt:
+            print('\nServer shutting down...')
+        finally:
+            server_socket.close()
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Handle a single client connection."""
+        try:
+            request_data = client_socket.recv(4096)
+            if not request_data:
+                return
+            
+            request = HTTPRequest(request_data)
+            print(f'{address[0]} - {request.method} {request.path}')
+            
+            if request.method == 'GET':
+                response = self.handle_get(request)
+            elif request.method == 'POST':
+                response = self.handle_post(request)
+            else:
+                response = HTTPResponse(405)
+                response.set_content(b'Method Not Allowed', 'text/plain')
+            
+            client_socket.sendall(response.to_bytes())
+        except Exception as e:
+            print(f'Error handling request: {e}')
+            response = HTTPResponse(500)
+            response.set_content(b'Internal Server Error', 'text/plain')
+            client_socket.sendall(response.to_bytes())
+        finally:
+            client_socket.close()
+    
+    def handle_get(self, request: HTTPRequest) -> HTTPResponse:
+        """Handle a GET request."""
+        path = request.path
+        if path == '/':
+            path = '/index.html'
+        
+        # Security: prevent directory traversal
+        file_path = os.path.normpath(os.path.join(self.document_root, path.lstrip('/')))
+        if not file_path.startswith(self.document_root):
+            response = HTTPResponse(403)
+            response.set_content(b'Forbidden', 'text/plain')
+            return response
+        
+        if os.path.isfile(file_path):
+            content_type, _ = mimetypes.guess_type(file_path)
+            if content_type is None:
+                content_type = 'application/octet-stream'
+            
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            
+            response = HTTPResponse(200)
+            response.set_content(content, content_type)
+            return response
+        else:
+            response = HTTPResponse(404)
+            response.set_content(b'<h1>404 Not Found</h1>', 'text/html')
+            return response
+    
+    def handle_post(self, request: HTTPRequest) -> HTTPResponse:
+        """Handle a POST request."""
+        response = HTTPResponse(200)
+        response.set_content(b'POST received', 'text/plain')
+        return response
+
+if __name__ == '__main__':
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    root = sys.argv[2] if len(sys.argv) > 2 else '.'
+    server = SimpleHTTPServer(port=port, document_root=root)
+    server.start()

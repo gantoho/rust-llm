@@ -1,0 +1,157 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import axios from 'axios';
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8080';
+
+const useApi = (endpoint) => {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const fetchData = useCallback(async () => {
+    try {
+      setLoading(true);
+      const response = await axios.get(`${API_BASE_URL}${endpoint}`);
+      setData(response.data);
+      setError(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [endpoint]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  return { data, loading, error, refetch: fetchData };
+};
+
+const TodoItem = ({ todo, onToggle, onDelete }) => {
+  return (
+    <div className={`todo-item ${todo.completed ? 'completed' : ''}`}>
+      <input
+        type="checkbox"
+        checked={todo.completed}
+        onChange={() => onToggle(todo.id)}
+      />
+      <span className="todo-text">{todo.text}</span>
+      <button onClick={() => onDelete(todo.id)} className="delete-btn">
+        Delete
+      </button>
+    </div>
+  );
+};
+
+const TodoForm = ({ onAdd }) => {
+  const [text, setText] = useState('');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (text.trim()) {
+      onAdd(text);
+      setText('');
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="todo-form">
+      <input
+        type="text"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Add a new todo..."
+        className="todo-input"
+      />
+      <button type="submit" className="add-btn">
+        Add
+      </button>
+    </form>
+  );
+};
+
+const TodoList = () => {
+  const { data: todos, loading, error, refetch } = useApi('/todos');
+  const [localTodos, setLocalTodos] = useState([]);
+
+  useEffect(() => {
+    if (todos) {
+      setLocalTodos(todos);
+    }
+  }, [todos]);
+
+  const handleAdd = async (text) => {
+    try {
+      const response = await axios.post(`${API_BASE_URL}/todos`, { text });
+      setLocalTodos(prev => [...prev, response.data]);
+    } catch (err) {
+      console.error('Failed to add todo:', err);
+    }
+  };
+
+  const handleToggle = async (id) => {
+    try {
+      const todo = localTodos.find(t => t.id === id);
+      const response = await axios.put(`${API_BASE_URL}/todos/${id}`, {
+        completed: !todo.completed
+      });
+      setLocalTodos(prev =>
+        prev.map(t => t.id === id ? response.data : t)
+      );
+    } catch (err) {
+      console.error('Failed to toggle todo:', err);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    try {
+      await axios.delete(`${API_BASE_URL}/todos/${id}`);
+      setLocalTodos(prev => prev.filter(t => t.id !== id));
+    } catch (err) {
+      console.error('Failed to delete todo:', err);
+    }
+  };
+
+  if (loading) return <div className="loading">Loading...</div>;
+  if (error) return <div className="error">Error: {error}</div>;
+
+  const completedCount = localTodos.filter(t => t.completed).length;
+  const totalCount = localTodos.length;
+
+  return (
+    <div className="todo-list">
+      <h1>Todo List</h1>
+      <TodoForm onAdd={handleAdd} />
+      <div className="todo-stats">
+        <span>{completedCount} of {totalCount} completed</span>
+        <button onClick={refetch} className="refresh-btn">
+          Refresh
+        </button>
+      </div>
+      <div className="todos">
+        {localTodos.map(todo => (
+          <TodoItem
+            key={todo.id}
+            todo={todo}
+            onToggle={handleToggle}
+            onDelete={handleDelete}
+          />
+        ))}
+      </div>
+      {localTodos.length === 0 && (
+        <p className="empty-message">No todos yet. Add one above!</p>
+      )}
+    </div>
+  );
+};
+
+const App = () => {
+  return (
+    <div className="app">
+      <TodoList />
+    </div>
+  );
+};
+
+export default App;

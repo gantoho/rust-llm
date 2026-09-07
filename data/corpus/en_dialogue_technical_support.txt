@@ -1,0 +1,28 @@
+A: Hi, I'm calling to report a problem with my internet connection.
+B: I'm sorry to hear that. Can you describe the issue?
+A: My internet has been very slow for the past two days. Pages take forever to load.
+B: I understand. Have you tried restarting your router?
+A: Yes, I've restarted it twice, but it didn't help.
+B: Let me check your account. What's your account number?
+A: It's 12345678.
+B: Thank you. I can see your account here. Let me run a diagnostic on your connection.
+A: Okay.
+B: I'm seeing some issues with your connection speed. It appears to be below the plan you're subscribed to.
+A: That's what I thought. I'm paying for 100 Mbps, but I'm only getting about 10.
+B: I apologize for the inconvenience. Let me check if there are any outages in your area.
+A: Thank you.
+B: I don't see any outages, but there is some maintenance work being done in your neighborhood that might be affecting your service.
+A: When will it be fixed?
+B: The maintenance is scheduled to be completed by tomorrow evening. In the meantime, I can offer you a credit for the days your service has been subpar.
+A: That would be appreciated. How much will the credit be?
+B: Based on the two days of poor service, I can offer you a $5 credit on your next bill.
+A: That's fair. Is there anything else I can do to improve my connection?
+B: You could try moving your router to a more central location in your home, away from walls and electronic devices that might interfere with the signal.
+A: I'll try that. What if the problem persists after the maintenance?
+B: If the issue continues, we can schedule a technician visit to check your equipment and connection at no additional cost.
+A: That's good to know. How do I schedule that?
+B: You can call us back or use our online portal. I'll make a note on your account so the next representative can help you quickly.
+A: Thank you for your help.
+B: You're welcome! Is there anything else I can assist you with today?
+A: No, that's all. Thanks again.
+B: Thank you for calling TechNet. Have a great day!

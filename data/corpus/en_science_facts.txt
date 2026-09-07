@@ -1,0 +1,50 @@
+Universe: 13.8 billion years old
+Observable universe diameter: 93 billion light-years
+Number of galaxies: approximately 2 trillion
+Number of stars in the Milky Way: 100-400 billion
+Distance from Earth to Sun: 149.6 million km (1 AU)
+Speed of light in vacuum: 299,792,458 m/s
+Gravitational constant: 6.674 × 10^-11 N⋅m²/kg²
+Planck constant: 6.626 × 10^-34 J⋅s
+Boltzmann constant: 1.381 × 10^-23 J/K
+Avogadro number: 6.022 × 10^23 mol^-1
+Elementary charge: 1.602 × 10^-19 C
+Electron mass: 9.109 × 10^-31 kg
+Proton mass: 1.673 × 10^-27 kg
+Neutron mass: 1.675 × 10^-27 kg
+Speed of sound in air at 20°C: 343 m/s
+Acceleration due to gravity (Earth): 9.807 m/s²
+Atmospheric pressure at sea level: 101,325 Pa
+Density of water at 4°C: 999.97 kg/m³
+Absolute zero: 0 K = -273.15°C
+Cosmic microwave background temperature: 2.725 K
+Age of Earth: 4.54 billion years
+Radius of Earth: 6,371 km
+Mass of Earth: 5.972 × 10^24 kg
+Distance to Moon: 384,400 km
+Radius of Sun: 696,340 km
+Mass of Sun: 1.989 × 10^30 kg
+Surface temperature of Sun: 5,778 K
+Distance to nearest star (Proxima Centauri): 4.24 light-years
+Distance to Andromeda galaxy: 2.537 million light-years
+Age of oldest known fossil: 3.5 billion years
+Number of known elements: 118
+Speed of Earth's rotation at equator: 1,670 km/h
+Orbital speed of Earth: 107,000 km/h
+Depth of Mariana Trench: 10,994 m
+Height of Mount Everest: 8,849 m
+Length of DNA in human cell: 2 meters
+Number of cells in human body: approximately 37.2 trillion
+Number of neurons in human brain: approximately 86 billion
+Weight of human brain: approximately 1.4 kg
+Normal human body temperature: 37°C (98.6°F)
+Average human heart rate: 60-100 beats per minute
+Total length of blood vessels in human body: approximately 100,000 km
+Number of bones in adult human body: 206
+Largest organ in human body: skin
+Smallest bone in human body: stapes (in ear)
+Fastest land animal: cheetah (120 km/h)
+Fastest bird: peregrine falcon (390 km/h in dive)
+Largest animal: blue whale (up to 30 meters)
+Loudest animal: sperm whale (236 dB)
+Deepest diving mammal: Cuvier's beaked whale (2,992 m)

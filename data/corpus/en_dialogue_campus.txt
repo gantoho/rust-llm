@@ -1,0 +1,24 @@
+A: Excuse me, could you help me find the Chemistry building?
+B: Of course! Are you a new student here?
+A: Yes, I just transferred here this semester. I'm a bit lost.
+B: Welcome! The Chemistry building is on the north side of campus. Do you see that big clock tower?
+A: Yes, I can see it from here.
+B: Walk past the clock tower and turn left. The Chemistry building is the third building on your right.
+A: Is it the one with the glass entrance?
+B: That's the one! It was renovated last year, so it looks quite modern now.
+A: Great, thank you so much! By the way, do you know where I can get a campus map?
+B: There's an information desk in the Student Center. It's right behind us.
+A: Perfect. I'll stop there first.
+B: Are you heading to a class?
+A: Yes, I have Chemistry 101 at 2 PM with Professor Johnson.
+B: Oh, I had that class last semester! Professor Johnson is excellent. Very clear explanations.
+A: That's good to hear. I was a bit nervous about the class.
+B: Don't worry. Just make sure to attend all the lectures and do the problem sets. The exams are fair if you keep up with the work.
+A: Thanks for the advice. Are there any good study spots on campus?
+B: The library on the second floor of the Science building is quiet and has great views. Also, the coffee shop in the Student Center is popular for group study sessions.
+A: I'll check those out. One more question - where's the best place to eat on campus?
+B: The dining hall has decent food, but I prefer the food trucks near the gym. There's a great Thai place and a taco truck that's amazing.
+A: Sounds delicious. Thanks for all your help!
+B: No problem! Feel free to ask if you need anything else. Good luck with your semester!
+A: Thanks! I really appreciate it.
+B: You're welcome! Enjoy your time here!

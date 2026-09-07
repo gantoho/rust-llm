@@ -1,0 +1,28 @@
+A: Hi, I'm looking to book a flight to New York.
+B: Sure! When are you planning to travel?
+A: I'd like to leave on March 15th and return on March 20th.
+B: Let me check availability for you. Do you prefer morning or evening flights?
+A: Morning flights would be better, preferably before 10 AM.
+B: I found a flight departing at 8:30 AM on March 15th with a return at 9:15 AM on March 20th. Would that work?
+A: That sounds perfect. How much is it?
+B: The round trip is $450 for economy class. Business class is $1,200.
+A: I'll go with economy. Can I choose my seats?
+B: Of course! Window or aisle?
+A: Window, please. And I'd like to request a vegetarian meal for both flights.
+B: Noted. Can I have your full name as it appears on your ID?
+A: It's John Michael Smith.
+B: And your date of birth?
+A: June 15, 1990.
+B: Do you have any luggage to check in?
+A: Just one bag, about 20 kilograms.
+B: That's within the allowance. Do you need travel insurance?
+A: Yes, I'd like the basic coverage.
+B: That's an additional $35. Your total comes to $485.
+A: That's fine. Here's my credit card.
+B: Thank you. I've booked your flights. You'll receive a confirmation email shortly.
+A: Great! What time should I arrive at the airport?
+B: For international flights, we recommend arriving 3 hours before departure. So around 5:30 AM.
+A: Got it. Is there anything else I need to know?
+B: Make sure to bring your passport and check the visa requirements for your destination.
+A: I already have my visa. Thank you for your help!
+B: You're welcome! Have a wonderful trip!

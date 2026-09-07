@@ -1,0 +1,194 @@
+class Stack:
+    """栈：后进先出（LIFO）数据结构"""
+    
+    def __init__(self):
+        self.items = []
+    
+    def push(self, item):
+        """入栈"""
+        self.items.append(item)
+    
+    def pop(self):
+        """出栈"""
+        if self.is_empty():
+            raise IndexError("栈为空")
+        return self.items.pop()
+    
+    def peek(self):
+        """查看栈顶元素"""
+        if self.is_empty():
+            raise IndexError("栈为空")
+        return self.items[-1]
+    
+    def is_empty(self):
+        """判断栈是否为空"""
+        return len(self.items) == 0
+    
+    def size(self):
+        """返回栈的大小"""
+        return len(self.items)
+    
+    def __str__(self):
+        return f"Stack({self.items})"
+
+
+class Queue:
+    """队列：先进先出（FIFO）数据结构"""
+    
+    def __init__(self):
+        self.items = []
+    
+    def enqueue(self, item):
+        """入队"""
+        self.items.append(item)
+    
+    def dequeue(self):
+        """出队"""
+        if self.is_empty():
+            raise IndexError("队列为空")
+        return self.items.pop(0)
+    
+    def front(self):
+        """查看队首元素"""
+        if self.is_empty():
+            raise IndexError("队列为空")
+        return self.items[0]
+    
+    def is_empty(self):
+        """判断队列是否为空"""
+        return len(self.items) == 0
+    
+    def size(self):
+        """返回队列的大小"""
+        return len(self.items)
+    
+    def __str__(self):
+        return f"Queue({self.items})"
+
+
+class TreeNode:
+    """二叉树节点"""
+    
+    def __init__(self, val=0, left=None, right=None):
+        self.val = val
+        self.left = left
+        self.right = right
+
+
+class BinarySearchTree:
+    """二叉搜索树"""
+    
+    def __init__(self):
+        self.root = None
+    
+    def insert(self, val):
+        """插入节点"""
+        if not self.root:
+            self.root = TreeNode(val)
+        else:
+            self._insert_recursive(self.root, val)
+    
+    def _insert_recursive(self, node, val):
+        if val < node.val:
+            if node.left is None:
+                node.left = TreeNode(val)
+            else:
+                self._insert_recursive(node.left, val)
+        else:
+            if node.right is None:
+                node.right = TreeNode(val)
+            else:
+                self._insert_recursive(node.right, val)
+    
+    def search(self, val):
+        """搜索节点"""
+        return self._search_recursive(self.root, val)
+    
+    def _search_recursive(self, node, val):
+        if node is None:
+            return False
+        if val == node.val:
+            return True
+        elif val < node.val:
+            return self._search_recursive(node.left, val)
+        else:
+            return self._search_recursive(node.right, val)
+    
+    def inorder(self):
+        """中序遍历"""
+        result = []
+        self._inorder_recursive(self.root, result)
+        return result
+    
+    def _inorder_recursive(self, node, result):
+        if node:
+            self._inorder_recursive(node.left, result)
+            result.append(node.val)
+            self._inorder_recursive(node.right, result)
+    
+    def preorder(self):
+        """前序遍历"""
+        result = []
+        self._preorder_recursive(self.root, result)
+        return result
+    
+    def _preorder_recursive(self, node, result):
+        if node:
+            result.append(node.val)
+            self._preorder_recursive(node.left, result)
+            self._preorder_recursive(node.right, result)
+    
+    def postorder(self):
+        """后序遍历"""
+        result = []
+        self._postorder_recursive(self.root, result)
+        return result
+    
+    def _postorder_recursive(self, node, result):
+        if node:
+            self._postorder_recursive(node.left, result)
+            self._postorder_recursive(node.right, result)
+            result.append(node.val)
+    
+    def height(self):
+        """计算树的高度"""
+        return self._height_recursive(self.root)
+    
+    def _height_recursive(self, node):
+        if node is None:
+            return -1
+        left_height = self._height_recursive(node.left)
+        right_height = self._height_recursive(node.right)
+        return 1 + max(left_height, right_height)
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 栈
+    s = Stack()
+    s.push(1)
+    s.push(2)
+    s.push(3)
+    print(f"栈: {s}")
+    print(f"出栈: {s.pop()}")
+    print(f"栈顶: {s.peek()}")
+    
+    # 队列
+    q = Queue()
+    q.enqueue(1)
+    q.enqueue(2)
+    q.enqueue(3)
+    print(f"\n队列: {q}")
+    print(f"出队: {q.dequeue()}")
+    print(f"队首: {q.front()}")
+    
+    # 二叉搜索树
+    bst = BinarySearchTree()
+    for val in [5, 3, 7, 1, 4, 6, 8]:
+        bst.insert(val)
+    print(f"\n中序遍历: {bst.inorder()}")
+    print(f"前序遍历: {bst.preorder()}")
+    print(f"后序遍历: {bst.postorder()}")
+    print(f"树的高度: {bst.height()}")
+    print(f"搜索4: {bst.search(4)}")
+    print(f"搜索9: {bst.search(9)}")

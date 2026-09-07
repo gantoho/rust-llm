@@ -1,0 +1,39 @@
+A: Welcome to our restaurant! Do you have a reservation?
+B: Yes, I have a reservation for two under the name Smith.
+A: Let me check... Smith, party of two at 7 PM. Perfect, right this way.
+B: Thank you.
+A: Here's your table. Can I get you something to drink while you look at the menu?
+B: I'll have a glass of red wine, please. What do you recommend?
+A: Our house Cabernet Sauvignon is very popular. It pairs well with our steaks.
+B: That sounds great. I'll have that.
+A: And for your companion?
+B: She'll have sparkling water with lemon.
+A: Excellent. I'll be right back with your drinks and some bread.
+B: Thank you.
+A: Here are your drinks and fresh bread. Are you ready to order, or do you need a few more minutes?
+B: I think we're ready. I'll have the grilled salmon with seasonal vegetables.
+A: How would you like your salmon cooked?
+B: Medium, please.
+A: And for the lady?
+C: I'll have the mushroom risotto, please.
+A: Would you like to add any appetizers or soup?
+B: We'll start with the Caesar salad to share.
+A: Great choice. I'll put that order in right away.
+B: Thank you.
+A: Here's your Caesar salad. Enjoy!
+B: This looks delicious. The presentation is beautiful.
+C: It tastes even better than it looks!
+A: How is everything so far?
+B: Excellent! The salmon is perfectly cooked.
+C: The risotto is amazing. Very creamy.
+A: I'm glad you're enjoying it. Save room for dessert - our chocolate lava cake is legendary.
+B: You've convinced us. We'll definitely try it.
+A: Here's your chocolate lava cake. The ice cream is homemade vanilla bean.
+B: This is incredible. Best dessert I've had in a long time.
+C: I agree. The combination of warm cake and cold ice cream is perfect.
+A: Would you like anything else? Coffee or tea?
+B: Just the check, please. And can we get a box for the leftover cake?
+A: Of course. Here's your check. Thank you for dining with us!
+B: Everything was wonderful. We'll definitely come back.
+A: We look forward to seeing you again. Have a great evening!
+B: Thank you! Good night!

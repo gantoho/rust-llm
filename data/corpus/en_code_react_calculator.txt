@@ -1,0 +1,123 @@
+import React, { useState } from 'react';
+
+const Calculator = () => {
+  const [display, setDisplay] = useState('0');
+  const [firstOperand, setFirstOperand] = useState(null);
+  const [operator, setOperator] = useState(null);
+  const [waitingForSecondOperand, setWaitingForSecondOperand] = useState(false);
+
+  const handleDigit = (digit) => {
+    if (waitingForSecondOperand) {
+      setDisplay(String(digit));
+      setWaitingForSecondOperand(false);
+    } else {
+      setDisplay(display === '0' ? String(digit) : display + digit);
+    }
+  };
+
+  const handleOperator = (nextOperator) => {
+    const inputValue = parseFloat(display);
+
+    if (firstOperand === null) {
+      setFirstOperand(inputValue);
+    } else if (operator) {
+      const result = calculate(firstOperand, inputValue, operator);
+      setDisplay(String(result));
+      setFirstOperand(result);
+    }
+
+    setWaitingForSecondOperand(true);
+    setOperator(nextOperator);
+  };
+
+  const calculate = (first, second, op) => {
+    switch (op) {
+      case '+': return first + second;
+      case '-': return first - second;
+      case '*': return first * second;
+      case '/': return second !== 0 ? first / second : 'Error';
+      default: return second;
+    }
+  };
+
+  const handleEqual = () => {
+    if (firstOperand === null || operator === null) return;
+
+    const inputValue = parseFloat(display);
+    const result = calculate(firstOperand, inputValue, operator);
+
+    setDisplay(String(result));
+    setFirstOperand(null);
+    setOperator(null);
+    setWaitingForSecondOperand(false);
+  };
+
+  const handleClear = () => {
+    setDisplay('0');
+    setFirstOperand(null);
+    setOperator(null);
+    setWaitingForSecondOperand(false);
+  };
+
+  const handleDecimal = () => {
+    if (waitingForSecondOperand) {
+      setDisplay('0.');
+      setWaitingForSecondOperand(false);
+      return;
+    }
+    if (!display.includes('.')) {
+      setDisplay(display + '.');
+    }
+  };
+
+  const handlePercent = () => {
+    const value = parseFloat(display);
+    setDisplay(String(value / 100));
+  };
+
+  const handleToggleSign = () => {
+    const value = parseFloat(display);
+    setDisplay(String(value * -1));
+  };
+
+  const buttons = [
+    { label: 'AC', action: handleClear, className: 'func' },
+    { label: '±', action: handleToggleSign, className: 'func' },
+    { label: '%', action: handlePercent, className: 'func' },
+    { label: '/', action: () => handleOperator('/'), className: 'operator' },
+    { label: '7', action: () => handleDigit(7) },
+    { label: '8', action: () => handleDigit(8) },
+    { label: '9', action: () => handleDigit(9) },
+    { label: '*', action: () => handleOperator('*'), className: 'operator' },
+    { label: '4', action: () => handleDigit(4) },
+    { label: '5', action: () => handleDigit(5) },
+    { label: '6', action: () => handleDigit(6) },
+    { label: '-', action: () => handleOperator('-'), className: 'operator' },
+    { label: '1', action: () => handleDigit(1) },
+    { label: '2', action: () => handleDigit(2) },
+    { label: '3', action: () => handleDigit(3) },
+    { label: '+', action: () => handleOperator('+'), className: 'operator' },
+    { label: '0', action: () => handleDigit(0), className: 'zero' },
+    { label: '.', action: handleDecimal },
+    { label: '=', action: handleEqual, className: 'operator' },
+  ];
+
+  return (
+    <div className="calculator">
+      <div className="display">{display}</div>
+      <div className="buttons">
+        {buttons.map((btn, index) => (
+          <button
+            key={index}
+            onClick={btn.action}
+            className={btn.className || ''}
+          >
+            {btn.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+export default Calculator;

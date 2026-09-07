@@ -46,13 +46,13 @@
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
-| MoE 混合专家模型 | `docs/31-MoE混合专家模型.md` | 稀疏激活、Router 门控网络、负载均衡、Switch/Mixtral/DeepSeek 架构 |
-| 量化技术 | `docs/32-量化技术.md` | INT8/INT4 量化、GPTQ、AWQ、GGUF、PTQ vs QAT、STE |
-| RLHF 与对齐 | `docs/33-RLHF与对齐.md` | SFT、奖励模型（Bradley-Terry）、PPO、DPO、GRPO、Constitutional AI |
+| Scaling Laws | `docs/31-Scaling-Laws.md` | 幂律关系、Chinchilla 最优配比、算力估算、涌现能力 |
+| MoE 混合专家模型 | `docs/32-MoE混合专家模型.md` | 稀疏激活、Router 门控网络、负载均衡、Switch/Mixtral/DeepSeek 架构 |
+| 量化技术 | `docs/33-量化技术.md` | INT8/INT4 量化、GPTQ、AWQ、GGUF、PTQ vs QAT、STE |
 | 推测解码 | `docs/34-推测解码.md` | 草稿模型 + 验证、拒绝采样、无损保证、Medusa/EAGLE |
-| RAG 检索增强生成 | `docs/35-RAG检索增强生成.md` | 文档分块、向量嵌入、相似度检索、重排序、HyDE、Self-RAG |
-| Scaling Laws | `docs/36-Scaling-Laws.md` | 幂律关系、Chinchilla 最优配比、算力估算、涌现能力 |
-| 多 Token 预测 | `docs/37-多token预测.md` | MTP 训练目标、DeepSeek 实现、与推测解码结合 |
+| 多 Token 预测 | `docs/35-多token预测.md` | MTP 训练目标、DeepSeek 实现、与推测解码结合 |
+| RLHF 与对齐 | `docs/36-RLHF与对齐.md` | SFT、奖励模型（Bradley-Terry）、PPO、DPO、GRPO、Constitutional AI |
+| RAG 检索增强生成 | `docs/37-RAG检索增强生成.md` | 文档分块、向量嵌入、相似度检索、重排序、HyDE、Self-RAG |
 | 分布式训练 | `docs/38-分布式训练.md` | 数据并行、ZeRO、张量并行、流水线并行、3D 并行、通信原语 |
 
 ### 工程化完善教程（第 39 课，代码+文档）
@@ -603,7 +603,7 @@ cargo test test_softmax -- --nocapture
 
 ---
 
-### 6. GPU 加速（可选 feature）
+### 9. GPU 加速（可选 feature）
 
 默认构建**不启用 GPU**，保持依赖轻量。通过 `--features gpu` 开启 wgpu 计算着色器加速：
 
@@ -655,10 +655,10 @@ cargo run --features gpu -- demo
 {
   "model": {
     "vocab_size": 0,       // 词表大小。0 = 由分词器决定（训练时自动填入）
-    "n_embd": 128,         // 隐藏维度（越大模型越强，显存和计算量越大）
+    "n_embd": 64,          // 隐藏维度（越大模型越强，显存和计算量越大）
     "n_head": 4,           // 注意力头数（Q 的头数）
-    "n_layer": 4,          // Transformer 层数（越深越强）
-    "block_size": 64,      // 最大上下文长度（能处理的最长序列）
+    "n_layer": 2,          // Transformer 层数（越深越强）
+    "block_size": 32,      // 最大上下文长度（能处理的最长序列）
     "n_kv_head": 0,        // KV 头数。0 = 标准 MHA；< n_head 时启用 GQA
     "use_rmsnorm": false,  // true = RMSNorm（LLaMA 风格），false = LayerNorm（GPT-2 风格）
     "use_swiglu": false,   // true = SwiGLU MLP（LLaMA 风格），false = GELU MLP（GPT-2 风格）
@@ -686,17 +686,17 @@ cargo run --features gpu -- demo
   "train": {
     "seed": 42,               // 随机种子（相同种子 = 可复现的实验）
     "batch_size": 8,          // 每批序列条数
-    "steps": 2000,            // 总训练步数
-    "max_lr": 6e-4,           // 峰值学习率（warmup 后达到）
-    "min_lr": 6e-5,           // cosine 衰减的最低学习率
-    "warmup_steps": 50,       // 线性预热步数（从 0 线性升到 max_lr）
+    "steps": 1000,            // 总训练步数
+    "max_lr": 3e-3,           // 峰值学习率（warmup 后达到）
+    "min_lr": 3e-4,           // cosine 衰减的最低学习率
+    "warmup_steps": 20,       // 线性预热步数（从 0 线性升到 max_lr）
     "weight_decay": 0.01,     // AdamW 权重衰减系数
     "grad_clip": 1.0,         // 梯度裁剪阈值（梯度总范数超过此值时等比缩放）
-    "eval_every": 250,        // 每 N 步评估一次验证集（同时保存 latest checkpoint）
+    "eval_every": 100,        // 每 N 步评估一次验证集（同时保存 latest checkpoint）
     "eval_iters": 20,         // 评估时采样的批数（取平均减少方差）
     "tokenizer": "bpe",       // 分词器类型："char"（字符级）或 "bpe"（字节对编码）
     "bpe_vocab": 512,         // BPE 目标词表大小（= 256 字节 + 合并数）
-    "train_file": "data/alice.txt", // 训练语料文件路径（支持目录路径，自动合并 .txt 文件）
+    "train_file": "data/sample.txt", // 训练语料文件路径（支持目录路径，自动合并 .txt 文件）
     "val_file": null,         // 验证语料文件路径。null = 自动从训练文本末尾切 10%
     "out_dir": "checkpoints", // checkpoint 输出目录
     "accum_steps": 1,         // 梯度累积步数。有效 batch = batch_size × accum_steps

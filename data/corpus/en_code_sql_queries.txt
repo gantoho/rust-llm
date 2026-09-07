@@ -1,0 +1,83 @@
+SELECT 
+    p.product_name,
+    p.category,
+    SUM(oi.quantity) as total_sold,
+    SUM(oi.quantity * oi.unit_price) as total_revenue,
+    AVG(oi.unit_price) as avg_price,
+    COUNT(DISTINCT o.customer_id) as unique_customers
+FROM products p
+JOIN order_items oi ON p.id = oi.product_id
+JOIN orders o ON oi.order_id = o.id
+WHERE o.order_date >= '2024-01-01'
+    AND o.order_date < '2025-01-01'
+    AND o.status = 'completed'
+GROUP BY p.product_name, p.category
+HAVING SUM(oi.quantity) > 100
+ORDER BY total_revenue DESC
+LIMIT 20;
+
+-- Recursive CTE to find all employees in a management chain
+WITH RECURSIVE employee_hierarchy AS (
+    -- Base case: CEO (no manager)
+    SELECT id, name, manager_id, 1 as level, 
+           CAST(name AS VARCHAR(1000)) as path
+    FROM employees
+    WHERE manager_id IS NULL
+    
+    UNION ALL
+    
+    -- Recursive case: find direct reports
+    SELECT e.id, e.name, e.manager_id, eh.level + 1,
+           CONCAT(eh.path, ' -> ', e.name)
+    FROM employees e
+    JOIN employee_hierarchy eh ON e.manager_id = eh.id
+    WHERE eh.level < 10  -- Prevent infinite recursion
+)
+SELECT * FROM employee_hierarchy ORDER BY path;
+
+-- Window function: running total and moving average
+SELECT 
+    order_date,
+    daily_revenue,
+    SUM(daily_revenue) OVER (ORDER BY order_date) as cumulative_revenue,
+    AVG(daily_revenue) OVER (
+        ORDER BY order_date 
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) as moving_avg_7day
+FROM (
+    SELECT 
+        DATE(created_at) as order_date,
+        SUM(total_amount) as daily_revenue
+    FROM orders
+    WHERE status = 'completed'
+    GROUP BY DATE(created_at)
+) daily_stats
+ORDER BY order_date;
+
+-- Pivot table: monthly sales by category
+SELECT 
+    category,
+    SUM(CASE WHEN EXTRACT(MONTH FROM order_date) = 1 THEN amount ELSE 0 END) as jan,
+    SUM(CASE WHEN EXTRACT(MONTH FROM order_date) = 2 THEN amount ELSE 0 END) as feb,
+    SUM(CASE WHEN EXTRACT(MONTH FROM order_date) = 3 THEN amount ELSE 0 END) as mar,
+    SUM(amount) as total
+FROM sales
+WHERE EXTRACT(YEAR FROM order_date) = 2024
+GROUP BY category
+ORDER BY total DESC;
+
+-- Subquery: customers who bought all products in a category
+SELECT c.name, c.email
+FROM customers c
+WHERE NOT EXISTS (
+    SELECT p.id 
+    FROM products p 
+    WHERE p.category = 'Electronics'
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM orders o 
+        JOIN order_items oi ON o.id = oi.order_id
+        WHERE o.customer_id = c.id 
+        AND oi.product_id = p.id
+    )
+);

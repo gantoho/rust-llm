@@ -74,10 +74,13 @@ pub fn save(path: &str, model: &GPT, opt: &AdamW, step: usize, best_val_loss: f3
     write(f.write_all(MAGIC));
     write(f.write_all(&(json.len() as u32).to_le_bytes()));
     write(f.write_all(&json));
+    // 批量写入参数数据（避免逐元素 write_all 的系统调用开销）
     for (_, t) in &named {
-        for v in t.data() {
-            write(f.write_all(&v.to_le_bytes()));
-        }
+        let data = t.data_ref();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        write(f.write_all(bytes));
     }
 }
 

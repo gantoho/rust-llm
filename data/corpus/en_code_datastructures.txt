@@ -1,0 +1,188 @@
+class HashMap:
+    def __init__(self, capacity=16):
+        self.capacity = capacity
+        self.size = 0
+        self.buckets = [[] for _ in range(capacity)]
+    
+    def _hash(self, key):
+        return hash(key) % self.capacity
+    
+    def put(self, key, value):
+        index = self._hash(key)
+        bucket = self.buckets[index]
+        
+        for i, (k, v) in enumerate(bucket):
+            if k == key:
+                bucket[i] = (key, value)
+                return
+        
+        bucket.append((key, value))
+        self.size += 1
+        
+        if self.size > self.capacity * 0.75:
+            self._resize()
+    
+    def get(self, key):
+        index = self._hash(key)
+        bucket = self.buckets[index]
+        
+        for k, v in bucket:
+            if k == key:
+                return v
+        
+        raise KeyError(key)
+    
+    def delete(self, key):
+        index = self._hash(key)
+        bucket = self.buckets[index]
+        
+        for i, (k, v) in enumerate(bucket):
+            if k == key:
+                del bucket[i]
+                self.size -= 1
+                return v
+        
+        raise KeyError(key)
+    
+    def _resize(self):
+        old_buckets = self.buckets
+        self.capacity *= 2
+        self.buckets = [[] for _ in range(self.capacity)]
+        self.size = 0
+        
+        for bucket in old_buckets:
+            for key, value in bucket:
+                self.put(key, value)
+    
+    def __len__(self):
+        return self.size
+    
+    def __contains__(self, key):
+        try:
+            self.get(key)
+            return True
+        except KeyError:
+            return False
+
+class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.is_end = False
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode()
+    
+    def insert(self, word):
+        node = self.root
+        for char in word:
+            if char not in node.children:
+                node.children[char] = TrieNode()
+            node = node.children[char]
+        node.is_end = True
+    
+    def search(self, word):
+        node = self.root
+        for char in word:
+            if char not in node.children:
+                return False
+            node = node.children[char]
+        return node.is_end
+    
+    def starts_with(self, prefix):
+        node = self.root
+        for char in prefix:
+            if char not in node.children:
+                return False
+            node = node.children[char]
+        return True
+    
+    def autocomplete(self, prefix):
+        node = self.root
+        for char in prefix:
+            if char not in node.children:
+                return []
+            node = node.children[char]
+        
+        results = []
+        self._collect(node, prefix, results)
+        return results
+    
+    def _collect(self, node, prefix, results):
+        if node.is_end:
+            results.append(prefix)
+        for char, child in node.children.items():
+            self._collect(child, prefix + char, results)
+
+class MinHeap:
+    def __init__(self):
+        self.heap = []
+    
+    def push(self, val):
+        self.heap.append(val)
+        self._bubble_up(len(self.heap) - 1)
+    
+    def pop(self):
+        if not self.heap:
+            raise IndexError("pop from empty heap")
+        if len(self.heap) == 1:
+            return self.heap.pop()
+        
+        root = self.heap[0]
+        self.heap[0] = self.heap.pop()
+        self._bubble_down(0)
+        return root
+    
+    def peek(self):
+        if not self.heap:
+            raise IndexError("peek from empty heap")
+        return self.heap[0]
+    
+    def _bubble_up(self, index):
+        parent = (index - 1) // 2
+        while index > 0 and self.heap[index] < self.heap[parent]:
+            self.heap[index], self.heap[parent] = self.heap[parent], self.heap[index]
+            index = parent
+            parent = (index - 1) // 2
+    
+    def _bubble_down(self, index):
+        smallest = index
+        left = 2 * index + 1
+        right = 2 * index + 2
+        
+        if left < len(self.heap) and self.heap[left] < self.heap[smallest]:
+            smallest = left
+        if right < len(self.heap) and self.heap[right] < self.heap[smallest]:
+            smallest = right
+        
+        if smallest != index:
+            self.heap[index], self.heap[smallest] = self.heap[smallest], self.heap[index]
+            self._bubble_down(smallest)
+    
+    def __len__(self):
+        return len(self.heap)
+    
+    def __bool__(self):
+        return len(self.heap) > 0
+
+# Example usage
+h = HashMap()
+h.put("name", "Alice")
+h.put("age", 30)
+h.put("city", "New York")
+print(h.get("name"))  # Alice
+print("age" in h)      # True
+
+t = Trie()
+words = ["apple", "app", "application", "bat", "ball"]
+for word in words:
+    t.insert(word)
+print(t.search("apple"))        # True
+print(t.starts_with("app"))     # True
+print(t.autocomplete("app"))    # ['app', 'apple', 'application']
+
+heap = MinHeap()
+for val in [5, 3, 7, 1, 4]:
+    heap.push(val)
+print(heap.pop())  # 1
+print(heap.pop())  # 3

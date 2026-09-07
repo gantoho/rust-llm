@@ -1,0 +1,20 @@
+# Neural Machine Translation by Jointly Learning to Align and Translate
+## Abstract
+The encoder-decoder architecture for machine translation has recently achieved promising results. In this paper, we propose an extension to the encoder-decoder model which learns to align and translate jointly. Each time the proposed model generates a word in a translation, it searches for a set of positions in the source sentence where the most relevant information is concentrated. The model then predicts a target word based on the context vectors associated with these source positions and all the previous generated target words. Our model achieves 25.8 BLEU on the WMT'14 English-to-French task, outperforming the existing encoder-decoder model by more than 5.0 BLEU.
+
+## Introduction
+Neural machine translation is a recently proposed approach to machine translation. Unlike the traditional statistical machine translation system which consists of many small sub-components that are tuned separately, a neural machine translation system is built using a single large neural network which is trained end-to-end to maximize the translation performance. The encoder-decoder architecture is a typical neural machine translation model. The encoder reads the source sentence and converts it into a vector representation, from which the decoder generates the translation.
+
+## Method
+We propose a novel architecture for neural machine translation. The new architecture consists of a bidirectional RNN as an encoder and a decoder that simulates searching through a source sentence during decoding. The encoder uses a bidirectional RNN with GRU units. The forward hidden state and backward hidden state are concatenated to obtain the annotation for each word.
+
+The decoder generates the translation by predicting one word at a time. At each time step, the decoder computes a context vector as a weighted sum of all the annotations. The weights are computed by an alignment model, which scores how well the inputs around position j and the output at position i are aligned.
+
+## Experiments
+We evaluated our model on the WMT'14 English-to-French translation task. Our model achieved a BLEU score of 25.8, outperforming the baseline encoder-decoder model by more than 5.0 BLEU. We also performed qualitative analysis by visualizing the attention weights, and found that the model learned to align source and target words in a linguistically plausible way.
+
+## Related Work
+Our approach is related to the attention mechanism proposed by Bahdanau et al. (2015), but differs in several key aspects. We use a bidirectional encoder and a more sophisticated alignment model. Our work also relates to the broader literature on neural network architectures for sequence-to-sequence learning.
+
+## Conclusion
+We proposed a novel neural machine translation architecture that jointly learns to align and translate. Our model achieves state-of-the-art performance on the WMT'14 English-to-French task. The attention mechanism provides an intuitive way to visualize the translation process and understand the model's behavior.

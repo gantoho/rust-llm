@@ -1,0 +1,84 @@
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]
+    left = [x for x in arr if x < pivot]
+    middle = [x for x in arr if x == pivot]
+    right = [x for x in arr if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+
+class BinarySearchTree:
+    def __init__(self, value):
+        self.value = value
+        self.left = None
+        self.right = None
+    
+    def insert(self, val):
+        if val < self.value:
+            if self.left is None:
+                self.left = BinarySearchTree(val)
+            else:
+                self.left.insert(val)
+        else:
+            if self.right is None:
+                self.right = BinarySearchTree(val)
+            else:
+                self.right.insert(val)
+
+def binary_search(sorted_list, target):
+    left, right = 0, len(sorted_list) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if sorted_list[mid] == target:
+            return mid
+        elif sorted_list[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    return -1
+
+import threading
+from collections import defaultdict
+
+class Graph:
+    def __init__(self):
+        self.graph = defaultdict(list)
+    
+    def add_edge(self, u, v):
+        self.graph[u].append(v)
+    
+    def bfs(self, start):
+        visited = set()
+        queue = [start]
+        visited.add(start)
+        result = []
+        while queue:
+            vertex = queue.pop(0)
+            result.append(vertex)
+            for neighbor in self.graph[vertex]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        return result
+
+def merge_sort(arr):
+    if len(arr) <= 1:
+        return arr
+    mid = len(arr) // 2
+    left = merge_sort(arr[:mid])
+    right = merge_sort(arr[mid:])
+    return merge(left, right)
+
+def merge(left, right):
+    result = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        if left[i] <= right[j]:
+            result.append(left[i])
+            i += 1
+        else:
+            result.append(right[j])
+            j += 1
+    result.extend(left[i:])
+    result.extend(right[j:])
+    return result

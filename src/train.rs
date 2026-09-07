@@ -334,8 +334,8 @@ pub fn train_gpt(
         }
         scheduler.step();
 
-        // [诊断] 每步打印耗时与 GPU/CPU 分流
-        if (step + 1) % 1 == 0 {
+        // [诊断] 周期性打印耗时与 GPU/CPU 分流
+        if (step + 1) % cfg.eval_every == 0 || step + 1 == cfg.steps {
             let n = (step - start_step + 1) as f64;
             let wall = diag_t0.elapsed().as_secs_f64();
             let s_other = (wall - s_fw - s_bw - s_opt).max(0.0);

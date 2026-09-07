@@ -1,0 +1,32 @@
+A: Good morning, Dr. Smith. I've been experiencing some headaches lately.
+B: Good morning. How long have you been having these headaches?
+A: About two weeks now. They usually start in the afternoon.
+B: Can you describe the pain? Is it sharp, dull, or throbbing?
+A: It's more of a dull ache, usually on the right side of my head.
+B: How severe is the pain on a scale of 1 to 10?
+A: I'd say about a 5 or 6. It's not unbearable, but it's annoying.
+B: Have you taken any medication for it?
+A: I've been taking ibuprofen, but it only helps temporarily.
+B: Do you have any other symptoms? Nausea, vision changes, or sensitivity to light?
+A: Sometimes I feel a bit nauseous, but no vision changes.
+B: How's your sleep been lately?
+A: Not great. I've been staying up late working on my computer.
+B: How many hours of sleep do you get per night?
+A: Usually about 5 or 6 hours. I know it's not enough.
+B: That could be a major factor. Sleep deprivation often causes headaches.
+A: I've also been under a lot of stress at work lately.
+B: Stress is another common trigger. Let me check your blood pressure.
+A: Sure.
+B: Your blood pressure is 135 over 85, which is slightly elevated.
+A: Is that bad?
+B: It's not dangerous, but it's higher than ideal. Combined with stress and lack of sleep, it could contribute to your headaches.
+A: What should I do?
+B: First, try to get at least 7-8 hours of sleep per night. Second, take regular breaks from your computer screen.
+A: I'll try. Anything else?
+B: Regular exercise can help reduce stress and improve sleep quality. Even a 30-minute walk daily makes a difference.
+A: Should I keep taking the ibuprofen?
+B: Don't take it more than three times a week. Overuse can actually cause more headaches.
+A: Okay. When should I come back?
+B: If the headaches persist after two weeks of better sleep and stress management, come back and we'll run some tests.
+A: Thank you, Doctor. I'll follow your advice.
+B: You're welcome. Take care of yourself!

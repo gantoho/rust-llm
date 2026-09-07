@@ -351,8 +351,15 @@ impl Tensor {
 
     // ---------- 访问器 ----------
 
+    /// 返回数据副本（兼容旧调用点，热路径建议用 `data_ref`）
     pub fn data(&self) -> Vec<f32> {
         self.data.borrow().clone()
+    }
+
+    /// 只读借用底层数据，避免 O(N) 克隆。
+    /// 适用于只读遍历（checkpoint 写入、采样取最后一行等）。
+    pub fn data_ref(&self) -> std::cell::Ref<'_, Vec<f32>> {
+        self.data.borrow()
     }
 
     /// 读取标量值（0 维张量专用，避免克隆整个 Vec）
@@ -1448,10 +1455,13 @@ impl Tensor {
                             }
                         }
                         // 4. 计算 P_ij 并累加
+                        // 存储未归一化的 exp(score - m_final)，
+                        // 末尾统一除以 l 做归一化。
+                        // 之前乘 rescale 导致第一个块的权重全为 0，修复为不乘。
                         let mut block_sum = 0.0f32;
                         for cj in 0..bc {
                             let p = (score_buf[ri * bc + cj] - m_new).exp();
-                            attn_data[attn_off + row * t_total + j_start + cj] = p * rescale;
+                            attn_data[attn_off + row * t_total + j_start + cj] = p;
                             block_sum += p;
                             for h in 0..head_dim {
                                 out_data[out_off + row * head_dim + h] +=
@@ -1700,9 +1710,16 @@ impl Tensor {
         let scale = 1.0 / keep;
         let sd = self.data.borrow();
         let len = sd.len();
-        // 用 xorshift64* 生成 mask（线程安全，种子基于当前元素值 + 下标的哈希）
+        // 用 xorshift64* 生成 mask。
+        // 种子从数据指针 + 长度 + 首元素派生，保证不同层/不同张量的 mask 不同，
+        // 同一张量重复调用时种子相同（可复现）。
         let mut mask = vec![0.0f32; len];
-        let mut state: u64 = 0x12345678ABCDEF01; // 固定种子（可复现）
+        let seed_base = sd.as_ptr() as u64;
+        let seed_val = if len > 0 { sd[0].to_bits() as u64 } else { 0 };
+        let mut state: u64 = seed_base.wrapping_mul(6364136223846793005)
+            ^ (len as u64).wrapping_mul(1442695040888963407)
+            ^ seed_val.wrapping_mul(0x9E3779B97F4A7C15);
+        if state == 0 { state = 1; } // 避免全零退化
         for m in mask.iter_mut() {
             // xorshift64*
             state ^= state << 13;

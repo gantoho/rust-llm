@@ -1,0 +1,199 @@
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <memory>
+
+class Node {
+public:
+    int data;
+    std::shared_ptr<Node> next;
+    
+    Node(int val) : data(val), next(nullptr) {}
+};
+
+class LinkedList {
+private:
+    std::shared_ptr<Node> head;
+    int size;
+    
+public:
+    LinkedList() : head(nullptr), size(0) {}
+    
+    void insert(int val) {
+        auto newNode = std::make_shared<Node>(val);
+        newNode->next = head;
+        head = newNode;
+        size++;
+    }
+    
+    bool search(int val) {
+        auto current = head;
+        while (current) {
+            if (current->data == val) return true;
+            current = current->next;
+        }
+        return false;
+    }
+    
+    void remove(int val) {
+        if (!head) return;
+        if (head->data == val) {
+            head = head->next;
+            size--;
+            return;
+        }
+        auto current = head;
+        while (current->next) {
+            if (current->next->data == val) {
+                current->next = current->next->next;
+                size--;
+                return;
+            }
+            current = current->next;
+        }
+    }
+    
+    int getSize() const { return size; }
+};
+
+template<typename T>
+class Stack {
+private:
+    std::vector<T> elements;
+    
+public:
+    void push(const T& element) {
+        elements.push_back(element);
+    }
+    
+    void pop() {
+        if (empty()) throw std::runtime_error("Stack is empty");
+        elements.pop_back();
+    }
+    
+    T& top() {
+        if (empty()) throw std::runtime_error("Stack is empty");
+        return elements.back();
+    }
+    
+    bool empty() const {
+        return elements.empty();
+    }
+    
+    size_t size() const {
+        return elements.size();
+    }
+};
+
+template<typename T>
+class Queue {
+private:
+    std::vector<T> elements;
+    size_t front_idx;
+    
+public:
+    Queue() : front_idx(0) {}
+    
+    void enqueue(const T& element) {
+        elements.push_back(element);
+    }
+    
+    void dequeue() {
+        if (empty()) throw std::runtime_error("Queue is empty");
+        front_idx++;
+        if (front_idx > elements.size() / 2) {
+            elements.erase(elements.begin(), elements.begin() + front_idx);
+            front_idx = 0;
+        }
+    }
+    
+    T& front() {
+        if (empty()) throw std::runtime_error("Queue is empty");
+        return elements[front_idx];
+    }
+    
+    bool empty() const {
+        return front_idx >= elements.size();
+    }
+    
+    size_t size() const {
+        return elements.size() - front_idx;
+    }
+};
+
+class BinarySearchTree {
+private:
+    struct TreeNode {
+        int val;
+        std::shared_ptr<TreeNode> left;
+        std::shared_ptr<TreeNode> right;
+        TreeNode(int v) : val(v), left(nullptr), right(nullptr) {}
+    };
+    
+    std::shared_ptr<TreeNode> root;
+    
+    std::shared_ptr<TreeNode> insert(std::shared_ptr<TreeNode> node, int val) {
+        if (!node) return std::make_shared<TreeNode>(val);
+        if (val < node->val) node->left = insert(node->left, val);
+        else if (val > node->val) node->right = insert(node->right, val);
+        return node;
+    }
+    
+    bool search(std::shared_ptr<TreeNode> node, int val) {
+        if (!node) return false;
+        if (val == node->val) return true;
+        if (val < node->val) return search(node->left, val);
+        return search(node->right, val);
+    }
+    
+    void inorder(std::shared_ptr<TreeNode> node, std::vector<int>& result) {
+        if (!node) return;
+        inorder(node->left, result);
+        result.push_back(node->val);
+        inorder(node->right, result);
+    }
+    
+public:
+    BinarySearchTree() : root(nullptr) {}
+    
+    void insert(int val) { root = insert(root, val); }
+    bool search(int val) { return search(root, val); }
+    
+    std::vector<int> inorderTraversal() {
+        std::vector<int> result;
+        inorder(root, result);
+        return result;
+    }
+};
+
+int main() {
+    LinkedList list;
+    list.insert(3);
+    list.insert(1);
+    list.insert(4);
+    list.insert(1);
+    list.insert(5);
+    
+    std::cout << "List size: " << list.getSize() << std::endl;
+    std::cout << "Search 4: " << (list.search(4) ? "found" : "not found") << std::endl;
+    
+    Stack<int> stack;
+    stack.push(10);
+    stack.push(20);
+    stack.push(30);
+    std::cout << "Stack top: " << stack.top() << std::endl;
+    
+    BinarySearchTree bst;
+    bst.insert(5);
+    bst.insert(3);
+    bst.insert(7);
+    bst.insert(1);
+    bst.insert(4);
+    
+    auto inorder = bst.inorderTraversal();
+    std::cout << "BST inorder: ";
+    for (int val : inorder) std::cout << val << " ";
+    std::cout << std::endl;
+    
+    return 0;
+}

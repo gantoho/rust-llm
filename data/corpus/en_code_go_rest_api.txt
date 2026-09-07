@@ -1,0 +1,187 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+)
+
+type Task struct {
+	ID          int       `json:"id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type TaskStore struct {
+	mu     sync.RWMutex
+	tasks  map[int]Task
+	nextID int
+}
+
+func NewTaskStore() *TaskStore {
+	return &TaskStore{
+		tasks:  make(map[int]Task),
+		nextID: 1,
+	}
+}
+
+func (s *TaskStore) Create(title, description string) Task {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task := Task{
+		ID:          s.nextID,
+		Title:       title,
+		Description: description,
+		Status:      "pending",
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	s.tasks[task.ID] = task
+	s.nextID++
+	return task
+}
+
+func (s *TaskStore) Get(id int) (Task, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	task, ok := s.tasks[id]
+	return task, ok
+}
+
+func (s *TaskStore) List() []Task {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tasks := make([]Task, 0, len(s.tasks))
+	for _, task := range s.tasks {
+		tasks = append(tasks, task)
+	}
+	return tasks
+}
+
+func (s *TaskStore) Update(id int, title, description, status string) (Task, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[id]
+	if !ok {
+		return Task{}, false
+	}
+	if title != "" {
+		task.Title = title
+	}
+	if description != "" {
+		task.Description = description
+	}
+	if status != "" {
+		task.Status = status
+	}
+	task.UpdatedAt = time.Now()
+	s.tasks[id] = task
+	return task, true
+}
+
+func (s *TaskStore) Delete(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[id]; !ok {
+		return false
+	}
+	delete(s.tasks, id)
+	return true
+}
+
+type Server struct {
+	store *TaskStore
+}
+
+func NewServer() *Server {
+	return &Server{store: NewTaskStore()}
+}
+
+func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		tasks := s.store.List()
+		json.NewEncoder(w).Encode(tasks)
+	case http.MethodPost:
+		var req struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		task := s.store.Create(req.Title, req.Description)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(task)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	id, err := parseID(r.URL.Path)
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		task, ok := s.store.Get(id)
+		if !ok {
+			http.Error(w, "Task not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(task)
+	case http.MethodPut:
+		var req struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Status      string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		task, ok := s.store.Update(id, req.Title, req.Description, req.Status)
+		if !ok {
+			http.Error(w, "Task not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(task)
+	case http.MethodDelete:
+		if !s.store.Delete(id) {
+			http.Error(w, "Task not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func parseID(path string) (int, error) {
+	var id int
+	_, err := fmt.Sscanf(path, "/tasks/%d", &id)
+	return id, err
+}
+
+func main() {
+	server := NewServer()
+	http.HandleFunc("/tasks", server.handleTasks)
+	http.HandleFunc("/tasks/", server.handleTask)
+
+	fmt.Println("Server starting on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}

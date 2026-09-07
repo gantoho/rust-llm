@@ -1,0 +1,27 @@
+A: Hello, I'm calling about the apartment listing I saw online.
+B: Hi! Yes, the one-bedroom on Oak Street. It's still available. Would you like to schedule a viewing?
+A: Yes, I'd love to see it. When is a good time?
+B: I'm available tomorrow at 2 PM or 4 PM. Would either of those work for you?
+A: 2 PM works perfectly for me.
+B: Great. I'll meet you at the building entrance. Do you need directions?
+A: I think I can find it, but just in case, what's the nearest subway station?
+B: It's about a 5-minute walk from Central Station. Take the north exit and walk two blocks east.
+A: Got it. Can you tell me a bit more about the apartment?
+B: Of course! It's a one-bedroom, one-bathroom apartment on the third floor. It's about 600 square feet with a balcony overlooking a park.
+A: That sounds nice. What's the rent?
+B: The rent is $1,800 per month, which includes water and trash removal. Electricity and internet are separate.
+A: Is there a security deposit?
+B: Yes, it's one month's rent, so $1,800. It's refundable at the end of the lease, minus any deductions for damages.
+A: How long is the lease?
+B: We prefer a 12-month lease, but we can discuss a 6-month lease with a slightly higher rent.
+A: What about parking?
+B: There's a parking garage in the building. A spot is $150 per month. Street parking is also available but can be competitive.
+A: Is the building pet-friendly?
+B: Yes, we allow cats and small dogs under 25 pounds. There's a one-time pet deposit of $300.
+A: Perfect, I have a cat. What amenities does the building have?
+B: We have a gym, a rooftop terrace, a laundry room on each floor, and 24-hour security. There's also a package room for deliveries.
+A: That's great. When is the apartment available for move-in?
+B: It's available starting February 1st. We can do the walkthrough and sign the lease this week if you're interested.
+A: I'll definitely think about it after seeing it tomorrow.
+B: Of course. I'll send you a text with my contact information. See you tomorrow at 2!
+A: See you then. Thank you!
