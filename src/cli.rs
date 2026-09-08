@@ -44,6 +44,9 @@ pub enum Cmd {
         /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
         #[arg(long)]
         ckpt: Option<String>,
+        /// 分词器文件路径（缺省自动从 out_dir/tokenizer.json 加载）
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
     /// 用训练好的模型生成文本
     Generate {
@@ -53,6 +56,9 @@ pub enum Cmd {
         /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
         #[arg(long)]
         ckpt: Option<String>,
+        /// 分词器文件路径（缺省自动从 out_dir/tokenizer.json 加载）
+        #[arg(long)]
+        tokenizer: Option<String>,
         /// 初始提示词
         #[arg(long, default_value = "")]
         prompt: String,
@@ -89,6 +95,9 @@ pub enum Cmd {
         /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
         #[arg(long)]
         ckpt: Option<String>,
+        /// 分词器文件路径（缺省自动从 out_dir/tokenizer.json 加载）
+        #[arg(long)]
+        tokenizer: Option<String>,
         /// 系统提示词（可选，会在每次输入前附加）
         #[arg(long, default_value = "")]
         system: String,

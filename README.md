@@ -67,10 +67,11 @@
 
 ```bash
 # ═══════════════════════════════════════════
-#  最简方式：训练 + 生成
+#  最简方式：训练 + 生成（推理不需要语料）
 # ═══════════════════════════════════════════
 cargo run --release -- train --config config.json
-cargo run --release -- generate --config config.json --prompt "Once upon a" --max-new 100
+# 训练完成后，推理只需 checkpoint，分词器自动加载
+cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
 
 # ═══════════════════════════════════════════
 #  使用预设配置（推荐）
@@ -80,9 +81,9 @@ cargo run --release -- preset --name medium --output config_medium.json
 cargo run --release -- train --config config_medium.json
 
 # ═══════════════════════════════════════════
-#  交互式对话
+#  交互式对话（训练后直接对话，无需语料）
 # ═══════════════════════════════════════════
-cargo run --release -- chat --config config.json
+cargo run --release -- chat --ckpt checkpoints/best.ckpt
 
 # ═══════════════════════════════════════════
 #  LoRA 微调（加载预训练模型，只训练低秩适配层）
@@ -124,6 +125,24 @@ cargo run --release -- train [参数]
 - `latest.ckpt` —— 最近一次评估的 checkpoint
 - `best.ckpt` —— 验证 loss 最优的 checkpoint
 - `final.ckpt` —— 训练结束时的 checkpoint
+- `tokenizer.json` —— 训练好的分词器（推理时自动加载，无需语料）
+
+**推理不需要语料文件**：训练完成后，`eval` / `generate` / `chat` 命令自动从 checkpoint 目录加载 `tokenizer.json`，不再需要 `train_file` 或语料。只需指定 `--ckpt` 即可：
+
+```bash
+# 训练
+cargo run --release -- train --config config.json
+# 推理（只需 checkpoint，分词器自动加载）
+cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
+cargo run --release -- chat --ckpt checkpoints/best.ckpt
+cargo run --release -- eval --ckpt checkpoints/best.ckpt
+```
+
+**分词器加载优先级**：
+1. `--tokenizer` 参数（命令行显式指定）
+2. `config.json` 的 `tokenizer_file` 字段
+3. `{out_dir}/tokenizer.json`（训练时自动保存的，推荐）
+4. 从 `train_file` 语料训练（兜底，不推荐）
 
 **示例**：
 
@@ -188,6 +207,7 @@ cargo run --release -- eval [参数]
 |------|------|--------|------|
 | `--config <路径>` | string | `config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 
 **评估指标**：
 - `val_loss` —— 验证集上的交叉熵损失
@@ -196,6 +216,9 @@ cargo run --release -- eval [参数]
 **示例**：
 
 ```bash
+# ── 最简评估（只需 checkpoint，分词器自动加载）──
+cargo run --release -- eval --ckpt checkpoints/best.ckpt
+
 # ── 基础评估 ──
 # 评估最新 checkpoint（默认 checkpoints/latest.ckpt）
 cargo run --release -- eval --config config.json
@@ -231,6 +254,7 @@ cargo run --release -- generate [参数]
 |------|------|--------|------|
 | `--config <路径>` | string | `config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--prompt <文本>` | string | `""`（空） | 初始提示词（模型从这里开始续写） |
 | `--max-new <数量>` | int | `100` | 最多生成的新 token 数 |
 | `--temperature <温度>` | float | `0.8` | 采样温度（>1 更随机，<1 更确定，0 = 贪心） |
@@ -238,12 +262,21 @@ cargo run --release -- generate [参数]
 | `--top-p <概率>` | float | `0.9` | top-p 采样：累积概率到 p 的最小集合 |
 | `--seed <种子>` | int | `42` | 随机种子（相同种子 + 相同参数 = 相同输出） |
 | `--no-kv-cache` | flag | 关闭 | 禁用 KV cache（每个新 token 都全量前向，慢但省内存） |
+| `--beam <束宽>` | int | 无（不用） | Beam Search 束宽（通常 4-10），指定后使用确定性搜索 |
+| `--length-penalty <α>` | float | `0.6` | Beam Search 长度惩罚（0=不惩罚，>0 偏好长序列） |
+
+**推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，推理时自动加载。
 
 **采样策略**：temperature 调整 → top-k 截断 → top-p 截断 → 按概率随机抽样
 
 **示例**：
 
 ```bash
+# ═══════════════════════════════════════════
+#  最简推理（只需 checkpoint，无需 config 和语料）
+# ═══════════════════════════════════════════
+cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Alice was" --max-new 100
+
 # ═══════════════════════════════════════════
 #  基础生成
 # ═══════════════════════════════════════════
@@ -425,6 +458,7 @@ cargo run --release -- chat [参数]
 |------|------|--------|------|
 | `--config <路径>` | string | `config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--system <文本>` | string | `""` | 系统提示词（在每次输入前附加） |
 | `--temperature <温度>` | float | `0.8` | 采样温度 |
 | `--top-k <数量>` | int | `40` | top-k 采样 |
@@ -432,17 +466,19 @@ cargo run --release -- chat [参数]
 | `--max-new <数量>` | int | `200` | 每次生成的最大 token 数 |
 | `--seed <种子>` | int | `42` | 随机种子 |
 
+**推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，对话时自动加载。
+
 **示例**：
 
 ```bash
-# ── 基础对话 ──
-cargo run --release -- chat --config config.json
+# ── 最简对话（只需 checkpoint，无需 config 和语料）──
+cargo run --release -- chat --ckpt checkpoints/best.ckpt
 
 # ── 带系统提示的对话 ──
-cargo run --release -- chat --config config.json --system "You are a helpful assistant."
+cargo run --release -- chat --ckpt checkpoints/best.ckpt --system "You are a helpful assistant."
 
 # ── 创意对话（高温采样）──
-cargo run --release -- chat --config config.json --temperature 1.0 --max-new 300
+cargo run --release -- chat --ckpt checkpoints/best.ckpt --temperature 1.0 --max-new 300
 ```
 
 ---

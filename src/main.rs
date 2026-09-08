@@ -51,10 +51,11 @@ fn main() {
     let cli = Cli::parse_args();
     match cli.cmd {
         Cmd::Train { config, resume } => cmd_train(&config, resume.as_deref()),
-        Cmd::Eval { config, ckpt } => cmd_eval(&config, ckpt.as_deref()),
+        Cmd::Eval { config, ckpt, tokenizer } => cmd_eval(&config, ckpt.as_deref(), tokenizer.as_deref()),
         Cmd::Generate {
             config,
             ckpt,
+            tokenizer,
             prompt,
             max_new,
             temperature,
@@ -67,6 +68,7 @@ fn main() {
         } => cmd_generate(
             &config,
             ckpt.as_deref(),
+            tokenizer.as_deref(),
             &prompt,
             max_new,
             temperature,
@@ -80,6 +82,7 @@ fn main() {
         Cmd::Chat {
             config,
             ckpt,
+            tokenizer,
             system,
             temperature,
             top_k,
@@ -89,6 +92,7 @@ fn main() {
         } => cmd_chat(
             &config,
             ckpt.as_deref(),
+            tokenizer.as_deref(),
             &system,
             temperature,
             top_k,
@@ -131,19 +135,63 @@ fn resolve_ckpt<'a>(ckpt: Option<&'a str>, out_dir: &str) -> std::borrow::Cow<'a
     }
 }
 
-/// 从 checkpoint 加载模型和分词器的通用辅助函数
+/// 从 checkpoint 加载模型和分词器的通用辅助函数（推理用）
+///
+/// 分词器加载策略（按优先级）：
+/// 1. `tokenizer_path` 参数（用户通过 --tokenizer 显式指定）
+/// 2. `tcfg.tokenizer_file`（config.json 中配置的路径）
+/// 3. 自动查找 `{out_dir}/tokenizer.json`（训练时自动保存的）
+/// 4. 最后才从语料训练（需要 train_file 存在）
 fn load_model_and_tokenizer(
     ckpt_path: &str,
     tcfg: &config::TrainConfig,
     seed: u64,
+    tokenizer_path: Option<&str>,
 ) -> (GPT, Tokenizer, checkpoint::Checkpoint) {
     let ckpt = checkpoint::load_header(ckpt_path);
-    let train_text = load_text(&tcfg.train_file);
-    let tokenizer = build_tokenizer(tcfg, &train_text, ckpt.model.vocab_size);
+    let tokenizer = if let Some(path) = tokenizer_path {
+        let loaded = Tokenizer::load(path);
+        if ckpt.model.vocab_size != 0 {
+            assert_eq!(loaded.vocab_size(), ckpt.model.vocab_size,
+                "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), ckpt.model.vocab_size);
+        }
+        println!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        loaded
+    } else {
+        load_tokenizer_for_inference(tcfg, ckpt.model.vocab_size)
+    };
     let mut rng = Rng::new(seed);
     let model = GPT::new(ckpt.model.clone(), &mut rng);
     checkpoint::load_params(ckpt_path, &model);
     (model, tokenizer, ckpt)
+}
+
+/// 推理时加载分词器：优先从文件加载，避免依赖语料
+fn load_tokenizer_for_inference(tcfg: &config::TrainConfig, expect_vocab: usize) -> Tokenizer {
+    // 1. 用户显式配置了 tokenizer_file
+    if let Some(ref path) = tcfg.tokenizer_file {
+        let loaded = Tokenizer::load(path);
+        if expect_vocab != 0 {
+            assert_eq!(loaded.vocab_size(), expect_vocab,
+                "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), expect_vocab);
+        }
+        println!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        return loaded;
+    }
+    // 2. 自动查找训练时保存的 tokenizer.json
+    let auto_path = format!("{}/tokenizer.json", tcfg.out_dir);
+    if std::path::Path::new(&auto_path).exists() {
+        let loaded = Tokenizer::load(&auto_path);
+        if expect_vocab != 0 {
+            assert_eq!(loaded.vocab_size(), expect_vocab,
+                "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), expect_vocab);
+        }
+        println!("分词器：从 {} 加载（{}，词表 {}）", auto_path, loaded.kind(), loaded.vocab_size());
+        return loaded;
+    }
+    // 3. 都没有，从语料训练（兜底）
+    let train_text = load_text(&tcfg.train_file);
+    build_tokenizer(tcfg, &train_text, expect_vocab)
 }
 
 #[cfg(not(windows))]
@@ -222,11 +270,11 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
 }
 
 /// 评估：在验证集上计算 loss 与困惑度
-fn cmd_eval(config_path: &str, ckpt_path: Option<&str>) {
+fn cmd_eval(config_path: &str, ckpt_path: Option<&str>, tokenizer_path: Option<&str>) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
-    let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed);
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed, tokenizer_path);
 
     let train_text = load_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
@@ -255,6 +303,7 @@ fn cmd_eval(config_path: &str, ckpt_path: Option<&str>) {
 fn cmd_generate(
     config_path: &str,
     ckpt_path: Option<&str>,
+    tokenizer_path: Option<&str>,
     prompt: &str,
     max_new: usize,
     temperature: f32,
@@ -268,7 +317,7 @@ fn cmd_generate(
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
-    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed);
+    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
     let mut rng = Rng::new(seed);
 
     if let Some(beam_size) = beam {
@@ -317,6 +366,7 @@ fn cmd_generate(
 fn cmd_chat(
     config_path: &str,
     ckpt_path: Option<&str>,
+    tokenizer_path: Option<&str>,
     system: &str,
     temperature: f32,
     top_k: usize,
@@ -327,7 +377,7 @@ fn cmd_chat(
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
-    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed);
+    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
     let mut rng = Rng::new(seed);
 
     println!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
@@ -424,7 +474,7 @@ fn cmd_finetune(
         lora_rank, lora_alpha, steps, lr
     );
 
-    let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed);
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed, None);
     let train_text = load_text(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
 
