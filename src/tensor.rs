@@ -231,6 +231,7 @@ fn transpose_flat(v: &[f32], rows: usize, cols: usize, batch: usize) -> Vec<f32>
 /// 掩码 softmax 的 CPU 参考实现（GPU 不可用或数组太小时回退用）。
 /// mask 必须是输入的右后缀：行 r 的掩码偏移 mb = (r*d) % mask_numel。
 /// 并行：每行独立 softmax，行间无依赖。
+#[cfg_attr(not(test), allow(dead_code))]
 fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * d];
     out.par_chunks_mut(d).enumerate().for_each(|(r, chunk)| {
@@ -583,6 +584,7 @@ impl Tensor {
         self.binary(other, |a, b| a * b, |a, b| (b, a))
     }
 
+    #[allow(dead_code)]
     pub fn div(&self, other: &Tensor) -> Tensor {
         self.binary(other, |a, b| a / b, |a, b| { let s = b + 1e-8; (1.0 / s, -a / (s * s)) })
     }
@@ -662,6 +664,7 @@ impl Tensor {
 
     // ---------- 标量运算 ----------
 
+    #[allow(dead_code)]
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
         let data = self.data.borrow().iter().map(|a| a + scalar).collect();
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
@@ -964,6 +967,7 @@ impl Tensor {
     }
 
     /// sqrt：c = sqrt(x)，∂x = g / (2c)
+    #[allow(dead_code)]
     pub fn sqrt(&self) -> Tensor {
         self.pow(0.5)
     }
@@ -1092,6 +1096,7 @@ impl Tensor {
     ///
     /// 数值稳定技巧：先减去每行最大值再 exp（防止指数爆炸）。
     /// 反向公式：∂x_i = s_i * (g_i - Σ_j g_j * s_j)
+    #[allow(dead_code)]
     pub fn softmax_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "softmax_last_dim 需要至少 1 维");
         let (rows, d) = (
@@ -1559,6 +1564,7 @@ impl Tensor {
     /// 每个元素对应的 mask 下标 = `flat % mask.numel()`。mask 中 -inf 的位置 softmax 后为 0。
     /// 反向与普通 softmax 相同（s=0 的位置梯度自然为 0，且 mask 是常量不需要梯度）。
     /// 一个算子替代 `add` + `softmax_last_dim` 两个算子，训练热路径里每层 block 一次。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn masked_softmax(&self, mask: &Tensor) -> Tensor {
         let d = *self.shape.last().unwrap();
         assert!(

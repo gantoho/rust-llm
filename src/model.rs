@@ -122,38 +122,18 @@ impl TransformerBlock {
         base: usize,
         training: bool,
     ) -> Tensor {
-        // [诊断] block 内部分段计时（仅前 2 次调用）
-        static BLK_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let blk_diag = BLK_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2;
-        let blk_t0 = std::time::Instant::now();
         // 注意力子层 + 残差连接
         let ln1_out = self.ln1.forward(x);
-        let t_ln1 = blk_t0.elapsed();
         let h = self
             .attn
             .forward(&ln1_out, mask, kv_cache, base);
-        let t_attn = blk_t0.elapsed();
         let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
         let x = x.add(&h);
-        let t_add1 = blk_t0.elapsed();
         // 前馈子层 + 残差连接
         let h = self.ln2.forward(&x);
-        let t_ln2 = blk_t0.elapsed();
         let h = self.mlp.forward(&h);
-        let t_mlp1 = blk_t0.elapsed();
         let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
         let out = x.add(&h);
-        if blk_diag {
-            println!(
-                "[diag-blk] ln1 {:.1} | attn {:.1} | res1 {:.1} | ln2 {:.1} | mlp {:.1} | 总 {:.1} ms",
-                t_ln1.as_secs_f64() * 1000.0,
-                (t_attn - t_ln1).as_secs_f64() * 1000.0,
-                (t_add1 - t_attn).as_secs_f64() * 1000.0,
-                (t_ln2 - t_add1).as_secs_f64() * 1000.0,
-                (t_mlp1 - t_ln2).as_secs_f64() * 1000.0,
-                blk_t0.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
         out
     }
 }
@@ -221,11 +201,6 @@ impl GPT {
         let d = self.cfg.n_embd;
         assert_eq!(idx.len(), b * t, "输入 id 数量必须等于 b*t");
 
-        // [诊断] forward 分段计时（仅前 2 次调用）
-        static FW_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let fw_diag = FW_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2;
-        let fw_t0 = std::time::Instant::now();
-
         // 1. token embedding
         let x = self.tok_emb.forward(idx).reshape(vec![b, t, d]);
         let x = if self.dropout > 0.0 { x.dropout(self.dropout, training) } else { x };
@@ -248,36 +223,18 @@ impl GPT {
             }
         }
         let mask = Tensor::from_vec(mask_data, vec![t, t_total]);
-        let t_emb_mask = fw_t0.elapsed();
 
         // 4. 逐层过 Transformer Block
         let mut x = x;
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = kv_cache.as_mut().map(|c| &mut c[i]);
-            let t_blk = std::time::Instant::now();
             x = block.forward(&x, &mask, cache, base, training);
-            if fw_diag {
-                println!(
-                    "[diag-fw] block {i}: {:.1}ms",
-                    t_blk.elapsed().as_secs_f64() * 1000.0
-                );
-            }
         }
-        let t_after_blocks = fw_t0.elapsed();
 
         // 5. 最终归一化 + 输出头（权重绑定：lm_head 复用 tok_emb.table 的转置）
         let x = self.ln_f.forward(&x);
         let x = x.reshape(vec![b * t, d]);
         let out = x.matmul(&self.tok_emb.table.transpose());
-        if fw_diag {
-            println!(
-                "[diag-fw] emb+mask {:.1}ms | blocks 共 {:.1}ms | ln_f+lm_head {:.1}ms | forward 总 {:.1}ms",
-                t_emb_mask.as_secs_f64() * 1000.0,
-                (t_after_blocks - t_emb_mask).as_secs_f64() * 1000.0,
-                (fw_t0.elapsed() - t_after_blocks).as_secs_f64() * 1000.0,
-                fw_t0.elapsed().as_secs_f64() * 1000.0
-            );
-        }
         out
     }
 

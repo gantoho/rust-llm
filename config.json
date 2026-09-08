@@ -8,7 +8,7 @@
     "n_kv_head": 0,
     "use_rmsnorm": false,
     "use_swiglu": false,
-    "dropout": 0.0
+    "dropout": 0.1
   },
   "train": {
     "seed": 42,
@@ -17,7 +17,7 @@
     "max_lr": 6e-4,
     "min_lr": 6e-5,
     "warmup_steps": 100,
-    "weight_decay": 0.01,
+    "weight_decay": 0.1,
     "grad_clip": 1.0,
     "eval_every": 250,
     "eval_iters": 20,
@@ -29,6 +29,7 @@
     "accum_steps": 1,
     "tokenizer_file": null,
     "lora": null,
-    "log_file": null
+    "log_file": null,
+    "early_stop_patience": 5
   }
 }

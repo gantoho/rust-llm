@@ -37,6 +37,9 @@ pub struct TrainConfig {
     /// 训练指标日志文件路径：每步记录 lr/loss/ppl 到 CSV。
     /// None 时不记录。Some(path) 时记录到指定文件。
     pub log_file: Option<String>,
+    /// 早停耐心值：验证 loss 连续 N 次评估不改善就提前终止训练。
+    /// 0 = 不启用早停（默认）。
+    pub early_stop_patience: usize,
 }
 
 /// LoRA 微调配置
@@ -68,6 +71,7 @@ impl Default for TrainConfig {
             tokenizer_file: None,
             lora: None,
             log_file: None,
+            early_stop_patience: 0,
         }
     }
 }

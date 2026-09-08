@@ -30,12 +30,48 @@ const SOFTMAX_MIN_ELEMS: usize = 200_000;
 static STATS_GPU: AtomicUsize = AtomicUsize::new(0);
 static STATS_CPU: AtomicUsize = AtomicUsize::new(0);
 
+/// GPU dispatch 诊断记录（前几次调用缓存，训练开始后统一打印）
+struct GpuDispatchDiag {
+    n: usize,
+    x: u32, y: u32, z: u32,
+    out_len: usize,
+    total_ms: f64,
+    upload_ms: f64,
+    dispatch_ms: f64,
+    sync_ms: f64,
+}
+static GPU_DIAG_LOG: Mutex<Vec<GpuDispatchDiag>> = Mutex::new(Vec::new());
+
 /// matmul 分流统计：(走 GPU 次数, 走 CPU 次数)，用于训练结束后向用户说明利用率。
 pub fn stats() -> (usize, usize) {
     (
         STATS_GPU.load(Ordering::Relaxed),
         STATS_CPU.load(Ordering::Relaxed),
     )
+}
+
+/// 打印启动阶段收集的 GPU dispatch 诊断摘要（训练开始前调用一次）
+pub fn flush_diag_log() {
+    let log: Vec<GpuDispatchDiag> = {
+        let mut v = GPU_DIAG_LOG.lock().unwrap();
+        std::mem::take(&mut *v)
+    };
+    if log.is_empty() {
+        return;
+    }
+    let avg_total: f64 = log.iter().map(|d| d.total_ms).sum::<f64>() / log.len() as f64;
+    let avg_sync: f64 = log.iter().map(|d| d.sync_ms).sum::<f64>() / log.len() as f64;
+    let avg_dispatch: f64 = log.iter().map(|d| d.dispatch_ms).sum::<f64>() / log.len() as f64;
+    println!(
+        "[gpu] 预热 {} 次 dispatch | 平均 {:.1}ms/次（调度 {:.1}ms + 同步 {:.1}ms）",
+        log.len(), avg_total, avg_dispatch, avg_sync,
+    );
+    for d in &log {
+        println!(
+            "[gpu]   #{} {}x{}x{} out={:<8} {:.1}ms",
+            d.n, d.x, d.y, d.z, d.out_len, d.total_ms,
+        );
+    }
 }
 
 /// buffer 池的三种用途（决定 usage 与归还键）
@@ -814,14 +850,15 @@ impl GpuContext {
         self.put_buf(readback);
         if diag_dump {
             let total = diag_t.elapsed();
-            println!(
-                "[diag] run#{} x={x} y={y} z={z} out={out_len} 总 {:.2}ms | 上传 {:.2}ms | 调度 {:.2}ms | 同步等待 {:.2}ms",
-                diag_n,
-                total.as_secs_f64() * 1000.0,
-                diag_t_upload.as_secs_f64() * 1000.0,
-                (diag_t_submit - diag_t_upload).as_secs_f64() * 1000.0,
-                (total - diag_t_sync).as_secs_f64() * 1000.0,
-            );
+            GPU_DIAG_LOG.lock().unwrap().push(GpuDispatchDiag {
+                n: diag_n,
+                x, y, z,
+                out_len,
+                total_ms: total.as_secs_f64() * 1000.0,
+                upload_ms: diag_t_upload.as_secs_f64() * 1000.0,
+                dispatch_ms: (diag_t_submit - diag_t_upload).as_secs_f64() * 1000.0,
+                sync_ms: (total - diag_t_sync).as_secs_f64() * 1000.0,
+            });
         }
         Some(result)
     }

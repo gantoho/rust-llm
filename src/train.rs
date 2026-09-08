@@ -295,31 +295,33 @@ pub fn train_gpt(
         println!("训练指标将记录到 {}", log_path.unwrap());
     }
 
+    // 打印启动阶段收集的 GPU 诊断摘要
+    #[cfg(feature = "gpu")]
+    crate::gpu::flush_diag_log();
+
     let mut eval_rng = Rng::new(cfg.seed); // 固定种子，评估结果可复现
+    let mut no_improve_count = 0usize; // 早停计数器
+    let patience = cfg.early_stop_patience; // 0 = 不启用
+    if patience > 0 {
+        println!("[info] 早停已启用：patience={}（连续 {} 次评估不改善则停止）", patience, patience);
+    }
     let mut final_loss = f32::INFINITY;
-    let diag_t0 = std::time::Instant::now(); // [诊断] 每步耗时
-    // [诊断] 分段计时（每步独立计量，避免累计误差）
-    let (mut s_fw, mut s_bw, mut s_opt) = (0.0f64, 0.0f64, 0.0f64);
+    let train_t0 = std::time::Instant::now();
     let accum = cfg.accum_steps.max(1);
     for step in start_step..cfg.steps {
         // 1. 采样 batch
         let (x, y) = loader.sample_batch(rng);
 
         // 2. 前向 + 损失（梯度累积时 loss 除以 accum_steps）
-        let t0 = std::time::Instant::now();
         let logits = model.forward(&x, batch_size, block_size, None, true);
         let loss = cross_entropy_loss(&logits, &y);
         let scaled_loss = loss.mul_scalar(1.0 / accum as f32);
-        s_fw += t0.elapsed().as_secs_f64();
 
         // 3. 反向（梯度自动累加到现有梯度上）
-        let t1 = std::time::Instant::now();
         scaled_loss.backward();
-        s_bw += t1.elapsed().as_secs_f64();
 
         // 每 accum 步才做一次梯度裁剪 + 优化器更新 + 清零
         if (step + 1) % accum == 0 || step + 1 == cfg.steps {
-            let t2 = std::time::Instant::now();
             // 4. 梯度裁剪
             clip_grad_norm(&params, cfg.grad_clip);
 
@@ -330,35 +332,8 @@ pub fn train_gpt(
 
             // 6. 清零梯度
             opt.zero_grad();
-            s_opt += t2.elapsed().as_secs_f64();
         }
         scheduler.step();
-
-        // [诊断] 周期性打印耗时与 GPU/CPU 分流
-        if (step + 1) % cfg.eval_every == 0 || step + 1 == cfg.steps {
-            let n = (step - start_step + 1) as f64;
-            let wall = diag_t0.elapsed().as_secs_f64();
-            let s_other = (wall - s_fw - s_bw - s_opt).max(0.0);
-            println!(
-                "[diag] step {} | 平均 {:.3}s/步 | fw {:.2}s | bw {:.2}s | opt {:.2}s | 采样 {:.2}s",
-                step + 1,
-                wall / n,
-                s_fw,
-                s_bw,
-                s_opt,
-                s_other
-            );
-            #[cfg(feature = "gpu")]
-            {
-                let (g, c) = crate::gpu::stats();
-                println!(
-                    "[diag]   matmul GPU {} / CPU {} | GPU {:.1} 次/步",
-                    g,
-                    c,
-                    g as f64 / n
-                );
-            }
-        }
 
         // 周期性评估 + 存 checkpoint
         let last = step + 1 == cfg.steps;
@@ -372,6 +347,16 @@ pub fn train_gpt(
             let is_best = val_loss.is_some_and(|v| v < best_val_loss);
             if is_best {
                 best_val_loss = val_loss.unwrap();
+                no_improve_count = 0;
+            } else if val_loss.is_some() && patience > 0 {
+                no_improve_count += 1;
+                if no_improve_count >= patience {
+                    println!(
+                        "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
+                        patience, best_val_loss, step + 1
+                    );
+                    break;
+                }
             }
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(dir).expect("创建 checkpoint 目录失败");
@@ -393,23 +378,26 @@ pub fn train_gpt(
                 }
             }
             // 计算 tokens/sec
-            let elapsed = diag_t0.elapsed().as_secs_f64().max(1e-9);
+            let elapsed = train_t0.elapsed().as_secs_f64().max(1e-9);
             let tokens_processed = (step - start_step + 1) as f64 * batch_size as f64 * block_size as f64;
             let tps = tokens_processed / elapsed;
             metrics.log(step + 1, scheduler.lr(), loss.item(), val_loss, tps);
 
             match val_loss {
-                Some(v) => println!(
-                    "step {:>5} | lr {:.6} | train_loss {:.4} | val_loss {:.4} | ppl {:.2} | {:.0} tok/s",
-                    step + 1,
-                    scheduler.lr(),
-                    loss.item(),
-                    v,
-                    v.exp(),
-                    tps
-                ),
+                Some(v) => {
+                    let marker = if is_best { " *" } else { "" };
+                    println!(
+                        "step {:>5} | lr {:.6} | loss {:.4} | val {:.4} (ppl {:.1}) | {:.0} tok/s{marker}",
+                        step + 1,
+                        scheduler.lr(),
+                        loss.item(),
+                        v,
+                        v.exp(),
+                        tps
+                    );
+                }
                 None => println!(
-                    "step {:>5} | lr {:.6} | train_loss {:.4} | {:.0} tok/s",
+                    "step {:>5} | lr {:.6} | loss {:.4} | {:.0} tok/s",
                     step + 1,
                     scheduler.lr(),
                     loss.item(),
@@ -420,6 +408,8 @@ pub fn train_gpt(
         final_loss = loss.item();
     }
 
+    let elapsed = train_t0.elapsed().as_secs_f64();
+    let steps_done = cfg.steps - start_step;
     if let Some(dir) = out_dir {
         checkpoint::save(
             &format!("{dir}/final.ckpt"),
@@ -428,14 +418,16 @@ pub fn train_gpt(
             cfg.steps,
             best_val_loss,
         );
-        println!("训练完成，checkpoint 已保存到 {dir}/（latest / best / final）");
+        println!(
+            "[done] checkpoint 已保存到 {dir}/ | 总耗时 {:.0}s | {:.1}s/步",
+            elapsed,
+            elapsed / steps_done.max(1) as f64,
+        );
     }
     #[cfg(feature = "gpu")]
     {
         let (gpu_calls, cpu_calls) = crate::gpu::stats();
-        println!(
-            "matmul 分流统计：GPU {gpu_calls} 次 / CPU {cpu_calls} 次（小矩阵走 CPU 更划算，GPU 只负责足够大的矩阵乘）"
-        );
+        println!("[done] matmul 分流：GPU {} / CPU {}", gpu_calls, cpu_calls);
     }
     if best_val_loss.is_finite() {
         best_val_loss
