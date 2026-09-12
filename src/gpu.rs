@@ -17,13 +17,12 @@ use std::sync::{Mutex, OnceLock};
 use pollster::block_on;
 
 /// matmul 最小规模阈值：FLOPs = 2·m·k·n·batch 低于该值时走 CPU。
-/// GPU 一次 dispatch 的固定开销（上传/调度/同步/下载）对小矩阵而言超过计算本身，
-/// 训练中 scores/attn 这类微型矩阵乘直接走 CPU 反而更快；
-/// 只有足够大的矩阵（如 QKV 投影、MLP、512×512 基准）才值得上 GPU。
-pub const MATMUL_MIN_FLOPS: usize = 200_000;
+/// GPU 一次 dispatch 的固定开销（上传/调度/同步/下载）~10ms，CPU 做 256×256 矩阵乘只需 ~0.1ms。
+/// 阈值 5000 万 FLOPs 适用于 n_embd=256 的小模型，让 QKV/MLP 投影（~2.68 亿 FLOPs）走 GPU；
+/// 更小的注意力头内积（head_dim=32，~1700 万 FLOPs）仍走 CPU。
+pub const MATMUL_MIN_FLOPS: usize = 50_000_000;
 
 /// softmax 最小规模阈值（元素数）：低于该值时走 CPU。
-/// 一次 GPU dispatch 固定 ~10ms 开销，元素太少不划算（推理单 token 的 softmax 走 CPU）。
 const SOFTMAX_MIN_ELEMS: usize = 200_000;
 
 // 分流统计：实际走 GPU 的次数 / 回退 CPU 的次数（含未启用 GPU 或尺寸不足）
@@ -400,14 +399,49 @@ fn create() -> Option<GpuContext> {
         backend_options: wgpu::BackendOptions::default(),
         display: None,
     });
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    }))
-    .ok()?;
+
+    // 枚举所有适配器，优先选择独显（DiscreteGpu），避免选到核显
+    let mut adapters: Vec<wgpu::Adapter> = block_on(instance.enumerate_adapters(backends));
+    if adapters.is_empty() {
+        eprintln!("[gpu] 未找到任何 GPU 适配器");
+        return None;
+    }
+    // 打印所有可用适配器供调试
+    for (i, a) in adapters.iter().enumerate() {
+        let info = a.get_info();
+        let device_type = match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => "DiscreteGpu",
+            wgpu::DeviceType::IntegratedGpu => "IntegratedGpu",
+            wgpu::DeviceType::Cpu => "Cpu",
+            _ => "Other",
+        };
+        println!("[gpu] 适配器 {}: {} ({}, {:?})", i, info.name, device_type, info.backend);
+    }
+    // 排序：独显优先，其次集成显卡
+    adapters.sort_by(|a, b| {
+        let da = a.get_info().device_type;
+        let db = b.get_info().device_type;
+        let pa = match da {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        };
+        let pb = match db {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        };
+        pa.cmp(&pb)
+    });
+    let adapter = adapters.into_iter().next()?;
     let info = adapter.get_info();
+    let device_type = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => "DiscreteGpu",
+        wgpu::DeviceType::IntegratedGpu => "IntegratedGpu",
+        wgpu::DeviceType::Cpu => "Cpu",
+        _ => "Other",
+    };
+    println!("[gpu] 已选择适配器: {} ({})", info.name, device_type);
     let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("llm_from_scratch"),
         required_features: wgpu::Features::empty(),

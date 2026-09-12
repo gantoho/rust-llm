@@ -73,6 +73,8 @@ cargo run --release -- train --config config.json
 # 训练完成后，推理只需 checkpoint，分词器自动加载
 cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
 
+cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "The" --max-new 200
+
 # ═══════════════════════════════════════════
 #  使用预设配置（推荐）
 # ═══════════════════════════════════════════
@@ -167,7 +169,7 @@ cargo run --release --features gpu -- train --config config.json --resume checkp
 
 # ── 不同模型规模的训练（修改 config.json）──
 # 小模型（教学用，秒级完成）：n_embd=64, n_layer=2, block_size=32
-# 中模型（几分钟）：n_embd=256, n_layer=4, block_size=128
+# 中模型（几分钟）：n_embd=256, n_layer=4, block_size=256
 # 大模型（需要耐心）：n_embd=512, n_layer=8, block_size=256
 
 # ── 不同分词器（修改 config.json 的 tokenizer 字段）──
@@ -671,11 +673,20 @@ cargo run --features gpu -- demo
 **支持的 GPU**：NVIDIA 独显、Intel 核显（Windows 走 DX12 / Vulkan，无需额外驱动）
 
 **加速范围**：
-- 批量矩阵乘（tiled 16×16 共享内存）—— QKV 投影、MLP 等大矩阵自动走 GPU
+- 批量矩阵乘（tiled 16×16 共享内存）—— 大矩阵自动走 GPU
 - 逐元素 scale / add / ReLU
-- 微型矩阵（注意力 scores 等）自动回退 CPU（GPU dispatch 开销 > 计算本身）
+- 小矩阵自动回退 CPU（GPU dispatch 开销 ~10ms > 计算本身 ~0.1ms）
 
-**分流策略**：FLOPs < 200,000 的矩阵走 CPU，其余走 GPU。训练结束时打印 `matmul 分流统计：GPU x 次 / CPU y 次`
+**GPU vs CPU 选择指南**：
+
+| 模型规模 | n_embd | 推荐 | 原因 |
+|----------|--------|------|------|
+| small（~2M） | 256 | **GPU** | FLOPs 阈值已调低至 5000 万，QKV/MLP 投影走 GPU |
+| medium（~15M） | 512 | **GPU** | 矩阵更大，GPU 加速明显 |
+| large（~85M） | 768 | **GPU** | 矩阵够大，GPU 充分利用 |
+| xlarge（~300M） | 1024+ | **GPU** | 矩阵足够大，GPU 加速显著 |
+
+**分流策略**：FLOPs < 5000 万的矩阵走 CPU（如注意力头内积），其余走 GPU。训练结束时打印 `matmul 分流：GPU X / CPU Y`
 
 **自动回退**：GPU 初始化失败或任何调用出错时，自动回退 CPU，不影响正确性
 
@@ -774,7 +785,7 @@ cargo run --features gpu -- demo
     "n_embd": 256,
     "n_head": 8,
     "n_layer": 4,
-    "block_size": 128,
+    "block_size": 256,
     "n_kv_head": 0,
     "use_rmsnorm": false,
     "use_swiglu": false,

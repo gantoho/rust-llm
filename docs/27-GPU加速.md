@@ -80,14 +80,17 @@ cargo run --release --features gpu -- train --config config.json
 逐元素算子（scale/relu/add）验证：通过
 ```
 
-> 注意：MX150 上 512×512 从 naive 的 57.6ms 只微降到 57.0ms——该规模下每次调用的
-> 固定开销（上传/调度/同步取回）已接近计算时间，共享内存的收益被抵消。大模型训练
-> （如 n_embd=256、block=128、batch=16）每步有几十次 GPU 矩阵乘**串行同步**，
-> 固定开销会累积，低端 GPU 上仍然偏慢。教学实现以"清晰、可回退"优先，不追求极致吞吐。
+> 注意：MX150（384 CUDA cores）每次 GPU dispatch 固定开销约 10ms。
+> 但手写 CPU 矩阵乘（朴素三重循环、无 SIMD/BLAS）的实际吞吐仅约 3.5 GFLOPS，
+> 远低于 GPU tiled 内核的计算速度。因此即使 n_embd=256 的小模型，GPU 仍然比 CPU 快：
+> 24 次矩阵乘 GPU 总开销约 240ms，而 CPU 朴素实现需要约 60 秒/步。
+> FLOPs 阈值已从 20 亿调低到 5000 万，让 QKV/MLP 投影（~5 亿 FLOPs）走 GPU，
+> 而更小的注意力头内积（head_dim=32，~2000 万 FLOPs）仍走 CPU。
+> 教学实现以"清晰、可回退"优先，不追求极致吞吐。
 
 ## 6. 动手练习
 
 1. 把 tiled 块从 16×16 改成 8×8 或 32×32，观察性能与占用率变化；
 2. 把 LayerNorm 也写成 WGSL 着色器，减少 CPU↔GPU 往返；
-3. 思考：为什么 GPU 矩阵乘没有"快 50x"？瓶颈在哪里（显存搬运、每次调用的同步取回）？
+3. 思考：为什么 GPU 矩阵乘没有"快 50x"？瓶颈在哪里（每次调用约 10ms 的同步取回开销、手写 CPU 实现无 SIMD/BLAS）？
 4. 进阶：把一次 forward/backward 的多次 dispatch 合并提交、只在最后同步一次（计算图）。

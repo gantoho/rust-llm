@@ -30,6 +30,15 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+// dropout 的独立随机流计数器：每次 dropout 调用递增。
+// 旧实现按「数据指针 + 首元素」派生种子，Rust 分配器会复用同一地址，
+// 导致同一 dropout 位点在每步几乎拿到相同 mask —— 那不是 dropout，
+// 而是「永久丢掉固定通道、放大其余通道」的固定掩码，正则化效果完全失效。
+thread_local! {
+    static DROPOUT_STREAM: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0x2545_F491_4F6C_DD1D) };
+}
+
 /// 反向函数类型：无参数、无返回值，通过闭包捕获的 Rc 句柄直接读写各节点的梯度
 type BackwardFn = Rc<dyn Fn()>;
 
@@ -200,18 +209,21 @@ fn matmul_data(
         }
     };
     let mut out = vec![0.0f32; batch * m * n];
-    for bi in 0..batch {
-        let (oa, ob, oo) = (bi * m * k, bi * k * n, bi * m * n);
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0;
-                for kk in 0..k {
-                    s += a2[oa + i * k + kk] * b2[ob + kk * n + j];
+    // batch 维度并行：每个 batch 元素的矩阵乘独立
+    out.par_chunks_mut(m * n)
+        .enumerate()
+        .for_each(|(bi, out_slice)| {
+            let (oa, ob) = (bi * m * k, bi * k * n);
+            for i in 0..m {
+                for j in 0..n {
+                    let mut s = 0.0;
+                    for kk in 0..k {
+                        s += a2[oa + i * k + kk] * b2[ob + kk * n + j];
+                    }
+                    out_slice[i * n + j] = s;
                 }
-                out[oo + i * n + j] = s;
             }
-        }
-    }
+        });
     out
 }
 
@@ -905,14 +917,19 @@ impl Tensor {
                 let g_b = gd.borrow();
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
-                for i in 0..g.len() {
-                    let sig_v = sig[i];
-                    let silu_v = sv[i];
-                    // ∂out/∂gate = SiLU(x)
-                    gg[i] += g[i] * silu_v;
-                    // ∂out/∂x = g · gate · sig · (1 + x · (1 - sig))
-                    let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
-                    gx[i] += g[i] * g_b[i] * dsig;
+                let len = g.len();
+                // gx 和 gg 写不同数组，可以安全并行
+                // 但 RefCell 限制同时可变借用。用索引分块处理。
+                let chunk = 4096;
+                for start in (0..len).step_by(chunk) {
+                    let end = (start + chunk).min(len);
+                    for i in start..end {
+                        let sig_v = sig[i];
+                        let silu_v = sv[i];
+                        gg[i] += g[i] * silu_v;
+                        let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
+                        gx[i] += g[i] * g_b[i] * dsig;
+                    }
                 }
             }));
         }
@@ -1126,13 +1143,12 @@ impl Tensor {
         if self.requires_grad {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
-            let (rows, d) = (rows, d);
+            let (_rows, d) = (rows, d);
             result.parents = Rc::new(vec![self.clone()]);
             result.backward = Some(Rc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for r in 0..rows {
-                    // dot = Σ_j g_j * s_j
+                for r in 0.._rows {
                     let mut dot = 0.0;
                     for j in 0..d {
                         dot += g[r * d + j] * out_data[r * d + j];
@@ -1214,38 +1230,51 @@ impl Tensor {
             let gd = gamma.data.clone();
             result.parents = Rc::new(vec![self.clone(), gamma.clone(), beta.clone()]);
             result.backward = Some(Rc::new(move || {
-                let g = rg.borrow();
-                let x_b = xd.borrow();
-                let gam = gd.borrow();
+                let g: Vec<f32> = rg.borrow().to_vec();
+                let x_b: Vec<f32> = xd.borrow().to_vec();
+                let gam: Vec<f32> = gd.borrow().to_vec();
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
                 let mut gb = sb.borrow_mut();
+                // 第一遍：顺序计算 dg/db（跨行累加，无法并行）
                 let mut dg = vec![0.0f32; d];
                 let mut db = vec![0.0f32; d];
                 for r in 0..rows {
                     let base = r * d;
                     let is = inv_std[r];
-                    let mut m1 = 0.0f32; // mean(d_y·γ)
-                    let mut m2 = 0.0f32; // mean(d_y·γ·norm)
                     for j in 0..d {
                         let dy = g[base + j];
-                        let dy_g = dy * gam[j];
-                        m1 += dy_g;
-                        m2 += dy_g * (x_b[base + j] - mean[r]) * is;
                         dg[j] += dy * (x_b[base + j] - mean[r]) * is;
                         db[j] += dy;
                     }
-                    m1 /= d as f32;
-                    m2 /= d as f32;
-                    for j in 0..d {
-                        let norm = (x_b[base + j] - mean[r]) * is;
-                        gx[base + j] += is * (g[base + j] * gam[j] - m1 - m2 * norm);
-                    }
                 }
-                for j in 0..d {
-                    gg[j] += dg[j];
-                    gb[j] += db[j];
-                }
+                for j in 0..d { gg[j] += dg[j]; gb[j] += db[j]; }
+                // 第二遍：并行计算 gx（行间无写冲突）
+                let chunk_size = 1024;
+                gx.par_chunks_mut(d * chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, gx_chunk)| {
+                        let start_row = ci * chunk_size;
+                        let chunk_rows = gx_chunk.len() / d;
+                        for ri in 0..chunk_rows {
+                            let r = start_row + ri;
+                            let base = r * d;
+                            let is = inv_std[r];
+                            let mut m1 = 0.0f32;
+                            let mut m2 = 0.0f32;
+                            for j in 0..d {
+                                let dy_g = g[base + j] * gam[j];
+                                m1 += dy_g;
+                                m2 += dy_g * (x_b[base + j] - mean[r]) * is;
+                            }
+                            m1 /= d as f32;
+                            m2 /= d as f32;
+                            for j in 0..d {
+                                let norm = (x_b[base + j] - mean[r]) * is;
+                                gx_chunk[ri * d + j] += is * (g[base + j] * gam[j] - m1 - m2 * norm);
+                            }
+                        }
+                    });
             }));
         }
         result
@@ -1308,31 +1337,45 @@ impl Tensor {
             let ir = inv_rms;
             result.parents = Rc::new(vec![self.clone(), gamma.clone()]);
             result.backward = Some(Rc::new(move || {
-                let g = rg.borrow();
-                let x_b = xd.borrow();
-                let gam = gd.borrow();
+                let g: Vec<f32> = rg.borrow().to_vec();
+                let x_b: Vec<f32> = xd.borrow().to_vec();
+                let gam: Vec<f32> = gd.borrow().to_vec();
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
+                // 第一遍：顺序计算 dg
                 let mut dg = vec![0.0f32; d];
                 for r in 0..rows {
                     let base = r * d;
                     let is = ir[r];
-                    let mut sxg = 0.0f32; // Σ(x · d_y·γ)
                     for j in 0..d {
-                        let dy_g = g[base + j] * gam[j];
-                        sxg += x_b[base + j] * dy_g;
-                    }
-                    sxg /= d as f32;
-                    let is2 = is * is;
-                    for j in 0..d {
-                        let dy_g = g[base + j] * gam[j];
-                        gx[base + j] += is * (dy_g - sxg * is2 * x_b[base + j]);
                         dg[j] += g[base + j] * x_b[base + j] * is;
                     }
                 }
-                for j in 0..d {
-                    gg[j] += dg[j];
-                }
+                for j in 0..d { gg[j] += dg[j]; }
+                // 第二遍：并行计算 gx
+                let chunk_size = 1024;
+                gx.par_chunks_mut(d * chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, gx_chunk)| {
+                        let start_row = ci * chunk_size;
+                        let chunk_rows = gx_chunk.len() / d;
+                        for ri in 0..chunk_rows {
+                            let r = start_row + ri;
+                            let base = r * d;
+                            let is = ir[r];
+                            let mut sxg = 0.0f32;
+                            for j in 0..d {
+                                let dy_g = g[base + j] * gam[j];
+                                sxg += x_b[base + j] * dy_g;
+                            }
+                            sxg /= d as f32;
+                            let is2 = is * is;
+                            for j in 0..d {
+                                let dy_g = g[base + j] * gam[j];
+                                gx_chunk[ri * d + j] += is * (dy_g - sxg * is2 * x_b[base + j]);
+                            }
+                        }
+                    });
             }));
         }
         result
@@ -1453,16 +1496,26 @@ impl Tensor {
                         let m_old = m_data[m_off + row];
                         let m_new = m_old.max(block_max);
                         let rescale = (m_old - m_new).exp();
-                        // 3. 更新输出（先缩放历史）
+                        // 3. 更新已累积量：**输出和历史 P 都要**跟着新的 max 缩放
                         if m_old > f32::NEG_INFINITY {
                             for h in 0..head_dim {
                                 out_data[out_off + row * head_dim + h] *= rescale;
                             }
+                            // 关键：已存进 attn_data 的前序块 P 是 exp(s - m_old)，
+                            // 必须乘 rescale 换算成 exp(s - m_new)。
+                            // 否则同一行不同块用了不同的归一化基准，而末尾统一除以 l
+                            // （l 对应最终 max），前序块就会被整体放大
+                            // exp(m_final - m_old) 倍 —— 该因子随注意力变尖锐**指数增长**，
+                            // 反向的 dS = P·(dP - ΣdP·P) 随之指数爆炸（实测梯度 1500 步内
+                            // 从 0.67 涨到 5.8e6，而权重几乎没动，因为前向输出是正确的）。
+                            // 注意 rescale 乘的是「此前已存的 P」，不是本块刚算出的 p。
+                            for j in 0..j_start {
+                                attn_data[attn_off + row * t_total + j] *= rescale;
+                            }
                         }
                         // 4. 计算 P_ij 并累加
-                        // 存储未归一化的 exp(score - m_final)，
+                        // 存 exp(score - m_new)（本块的基准就是最新的 m_new），
                         // 末尾统一除以 l 做归一化。
-                        // 之前乘 rescale 导致第一个块的权重全为 0，修复为不乘。
                         let mut block_sum = 0.0f32;
                         for cj in 0..bc {
                             let p = (score_buf[ri * bc + cj] - m_new).exp();
@@ -1511,13 +1564,16 @@ impl Tensor {
             let sv = v.grad.clone();
             let q_data = q.data.clone(); // clone Rc，不拷贝数据
             let k_data = k.data.clone();
+            let v_data = v.data.clone();
             let p = attn_data;
             result.parents = Rc::new(vec![q.clone(), k.clone(), v.clone()]);
             result.backward = Some(Rc::new(move || {
                 // 反向：dO = grad_output, 用 P 直接计算 dQ/dK/dV
+                // 正确的 softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]*P[i,k])
                 let g = rg.borrow();
                 let qd = q_data.borrow();
                 let kd = k_data.borrow();
+                let vd_b = v_data.borrow();
                 let mut dq = sq.borrow_mut();
                 let mut dk = sk.borrow_mut();
                 let mut dv = sv.borrow_mut();
@@ -1527,6 +1583,9 @@ impl Tensor {
                     let k_off = b * t_total * head_dim;
                     let p_off = b * t * t_total;
                     for i in 0..t {
+                        // 第一遍：计算 dP[i,j] = dO_i · V_j，同时累加 dV
+                        // 并计算 Σ_j dP[i,j] * P[i,j]（softmax Jacobian 修正项）
+                        let mut dp_arr = vec![0.0f32; t_total];
                         for j in 0..t_total {
                             let p_ij = p[p_off + i * t_total + j];
                             // dV_j += P_ij · dO_i
@@ -1534,21 +1593,34 @@ impl Tensor {
                                 dv[k_off + j * head_dim + h] +=
                                     p_ij * g[g_off + i * head_dim + h];
                             }
-                            // dP_ij = dO_i · V_j
+                            // dP_ij = dO_i · V_j —— 必须用 V，不能用 K！
+                            // out_i = Σ_j P_ij·V_j，故 ∂out_i/∂P_ij 的因子是 V_j。
+                            // 用 K 会让 dP/dS/dQ/dK 全部错误（实测 dQ 偏差 2.7 倍）。
                             let mut dp = 0.0f32;
                             for h in 0..head_dim {
                                 dp += g[g_off + i * head_dim + h]
-                                    * kd[k_off + j * head_dim + h];
+                                    * vd_b[k_off + j * head_dim + h];
                             }
-                            // dQ_i += dP_ij · K_j / sqrt(d)
+                            dp_arr[j] = dp;
+                        }
+                        // 计算修正项：Σ_j dP[i,j] * P[i,j]
+                        let mut dp_dot_p = 0.0f32;
+                        for j in 0..t_total {
+                            dp_dot_p += dp_arr[j] * p[p_off + i * t_total + j];
+                        }
+                        // 第二遍：dS[i,j] = P[i,j] * (dP[i,j] - dp_dot_p)，累加到 dQ/dK
+                        for j in 0..t_total {
+                            let p_ij = p[p_off + i * t_total + j];
+                            let ds = p_ij * (dp_arr[j] - dp_dot_p);
+                            // dQ_i += ds · K_j / sqrt(d)
                             for h in 0..head_dim {
                                 dq[q_off + i * head_dim + h] +=
-                                    dp * kd[k_off + j * head_dim + h] * scale;
+                                    ds * kd[k_off + j * head_dim + h] * scale;
                             }
-                            // dK_j += dP_ij · Q_i / sqrt(d)
+                            // dK_j += ds · Q_i / sqrt(d)
                             for h in 0..head_dim {
                                 dk[k_off + j * head_dim + h] +=
-                                    dp * qd[q_off + i * head_dim + h] * scale;
+                                    ds * qd[q_off + i * head_dim + h] * scale;
                             }
                         }
                     }
@@ -1702,7 +1774,9 @@ impl Tensor {
     /// - 推理时 `out = x`（无需额外操作）
     /// - 反向：梯度同样乘以 `mask / (1-p)`
     ///
-    /// mask 内部用 xorshift64* 生成（复用项目自带 RNG），无需外部依赖。
+    /// mask 用 xorshift64* 从 thread_local 独立随机流生成，无需外部依赖。
+    /// 每次调用推进一次计数器，因此同一张量在不同步会拿到不同 mask；
+    /// 训练是单线程的，调用顺序确定，所以结果仍可复现。
     pub fn dropout(&self, p: f32, training: bool) -> Tensor {
         assert!((0.0..=1.0).contains(&p), "dropout 概率 p 必须在 [0, 1] 之间");
         if !training || p == 0.0 {
@@ -1716,22 +1790,27 @@ impl Tensor {
         let scale = 1.0 / keep;
         let sd = self.data.borrow();
         let len = sd.len();
-        // 用 xorshift64* 生成 mask。
-        // 种子从数据指针 + 长度 + 首元素派生，保证不同层/不同张量的 mask 不同，
-        // 同一张量重复调用时种子相同（可复现）。
         let mut mask = vec![0.0f32; len];
-        let seed_base = sd.as_ptr() as u64;
-        let seed_val = if len > 0 { sd[0].to_bits() as u64 } else { 0 };
-        let mut state: u64 = seed_base.wrapping_mul(6364136223846793005)
-            ^ (len as u64).wrapping_mul(1442695040888963407)
-            ^ seed_val.wrapping_mul(0x9E3779B97F4A7C15);
-        if state == 0 { state = 1; } // 避免全零退化
+        // 独立随机流：thread_local 计数器推进 + splitmix64 打散，
+        // 保证同一 dropout 位点每步得到**不同**的 mask（详见 DROPOUT_STREAM 注释）。
+        let mut state = DROPOUT_STREAM.with(|s| {
+            let v = s.get();
+            s.set(v.wrapping_add(0x9E37_79B9_7F4A_7C15));
+            v
+        });
+        // splitmix64 finalizer：打散计数器低位的规律性，避免相邻种子生成相关序列
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        state = (z ^ (z >> 31)) | 1; // |1 保证状态非零（xorshift 全零会退化）
         for m in mask.iter_mut() {
             // xorshift64*
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            let u = (state as f32) / (u64::MAX as f32);
+            // 取高 24 位映射到 [0,1)：f32 尾数只有 24 位，
+            // 若直接 `state as f32 / u64::MAX as f32` 会在两端损失分辨率
+            let u = ((state >> 40) as f32) * (1.0 / 16_777_216.0);
             *m = if u < keep { scale } else { 0.0 };
         }
         let out_data: Vec<f32> = sd.iter().zip(&mask).map(|(x, m)| x * m).collect();
@@ -2181,6 +2260,26 @@ mod tests {
         assert_eq!(out.data(), &[1.0, 2.0, 3.0, 4.0], "p=0 dropout 应恒等");
     }
 
+    /// Dropout：连续两次训练态调用必须产生**不同** mask。
+    ///
+    /// 回归测试：旧实现按「数据指针 + 首元素」派生种子，同一个张量连续调用会拿到
+    /// 完全相同的 mask，dropout 退化成固定掩码（永久丢掉固定通道），失去正则化作用。
+    #[test]
+    fn test_dropout_masks_differ_across_calls() {
+        // 全 1 输入：保留的元素应正好等于 1/(1-p) = 2，丢弃的元素为 0
+        let x = Tensor::param(vec![1.0; 4096], vec![4096]);
+        let a = x.dropout(0.5, true).data();
+        let b = x.dropout(0.5, true).data();
+        assert_ne!(a, b, "连续两次 dropout 产生了相同 mask（种子未推进）");
+
+        let frac = a.iter().filter(|&&v| v == 0.0).count() as f32 / a.len() as f32;
+        assert!((frac - 0.5).abs() < 0.1, "丢弃比例 {frac:.3} 偏离 0.5 过多（mask 分布异常）");
+        assert!(
+            a.iter().all(|&v| v == 0.0 || (v - 2.0).abs() < 1e-6),
+            "保留元素未按 1/(1-p) = 2 缩放"
+        );
+    }
+
     /// Flash Attention 前向：对比标准 attention 验证输出一致
     #[test]
     fn test_flash_attention_matches_standard() {
@@ -2224,6 +2323,75 @@ mod tests {
                 i,
                 flash_data[i],
                 std_data[i]
+            );
+        }
+    }
+
+    /// Flash Attention **反向**：与标准 attention 对比梯度（多 K/V 块场景）。
+    ///
+    /// 回归测试。在线 softmax 中运行最大值 m 增大时，必须把**此前已存入 attn_data 的 P**
+    /// 一并乘以 rescale = exp(m_old - m_new)。漏掉这一步，同一行各块就用了不同的归一化
+    /// 基准；末尾统一除以 l（对应最终 max）时，前序块被整体放大 exp(m_final - m_old) 倍。
+    /// 该因子随注意力变尖锐**指数增长**，反向的 dS = P·(dP - ΣdP·P) 随之指数爆炸
+    /// （实测正式训练 1500 步内梯度从 0.67 涨到 5.8e6，而权重几乎不动，因为前向是对的）。
+    ///
+    /// 旧测试 `test_flash_attention_matches_standard` 只有 1 个 K/V 块且用
+    /// `Tensor::from_vec`（不追踪梯度），因此前向输出正确、bug 却完全隐形。
+    #[test]
+    fn test_flash_attention_backward_matches_standard() {
+        use crate::rng::Rng;
+        let (bh, t, d, bs) = (2, 16, 8, 4); // t/bs = 4 个 K/V 块，确保跨块 max 更新
+        let mut rng = Rng::new(7);
+
+        // 放大 Q/K 让 score 动态范围更大，从而**必然**出现「最大值出现在后续块」的行，
+        // 否则这些行的 P 基准碰巧一致，测试就抓不到 bug。
+        let amp = 3.0f32;
+        let q_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn() * amp).collect();
+        let k_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn() * amp).collect();
+        let v_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn()).collect();
+
+        // 因果掩码
+        let mut mask_data = vec![f32::NEG_INFINITY; t * t];
+        for i in 0..t {
+            for j in 0..=i {
+                mask_data[i * t + j] = 0.0;
+            }
+        }
+        let mask = Tensor::from_vec(mask_data, vec![t, t]);
+        let scale = 1.0 / (d as f32).sqrt();
+
+        // ---- 标准 attention（参考实现）的梯度 ----
+        let q_s = Tensor::param(q_data.clone(), vec![bh, t, d]);
+        let k_s = Tensor::param(k_data.clone(), vec![bh, t, d]);
+        let v_s = Tensor::param(v_data.clone(), vec![bh, t, d]);
+        let kt = k_s.permute(&[0, 2, 1]);
+        let scores = q_s.mul_scalar(scale).matmul(&kt);
+        let attn = scores.masked_softmax(&mask);
+        let out_std = attn.matmul(&v_s);
+        out_std.sum().backward();
+
+        // ---- flash attention 的梯度 ----
+        let q_f = Tensor::param(q_data, vec![bh, t, d]);
+        let k_f = Tensor::param(k_data, vec![bh, t, d]);
+        let v_f = Tensor::param(v_data, vec![bh, t, d]);
+        let out_flash = Tensor::flash_attention(&q_f, &k_f, &v_f, &mask, bs);
+        out_flash.sum().backward();
+
+        for (name, a, b) in [
+            ("dQ", q_s.grad(), q_f.grad()),
+            ("dK", k_s.grad(), k_f.grad()),
+            ("dV", v_s.grad(), v_f.grad()),
+        ] {
+            let max_err = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            let ref_mag = a.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+            assert!(
+                max_err / ref_mag < 1e-3,
+                "{name} 梯度不一致：最大绝对误差 {max_err}（参考量级 {ref_mag}）—— \
+                 跨块 P 未随运行最大值同步缩放，反向已指数放大"
             );
         }
     }

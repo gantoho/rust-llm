@@ -23,26 +23,44 @@ pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
 ///
 /// 公式：loss = -mean( log_softmax(logits)[i, targets[i]] )
 ///
-/// 实现使用 log-sum-exp 技巧（`log_softmax_last_dim`），
-/// 避免先算 softmax（可能下溢到 0）再取 log（log(0) = -inf）的问题。
+/// 使用 gather 索引直接取正确类别的 log_prob，避免分配 [B, vocab_size] 的 one-hot 矩阵。
 pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     assert_eq!(logits.rank(), 2, "交叉熵的 logits 应为 [B, D]");
     let (b, d) = (logits.shape()[0], logits.shape()[1]);
-
-    // one-hot 编码：正确类别位置为 1，其余为 0
-    let mut onehot = vec![0.0f32; b * d];
-    for (i, &t) in targets.iter().enumerate() {
+    for &t in targets {
         assert!(t < d, "目标类别越界：{} >= {}", t, d);
-        onehot[i * d + t] = 1.0;
     }
-    let oh = Tensor::from_vec(onehot, vec![b, d]);
 
-    // log_softmax（数值稳定）→ 用 one-hot 取出正确类别的 log 概率 → 取负求均值
     let log_probs = logits.log_softmax_last_dim();
-    log_probs
-        .mul(&oh)
-        .sum_last_dim()
-        .neg()
-        .sum()
-        .mul_scalar(1.0 / b as f32)
+
+    // gather 操作：直接取 log_probs[i, targets[i]]，省掉 one-hot 分配和乘法
+    let lp = log_probs.data.borrow();
+    let mut gathered = vec![0.0f32; b];
+    for (i, &t) in targets.iter().enumerate() {
+        gathered[i] = lp[i * d + t];
+    }
+    drop(lp);
+
+    // 构建标量 loss = -mean(gathered)
+    let mean_loss: f32 = -gathered.iter().sum::<f32>() / b as f32;
+    let mut result = Tensor::new(vec![mean_loss], vec![], log_probs.requires_grad);
+    if log_probs.requires_grad {
+        let rg = result.grad.clone();
+        let sg = log_probs.grad.clone();
+        let targets_rc = std::rc::Rc::new(targets.to_vec());
+        let b2 = b;
+        let d2 = d;
+        result.parents = std::rc::Rc::new(vec![log_probs]);
+        result.backward = Some(std::rc::Rc::new(move || {
+            let g = rg.borrow()[0];
+            let mut sgm = sg.borrow_mut();
+            let t = targets_rc.clone();
+            // 反向：d_loss/d_log_probs[i, targets[i]] = -1/B，其余为 0
+            let scale = -g / b2 as f32;
+            for (i, &tgt) in t.iter().enumerate() {
+                sgm[i * d2 + tgt] += scale;
+            }
+        }));
+    }
+    result
 }

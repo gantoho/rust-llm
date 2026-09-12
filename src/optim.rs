@@ -130,18 +130,25 @@ impl Optimizer for AdamW {
         self.t += 1;
         let bc1 = 1.0 - self.beta1.powi(self.t as i32);
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+        let lr = self.lr;
+        let beta1 = self.beta1;
+        let beta2 = self.beta2;
+        let eps = self.eps;
+        let wd = self.weight_decay;
 
-        for (i, p) in self.params.iter().enumerate() {
-            let g = p.grad.borrow();
-            let mut d = p.data.borrow_mut();
+        for i in 0..self.params.len() {
+            let g = self.params[i].grad.borrow();
+            let mut d = self.params[i].data.borrow_mut();
+            let mi = &mut self.m[i];
+            let vi = &mut self.v[i];
             for j in 0..d.len() {
                 let gv = g[j];
-                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * gv;
-                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * gv * gv;
-                let m_hat = self.m[i][j] / bc1;
-                let v_hat = self.v[i][j] / bc2;
-                let step = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                let decay = self.lr * self.weight_decay * d[j];
+                mi[j] = beta1 * mi[j] + (1.0 - beta1) * gv;
+                vi[j] = beta2 * vi[j] + (1.0 - beta2) * gv * gv;
+                let m_hat = mi[j] / bc1;
+                let v_hat = vi[j] / bc2;
+                let step = lr * m_hat / (v_hat.sqrt() + eps);
+                let decay = lr * wd * d[j];
                 d[j] = d[j] - step - decay;
             }
         }

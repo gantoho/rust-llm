@@ -218,6 +218,8 @@ impl Module for MultiHeadAttention {
 ///
 /// 例如 n_kv_head=2, n_rep=4 时：
 /// [head0, head1] -> [head0, head0, head0, head0, head1, head1, head1, head1]
+///
+/// 反向：将 n_rep 个重复副本的梯度求和回原始 KV 头。
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
     if n_rep == 1 {
         return x.clone();
@@ -226,7 +228,7 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
     assert_eq!(shape.len(), 3, "repeat_kv 输入必须为 3D");
     let (batch_kv, t, head_dim) = (shape[0], shape[1], shape[2]);
     let batch = batch_kv * n_rep;
-    let xd = x.data();
+    let xd = x.data.borrow();
     let mut out = vec![0.0f32; batch * t * head_dim];
     for b in 0..batch_kv {
         let src = &xd[b * t * head_dim..(b + 1) * t * head_dim];
@@ -235,5 +237,29 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
             out[dst_start..dst_start + t * head_dim].copy_from_slice(src);
         }
     }
-    Tensor::from_vec(out, vec![batch, t, head_dim])
+    drop(xd);
+
+    let mut result = Tensor::new(out, vec![batch, t, head_dim], x.requires_grad);
+    if x.requires_grad {
+        let rg = result.grad.clone();
+        let sg = x.grad.clone();
+        let n_rep2 = n_rep;
+        let elems = t * head_dim;
+        result.parents = Rc::new(vec![x.clone()]);
+        result.backward = Some(Rc::new(move || {
+            let g = rg.borrow();
+            let mut sgm = sg.borrow_mut();
+            // 反向：将 n_rep 个副本的梯度求和回原始头
+            for b in 0..batch_kv {
+                let dst_base = b * elems;
+                for r in 0..n_rep2 {
+                    let src_base = (b * n_rep2 + r) * elems;
+                    for i in 0..elems {
+                        sgm[dst_base + i] += g[src_base + i];
+                    }
+                }
+            }
+        }));
+    }
+    result
 }

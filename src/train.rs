@@ -307,7 +307,11 @@ pub fn train_gpt(
     }
     let mut final_loss = f32::INFINITY;
     let train_t0 = std::time::Instant::now();
+    let mut last_progress_t = train_t0; // 上次打印进度的时间
+    let progress_interval = 5.0; // 每 5 秒打印一次进度
     let accum = cfg.accum_steps.max(1);
+    // 实际完成到的步数：早停会提前退出，结尾统计与 final.ckpt 都不能用 cfg.steps
+    let mut last_step_done = start_step;
     for step in start_step..cfg.steps {
         // 1. 采样 batch
         let (x, y) = loader.sample_batch(rng);
@@ -322,6 +326,32 @@ pub fn train_gpt(
 
         // 每 accum 步才做一次梯度裁剪 + 优化器更新 + 清零
         if (step + 1) % accum == 0 || step + 1 == cfg.steps {
+            // 周期性打印进度（在 zero_grad 之前，此时梯度有效）
+            {
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_progress_t).as_secs_f64();
+                if dt >= progress_interval {
+                    let elapsed = now.duration_since(train_t0).as_secs_f64();
+                    let steps_done = step - start_step + 1;
+                    let steps_per_sec = steps_done as f64 / elapsed;
+                    let remaining = (cfg.steps - step - 1) as f64 / steps_per_sec.max(0.001);
+                    let tps = steps_done as f64 * batch_size as f64 * block_size as f64 / elapsed;
+                    // 裁剪**前**的原始梯度范数，末尾 `*` 表示本步会触发裁剪。
+                    // 不能打印 min(raw, grad_clip)：那样范数恒被压在阈值上限，
+                    // 梯度是否爆炸、裁剪是否频繁完全看不出来（曾经因此漏判梯度异常）。
+                    let raw_norm: f32 = params.iter().map(|p| {
+                        p.grad.borrow().iter().map(|g| g * g).sum::<f32>()
+                    }).sum::<f32>().sqrt();
+                    let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
+                    println!(
+                        "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | {:.0}s | ~{:.0}s",
+                        step + 1, cfg.steps, loss.item(), raw_norm, clipped, scheduler.lr(),
+                        steps_per_sec, tps, elapsed, remaining
+                    );
+                    last_progress_t = now;
+                }
+            }
+
             // 4. 梯度裁剪
             clip_grad_norm(&params, cfg.grad_clip);
 
@@ -332,12 +362,15 @@ pub fn train_gpt(
 
             // 6. 清零梯度
             opt.zero_grad();
+
+            // 学习率调度：只在 optimizer 实际更新后递增
+            scheduler.step();
         }
-        scheduler.step();
 
         // 周期性评估 + 存 checkpoint
         let last = step + 1 == cfg.steps;
         if (step + 1) % cfg.eval_every == 0 || last {
+            last_step_done = step + 1;
             let val_loss = if loader.has_val() {
                 Some(eval_loss(model, loader, cfg.eval_iters, &mut eval_rng))
             } else {
@@ -345,19 +378,17 @@ pub fn train_gpt(
             };
             // 仅在本次验证 loss 严格更优时刷新 best（同时避免用 f32 相等比较）
             let is_best = val_loss.is_some_and(|v| v < best_val_loss);
+            let mut should_stop = false;
             if is_best {
                 best_val_loss = val_loss.unwrap();
                 no_improve_count = 0;
             } else if val_loss.is_some() && patience > 0 {
                 no_improve_count += 1;
-                if no_improve_count >= patience {
-                    println!(
-                        "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
-                        patience, best_val_loss, step + 1
-                    );
-                    break;
-                }
+                should_stop = no_improve_count >= patience;
             }
+            // 早停不能在此处直接 break：必须先存 checkpoint、写指标、打印本步评估行。
+            // 否则最后一次评估会从日志里消失，且 latest.ckpt 停留在上一次评估
+            //（断点续训会拿到落后一个 eval 周期的过期权重）。真正 break 在块末尾。
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(dir).expect("创建 checkpoint 目录失败");
                 checkpoint::save(
@@ -404,24 +435,36 @@ pub fn train_gpt(
                     tps
                 ),
             }
+
+            // 至此 checkpoint 已保存、指标已记录、评估行已打印，可以安全早停
+            if should_stop {
+                println!(
+                    "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
+                    patience, best_val_loss, step + 1
+                );
+                break;
+            }
         }
         final_loss = loss.item();
     }
 
     let elapsed = train_t0.elapsed().as_secs_f64();
-    let steps_done = cfg.steps - start_step;
+    // 实际完成的步数：早停时小于 cfg.steps - start_step，用 cfg.steps 会让「每步耗时」
+    // 被系统性低估（分母偏大）。
+    let steps_done = last_step_done.saturating_sub(start_step).max(1);
     if let Some(dir) = out_dir {
         checkpoint::save(
             &format!("{dir}/final.ckpt"),
             model,
             &opt,
-            cfg.steps,
+            last_step_done,
             best_val_loss,
         );
         println!(
-            "[done] checkpoint 已保存到 {dir}/ | 总耗时 {:.0}s | {:.1}s/步",
+            "[done] checkpoint 已保存到 {dir}/ | 总耗时 {:.0}s | {:.2}s/步（共 {} 步）",
             elapsed,
-            elapsed / steps_done.max(1) as f64,
+            elapsed / steps_done as f64,
+            steps_done,
         );
     }
     #[cfg(feature = "gpu")]

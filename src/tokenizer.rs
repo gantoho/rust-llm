@@ -75,7 +75,8 @@ impl CharTokenizer {
             .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
     }
 
-    /// 从文件加载
+    /// 从文件加载（独立使用，Tokenizer::load 会自动调用 from_json 避免重复读文件）
+    #[allow(dead_code)]
     pub fn load(path: &str) -> Self {
         let mut f = std::fs::File::open(path)
             .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
@@ -84,6 +85,11 @@ impl CharTokenizer {
             .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
         let json: serde_json::Value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
+        Self::from_json(&json)
+    }
+
+    /// 从已解析的 JSON 值构造
+    pub fn from_json(json: &serde_json::Value) -> Self {
         let chars: Vec<char> = json["chars"]
             .as_array()
             .expect("分词器文件格式错误：缺少 chars 字段")
@@ -219,7 +225,8 @@ impl BPETokenizer {
             .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
     }
 
-    /// 从文件加载
+    /// 从文件加载（独立使用，Tokenizer::load 会自动调用 from_json 避免重复读文件）
+    #[allow(dead_code)]
     pub fn load(path: &str) -> Self {
         let mut f = std::fs::File::open(path)
             .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
@@ -228,6 +235,11 @@ impl BPETokenizer {
             .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
         let json: serde_json::Value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
+        Self::from_json(&json)
+    }
+
+    /// 从已解析的 JSON 值构造
+    pub fn from_json(json: &serde_json::Value) -> Self {
         let merges: Vec<(u16, u16)> = json["merges"]
             .as_array()
             .expect("分词器文件格式错误：缺少 merges 字段")
@@ -321,7 +333,7 @@ impl Tokenizer {
         }
     }
 
-    /// 从文件加载分词器（自动识别 char/bpe 类型）
+    /// 从文件加载分词器（自动识别 char/bpe 类型，只读一次文件）
     pub fn load(path: &str) -> Self {
         let mut f = std::fs::File::open(path)
             .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
@@ -334,8 +346,8 @@ impl Tokenizer {
             .as_str()
             .expect("分词器文件格式错误：缺少 type 字段");
         match typ {
-            "char" => Tokenizer::Char(CharTokenizer::load(path)),
-            "bpe" => Tokenizer::Bpe(BPETokenizer::load(path)),
+            "char" => Tokenizer::Char(CharTokenizer::from_json(&json)),
+            "bpe" => Tokenizer::Bpe(BPETokenizer::from_json(&json)),
             other => panic!("未知分词器类型 '{}'（可选：char / bpe）", other),
         }
     }

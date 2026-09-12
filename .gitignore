@@ -2,4 +2,6 @@
 .trae
 # 训练产物：checkpoint 目录与临时日志
 /checkpoints
+/checkpoints*
+config*.json
 *.log

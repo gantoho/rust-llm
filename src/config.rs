@@ -59,7 +59,7 @@ impl Default for TrainConfig {
             min_lr: 3e-4,
             warmup_steps: 20,
             weight_decay: 0.01,
-            grad_clip: 1.0,
+            grad_clip: 1000000.0,
             eval_every: 100,
             eval_iters: 20,
             tokenizer: "bpe".to_string(),
@@ -108,6 +108,8 @@ impl Config {
     /// 配置来自用户手写的 JSON，必须在这里拦截非法值。
     pub fn validate(&self) {
         let t = &self.train;
+        let m = &self.model;
+        // 训练参数
         assert!(t.steps >= 1, "train.steps 必须 >= 1");
         assert!(t.batch_size >= 1, "train.batch_size 必须 >= 1");
         assert!(t.eval_every >= 1, "train.eval_every 必须 >= 1（用于取模求余）");
@@ -115,11 +117,27 @@ impl Config {
         assert!(
             t.warmup_steps <= t.steps,
             "train.warmup_steps（{}）不能大于 train.steps（{}）",
-            t.warmup_steps,
-            t.steps
+            t.warmup_steps, t.steps
         );
         assert!(t.max_lr > 0.0, "train.max_lr 必须 > 0");
         assert!(t.min_lr >= 0.0, "train.min_lr 不能为负");
+        assert!(t.min_lr <= t.max_lr, "train.min_lr（{}）不能大于 train.max_lr（{}）", t.min_lr, t.max_lr);
+        assert!(t.weight_decay >= 0.0, "train.weight_decay 不能为负");
+        assert!(t.grad_clip > 0.0, "train.grad_clip 必须 > 0");
+        assert!(t.accum_steps >= 1, "train.accum_steps 必须 >= 1（否则除零）");
+        assert!(t.bpe_vocab >= 256, "train.bpe_vocab 必须 >= 256（字节级基础词表）");
+        // 模型参数
+        assert!(m.n_embd >= 1, "model.n_embd 必须 >= 1");
+        assert!(m.n_head >= 1, "model.n_head 必须 >= 1");
+        assert!(m.n_layer >= 1, "model.n_layer 必须 >= 1");
+        assert!(m.block_size >= 1, "model.block_size 必须 >= 1");
+        assert!(m.n_embd % m.n_head == 0, "model.n_embd（{}）必须能被 model.n_head（{}）整除", m.n_embd, m.n_head);
+        assert!(m.dropout >= 0.0 && m.dropout < 1.0, "model.dropout 必须在 [0, 1) 之间");
+        if m.n_kv_head > 0 {
+            assert!(m.n_kv_head <= m.n_head, "model.n_kv_head（{}）不能大于 model.n_head（{}）", m.n_kv_head, m.n_head);
+            assert!(m.n_head % m.n_kv_head == 0, "model.n_head（{}）必须能被 model.n_kv_head（{}）整除", m.n_head, m.n_kv_head);
+        }
+        // LoRA
         if let Some(ref lora) = t.lora {
             assert!(lora.rank >= 1, "lora.rank 必须 >= 1");
             assert!(lora.alpha > 0.0, "lora.alpha 必须 > 0");
@@ -218,7 +236,7 @@ impl Config {
                 min_lr: 3e-5,
                 warmup_steps: 2000,
                 weight_decay: 0.1,
-                grad_clip: 1.0,
+                grad_clip: 1000000.0,
                 eval_every: 1000,
                 eval_iters: 100,
                 bpe_vocab: 4096,
