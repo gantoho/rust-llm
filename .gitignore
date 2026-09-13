@@ -3,5 +3,9 @@
 # 训练产物：checkpoint 目录与临时日志
 /checkpoints
 /checkpoints*
+# 备份用的 checkpoint 目录（如 ckpt_240kb / ckpt_preflashfix），单个 100MB+
+/ckpt_*
 config*.json
 *.log
+# 重定向出来的 stderr 文件（如 probe.err）
+*.err
