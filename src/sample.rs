@@ -106,19 +106,22 @@ pub fn generate(
         let start = ids.len().saturating_sub(block_size);
         let ctx = &ids[start..];
 
-        let logits = if use_kv_cache {
-            // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
-            // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-            let c = cache.as_mut().unwrap();
-            if c[0].seq_len() == 0 {
-                model.forward(ctx, 1, ctx.len(), Some(c), false)
+        // 推理不需要反向：no_grad 下不挂计算图、不分配梯度缓冲
+        let logits = crate::tensor::no_grad(|| {
+            if use_kv_cache {
+                // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
+                // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
+                let c = cache.as_mut().unwrap();
+                if c[0].seq_len() == 0 {
+                    model.forward(ctx, 1, ctx.len(), Some(c), false)
+                } else {
+                    model.forward(&ids[ids.len() - 1..], 1, 1, Some(c), false)
+                }
             } else {
-                model.forward(&ids[ids.len() - 1..], 1, 1, Some(c), false)
+                // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
+                model.forward(ctx, 1, ctx.len(), None, false)
             }
-        } else {
-            // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-            model.forward(ctx, 1, ctx.len(), None, false)
-        };
+        });
 
         // 取最后一个位置的 logits
         let v = model.cfg.vocab_size;
@@ -181,7 +184,8 @@ pub fn beam_search(
             let ctx = &ids[start..];
 
             // 全量前向（beam search 通常是离线的，不用 KV cache）
-            let logits = model.forward(ctx, 1, ctx.len(), None, false);
+            // 推理无需反向，包在 no_grad 里避免建图开销
+            let logits = crate::tensor::no_grad(|| model.forward(ctx, 1, ctx.len(), None, false));
             let n = logits.numel();
             let last_row = &logits.data()[n - vocab_size..];
 

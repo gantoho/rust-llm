@@ -15,8 +15,10 @@
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
 - **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、39 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善。
-- **工程化完整**：CLI 子命令（train / eval / generate / chat / finetune / preset / demo）、
+- **工程化完整**：CLI 子命令（train / eval / generate / chat / finetune / preset / demo / bench）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
+- **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
+  优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
 - **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、LoRA 微调、混合精度、梯度累积、Beam Search。
 - **真实可用**：支持 LoRA 微调、交互式对话、分词器持久化、训练指标日志、预设模型配置。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
@@ -38,7 +40,7 @@
 | 采样 | `src/sample.rs` | temperature / top-k / top-p 采样，KV cache 推理，**Beam Search** |
 | 配置 | `src/config.rs` | `config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
-| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **finetune** / **preset** / demo |
+| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **finetune** / **preset** / demo / **bench** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
@@ -96,13 +98,19 @@ cargo run --release -- finetune --config config.json --pretrained checkpoints/be
 #  教学演示（验证所有算法正确性）
 # ═══════════════════════════════════════════
 cargo run --release -- demo
+
+# ═══════════════════════════════════════════
+#  性能基准（秒级测出训练/推理吞吐，用于优化前后对比）
+# ═══════════════════════════════════════════
+cargo run --release -- bench
+cargo run --release -- bench --steps 30
 ```
 
 ---
 
 ## 命令行完整参考
 
-程序提供 7 个子命令：`train` / `eval` / `generate` / `chat` / `finetune` / `preset` / `demo`。
+程序提供 8 个子命令：`train` / `eval` / `generate` / `chat` / `finetune` / `preset` / `demo` / `bench`。
 
 ### 1. `train` —— 训练模型
 
@@ -586,7 +594,66 @@ cargo run -- demo
 
 ---
 
-### 8. `cargo test` —— 单元测试
+### 8. `bench` —— 性能基准
+
+```bash
+cargo run --release -- bench [参数]
+```
+
+用**固定、可复现、短时**的任务测训练与推理吞吐（tok/s），专用于「优化改动前后」的同机对比，
+不必每次都跑完整训练。模型结构、语料、随机种子全部写死，只受下面两个参数影响。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--steps <步数>` | int | `10` | 训练步数（越大越稳、越慢） |
+| `--gen-tokens <数量>` | int | `64` | 生成 token 数（受 `block_size` 上限约束） |
+
+**固定任务**：
+
+- 模型：`n_layer=2 n_embd=128 n_head=4 block_size=64`，词表来自内置小语料（字符级，约 35 个 token）
+- 训练：`batch_size=4`，走真实训练路径（前向 + 反向 + 梯度裁剪 + AdamW + 学习率调度）
+- 推理：分别测 **KV cache** 与 **全量前向** 两种模式的生成吞吐
+
+**抗噪处理**（否则数字没法比）：
+
+- 推理先**预热一次**（排除线程池、首次内存分配的影响），再重复多次取**最短**耗时
+- 训练用固定种子，`eval_every` 设到步数之外，避免评估干扰计时
+
+**输出示例**：
+
+```
+=== 性能基准（bench）===
+rayon 线程数：8
+模型：n_layer=2 n_embd=128 n_head=4 block=64 vocab=35 | 参数 401280
+开始训练：char（vocab=35）模型参数 401280 | 语料 669 tokens（训练 669 / 验证 0）| batch=4 block=64
+step    30 | lr 0.000060 | loss 2.6326 | 1597 tok/s
+[bench] train     : 30 steps | 4.823s | 0.1608s/step | 1592 tok/s
+[bench] infer/kv  : 47 tok | 0.0388s | 1210.0 tok/s
+[bench] infer/full: 24 tok | 0.1404s | 170.9 tok/s
+（以上 tok/s 越高越好；优化前后同机对比即可看出收益）
+```
+
+> 同一 seed 下每步 loss 与训练步数完全一致（上例 step 30 的 loss 恒为 `2.6326`），
+> 因此数值正确性可以直接用 loss 对比来验证。
+
+**用法建议**：
+
+```bash
+# ── 快速冒烟（默认 10 步）──
+cargo run --release -- bench
+
+# ── 稳定对比（30 步，建议连跑 3 次取最优）──
+cargo run --release -- bench --steps 30
+cargo run --release -- bench --steps 30
+cargo run --release -- bench --steps 30
+```
+
+> ⚠️ 同一二进制连跑也可能有 ±20% 波动（CPU 频率/后台负载），
+> **务必跑多次取最优值**再下结论，别用单次结果判断优化是否有效。
+
+---
+
+### 9. `cargo test` —— 单元测试
 
 ```bash
 # ── 运行全部测试 ──
@@ -615,7 +682,7 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-运行 26 个单元测试（零外部依赖，秒级完成）：
+运行 28 个单元测试（零外部依赖，秒级完成）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -641,7 +708,7 @@ cargo test test_softmax -- --nocapture
 
 ---
 
-### 9. GPU 加速（可选 feature）
+### 10. GPU 加速（可选 feature）
 
 默认构建**不启用 GPU**，保持依赖轻量。通过 `--features gpu` 开启 wgpu 计算着色器加速：
 
@@ -849,7 +916,7 @@ llm_from_scratch/
 ├── config.json         # 训练配置（模型超参 + 训练参数）
 ├── data/               # 示例语料（data/alice.txt：公版《爱丽丝梦游仙境》）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / demo
+│   ├── main.rs         # CLI 入口：train / eval / generate / demo / bench
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）
 │   ├── checkpoint.rs   # checkpoint 保存 / 恢复
@@ -895,12 +962,76 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **26 个单元测试全部通过**（`cargo test`），零警告
+- **28 个单元测试全部通过**（`cargo test`）
+- 已知提示：`cargo build` / `cargo test` 各会报 1 条 `neg` / `mul` / `sum_last_dim` 的 `never used` 警告，
+  它们是给自动微分测试留的算子，非测试构建下未被调用，属既有情况，不影响功能
 - 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
   RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 4.14→0.16、文本生成正常
 - **工程化功能已全部集成**：LoRA 微调（`finetune`）、Beam Search（`generate --beam`）、交互式对话（`chat`）、
   分词器持久化（`tokenizer.json`）、预设配置（`preset`）、训练指标日志（CSV）
+
+## 性能优化与基准测试
+
+### 怎么测：`bench` 子命令
+
+性能优化最大的坑是「感觉快了」——所以本项目内置了 `bench`，把测量固化下来：
+
+```bash
+cargo run --release -- bench --steps 30
+```
+
+固定小模型 + 固定语料 + 固定种子，输出训练 / 推理吞吐（tok/s）。两个关键设计：
+
+1. **抗噪**：推理先预热一次，再重复多次取**最短**耗时；训练把 `eval_every` 设到步数之外，不让评估干扰计时。
+2. **可校验正确性**：固定种子下每步 loss 完全确定（如 step 30 恒为 `2.6326`），
+   所以「性能是否提升」看 tok/s，「数值是否被改坏」看 loss —— 一跑就有答案，不用等长训练。
+
+> 测出来的数字有 ±20% 波动（CPU 频率、后台负载），**务必跑 3 次取最优**再下结论。
+
+### 优化一：CPU matmul 改为「按输出行并行 + cache 友好循环顺序」
+
+**根因**：`matmul_data`（`src/tensor.rs`）原本只按 `batch` 维度并行，
+但 `Linear` 会把 3D 输入展平成 2D 再调用（此时 `batch = 1`）——
+于是注意力 QKV 投影、MLP、输出头这些**最重的矩阵乘只拿到 1 个并行任务**，
+实际退化成单线程三重循环，多核完全用不上。
+
+**改动**：把 `(batch × m)` 个输出行拉平后交给 rayon（行与行之间无依赖）；
+循环顺序从 `i-j-k` 改为 `i-k-j`（axpy 累加），使 `b` 的一行、`out` 的一行都是**连续**访问，
+对缓存和自动向量化友好（原顺序里 `b[k*n+j]` 每步跨 `n` 个元素，命中率极差）。
+
+每个输出元素仍在 `k` 上按**相同顺序**累加，因此浮点结果与旧实现**逐位一致**，测试无需放宽容差。
+
+### 优化二：推理路径引入 `no_grad`，不再构建计算图
+
+**根因**：算子按 `requires_grad` 决定是否挂 `parents` / `backward` 闭包，而模型参数恒为 `true`，
+导致**每次推理前向都在分配一堆永远不会执行的反向闭包**。单 token 前向时计算量极小，
+建图开销甚至超过矩阵乘本身。
+
+**改动**：加入 thread-local 开关与 `Tensor::req()`（`src/tensor.rs`），
+所有「要不要建图」的判断改走 `req()`（no_grad 模式下恒为 false）；
+`generate` / `beam_search` / `eval_loss` 的前向包进 `no_grad`。
+语义与 PyTorch 的 `torch.no_grad()` 一致，用 RAII 守卫恢复状态。
+
+**收益**：推理 1.9~3.9×，且**训练路径完全不受影响**（已验证）。
+
+### 实测结果
+
+同机（8 线程 CPU）用 `bench` 默认参数，优化前后各自多次运行取较优值：
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 训练 | ~440 tok/s | ~1600 tok/s | **约 3.6×** |
+| 推理（KV cache） | ~591 tok/s | ~1129 tok/s | **约 1.9×** |
+| 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
+
+**正确性**：28 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+
+### 还能压的地方
+
+- `flash_attention` 目前按 `b*h` 单线程循环，可按 head 并行
+- KV cache 每步 `k()`/`v()` 会克隆整段历史，可改为共享缓冲
+- Beam Search 的打分目前累加原始 logit（非 log_softmax），语义上不够严格
 
 ## 实现要点与踩坑记录
 
@@ -927,6 +1058,13 @@ llm_from_scratch/
   `get_mapped_range()` 返回 `Result`、`ComputePipelineDescriptor` 需 `cache` 字段。
 - **绑定编号**：多个计算入口共用同一 module 时，storage 绑定声明（binding 0/1/2/3）是全局的；
   scale/relu 只用其中 3 个，创建 bind group 时要显式指定与 layout 一致的 binding 编号（0/2/3），不能从 0 连续排。
+- **梯度缓冲不能按需分配**：做推理 `no_grad` 优化时，曾顺手把「不求导的张量就不分配 grad 缓冲」也加上，
+  结果 `test_masked_softmax_matches_chain` 直接越界 panic —— 反向闭包可能写入**不需要梯度**的父节点
+  （`masked_softmax` 的 mask 就不参与求导，但闭包仍会往它的 grad 里累加）。
+  结论：`grad` 缓冲必须始终按 `data` 全长分配，想省这块只能改闭包的写入逻辑，不能改分配策略。
+- **推理建图是纯浪费**：模型参数的 `requires_grad` 恒为 `true`，若算子只用它决定是否建图，
+  推理时也会一路把整张计算图（含 backward 闭包）建出来。加一个全局 `no_grad` 开关、
+  把判断改走 `Tensor::req()` 后，推理提升 1.9~3.9×。
 
 ## 后续方向
 

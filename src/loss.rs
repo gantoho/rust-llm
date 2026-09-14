@@ -43,8 +43,8 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
 
     // 构建标量 loss = -mean(gathered)
     let mean_loss: f32 = -gathered.iter().sum::<f32>() / b as f32;
-    let mut result = Tensor::new(vec![mean_loss], vec![], log_probs.requires_grad);
-    if log_probs.requires_grad {
+    let mut result = Tensor::new(vec![mean_loss], vec![], log_probs.req());
+    if log_probs.req() {
         let rg = result.grad.clone();
         let sg = log_probs.grad.clone();
         let targets_rc = std::rc::Rc::new(targets.to_vec());

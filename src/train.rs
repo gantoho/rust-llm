@@ -196,8 +196,11 @@ pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut 
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
         let (x, y) = loader.eval_batch(rng);
-        let logits = model.forward(&x, loader.batch_size(), loader.block_size(), None, false);
-        let loss = cross_entropy_loss(&logits, &y);
+        // 评估只做前向，无需建图：no_grad 下省掉整张计算图
+        let loss = crate::tensor::no_grad(|| {
+            let logits = model.forward(&x, loader.batch_size(), loader.block_size(), None, false);
+            cross_entropy_loss(&logits, &y)
+        });
         total += loss.item();
     }
     total / eval_iters as f32

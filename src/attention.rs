@@ -239,8 +239,8 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
     }
     drop(xd);
 
-    let mut result = Tensor::new(out, vec![batch, t, head_dim], x.requires_grad);
-    if x.requires_grad {
+    let mut result = Tensor::new(out, vec![batch, t, head_dim], x.req());
+    if x.req() {
         let rg = result.grad.clone();
         let sg = x.grad.clone();
         let n_rep2 = n_rep;

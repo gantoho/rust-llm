@@ -110,6 +110,7 @@ fn main() {
         } => cmd_finetune(&config, &pretrained, lora_rank, lora_alpha, steps, lr),
         Cmd::Preset { name, output } => cmd_preset(&name, &output),
         Cmd::Demo => run_demo(),
+        Cmd::Bench { steps, gen_tokens } => cmd_bench(steps, gen_tokens),
     }
 }
 
@@ -521,6 +522,107 @@ fn cmd_preset(name: &str, output: &str) {
     } else {
         println!("  架构：GPT-2 风格（LayerNorm + GELU + MHA）");
     }
+}
+
+// ==================== 性能基准（bench 子命令） ====================
+
+/// 性能基准：用**固定、可复现、短时**的任务测训练与推理吞吐（tok/s）。
+///
+/// 目的：优化改动前后在同一台机器、同一套参数下对比，不必跑完整训练。
+/// 模型/数据/步数全部写死，只受 `--steps`、`--gen-tokens` 影响，
+/// 因此两次运行的差异只来自代码本身。
+fn cmd_bench(steps: usize, gen_tokens: usize) {
+    use std::time::Instant;
+
+    println!("=== 性能基准（bench）===");
+    println!("rayon 线程数：{}", rayon::current_num_threads());
+
+    let mut rng = Rng::new(1234);
+    let tokenizer = Tokenizer::char(data::CORPUS);
+    let vocab_size = tokenizer.vocab_size();
+    let gcfg = GPTConfig {
+        vocab_size,
+        n_embd: 128,
+        n_head: 4,
+        n_layer: 2,
+        block_size: 64,
+        ..GPTConfig::default()
+    };
+    let model = GPT::new(gcfg.clone(), &mut rng);
+    let param_count: usize = model.parameters().iter().map(|p| p.numel()).sum();
+    println!(
+        "模型：n_layer={} n_embd={} n_head={} block={} vocab={} | 参数 {}",
+        gcfg.n_layer, gcfg.n_embd, gcfg.n_head, gcfg.block_size, vocab_size, param_count
+    );
+
+    // ---- 训练吞吐 ----
+    let batch = 4;
+    let loader = DataLoader::new(data::CORPUS, &tokenizer, gcfg.block_size, batch);
+    let tcfg = config::TrainConfig {
+        seed: 42,
+        batch_size: batch,
+        steps,
+        max_lr: 6e-4,
+        min_lr: 6e-5,
+        warmup_steps: (steps / 10).max(1),
+        eval_every: steps + 1, // 基准不评估，避免干扰计时
+        ..config::TrainConfig::default()
+    };
+    let t0 = Instant::now();
+    train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+    let train_secs = t0.elapsed().as_secs_f64();
+    let train_tokens = steps * batch * gcfg.block_size;
+    println!(
+        "[bench] train     : {} steps | {:.3}s | {:.4}s/step | {:.0} tok/s",
+        steps,
+        train_secs,
+        train_secs / steps.max(1) as f64,
+        train_tokens as f64 / train_secs
+    );
+
+    // ---- 推理吞吐 ----
+    // 单次生成只几十毫秒，计时抖动大；先预热一次（线程池/首次分配），
+    // 再重复若干次取**最短**耗时作为吞吐上限，前后对比才稳定。
+    fn bench_generate(
+        model: &GPT,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        n: usize,
+        use_kv: bool,
+        reps: usize,
+    ) -> f64 {
+        let mut rng = Rng::new(42);
+        let _ = generate(model, tokenizer, prompt, n, 0.8, 40, 0.9, use_kv, &mut rng);
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let _ = generate(model, tokenizer, prompt, n, 0.8, 40, 0.9, use_kv, &mut rng);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best
+    }
+
+    let prompt = "Once upon a time";
+    let prompt_len = tokenizer.encode(prompt).len();
+    // KV cache 模式下上下文总长达到 block_size 就会停，这里取不超过该上限
+    let kv_new = gen_tokens.min(gcfg.block_size.saturating_sub(prompt_len + 1));
+    let kv_secs = bench_generate(&model, &tokenizer, prompt, kv_new, true, 5);
+    println!(
+        "[bench] infer/kv  : {} tok | {:.4}s | {:.1} tok/s",
+        kv_new,
+        kv_secs,
+        kv_new as f64 / kv_secs
+    );
+
+    let full_new = gen_tokens.min(24);
+    let full_secs = bench_generate(&model, &tokenizer, prompt, full_new, false, 3);
+    println!(
+        "[bench] infer/full: {} tok | {:.4}s | {:.1} tok/s",
+        full_new,
+        full_secs,
+        full_new as f64 / full_secs
+    );
+    println!("（以上 tok/s 越高越好；优化前后同机对比即可看出收益）");
 }
 
 // ==================== 教学演示（demo 子命令） ====================

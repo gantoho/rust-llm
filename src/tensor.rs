@@ -39,6 +39,34 @@ thread_local! {
         const { std::cell::Cell::new(0x2545_F491_4F6C_DD1D) };
 }
 
+// 推理模式开关（no_grad）：置 false 时所有算子的"是否建图"判断一律为假，
+// 既不挂 parents / backward 闭包，也不分配梯度缓冲。
+// 推理不需要反向，建图是纯开销 —— 单 token 前向时，分配 Rc + 闭包的代价
+// 甚至超过矩阵乘本身。
+thread_local! {
+    static GRAD_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// 当前是否处于"需要梯度"模式（默认 true）。
+pub fn grad_enabled() -> bool {
+    GRAD_ENABLED.with(|c| c.get())
+}
+
+/// 在禁用梯度（推理）模式下执行 `f`，语义同 PyTorch 的 `torch.no_grad()`：
+/// 块内产生的张量一律不参与自动微分，也不分配梯度缓冲。
+/// 通过 RAII 守卫恢复原状态，`f` 内即使 panic 也不会把开关卡在 off。
+pub fn no_grad<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GRAD_ENABLED.with(|c| c.set(self.0));
+        }
+    }
+    let prev = GRAD_ENABLED.with(|c| c.replace(false));
+    let _restore = Restore(prev);
+    f()
+}
+
 /// 反向函数类型：无参数、无返回值，通过闭包捕获的 Rc 句柄直接读写各节点的梯度
 type BackwardFn = Rc<dyn Fn()>;
 
@@ -209,18 +237,27 @@ fn matmul_data(
         }
     };
     let mut out = vec![0.0f32; batch * m * n];
-    // batch 维度并行：每个 batch 元素的矩阵乘独立
-    out.par_chunks_mut(m * n)
+    // 按**输出行**并行：把 (batch × m) 行拉平后交给 rayon，行与行之间无依赖。
+    // 旧实现按 batch 并行，而 Linear 会把 3D 输入展平成 2D（batch=1）调用，
+    // 于是注意力/MLP/输出头这些最重的矩阵乘全部退化成单线程三重循环，
+    // 多核完全用不上 —— 这是训练与推理的主要瓶颈。
+    //
+    // 循环顺序从 i-j-k 改为 i-k-j（axpy 累加）：
+    // - b 的一行、out 的一行都是**连续**访问，对缓存和自动向量化友好；
+    // - 原 i-j-k 里 b[kk*n+j] 每步跨 n 个元素，命中率极差。
+    // 每个输出元素仍在 kk 上按同样顺序累加，浮点结果与旧实现逐位一致。
+    out.par_chunks_mut(n)
         .enumerate()
-        .for_each(|(bi, out_slice)| {
-            let (oa, ob) = (bi * m * k, bi * k * n);
-            for i in 0..m {
-                for j in 0..n {
-                    let mut s = 0.0;
-                    for kk in 0..k {
-                        s += a2[oa + i * k + kk] * b2[ob + kk * n + j];
-                    }
-                    out_slice[i * n + j] = s;
+        .for_each(|(row, out_row)| {
+            let bi = row / m;
+            let i = row % m;
+            let a_base = (bi * m + i) * k;
+            let b_base = bi * k * n;
+            for kk in 0..k {
+                let a_v = a2[a_base + kk];
+                let b_row = &b2[b_base + kk * n..b_base + kk * n + n];
+                for (o, &b_v) in out_row.iter_mut().zip(b_row) {
+                    *o += a_v * b_v;
                 }
             }
         });
@@ -325,14 +362,29 @@ impl Tensor {
     // ---------- 构造 ----------
     pub(crate) fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
         let len = data.len();
+        // no_grad 模式下强制关闭求导
+        let requires_grad = requires_grad && grad_enabled();
         Tensor {
             data: Rc::new(RefCell::new(data)),
             shape,
+            // 注意：grad 缓冲必须始终按 data 全长分配。反向闭包可能写入
+            // **不需要梯度**的父节点（如 masked_softmax 的 mask：它不参与求导，
+            // 但闭包仍会往它的 grad 里累加），缓冲长度不足会直接越界 panic。
             grad: Rc::new(RefCell::new(vec![0.0; len])),
             requires_grad,
             parents: Rc::new(Vec::new()),
             backward: None,
         }
+    }
+
+    /// 该张量在当前模式下是否需要自动微分。
+    ///
+    /// 与直接读字段 `requires_grad` 的区别：no_grad 模式下恒为 false。
+    /// 算子在决定"要不要挂 backward 闭包"时必须用它，否则推理时
+    /// 仍会拿着参数张量的 `requires_grad = true` 一路建出整张计算图。
+    #[inline]
+    pub(crate) fn req(&self) -> bool {
+        self.requires_grad && grad_enabled()
     }
 
     /// 用数据 + 形状构造叶子张量（不追踪梯度，例如输入数据）
@@ -425,15 +477,16 @@ impl Tensor {
             self.shape,
             new_shape
         );
+        let requires_grad = self.req();
         let mut result = Tensor {
             data: self.data.clone(), // Rc 共享，不克隆 Vec
             shape: new_shape,
             grad: Rc::new(RefCell::new(vec![0.0; numel])),
-            requires_grad: self.requires_grad,
+            requires_grad,
             parents: Rc::new(Vec::new()),
             backward: None,
         };
-        if self.requires_grad {
+        if requires_grad {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -515,7 +568,7 @@ impl Tensor {
         drop(sd);
 
         let mut result = Tensor::new(out_data, new_shape, self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             let map_bw = map.clone();
@@ -634,7 +687,7 @@ impl Tensor {
         drop(sa);
         drop(sb);
 
-        let requires = self.requires_grad || other.requires_grad;
+        let requires = self.req() || other.req();
         let mut result = Tensor::new(out_data, target_shape, requires);
         if requires {
             let rg = result.grad.clone();
@@ -680,7 +733,7 @@ impl Tensor {
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
         let data = self.data.borrow().iter().map(|a| a + scalar).collect();
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -698,7 +751,7 @@ impl Tensor {
     pub fn mul_scalar(&self, scalar: f32) -> Tensor {
         let data = self.data.borrow().iter().map(|a| a * scalar).collect();
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -719,7 +772,7 @@ impl Tensor {
     pub fn neg(&self) -> Tensor {
         let data = self.data.borrow().iter().map(|a| -a).collect();
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -745,7 +798,7 @@ impl Tensor {
             .collect();
         drop(sd);
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -767,7 +820,7 @@ impl Tensor {
         let data: Vec<f32> = sd.iter().map(|&a| a.tanh()).collect();
         drop(sd);
         let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -809,7 +862,7 @@ impl Tensor {
             });
         drop(sd);
         let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             let sd = self.data.clone();
@@ -900,7 +953,7 @@ impl Tensor {
         drop(sd);
         drop(gd);
 
-        let requires = self.requires_grad || gate.requires_grad;
+        let requires = self.req() || gate.req();
         let mut result = Tensor::new(out_data, self.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
@@ -943,7 +996,7 @@ impl Tensor {
         let data: Vec<f32> = sd.iter().map(|&a| a.ln()).collect();
         drop(sd);
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             let sd = self.data.clone();
@@ -966,7 +1019,7 @@ impl Tensor {
         let data: Vec<f32> = sd.iter().map(|&a| a.powf(p)).collect();
         drop(sd);
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             let sd = self.data.clone();
@@ -1018,7 +1071,7 @@ impl Tensor {
         drop(sd);
         drop(od);
 
-        let requires = self.requires_grad || other.requires_grad;
+        let requires = self.req() || other.req();
         let mut result = Tensor::new(out_data, vec![b, m, n], requires);
         if requires {
             matmul_backward(&mut result, self, other, m, k1, n, b);
@@ -1041,7 +1094,7 @@ impl Tensor {
         drop(sd);
         drop(od);
 
-        let requires = self.requires_grad || other.requires_grad;
+        let requires = self.req() || other.req();
         let mut result = Tensor::new(out_data, vec![m, n], requires);
         if requires {
             matmul_backward(&mut result, self, other, m, k1, n, 1);
@@ -1055,7 +1108,7 @@ impl Tensor {
     pub fn sum(&self) -> Tensor {
         let total = self.data.borrow().iter().sum();
         let mut result = Tensor::new(vec![total], vec![], self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -1092,7 +1145,7 @@ impl Tensor {
         *new_shape.last_mut().unwrap() = 1;
 
         let mut result = Tensor::new(out_data, new_shape, self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -1140,7 +1193,7 @@ impl Tensor {
         drop(sd);
 
         let mut result = Tensor::new(out_data.clone(), self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             let (_rows, d) = (rows, d);
@@ -1219,7 +1272,7 @@ impl Tensor {
         drop(gv);
         drop(bv);
 
-        let requires = self.requires_grad || gamma.requires_grad || beta.requires_grad;
+        let requires = self.req() || gamma.req() || beta.req();
         let mut result = Tensor::new(out, self.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
@@ -1326,7 +1379,7 @@ impl Tensor {
         drop(sd);
         drop(gv);
 
-        let requires = self.requires_grad || gamma.requires_grad;
+        let requires = self.req() || gamma.req();
         let mut result = Tensor::new(out, self.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
@@ -1555,7 +1608,7 @@ impl Tensor {
         drop(vd);
         drop(md);
 
-        let requires = q.requires_grad || k.requires_grad || v.requires_grad;
+        let requires = q.req() || k.req() || v.req();
         let mut result = Tensor::new(out_data, vec![bh, t, head_dim], requires);
         if requires {
             let rg = result.grad.clone();
@@ -1669,7 +1722,7 @@ impl Tensor {
         drop(sd);
         drop(md);
 
-        let requires = self.requires_grad || mask.requires_grad;
+        let requires = self.req() || mask.req();
         let out_shared = Rc::new(out);
         let mut result = Tensor::new(out_shared.as_ref().clone(), self.shape.clone(), requires);
         if requires {
@@ -1741,7 +1794,7 @@ impl Tensor {
         drop(sd);
 
         let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -1817,7 +1870,7 @@ impl Tensor {
         drop(sd);
 
         let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
@@ -1852,7 +1905,7 @@ impl Tensor {
         let idx_vec = indices.to_vec();
 
         let mut result = Tensor::new(out_data, vec![n, d], self.requires_grad);
-        if self.requires_grad {
+        if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
             let d2 = d;

@@ -149,6 +149,15 @@ pub enum Cmd {
     },
     /// 教学演示：XOR + BPE + 内置语料小 GPT
     Demo,
+    /// 性能基准：固定小模型跑少量训练步与短生成，输出吞吐（tok/s）供优化前后对比
+    Bench {
+        /// 训练步数
+        #[arg(long, default_value_t = 10)]
+        steps: usize,
+        /// 生成 token 数
+        #[arg(long, default_value_t = 64)]
+        gen_tokens: usize,
+    },
 }
 
 impl Cli {

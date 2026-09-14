@@ -66,8 +66,8 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
         });
     drop(sd);
 
-    let mut result = Tensor::new(out_data, x.shape.clone(), x.requires_grad);
-    if x.requires_grad {
+    let mut result = Tensor::new(out_data, x.shape.clone(), x.req());
+    if x.req() {
         let rg = result.grad.clone();
         let sg = x.grad.clone();
         let ct = c_tab.to_vec();
