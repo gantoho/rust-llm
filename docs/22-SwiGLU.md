@@ -1,10 +1,10 @@
 # 第 22 课：SwiGLU 激活函数 —— LLaMA 的"门控" MLP
 
-> 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::swiglu` 融合算子）
-> 代码位置：[src/layers.rs](src/layers.rs)（`SwiGLUMLP` 层、`MLPEnum` 枚举）
-> 代码位置：[src/model.rs](src/model.rs)（`TransformerBlock` 使用 `MLPEnum`）
+> 代码位置：[src/tensor.rs](../src/tensor.rs)（`Tensor::swiglu` 融合算子）
+> 代码位置：[src/layers.rs](../src/layers.rs)（`SwiGLUMLP` 层、`MLPEnum` 枚举）
+> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` 使用 `MLPEnum`）
 >
-> 配置开关：`config.json` → `model.use_swiglu: true` 启用
+> 配置开关：`config.json` → `model.use_swiglu: true`（示例值；仓库当前 `config.json` 里是 `false`，需手动改为 `true` 才能启用 SwiGLU）
 
 ---
 

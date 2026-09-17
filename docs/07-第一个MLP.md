@@ -1,6 +1,6 @@
 # 第 7 课：第一个 MLP —— 教会神经网络算 XOR
 
-> 代码位置：[src/main.rs](src/main.rs)（`demo_xor` 函数）
+> 代码位置：[src/main.rs](../src/main.rs)（`demo_xor` 函数）
 > 前置知识：第 5 课 Linear / 激活函数、第 6 课 CrossEntropy / SGD
 
 ---
@@ -89,7 +89,7 @@ let params: Vec<Tensor> = {
     ps.extend(fc2.parameters());
     ps
 };
-let opt = SGD::new(0.5, params);
+let mut opt = SGD::new(0.5, params);   // step() 需要 &mut self
 ```
 
 - `fc1.parameters()` + `fc2.parameters()`：共 2×4+4 + 4×2+2 = **22 个参数**
@@ -110,7 +110,7 @@ for step in 0..1000 {
     opt.zero_grad();
 
     if step % 200 == 0 {
-        println!("  step {:>4} | loss {:.4}", step, loss.data()[0]);
+        println!("  step {:>4} | loss {:.4}", step, loss.item());
     }
 }
 ```
@@ -156,14 +156,14 @@ println!("  训练后正确率：{}/4（100% 说明反向传播正确）\n", cor
 1. **参数是随机初始化的**（种子 42），绝不是"碰巧答对"；
 2. **梯度完全来自自动微分**：任何一个运算（matmul / add / relu / softmax / log / sum ...）的反向实现出错，梯度就会偏一点，参数越走越偏，1000 步后必然累积成大错；
 3. **XOR 没有捷径**：它是"必须两层非线性"的问题，梯度要穿透 Tanh 的导数（`1 - t²`）、两层 matmul 的转置路径、softmax 的雅可比路径——整条反向传播链路被真实训练"压测"了一遍；
-4. 结果 100% 正确 + loss 单调下降，还同时验证了**优化器**（SGD 的 `set_data` 写回）和**训练循环**（backward → step → zero_grad 的顺序）都是对的。
+4. 结果 100% 正确 + loss 单调下降，还同时验证了**优化器**（SGD 的原位更新 `d[j] -= lr·g[j]`）和**训练循环**（backward → step → zero_grad 的顺序）都是对的。
 
 换句话说：**XOR 训练收敛到 4/4，等于对"张量库 + 网络层 + 损失 + 优化器"整条链路做了一次端到端集成测试**。
 
 ## 8. 运行
 
 ```bash
-cargo run
+cargo run --release -- demo
 ```
 
 输出第一段（loss 数值随种子确定，趋势如下）：

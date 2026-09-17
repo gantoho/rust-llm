@@ -1,0 +1,10 @@
+# 本机编译优化（2026-09-16 新增）
+#
+# rustc 默认按 x86-64 基线编译 = 只用 SSE2（128 位，4 个 f32），
+# 白白浪费了 i5-8250U 的 AVX2 + FMA（256 位，8 个 f32 且乘加合并成一条指令）。
+# 打开后 matmul 内层循环的向量宽度翻倍、指令数减半，实测收益见文档第 9 节。
+#
+# 注意：target-cpu=native 产出的二进制只能在同类 CPU 上跑（本机训练无妨）。
+# 若要分发给别人，改成 rustflags = ["-C", "target-feature=+avx2,+fma"]。
+[build]
+rustflags = ["-C", "target-cpu=native"]

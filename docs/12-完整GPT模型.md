@@ -1,9 +1,9 @@
 # 第 12 课：完整 GPT 模型 —— 把积木拼成能预测下一个词的模型
 
-> 代码位置：[src/model.rs](src/model.rs)（`GPTConfig` / `GPT` / `TransformerBlock`）
-> 代码位置：[src/attention.rs](src/attention.rs)（`MultiHeadAttention` / `KVCache`）
-> 代码位置：[src/layers.rs](src/layers.rs)（`Embedding` / `Linear` / `LayerNorm` / `gelu`）
-> 演示入口：[src/main.rs](src/main.rs)（演示 3：训练小 GPT 并生成文本）
+> 代码位置：[src/model.rs](../src/model.rs)（`GPTConfig` / `GPT` / `TransformerBlock`）
+> 代码位置：[src/attention.rs](../src/attention.rs)（`MultiHeadAttention` / `KVCache`）
+> 代码位置：[src/layers.rs](../src/layers.rs)（`Embedding` / `Linear` / `LayerNorm` / `gelu`）
+> 演示入口：[src/main.rs](../src/main.rs)（演示 3：训练小 GPT 并生成文本）
 
 ---
 
@@ -25,7 +25,7 @@
  token id     │  tok_emb: Embedding [V, D]    │  ← 每个 token 查表成向量
               └───────────────────────────────┘
               │   x = tok（位置信息不再相加：由 RoPE 在   │
-              │   注意力内部旋转 Q/K 提供，见第 19 课）    │
+              │   注意力内部旋转 Q/K 提供，见第 20 课）    │
               ┌───────────────────────────────┐
               │  blocks: N 层 Transformer      │  ← 注意力找相关性 + MLP 加工信息
               │  Block（本课第 3 节）           │
@@ -47,7 +47,9 @@ pub struct GPT {
     pub cfg: GPTConfig,
     tok_emb: Embedding,          // 同时充当 lm_head（权重绑定）
     blocks: Vec<TransformerBlock>,
-    ln_f: LayerNorm,
+    ln_f: NormLayer,
+    /// Dropout 概率（残差/嵌入层用）
+    dropout: f32,
 }
 ```
 
@@ -56,24 +58,34 @@ pub struct GPT {
 | `cfg` | `GPTConfig` | 保存模型配置（维度、层数……） | —— |
 | `tok_emb` | `Embedding` | token id → 向量，查表 `[V, D]`；**权重绑定**：输出头直接复用它的转置，不再单独建 `lm_head` | 第 12 课（`layers.rs`） |
 | `blocks` | `Vec<TransformerBlock>` | N 层 Transformer Block，重复堆叠 | 第 9-11 课 |
-| `ln_f` | `LayerNorm` | 输出前的最后归一化 | 第 11 课 |
+| `ln_f` | `NormLayer` | 输出前的最后归一化（`LayerNorm` / `RMSNorm` 二选一） | 第 11 课 |
+| `dropout` | `f32` | Dropout 概率，来自 `cfg.dropout`（0 表示不丢弃） | —— |
 
-位置信息哪里去了？—— 第 11 课的正弦位置编码（`pos_emb`）在第 19 课被 **RoPE** 取代：不再向输入加位置向量，而是在每个注意力层内部对 Q/K 做旋转（见第 19 课与 `MultiHeadAttention::forward`）。所以 `GPT` 结构体里已经没有 `pos_emb` 字段了。
+位置信息哪里去了？—— 第 11 课的正弦位置编码（`pos_emb`）在第 20 课被 **RoPE** 取代：不再向输入加位置向量，而是在每个注意力层内部对 Q/K 做旋转（见第 20 课与 `MultiHeadAttention::forward`）。所以 `GPT` 结构体里已经没有 `pos_emb` 字段了。
 
 在 `GPT::new` 里把它们创建出来：
 
 ```rust
 pub fn new(cfg: GPTConfig, rng: &mut Rng) -> Self {
+    // GQA 校验：n_head 必须能被 n_kv_head 整除（n_kv_head = 0 表示与 n_head 相同）
+    let n_kv = if cfg.n_kv_head == 0 { cfg.n_head } else { cfg.n_kv_head };
+    assert!(
+        cfg.n_head % n_kv == 0,
+        "n_head（{}）必须能被 n_kv_head（{}）整除",
+        cfg.n_head,
+        n_kv
+    );
     let n_embd = cfg.n_embd;
     let vocab_size = cfg.vocab_size;
     let blocks = (0..cfg.n_layer)
         .map(|_| TransformerBlock::new(&cfg, rng))
         .collect();
     GPT {
-        cfg,
+        cfg: cfg.clone(),
         tok_emb: Embedding::new(vocab_size, n_embd, rng),
         blocks,
-        ln_f: LayerNorm::new(n_embd, 1e-5),
+        ln_f: NormLayer::new(n_embd, LN_EPS, cfg.use_rmsnorm),
+        dropout: cfg.dropout,
     }
 }
 ```
@@ -104,22 +116,30 @@ x ──► LN1 ──► MultiHeadAttention ──► (+残差) ──► LN2 �
 ///   x -> LayerNorm -> Attention -> 残差 +
 ///   x -> LayerNorm -> MLP(GELU)  -> 残差 +
 struct TransformerBlock {
-    ln1: LayerNorm,
+    ln1: NormLayer,
     attn: MultiHeadAttention,
-    ln2: LayerNorm,
-    mlp_linear1: Linear, // [D, 4D]
-    mlp_linear2: Linear, // [4D, D]
+    ln2: NormLayer,
+    mlp: MLPEnum,  // GELU MLP 或 SwiGLU MLP
+    dropout: f32,
 }
 
 impl TransformerBlock {
-    fn forward(&self, x: &Tensor, mask: &Tensor, kv_cache: Option<&mut KVCache>) -> Tensor {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        kv_cache: Option<&mut KVCache>,
+        base: usize,     // KV cache 推理时的位置偏移（训练 = 0，第 25 课）
+        training: bool,  // 是否训练模式（影响 dropout）
+    ) -> Tensor {
         // 注意力子层 + 残差连接
-        let h = self.attn.forward(&self.ln1.forward(x), mask, kv_cache);
+        let h = self.attn.forward(&self.ln1.forward(x), mask, kv_cache, base);
+        let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
         let x = x.add(&h);
         // 前馈子层 + 残差连接
         let h = self.ln2.forward(&x);
-        let h = gelu(&self.mlp_linear1.forward(&h));
-        let h = self.mlp_linear2.forward(&h);
+        let h = self.mlp.forward(&h);
+        let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
         x.add(&h)
     }
 }
@@ -130,12 +150,11 @@ impl TransformerBlock {
 | 代码 | 在做什么 | 对应结构 |
 |------|---------|---------|
 | `self.ln1.forward(x)` | 先归一化（pre-norm 的"pre"） | `x → LN1` |
-| `self.attn.forward(..., mask, kv_cache)` | 多头注意力（第 10 课），`mask` 保证只能看过去 | `→ Attention` |
+| `self.attn.forward(..., mask, kv_cache, base)` | 多头注意力（第 10 课），`mask` 保证只能看过去 | `→ Attention` |
+| `h.dropout(self.dropout, training)` | 子层输出做 Dropout（`training = true` 时才生效） | —— |
 | `let x = x.add(&h);` | 注意力输出 + 输入（残差连接） | `+ 残差` |
 | `self.ln2.forward(&x)` | 再归一化 | `→ LN2` |
-| `self.mlp_linear1.forward(&h)` | 升维到 4D：`[D] → [4D]`（每层 MLP 把维度先放大 4 倍） | `→ MLP 第一层` |
-| `gelu(...)` | GELU 激活（第 5 课，GPT 系列默认激活，比 ReLU 平滑） | `→ 激活` |
-| `self.mlp_linear2.forward(&h)` | 降维回 D：`[4D] → [D]` | `→ MLP 第二层` |
+| `self.mlp.forward(&h)` | 前馈子层：GELU MLP（内部先升维到 4D、激活、再降回 D，见 3.2）或 SwiGLU MLP | `→ MLP` |
 | `x.add(&h)` | 第二个残差连接 | `+ 残差` |
 
 ### 3.2 为什么 MLP 要"先升维再降维"
@@ -164,7 +183,8 @@ pub fn forward(
     idx: &[usize],          // [B*T] 展平的 token id
     b: usize,               // batch 大小
     t: usize,               // 序列长度
-    mut kv_cache: Option<&mut Vec<KVCache>>,  // 推理缓存（第 18 课，训练时传 None）
+    kv_cache: Option<&mut Vec<KVCache>>,  // 推理缓存（第 25 课，训练时传 None）
+    training: bool,         // 是否训练模式（影响 dropout）
 ) -> Tensor {
 ```
 
@@ -177,19 +197,20 @@ pub fn forward(
 |------|------|---------|
 | 0. 输入 | `idx: &[usize]` | `[B*T]` |
 | 1. token embedding | `self.tok_emb.forward(idx).reshape(vec![b, t, d])` | `[B*T] → [B*T, D] → [B, T, D]` |
-| 2. 位置信息（RoPE） | 在注意力内部对 Q/K 旋转（第 19 课），输入不再加位置向量；这里只算 `base`（KV cache 模式下已缓存的位置数） | —— |
+| 2. 位置信息（RoPE） | 在注意力内部对 Q/K 旋转（第 20 课），输入不再加位置向量；这里只算 `base`（KV cache 模式下已缓存的位置数） | —— |
 | 3. 构造因果掩码 | `Tensor::from_vec(mask_data, vec![t, t_total])` | `[T, T_total]`（未来位置为 -inf） |
-| 4. 逐层 Transformer Block | `x = block.forward(&x, &mask, cache, base);` | `[B, T, D]` → `[B, T, D]`（层内拆头又合并，形状不变） |
+| 4. 逐层 Transformer Block | `x = block.forward(&x, &mask, cache, base, training);` | `[B, T, D]` → `[B, T, D]`（层内拆头又合并，形状不变） |
 | 5. 最终归一化 + 输出头 | `ln_f.forward(&x)` 然后 `reshape(vec![b * t, d])`，`x.matmul(&tok_emb.table.transpose())` | `[B, T, D] → [B*T, D] → [B*T, V]` |
 
-完整代码：
+下面是 `forward` 主体（即 `forward_core`，`GPT::forward` 拿到它的结果后再乘输出头；这里省略 GPU 常驻分支）：
 
 ```rust
 let d = self.cfg.n_embd;
 assert_eq!(idx.len(), b * t, "输入 id 数量必须等于 b*t");
 
-// 1. token embedding
+// 1. token embedding（训练时按概率做 dropout）
 let x = self.tok_emb.forward(idx).reshape(vec![b, t, d]);
+let x = if self.dropout > 0.0 { x.dropout(self.dropout, training) } else { x };
 
 // 2. 位置信息由 RoPE 提供（在注意力内部旋转 Q/K，见 MultiHeadAttention::forward）。
 //    base = KV cache 模式下已缓存的位置数：新 token 的绝对位置 = base + 窗口内下标 j。
@@ -210,11 +231,11 @@ for i in 0..t {
 }
 let mask = Tensor::from_vec(mask_data, vec![t, t_total]);
 
-// 4. 逐层过 Transformer Block
+// 4. 逐层过 Transformer Block（每一层内部含 dropout 分支，见 TransformerBlock::forward）
 let mut x = x;
 for (i, block) in self.blocks.iter().enumerate() {
     let cache = kv_cache.as_mut().map(|c| &mut c[i]);
-    x = block.forward(&x, &mask, cache, base);
+    x = block.forward(&x, &mask, cache, base, training);
 }
 
 // 5. 最终归一化 + 输出头（权重绑定：lm_head 复用 tok_emb.table 的转置）
@@ -223,9 +244,19 @@ let x = x.reshape(vec![b * t, d]);
 x.matmul(&self.tok_emb.table.transpose())
 ```
 
+> 上面是逐算子的主路径。源码里还有 GPU 常驻显存的快路（`src/model.rs:382-572`）：`forward_hidden` 复用同一条 `forward_core` 但只返回到 `ln_f` 之后的 hidden `[B*T, d]`，`head_weight` 暴露输出头权重 `tok_emb.table`，两者配合把 `hidden @ Wᵀ` 与交叉熵一起放进显存算，避免把 `[B*T, vocab]` 的 logits 拉回 CPU；整叠 Block 的 `blocks_resident` 则把「LN → Attention → 残差 → LN → MLP → 残差」整段录进一次提交。它们只在启用 `gpu` feature、且训练模式（无 KV cache、`base == 0`）下生效，条件不满足就回落到上面的主路径，数值行为不变。
+
+`forward` 本体只有一行（`src/model.rs:365-376`）：
+
+```rust
+// 权重绑定：lm_head 复用 tok_emb.table 的转置
+self.forward_core(idx, b, t, kv_cache, training)
+    .matmul(&self.tok_emb.table.transpose())
+```
+
 几个容易忽略的细节：
 
-1. **位置信息来自 RoPE 而不是相加**：第 11 课的做法是 `x = tok + pos_emb`（把正弦位置向量加进去）；第 19 课之后改为在注意力内部对 Q/K 做旋转（`rotary_pair`），`GPT::forward` 不再需要 `pos_emb` 表，只把 `base` 传给各层——KV cache 推理时，新 token 的绝对位置是 `base + j`（第 18 课）。
+1. **位置信息来自 RoPE 而不是相加**：第 11 课的做法是 `x = tok + pos_emb`（把正弦位置向量加进去）；第 20 课之后改为在注意力内部对 Q/K 做旋转（`rotary_pair`），`GPT::forward` 不再需要 `pos_emb` 表，只把 `base` 传给各层——KV cache 推理时，新 token 的绝对位置是 `base + j`（第 25 课）。
 2. **因果掩码的构造**：`j > i + base` 的位置设为 `-inf`。也就是说第 i 个 token 只能看到"它自己和它前面的"（含 KV cache 里的历史位置），未来位置在 softmax 后概率为 0——保证模型只能预测下一个词、不能偷看答案。
 3. **权重绑定的输出头**：`tok_emb.table` 是 `[V, D]`，它的转置 `[D, V]` 恰好可以把 `[D]` 向量打分成 `[V]` 个词的分数（"第 i 行 = 第 i 个词的嵌入"与当前向量做点积）。这与 GPT 的"输入输出共享词嵌入"做法一致，省掉了一份独立的 `lm_head` 参数（第 5.2 节参数量里会体现）。
 
@@ -237,7 +268,7 @@ x.matmul(&self.tok_emb.table.transpose())
 |------|------|------|
 | `idx` | `[4]` | 4 个 token id |
 | `tok_emb.forward(idx)` | `[4, 64]` → reshape `[1, 4, 64]` | 每个 token 的语义向量 |
-| （位置由 RoPE 提供） | 在注意力内部旋转 Q/K，形状不变 | 相对位置信息（第 19 课） |
+| （位置由 RoPE 提供） | 在注意力内部旋转 Q/K，形状不变 | 相对位置信息（第 20 课） |
 | 注意力内部 | scores `[4, 4]`（1 个 batch、4 头时 `[4, 4, 4]`） | 相关性打分 |
 | 过完 2 个 Block | `[1, 4, 64]` | 形状不变，信息被加工 |
 | `ln_f` 后 | `[1, 4, 64]` | 归一化 |
@@ -272,7 +303,7 @@ pub fn tiny(vocab_size: usize) -> Self {
 
 - **每个头处理多少维**：`head_dim = n_embd / n_head = 64 / 4 = 16`（`MultiHeadAttention::forward` 里有断言 `head_dim * n_head == d`，配置必须能整除）。
 - **每层的形状**：注意力 4 个 Linear 都是 `[64, 64]`；MLP 是 `[64, 256]` 和 `[256, 64]`（4 倍升维）。
-- **位置信息**：RoPE 的 cos/sin 表按"位置 × 对偶下标"预计算（第 19 课），维度 `block_size × (D/2)` 的常数，不参与训练。
+- **位置信息**：RoPE 的 cos/sin 表按"位置 × 对偶下标"预计算（第 20 课），维度 `block_size × (D/2)` 的常数，不参与训练。
 
 ### 5.2 粗略参数量估算
 
@@ -299,14 +330,14 @@ pub fn tiny(vocab_size: usize) -> Self {
 1. **手推数据流**：设 `vocab=50, b=2, t=3`，用 tiny 配置，写出 `GPT::forward` 里每一步张量的形状（从 `idx` 到 `logits`），对照第 4.3 节的表检查。
 2. **改配置**：自己加一个 `GPTConfig::small`，比如 `n_embd=128, n_head=8, n_layer=4, block_size=64`。注意 `head_dim = 128/8 = 16` 仍成立；再按 5.2 节的表估一下参数量。
 3. **验证 logits 形状**：在 `main.rs` 演示 3 里，`model.forward(...)` 之后加一行打印 `logits.shape()`，确认是 `[B*T, V]`。
-4. **看 Block 内部分工**：把 `mlp_linear1` 的维度改成 `2 * cfg.n_embd`（2 倍而不是 4 倍），训练看 loss 变化——体会 MLP 宽度对模型能力的影响。
+4. **看 Block 内部分工**：把 MLP 的隐藏维改成 `2 * cfg.n_embd`（2 倍而不是 4 倍；GELU MLP 的隐藏维在 `MLPEnum::new_gelu` 里由 `MLP_RATIO` 决定，`src/layers.rs:270`），训练看 loss 变化——体会 MLP 宽度对模型能力的影响。
 5. **思考**：我们的输出头就是 `tok_emb.table` 的转置（权重绑定）。为什么可以这样做？相比"独立的 lm_head"省了多少参数？（提示：`[V, D]` 和 `[D, V]` 互为转置，`lm_head` 的参数量 `64×V+V` 恰好被省掉了。）
 
 ---
 
 ## 7. 本课总结
 
-- GPT 由 **token embedding + N 层 Transformer Block + 最终 LayerNorm + 权重绑定输出头** 四大部分组成（位置信息由第 19 课的 RoPE 在注意力内部提供，不再有独立的 `pos_emb` 表）
+- GPT 由 **token embedding + N 层 Transformer Block + 最终 LayerNorm + 权重绑定输出头** 四大部分组成（位置信息由第 20 课的 RoPE 在注意力内部提供，不再有独立的 `pos_emb` 表）
 - Transformer Block 是 **pre-norm** 结构：`LN → Attention → 残差`，再 `LN → MLP(GELU) → 残差`；MLP 做 `D → 4D → D` 的升维降维
 - `GPT::forward` 数据流：`idx [B*T] → [B, T, D] → ... → [B*T, V]`，只有进出输出头时形状变化，层内形状始终 `[B, T, D]`
 - 因果掩码保证"只能看过去"，RoPE 保证"知道相对位置"

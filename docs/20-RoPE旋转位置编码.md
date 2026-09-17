@@ -1,8 +1,8 @@
 # 第 20 课：RoPE 旋转位置编码 —— 把"相对位置"揉进注意力
 
-> 代码位置：[src/rope.rs](src/rope.rs)（`rotary_pair` 生产入口 + `rotary` 测试用 + `test_rotary` / `test_rotary_grad_exact` 测试）
-> 配套代码：[src/attention.rs](src/attention.rs)（RoPE 接入 `MultiHeadAttention`）
-> 配套文档：[docs/11-位置编码与归一化.md](docs/11-位置编码与归一化.md)
+> 代码位置：[src/rope.rs](../src/rope.rs)（`rotary_pair` 生产入口 + `rotary` 测试用 + `test_rotary` / `test_rotary_grad_exact` 测试）
+> 配套代码：[src/attention.rs](../src/attention.rs)（RoPE 接入 `MultiHeadAttention`）
+> 配套文档：[docs/11-位置编码与归一化.md](11-位置编码与归一化.md)
 
 ---
 
@@ -192,7 +192,7 @@ q_m · k_n = Σ_i  q_{2i}ᵀ · R((n-m)·θ_i) · k_{2i}    只依赖 n - m
 
 ## 6. 与 KV cache 天然兼容：只旋转新 token
 
-回顾第 18 课的 KV cache 推理流程（`src/sample.rs` 的 `generate` + `src/attention.rs` 的 `KVCache`）：
+回顾第 25 课的 KV cache 推理流程（`src/sample.rs` 的 `generate` + `src/attention.rs` 的 `KVCache`）：
 
 - 第一次：把整个 prompt 喂给模型，算出所有位置的 K/V 存入缓存；
 - 之后每步：**只前向最新 1 个 token**，历史的 K/V 直接从缓存取。
@@ -203,7 +203,7 @@ RoPE 和这个流程是无缝衔接的：
 新 token 的绝对位置 = 缓存长度 base + 它在当前窗口里的下标 j
 ```
 
-`base`（已缓存的位置数）由 `GPT::forward` 算出来传给每层（第 18 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
+`base`（已缓存的位置数）由 `GPT::forward` 算出来传给每层（第 25 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
 
 ```rust
 // src/model.rs（GPT::forward）：base = 缓存长度
@@ -244,34 +244,70 @@ for _ in 0..b {
 /// 同一批 positions 的三角只算一次：前向、反向、Q/K 复用。
 fn build_cos_sin_tab(positions: &[usize], d: usize) -> (Vec<f32>, Vec<f32>) {
     let rows = positions.len();
-    let mut c_tab = vec![0.0f32; rows * (d / 2)];
-    let mut s_tab = vec![0.0f32; rows * (d / 2)];
+    let half = d / 2;
+    let mut c_tab = vec![0.0f32; rows * half];
+    let mut s_tab = vec![0.0f32; rows * half];
+    let mut freq = vec![0.0f32; half];
+    for i in 0..half {
+        freq[i] = 10000f32.powf((2 * i) as f32 / d as f32);
+    }
     for r in 0..rows {
         let pos = positions[r] as f32;
-        for i in 0..d / 2 {
-            let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);
-            c_tab[r * (d / 2) + i] = theta.cos();
-            s_tab[r * (d / 2) + i] = theta.sin();
+        for i in 0..half {
+            let theta = pos / freq[i];
+            c_tab[r * half + i] = theta.cos();
+            s_tab[r * half + i] = theta.sin();
         }
     }
     (c_tab, s_tab)
 }
 
-/// 用现成的 cos/sin 表旋转一个张量（[rows, D]），每对元素按公式旋转。
+/// 用现成的 cos/sin 表旋转一个张量（[rows, D]）。
+/// 反向用旋转矩阵的转置 R(θ)ᵀ 回传梯度，闭包直接查表。
 fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
     let (rows, d) = (x.shape[0], x.shape[1]);
     let sd = x.data.borrow();
+    let sd_ref: &[f32] = &sd;
     let mut out_data = vec![0.0f32; rows * d];
-    for r in 0..rows {
-        for i in 0..d / 2 {
-            let (c, s) = (c_tab[r * (d / 2) + i], s_tab[r * (d / 2) + i]);
-            let (a, b) = (sd[r * d + 2 * i], sd[r * d + 2 * i + 1]);
-            out_data[r * d + 2 * i] = a * c - b * s;
-            out_data[r * d + 2 * i + 1] = a * s + b * c;
+    let half = d / 2;
+    // 并行：每行旋转独立，行间无依赖
+    out_data.par_chunks_mut(d).enumerate().for_each(|(r, out_row)| {
+        let base = r * d;
+        let ct_base = r * half;
+        for i in 0..half {
+            let (c, s) = (c_tab[ct_base + i], s_tab[ct_base + i]);
+            let (a, b) = (sd_ref[base + 2 * i], sd_ref[base + 2 * i + 1]);
+            out_row[2 * i] = a * c - b * s;
+            out_row[2 * i + 1] = a * s + b * c;
         }
-    }
+    });
     drop(sd);
-    // ...（反向闭包查同一张表、按 R(θ)ᵀ 回传，见第 8 节）
+
+    let mut result = Tensor::new(out_data, x.shape.clone(), x.req());
+    if x.req() {
+        let rg = result.grad.clone();
+        let sg = x.grad.clone();
+        let ct = c_tab.to_vec();
+        let st = s_tab.to_vec();
+        result.parents = Rc::new(vec![x.clone()]);
+        result.backward = Some(Rc::new(move || {
+            // 先把梯度拷出 RefCell，再并行写回（Ref<Vec<f32>> 不是 Sync）
+            let g_local: Vec<f32> = rg.borrow().to_vec();
+            let mut sgm = sg.borrow_mut();
+            // 并行：每行独立计算梯度，行间无依赖（与前向一致）
+            sgm.par_chunks_mut(d).enumerate().for_each(|(r, sgm_row)| {
+                let g_base = r * d;
+                let ct_base = r * (d / 2);
+                for i in 0..d / 2 {
+                    let (c, s) = (ct[ct_base + i], st[ct_base + i]);
+                    let (ga, gb) = (g_local[g_base + 2 * i], g_local[g_base + 2 * i + 1]);
+                    // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
+                    sgm_row[2 * i] += ga * c + gb * s;
+                    sgm_row[2 * i + 1] += -ga * s + gb * c;
+                }
+            });
+        }));
+    }
     result
 }
 ```
@@ -299,17 +335,17 @@ pub fn rotary_pair(&self, other: &Tensor, positions: &[usize]) -> (Tensor, Tenso
 | `assert_eq!(self.rank(), 2, ...)` | — | 输入必须是 2 维 `[rows, D]`：每行是一个待旋转的向量 |
 | `assert_eq!(self.shape[0], positions.len(), ...)` | — | `positions[r]` 就是第 `r` 行的位置，数量必须一一对应 |
 | `assert_eq!(d % 2, 0, ...)` | — | 最后一维必须是偶数，才能两两配对 |
-| `let theta = pos / 10000f32.powf((2 * i) as f32 / d as f32);` | `θ_i = pos / 10000^(2i/d)` | 第 `i` 对的旋转角度，注意 `i` 的范围是 `0..d/2` |
-| `let (c, s) = (theta.cos(), theta.sin());` | `cosθ_i, sinθ_i` | 一次算出，避免重复调用三角函数 |
-| `let (a, b) = (sd[r*d + 2*i], sd[r*d + 2*i + 1]);` | `(x_{2i}, x_{2i+1})` | 取出第 r 行第 i 对的两个元素 |
-| `out_data[r*d + 2*i] = a * c - b * s;` | `x'_{2i} = x_{2i}·cosθ - x_{2i+1}·sinθ` | 旋转后的第一个分量 |
-| `out_data[r*d + 2*i + 1] = a * s + b * c;` | `x'_{2i+1} = x_{2i}·sinθ + x_{2i+1}·cosθ` | 旋转后的第二个分量 |
+| `let theta = pos / freq[i];` | `θ_i = pos / freq[i]` | 第 `i` 对的旋转角度，其中 `freq[i] = 10000^(2i/d)` 已提前算好（`i` 的范围是 `0..d/2`） |
+| `let (c, s) = (c_tab[ct_base + i], s_tab[ct_base + i]);` | `cosθ_i, sinθ_i` | 直接查表取值，不再调用三角函数 |
+| `let (a, b) = (sd_ref[base + 2 * i], sd_ref[base + 2 * i + 1]);` | `(x_{2i}, x_{2i+1})` | 取出第 r 行第 i 对的两个元素 |
+| `out_row[2 * i] = a * c - b * s;` | `x'_{2i} = x_{2i}·cosθ - x_{2i+1}·sinθ` | 旋转后的第一个分量 |
+| `out_row[2 * i + 1] = a * s + b * c;` | `x'_{2i+1} = x_{2i}·sinθ + x_{2i+1}·cosθ` | 旋转后的第二个分量 |
 
 几个值得注意的设计点：
 
-1. **三重循环的次序**：建表时外层按行 `r`、内层按对 `i`，`cos/sin` 每个 `(r, i)` 只算一次；旋转时同样两层循环，但只做查表乘加，不再碰任何三角函数。
+1. **建表两层循环 + 旋转按行并行**：建表时外层按行 `r`、内层按对 `i`，`cos/sin` 每个 `(r, i)` 只算一次；旋转时用 `par_chunks_mut(d).enumerate().for_each(...)` 把每一行分给一个任务并行处理，行内只做查表乘加，不再碰任何三角函数（反向闭包同样按行并行）。
 2. **`drop(sd)`**：读完输入数据后立刻释放借用，之后才创建结果张量和反向闭包——避免闭包捕获时和 `self.data` 的借用纠缠。
-3. **`requires_grad` 分支**：如果输入不需要梯度（比如纯推理），就直接返回普通结果，不建 `parents`/`backward`，省下计算图的维护开销。这和第 18 课 KV cache 推理时"纯数据拼接、无梯度"的思路一致。
+3. **`requires_grad` 分支**：如果输入不需要梯度（比如纯推理），就直接返回普通结果，不建 `parents`/`backward`，省下计算图的维护开销。这和第 25 课 KV cache 推理时"纯数据拼接、无梯度"的思路一致。
 4. **反向闭包查同一张表**：反向闭包为了"自包含"（只捕获 `ct`/`st` 两份表拷贝 + `rg`/`sg` 两个 Rc），直接查表取值，**不再重算 `theta/cos/sin`**。代价是闭包多持有两张表，好处是前向建的三角表被完整复用。
 
 ---
@@ -344,10 +380,10 @@ pub fn rotary_pair(&self, other: &Tensor, positions: &[usize]) -> (Tensor, Tenso
 `src/rope.rs` 里 `rotate_with_tab` 反向闭包的循环体是（`c`/`s` 直接查 `ct`/`st` 表）：
 
 ```rust
-let (ga, gb) = (g[r * d + 2 * i], g[r * d + 2 * i + 1]);
+let (ga, gb) = (g_local[g_base + 2 * i], g_local[g_base + 2 * i + 1]);
 // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
-sgm[r * d + 2 * i] += ga * c + gb * s;
-sgm[r * d + 2 * i + 1] += -ga * s + gb * c;
+sgm_row[2 * i] += ga * c + gb * s;
+sgm_row[2 * i + 1] += -ga * s + gb * c;
 ```
 
 与 8.1 的结论逐行对应：第一行 `ga·c + gb·s`、第二行 `-ga·s + gb·c`，正是 `R(θ)ᵀ·g`。
@@ -515,4 +551,4 @@ let (q, k) = (
 - `test_rotary` 三个断言分别验证：正交性（范数不变）、`pos=0` 恒等、梯度范数守恒；`test_rotary_grad_exact` 逐元素验证梯度方向。
 - 实际接入：在 `MultiHeadAttention` 拆头前、KV cache append 之前对 Q/K 旋转（只转 Q/K、不转 V），已完成接入；`GPT` 已无 `pos_emb` 字段（第 11 课正弦编码被替换）。
 
-- 下一课（第 20 课）：收尾——学习率调度（warmup + cosine decay）与整个项目的总结回顾！
+- 下一课（第 21 课）：RMSNorm 均方根归一化

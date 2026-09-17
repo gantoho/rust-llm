@@ -8,6 +8,7 @@
 //! cargo run -- finetune --config config.json --pretrained ckpt [--lora-rank 16]
 //! cargo run -- preset   [--name small] [--output config.json]
 //! cargo run -- demo     # 教学演示（XOR + BPE + 内置语料小 GPT）
+//! cargo run -- bench    # 性能基准（固定小模型测训练 / 推理吞吐）
 //! ```
 
 use clap::{Parser, Subcommand};

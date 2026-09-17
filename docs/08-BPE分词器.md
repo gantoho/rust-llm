@@ -1,8 +1,8 @@
 # 第 8 课：BPE 分词器 —— 让模型"读懂"文字
 
-> 代码位置：[src/tokenizer.rs](src/tokenizer.rs)
-> 演示入口：[src/main.rs](src/main.rs)（`demo_bpe`）
-> 语料：[src/data.rs](src/data.rs)（`CORPUS`）
+> 代码位置：[src/tokenizer.rs](../src/tokenizer.rs)
+> 演示入口：[src/main.rs](../src/main.rs)（`demo_bpe`）
+> 语料：[src/data.rs](../src/data.rs)（`CORPUS`）
 
 ---
 
@@ -264,7 +264,7 @@ pub fn decode(&self, ids: &[usize]) -> String {
 
 ```bash
 cargo test   # 全部测试通过
-cargo run    # 演示 2（BPE）：词表 400（256 + 144 次合并）；"Red" -> [82, 101, 100]；"the garden" -> 2 个 token
+cargo run --release -- demo    # 演示 2（BPE）：词表 400（256 + 144 次合并）；"Red" -> [82, 101, 100]；"the garden" -> 2 个 token
 ```
 
 ---

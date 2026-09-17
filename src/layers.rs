@@ -183,6 +183,15 @@ impl NormLayer {
             NormLayer::RMS(rms) => rms.named_parameters(prefix),
         }
     }
+
+    /// LayerNorm 分支的 `(γ, β, ε)`；RMSNorm 分支返回 None
+    /// （GPU 常驻显存路径目前只实现了 LayerNorm）
+    pub fn ln_params(&self) -> Option<(&Tensor, &Tensor, f32)> {
+        match self {
+            NormLayer::LN(ln) => Some((&ln.gamma, &ln.beta, ln.eps)),
+            NormLayer::RMS(_) => None,
+        }
+    }
 }
 
 impl Module for NormLayer {
@@ -284,6 +293,20 @@ impl MLPEnum {
                 ps
             }
             MLPEnum::SwiGLU(s) => s.named_parameters(prefix),
+        }
+    }
+
+    /// GELU 分支的 `(W₁, b₁, W₂, b₂)`；SwiGLU 分支返回 None
+    /// （GPU 常驻显存路径目前只实现了 GPT-2 风格的 GELU MLP）
+    pub fn gelu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor)> {
+        match self {
+            MLPEnum::GELU { linear1, linear2 } => Some((
+                &linear1.weight,
+                &linear1.bias,
+                &linear2.weight,
+                &linear2.bias,
+            )),
+            MLPEnum::SwiGLU(_) => None,
         }
     }
 }

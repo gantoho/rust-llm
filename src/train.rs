@@ -1,4 +1,4 @@
-//! 训练循环与学习率调度（第 13、20 课）
+//! 训练循环与学习率调度（第 13、18 课）
 //!
 //! 训练 GPT 的完整骨架：
 //! 1. 采样一个 batch
@@ -8,7 +8,7 @@
 //! 5. 优化器更新参数
 //! 6. 清零梯度
 //!
-//! 学习率调度（第 20 课）：
+//! 学习率调度（第 18 课）：
 //! - warmup：前若干步学习率从 0 线性升到最大值（让训练稳定起步）
 //! - cosine decay：之后按余弦曲线衰减到最小值（后期精细收敛）
 //!
@@ -206,6 +206,59 @@ pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut 
     total / eval_iters as f32
 }
 
+/// 前向 + 交叉熵，返回「打印用未缩放、反向按 `1/accum` 缩放」的 loss 张量。
+///
+/// GPU 可用且尺寸合适时走「输出头常驻显存」路径：`hidden @ Wᵀ` 与 softmax+交叉熵
+/// 录进一次提交，logits 与 dlogits（本配置下各 33.6M 元素）全程留在显存、只回读每行 CE，
+/// 反向也一次算完 d_hidden / d_head。相比逐算子版省掉一步 268 MB 的往返（实测 445 ms）。
+///
+/// 交叉熵对 logits 的梯度是解析式的（softmax - onehot），不依赖上游梯度，
+/// 所以不必为中间那段建计算图：直接算好边界上的梯度、注入图上的张量即可，
+/// autograd 会从这些张量继续往前传播。
+fn forward_loss(
+    model: &GPT,
+    x: &[usize],
+    y: &[usize],
+    batch_size: usize,
+    block_size: usize,
+    accum: usize,
+) -> Tensor {
+    let hidden = model.forward_hidden(x, batch_size, block_size, true);
+    let head = model.head_weight();
+    let inv_accum = 1.0 / accum as f32;
+
+    #[cfg(feature = "gpu")]
+    if crate::tensor::grad_enabled() {
+        let rows = batch_size * block_size;
+        let d = hidden.shape()[1];
+        let vocab = head.shape()[0];
+        if let Some(resident) =
+            crate::gpu::lm_head_ce(&hidden.data.borrow(), &head.data.borrow(), y, rows, d, vocab)
+        {
+            let hidden_bwd = hidden.clone();
+            let head_bwd = head.clone();
+            return Tensor::external_scalar_loss(resident.loss, vec![hidden.clone()], move || {
+                let (dx, dw) = resident.backward().expect("常驻输出头反向失败");
+                hidden_bwd.accumulate_grad(&dx, inv_accum);
+                head_bwd.accumulate_grad(&dw, inv_accum);
+            });
+        }
+    }
+
+    // 回落：逐算子路径，输出头照旧走 Tensor 算子
+    let logits = hidden.matmul(&head.transpose());
+    let loss = cross_entropy_loss(&logits, y);
+    if accum == 1 {
+        return loss;
+    }
+    // 梯度累积：不缩放 loss 本身（打印要用原始值），只把 1/accum 作为上游梯度注入
+    let raw_val = loss.item();
+    let loss_bwd = loss.clone();
+    Tensor::external_scalar_loss(raw_val, vec![loss], move || {
+        loss_bwd.accumulate_grad(&[inv_accum], 1.0);
+    })
+}
+
 /// 训练指标记录器（CSV 格式）
 struct MetricsLogger {
     file: Option<std::fs::File>,
@@ -298,9 +351,19 @@ pub fn train_gpt(
         println!("训练指标将记录到 {}", log_path.unwrap());
     }
 
-    // 打印启动阶段收集的 GPU 诊断摘要
+    // GPU dispatch 开销分解：必须等首步的真实 dispatch 跑完才有数据可打印，
+    // 所以不在启动阶段调用，而是等训练循环里第一次进度打印时输出一次（见下）。
     #[cfg(feature = "gpu")]
-    crate::gpu::flush_diag_log();
+    let mut gpu_diag_printed = false;
+    // 判定实验：LLM_GPU_PROBE=1 时录制**第一步**的 matmul 形状，再用分组回放测批量吞吐，
+    // 用来判断 GPU 后端该改哪个形状（录制期间 GPU 不参与，CPU 兜底，数值不受影响）。
+    // 只录一步是刻意的：这样「每步几次」是精确值，而不是靠批数去猜。
+    #[cfg(feature = "gpu")]
+    let probe_on = std::env::var("LLM_GPU_PROBE").is_ok();
+    #[cfg(feature = "gpu")]
+    if probe_on {
+        crate::gpu::probe_capture(true);
+    }
 
     let mut eval_rng = Rng::new(cfg.seed); // 固定种子，评估结果可复现
     let mut no_improve_count = 0usize; // 早停计数器
@@ -319,13 +382,22 @@ pub fn train_gpt(
         // 1. 采样 batch
         let (x, y) = loader.sample_batch(rng);
 
-        // 2. 前向 + 损失（梯度累积时 loss 除以 accum_steps）
-        let logits = model.forward(&x, batch_size, block_size, None, true);
-        let loss = cross_entropy_loss(&logits, &y);
-        let scaled_loss = loss.mul_scalar(1.0 / accum as f32);
+        // 2. 前向 + 损失（梯度累积时反向按 1/accum 缩放）
+        let t_seg = std::time::Instant::now();
+        let loss = forward_loss(&model, &x, &y, batch_size, block_size, accum);
+        let fwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
 
         // 3. 反向（梯度自动累加到现有梯度上）
-        scaled_loss.backward();
+        let t_seg = std::time::Instant::now();
+        loss.backward();
+        let bwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
+
+        // 判定实验：第一步的反向跑完就收网，按形状回放测出「每步每个形状各花多少 ms」
+        #[cfg(feature = "gpu")]
+        if probe_on {
+            crate::gpu::probe_report();
+            crate::gpu::probe_fma();
+        }
 
         // 每 accum 步才做一次梯度裁剪 + 优化器更新 + 清零
         if (step + 1) % accum == 0 || step + 1 == cfg.steps {
@@ -347,10 +419,16 @@ pub fn train_gpt(
                     }).sum::<f32>().sqrt();
                     let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
                     println!(
-                        "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | {:.0}s | ~{:.0}s",
+                        "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | fwd {:.0}ms bwd {:.0}ms | {:.0}s | ~{:.0}s",
                         step + 1, cfg.steps, loss.item(), raw_norm, clipped, scheduler.lr(),
-                        steps_per_sec, tps, elapsed, remaining
+                        steps_per_sec, tps, fwd_ms, bwd_ms, elapsed, remaining
                     );
+                    // 首步结束后打印一次 GPU dispatch 开销分解（上传/提交/同步各占多少）
+                    #[cfg(feature = "gpu")]
+                    if !gpu_diag_printed {
+                        gpu_diag_printed = true;
+                        crate::gpu::flush_diag_log();
+                    }
                     last_progress_t = now;
                 }
             }
@@ -472,6 +550,9 @@ pub fn train_gpt(
     }
     #[cfg(feature = "gpu")]
     {
+        // 进度打印要等满 5s 才触发一次，短跑（如消融实验）会在触发前就结束，
+        // 于是分解永远打不出来。收尾再兜一次，保证任何长度的跑都能看到诊断。
+        crate::gpu::flush_diag_log();
         let (gpu_calls, cpu_calls) = crate::gpu::stats();
         println!("[done] matmul 分流：GPU {} / CPU {}", gpu_calls, cpu_calls);
     }

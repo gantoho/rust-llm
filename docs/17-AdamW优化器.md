@@ -1,8 +1,8 @@
-﻿# 第 17 课：AdamW 优化器 —— 给梯度下降装上"惯性"和"自适应步长"
+# 第 17 课：AdamW 优化器 —— 给梯度下降装上"惯性"和"自适应步长"
 
-> 代码位置：[src/optim.rs](src/optim.rs)（`SGD` / `AdamW`）
-> 代码位置：[src/train.rs](src/train.rs)（`train_gpt` 中 AdamW 的用法）
-> 演示入口：[src/main.rs](src/main.rs)（演示 3：训练小 GPT）
+> 代码位置：[src/optim.rs](../src/optim.rs)（`SGD` / `AdamW`）
+> 代码位置：[src/train.rs](../src/train.rs)（`train_gpt` 中 AdamW 的用法）
+> 演示入口：[src/main.rs](../src/main.rs)（演示 3：训练小 GPT）
 
 ---
 
@@ -21,13 +21,16 @@
 第 6 课实现的 SGD 是整个故事的原点：
 
 ```rust
-/// 更新一步：θ = θ - lr * g
-pub fn step(&self) {
-    for p in &self.params {
-        let g = p.grad();
-        let d = p.data();
-        let updated: Vec<f32> = d.iter().zip(&g).map(|(v, g)| v - self.lr * g).collect();
-        p.set_data(updated);
+impl Optimizer for SGD {
+    /// 更新一步：θ = θ - lr * g（原位更新，避免每次克隆整份数据）
+    fn step(&mut self) {
+        for p in &self.params {
+            let g = p.grad.borrow();
+            let mut d = p.data.borrow_mut();
+            for j in 0..d.len() {
+                d[j] -= self.lr * g[j];
+            }
+        }
     }
 }
 ```
@@ -129,30 +132,35 @@ v̂_t = v_t / (1 - β2^t)
 完整代码（`src/optim.rs`）：
 
 ```rust
-pub fn step(&mut self) {
+fn step(&mut self) {
     self.t += 1;
     // 偏差修正系数（训练初期 t 小，修正大）
     let bc1 = 1.0 - self.beta1.powi(self.t as i32);
     let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+    let lr = self.lr;
+    let beta1 = self.beta1;
+    let beta2 = self.beta2;
+    let eps = self.eps;
+    let wd = self.weight_decay;
 
-    for (i, p) in self.params.iter().enumerate() {
-        let g = p.grad();
-        let d = p.data();
-        let mut updated = vec![0.0f32; d.len()];
+    for i in 0..self.params.len() {
+        let g = self.params[i].grad.borrow();
+        let mut d = self.params[i].data.borrow_mut();
+        let mi = &mut self.m[i];
+        let vi = &mut self.v[i];
         for j in 0..d.len() {
             let gv = g[j];
             // 1. 更新动量
-            self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * gv;
-            self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * gv * gv;
+            mi[j] = beta1 * mi[j] + (1.0 - beta1) * gv;
+            vi[j] = beta2 * vi[j] + (1.0 - beta2) * gv * gv;
             // 2. 偏差修正
-            let m_hat = self.m[i][j] / bc1;
-            let v_hat = self.v[i][j] / bc2;
+            let m_hat = mi[j] / bc1;
+            let v_hat = vi[j] / bc2;
             // 3. 更新：θ -= lr * m_hat/(√v_hat + eps) + lr * wd * θ（权重衰减解耦）
-            let step = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-            let decay = self.lr * self.weight_decay * d[j];
-            updated[j] = d[j] - step - decay;
+            let step = lr * m_hat / (v_hat.sqrt() + eps);
+            let decay = lr * wd * d[j];
+            d[j] = d[j] - step - decay;   // 原位更新，不新建张量
         }
-        p.set_data(updated);
     }
 }
 ```
@@ -164,21 +172,21 @@ pub fn step(&mut self) {
 | `self.t += 1;` | —— | 步数计数，偏差修正要用到 t |
 | `bc1 = 1.0 - self.beta1.powi(t)` | `1 - β1^t` | 一阶动量修正系数（t 从 1 开始） |
 | `bc2 = 1.0 - self.beta2.powi(t)` | `1 - β2^t` | 二阶动量修正系数 |
-| `self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * gv;` | `m_t = β1·m_{t-1} + (1-β1)·g_t` | 一阶动量：新旧梯度按 9:1 加权 |
-| `self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * gv * gv;` | `v_t = β2·v_{t-1} + (1-β2)·g_t²` | 二阶动量：梯度**平方**，恒正 |
-| `m_hat = self.m[i][j] / bc1;` | `m̂_t = m_t/(1-β1^t)` | 修正初期被低估的一阶动量 |
-| `v_hat = self.v[i][j] / bc2;` | `v̂_t = v_t/(1-β2^t)` | 修正初期被低估的二阶动量 |
-| `step = self.lr * m_hat / (v_hat.sqrt() + self.eps);` | `lr·m̂/(√v̂+ε)` | Adam 更新步长：方向 m̂，大小被 √v̂ 自适应缩放 |
-| `decay = self.lr * self.weight_decay * d[j];` | `lr·wd·θ` | 解耦的权重衰减，**不经过 √v̂ 缩放** |
-| `updated[j] = d[j] - step - decay;` | `θ ← θ - step - decay` | 参数更新 = 旧值 - Adam 步长 - 衰减 |
-| `p.set_data(updated);` | —— | 写回参数张量 |
+| `let g = self.params[i].grad.borrow(); let mut d = self.params[i].data.borrow_mut();` | —— | 借用第 `i` 个参数的梯度与数据，后续全部**原位读写** |
+| `mi[j] = beta1 * mi[j] + (1.0 - beta1) * gv;` | `m_t = β1·m_{t-1} + (1-β1)·g_t` | 一阶动量：新旧梯度按 9:1 加权 |
+| `vi[j] = beta2 * vi[j] + (1.0 - beta2) * gv * gv;` | `v_t = β2·v_{t-1} + (1-β2)·g_t²` | 二阶动量：梯度**平方**，恒正 |
+| `let m_hat = mi[j] / bc1;` | `m̂_t = m_t/(1-β1^t)` | 修正初期被低估的一阶动量 |
+| `let v_hat = vi[j] / bc2;` | `v̂_t = v_t/(1-β2^t)` | 修正初期被低估的二阶动量 |
+| `let step = lr * m_hat / (v_hat.sqrt() + eps);` | `lr·m̂/(√v̂+ε)` | Adam 更新步长：方向 m̂，大小被 √v̂ 自适应缩放 |
+| `let decay = lr * wd * d[j];` | `lr·wd·θ` | 解耦的权重衰减，**不经过 √v̂ 缩放** |
+| `d[j] = d[j] - step - decay;` | `θ ← θ - step - decay` | 参数**原位更新**（直接改 `data`，不新建张量） |
 
 四个值得停下来想一想的细节：
 
 1. **为什么 `v_hat.sqrt()` 要加 `eps`**：防止 `v_hat ≈ 0`（训练初期）时除零，数值稳定性用。`eps = 1e-8` 是 Adam 论文的标准值。
 2. **`lr` 是 `pub` 字段**：`src/train.rs` 里每步都改它——
    ```rust
-   opt.lr = scheduler.lr();   // 第 20 课：warmup + cosine 调度
+   opt.lr = scheduler.lr();   // 第 18 课：warmup + cosine 调度
    opt.step();
    ```
    调度器只负责改 `lr`，AdamW 的 `m`、`v` 状态跨步累积、完全不受影响。
@@ -211,14 +219,14 @@ AdamW {
 | `beta2` | 0.999 | 二阶动量衰减系数 | 一般不动；训练不稳时有人降到 0.95 |
 | `eps` | 1e-8 | 除零保护 | 一般不动 |
 | `weight_decay` | 0.01（本项目） | 权重衰减强度 | 常用 0.01~0.1；越大正则化越强 |
-| `lr` | 调度器控制 | 基础步长 | 配合 warmup/cosine（第 20 课） |
+| `lr` | 调度器控制 | 基础步长 | 配合 warmup/cosine（第 18 课） |
 
 本项目在 `train_gpt` 里这样接入：
 
 ```rust
-let mut opt = AdamW::new(max_lr, params.clone(), 0.01);   // wd = 0.01
+let mut opt = AdamW::new(cfg.max_lr, params.clone(), cfg.weight_decay);
 ...
-clip_grad_norm(&params, 1.0);   // 先裁剪梯度（防止个别大梯度冲坏 m、v 的估计）
+clip_grad_norm(&params, cfg.grad_clip);   // 先裁剪梯度（防止个别大梯度冲坏 m、v 的估计）
 opt.lr = scheduler.lr();        // 再设置当前学习率
 opt.step();                     // 最后更新
 opt.zero_grad();

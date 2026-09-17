@@ -1,6 +1,6 @@
 # 第 29 课：LoRA 低秩适配 —— 用 0.1% 的参数微调大模型
 
-> 代码位置：[src/layers.rs](src/layers.rs)（`LoRA` 层、`inject_lora` 辅助函数）
+> 代码位置：[src/layers.rs](../src/layers.rs)（`LoRA` 层、`inject_lora` 辅助函数）
 >
 > 算法论文：*LoRA: Low-Rank Adaptation of Large Language Models* (Hu et al., 2021)
 
@@ -142,22 +142,26 @@ let optimizer = AdamW::new(trainable, lr=1e-4);
 
 ## 8. 集成状态
 
-`LoRA` 层和 `inject_lora` 辅助函数已完整实现（`layers.rs`），并通过 `finetune` 子命令接入 CLI。
+`LoRA` 层和 `inject_lora` 辅助函数已完整实现（`layers.rs`），但目前是**教学实现**——两者都挂着
+`#[allow(dead_code)]`，**尚未接入训练循环**（还没有"冻结主参数、只更新 A/B"的训练路径）。
+
+`finetune` 子命令当前做的是**加载预训练权重的常规全参微调**（`src/main.rs` 的 `cmd_finetune` → `train::train_gpt`）：
+`--lora-rank` / `--lora-alpha` 只是写进 `config.train.lora`，训练循环读到后打印一行提示，并不改变哪些参数被更新。
 
 ### 8.1 命令行用法
 
 ```bash
-# 基础 LoRA 微调（rank=16, alpha=16, 1000 步）
+# 加载预训练权重做全参微调（1000 步）
 cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
 
-# 自定义 LoRA 参数
+# 指定步数与学习率
 cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt \
-    --lora-rank 32 --lora-alpha 32 --steps 2000 --lr 5e-5
+    --steps 2000 --lr 5e-5
 ```
 
 ### 8.2 配置文件方式
 
-也可以在 `config.json` 中配置 LoRA：
+也可以在 `config.json` 中配置 LoRA（当前仅用于打印提示，供将来接入训练循环）：
 
 ```jsonc
 {
@@ -171,6 +175,14 @@ cargo run --release -- finetune --config config.json --pretrained checkpoints/be
 ```
 
 ### 8.3 工作流程
+
+**当前 `finetune` 的实际流程**：
+
+1. 加载预训练 checkpoint（`--pretrained` 参数）
+2. 用 `config.json` 里的数据与超参数做常规全参微调（`train::train_gpt`）
+3. 保存 checkpoint（全部参数都被更新）
+
+**LoRA 接入训练循环后应有的流程**：
 
 1. 加载预训练 checkpoint（`--pretrained` 参数）
 2. 冻结主模型所有参数

@@ -1,7 +1,7 @@
 # 第 19 课：Dropout —— 训练时的"随机失忆"
 
-> 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::dropout` 算子）
-> 代码位置：[src/model.rs](src/model.rs)（`TransformerBlock` / `GPT` 中的 dropout 调用）
+> 代码位置：[src/tensor.rs](../src/tensor.rs)（`Tensor::dropout` 算子）
+> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `GPT` 中的 dropout 调用）
 >
 > 配置开关：`config.json` → `model.dropout: 0.1`（推荐值 0.1~0.3）
 
@@ -86,7 +86,7 @@ x = Dropout(TokenEmbedding(tokens))
 
 - **残差连接之后**：Dropout 在残差加法之前（不是之后）
 - **不在 LN 内部**：LayerNorm/RMSNorm 本身不加 Dropout
-- **推理时关闭**：`model.eval()` 模式下 Dropout 自动关闭
+- **推理时关闭**：由 `forward(..., training: bool)` 参数控制，`training = false` 时 Dropout 直接返回输入的克隆（本项目没有 `model.eval()` 这种全局开关，详见 6.2 节）
 - **预训练 vs 微调**：大模型预训练通常用 Dropout=0.1；微调时可能关掉（数据够多时）
 
 ---

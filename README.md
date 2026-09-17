@@ -19,8 +19,10 @@
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
-- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、LoRA 微调、混合精度、梯度累积、Beam Search。
-- **真实可用**：支持 LoRA 微调、交互式对话、分词器持久化、训练指标日志、预设模型配置。
+- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、梯度累积、Beam Search。
+- **真实可用**：加载预训练权重微调、交互式对话、分词器持久化、训练指标日志、预设模型配置。
+- **教学实现（尚未接入训练循环）**：LoRA 层与 `MixedPrecision` 动态损失缩放都有完整实现和文档，
+  但都还没接进 `train_gpt`——`finetune` 目前是常规全参微调，见 [§5](#5-finetune--加载预训练权重微调) 与第 26 / 29 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
 ### 包含的功能（对应 39 课）
@@ -36,7 +38,7 @@
 | 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、KV Cache、**GQA 分组查询注意力** |
 | GPT 模型 | `src/model.rs` | Transformer Block 堆叠、GPT 整体前向、checkpoint 参数名、**Dropout** |
 | 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样 |
-| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、**混合精度 AMP**、**CSV 指标日志** |
+| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**；另外实现了但未接入的 `MixedPrecision` 动态损失缩放 |
 | 采样 | `src/sample.rs` | temperature / top-k / top-p 采样，KV cache 推理，**Beam Search** |
 | 配置 | `src/config.rs` | `config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
@@ -61,7 +63,7 @@
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
-| 工程化完善 | `docs/39-工程化完善.md` | 7 个 CLI 子命令、分词器序列化、预设配置、LoRA 微调工作流、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
+| 工程化完善 | `docs/39-工程化完善.md` | 8 个 CLI 子命令、分词器序列化、预设配置、微调工作流、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
 
 ## 快速开始
 
@@ -90,7 +92,7 @@ cargo run --release -- train --config config_medium.json
 cargo run --release -- chat --ckpt checkpoints/best.ckpt
 
 # ═══════════════════════════════════════════
-#  LoRA 微调（加载预训练模型，只训练低秩适配层）
+#  微调（加载预训练模型，当前为全参微调；LoRA 尚未接入训练循环）
 # ═══════════════════════════════════════════
 cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
 
@@ -493,14 +495,18 @@ cargo run --release -- chat --ckpt checkpoints/best.ckpt --temperature 1.0 --max
 
 ---
 
-### 5. `finetune` —— LoRA 微调
+### 5. `finetune` —— 加载预训练权重微调
 
 ```bash
 cargo run --release -- finetune [参数]
 ```
 
-LoRA（Low-Rank Adaptation）微调：加载预训练模型，冻结主参数，只训练低秩适配层。
-可训练参数量极小（通常 < 1%），适合在小数据集上快速适配。
+从预训练 checkpoint 接着训练：加载权重后按指定的步数与学习率做**全参微调**。
+
+> ⚠️ **LoRA 尚未接入训练循环**：`src/layers.rs` 的 `LoRA` / `inject_lora` 以及 `--lora-rank` / `--lora-alpha`
+> 参数都已实现，但它们只会写进 `config.train.lora` 并打印一行提示，**不会冻结主参数、也不会注入适配层**。
+> 也就是说当前 `finetune` 训练的是全部参数，可训练参数量并没有「降到 1% 以下」。
+> LoRA 的原理与完整实现见第 29 课。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -514,12 +520,12 @@ LoRA（Low-Rank Adaptation）微调：加载预训练模型，冻结主参数，
 **示例**：
 
 ```bash
-# ── 基础 LoRA 微调 ──
+# ── 基础微调 ──
 cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
 
-# ── 自定义 LoRA 参数 ──
+# ── 自定义步数与学习率 ──
 cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt \
-    --lora-rank 32 --lora-alpha 32 --steps 2000 --lr 5e-5
+    --steps 2000 --lr 5e-5
 ```
 
 ---
@@ -573,9 +579,10 @@ cargo run --release -- demo
 
 1. **MLP 学习 XOR**（第 7 课）：验证神经网络 + 反向传播正确，训练后正确率 4/4（100%）
 2. **BPE 分词器**（第 8 课）：在示例语料上训练 BPE 词表（400 个 token），演示编码/解码往返
-3. **训练小 GPT 并生成文本**（第 12-21 课）：669 字符英文故事上训练 600 步，loss 4.14→0.16，
-   然后用 temperature=0.8 / top-k=10 / top-p=0.9 生成文本，分别演示无 KV cache 和带 KV cache 两种推理
-4. **GPU 加速对比**（第 21 课，仅 `--features gpu`）：验证 CPU vs GPU 数值一致性，实测加速比
+3. **训练小 GPT 并生成文本**（第 12-20、25 课）：669 字符英文故事上训练 600 步，每 100 步记录一次
+   （loss `1.63 → 0.15`），然后用 temperature=0.8 / top-k=10 / top-p=0.9 生成文本，
+   分别演示无 KV cache 和带 KV cache 两种推理
+4. **GPU 加速对比**（第 27 课，仅 `--features gpu`）：验证 CPU vs GPU 数值一致性，实测加速比
 
 **示例**：
 
@@ -682,7 +689,8 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-运行 28 个单元测试（零外部依赖，秒级完成）：
+默认构建运行 **29 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
+合计 38 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -698,13 +706,37 @@ cargo test test_softmax -- --nocapture
 | `test_rmsnorm_fused_matches_chain` | RMSNorm 融合算子 vs 分步实现 |
 | `test_swiglu_matches_elementwise` | SwiGLU 融合算子 vs 逐元素实现 |
 | `test_masked_softmax_matches_chain` | 掩码 softmax 融合算子 vs 分步实现 |
-| `test_flash_attention_matches_standard` | Flash Attention vs 标准注意力 |
+| `test_flash_attention_matches_standard` | Flash Attention vs 标准注意力（前向） |
+| `test_flash_attention_backward_matches_standard` | Flash Attention 反向 vs 标准注意力反向 |
+| `test_flash_attention_resident_path_matches_loop_reference` | 注意力常驻显存路径 vs 逐算子参考 |
 | `test_dropout_p0_identity` / `test_dropout_eval_identity` | Dropout 正确性 |
+| `test_dropout_masks_differ_across_calls` | Dropout 每次调用的掩码不同（种子确实在推进） |
 | `test_rotary` / `test_rotary_grad_exact` | RoPE 正交性 + 梯度精确验证 |
 | `test_kv_cache_matches_full_forward` | KV cache 推理 vs 全量前向一致性 |
 | `test_char_tokenizer_roundtrip` / `test_bpe_roundtrip` | 分词器编码/解码往返 |
 | `test_linear_regression_converges` | 线性回归收敛 |
 | `test_rng_deterministic` / `test_rng_range` / `test_choice_range` | 随机数生成器 |
+
+`--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `gpu_matmul_matches_cpu` | 14 组形状（含 3D 批量、非 tile 整数倍、跨 tile 边界、三种转置组合）vs CPU 三重循环 |
+| `gpu_masked_softmax_matches_cpu` | 4 组 `(rows, d)` vs CPU，能暴露「归约数组复用少插一道 barrier」的竞态 |
+| `gpu_lm_head_ce_matches_loop_reference` | 输出头融合 CE 的前向 loss + 反向 `d_hidden` / `d_weight` vs 纯循环参考 |
+| `gpu_mlp_resident_matches_loop_reference` | 前馈常驻链路（含 dropout）前向输出 + 7 项梯度（第 2 组跨 256 归约边界） |
+| `gpu_attn_layer_resident_matches_loop_reference` | 注意力常驻链路前向 + 11 项边界梯度 |
+| `gpu_stack_resident_matches_sublayer_reference` | 整叠常驻路径前向 + `dx` + 每层 16 项参数梯度 vs 逐子层常驻路径 |
+| `gpu_matmul_small_tile_matches_big_tile_bits` | 4 形状 × 4 转置组合下，64×64 与 128×128 两个 matmul 内核输出**逐位相同** |
+| `matmul_throughput_probe`（`#[ignore]`） | 单次提交内连跑同一 matmul，测**纯内核**吞吐（排除回读造成的假象） |
+| `mm_tile_ab_probe`（`#[ignore]`） | 同进程内按「大 → 小」交替各 3 轮，标定两种 tile 的 ms 与 GFLOP/s |
+
+两个标定探针要手动跑（它们不是通过/失败型测试，而是打印数据）：
+
+```bash
+cargo test --release --features gpu matmul_throughput_probe -- --ignored --nocapture
+cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
+```
 
 ---
 
@@ -739,10 +771,47 @@ cargo run --features gpu -- demo
 
 **支持的 GPU**：NVIDIA 独显、Intel 核显（Windows 走 DX12 / Vulkan，无需额外驱动）
 
-**加速范围**：
-- 批量矩阵乘（tiled 16×16 共享内存）—— 大矩阵自动走 GPU
-- 逐元素 scale / add / ReLU
-- 小矩阵自动回退 CPU（GPU dispatch 开销 ~10ms > 计算本身 ~0.1ms）
+**加速范围**：GPU 后端有两条执行路径，粒度不同。
+
+**① 逐算子路径（per-op）** —— 一个算子一次提交、一次回读：
+
+- 批量矩阵乘（workgroup 8×8 = 64 线程、输出 tile 64×64、每线程 8×8 寄存器累加器）
+- 逐元素 scale / add / ReLU、掩码 softmax 正反向
+
+代价是**每个算子**都要付一次固定开销。本机（MX150）实测采样 50 次逐算子回读：
+绑定+编码+提交 `0.8ms(6%)`、**poll+回读 `13.0ms(94%)`**（回读带宽约 646 MB/s）。
+所以这条路只适合大形状，小矩阵自动回退 CPU（阈值默认 5000 万 FLOPs）。
+
+**② 常驻 / 批量路径（resident）** —— 一个**子层**录进同一个 command encoder，最后只提交一次：
+
+| 链路 | 入口 | 覆盖范围 | 回注的边界梯度 |
+|------|------|---------|--------------|
+| 输出头融合 CE | `gpu::lm_head_ce` | matmul → log_softmax → CE → dlogits | 2 项（d_hidden / d_weight） |
+| 注意力子层 | `gpu::attn_layer_forward` | ln1 → QKV → RoPE → attn → c_proj → dropout → 残差 | 11 项 |
+| 前馈子层 | `gpu::mlp_forward` | ln2 → linear1 → GELU → linear2 → dropout → 残差 | 7 项 |
+| 整叠 Block | `gpu::stack_forward` | 上述两条链路 × n_layer，子层边界也留在显存 | 每层 16 项 |
+
+走常驻路径时中间张量**全部留在显存不回读**，反向由 `Tensor::accumulate_grad` 把边界梯度注回计算图。
+效果最直观的是输出头：logits 有 4096×8192 = 3355 万个数，逐算子版一步来回 **268MB（实测 355ms）**，
+融合后只回读每行一个 f32 的 row_loss（约 16KB）。
+
+常驻路径的**适用条件**（任一不满足就自动回退逐算子 → CPU）：训练模式（无 KV cache、`base = 0`）、
+LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head == n_head`（不支持 GQA 头复制）、
+形状与规模够大。整叠路径默认**关闭**，用 `LLM_GPU_STACK` 打开——它与逐子层路径数值逐位一致，
+实测还**更快**（同配置 ABBA 两轮：0.59/0.60 s/步 vs 0.67/0.70 s/步，约快 12%）；默认关闭只是因为它的
+准入条件更严（要求所有层都是 LayerNorm + GELU MLP，任一层不满足就整条路径放弃）。
+详见 [docs/27-GPU加速.md](docs/27-GPU加速.md) 的 §4 与 §8。
+
+**环境变量**：
+
+| 变量 | 作用 | 默认 |
+|------|------|------|
+| `LLM_GPU_MATMUL_MIN_FLOPS` | 覆盖分流阈值（FLOPs 低于它走 CPU） | `50000000` |
+| `LLM_GPU_MM_SMALL` | `0` = 强制 128×128 大 tile matmul 内核；其他值 = 64×64 小 tile | 小 tile（见 [标定](#gpu-matmul-内核从-128128-改到-6464)） |
+| `LLM_GPU_STACK` | 存在即启用整叠 Block 常驻路径 | 关 |
+| `LLM_GPU_PROBE` | 存在即录制第一步的全部 matmul 形状并逐形状单独回放，打印每形状吞吐 + 纯 FMA 峰值 | 关 |
+| `LLM_GPU_ABLATE` | 逗号分隔算子类别名（`heads_split,heads_join,col_sum`），命中的类别只计数不提交，用步时差反推真实耗时 | 空 |
+| `LLM_GPU_ABLATE_MM` | 逗号分隔形状谓词（`k<=32`、`n>=8192`、`m<=128`），命中的 matmul 只计数不提交 | 空 |
 
 **GPU vs CPU 选择指南**：
 
@@ -754,6 +823,9 @@ cargo run --features gpu -- demo
 | xlarge（~300M） | 1024+ | **GPU** | 矩阵足够大，GPU 加速显著 |
 
 **分流策略**：FLOPs < 5000 万的矩阵走 CPU（如注意力头内积），其余走 GPU。训练结束时打印 `matmul 分流：GPU X / CPU Y`
+
+**运行时诊断**：训练第一步结束后打印一行 `[gpu] dispatch 分解…`（把每个算子类别的录制/提交/同步耗时按批数归一），
+结束时打印 `[gpu] 稳态（末尾 20 批）…`。这些是性能分析用的，不影响训练结果。
 
 **自动回退**：GPU 初始化失败或任何调用出错时，自动回退 CPU，不影响正确性
 
@@ -810,13 +882,14 @@ cargo run --features gpu -- demo
     "eval_iters": 20,         // 评估时采样的批数（取平均减少方差）
     "tokenizer": "bpe",       // 分词器类型："char"（字符级）或 "bpe"（字节对编码）
     "bpe_vocab": 512,         // BPE 目标词表大小（= 256 字节 + 合并数）
-    "train_file": "data/sample.txt", // 训练语料文件路径（支持目录路径，自动合并 .txt 文件）
+    "train_file": "data/alice.txt", // 训练语料文件路径（支持目录路径，自动合并 .txt 文件）
     "val_file": null,         // 验证语料文件路径。null = 自动从训练文本末尾切 10%
     "out_dir": "checkpoints", // checkpoint 输出目录
     "accum_steps": 1,         // 梯度累积步数。有效 batch = batch_size × accum_steps
     "tokenizer_file": null,   // 分词器文件路径。null = 从语料训练并保存；Some = 从文件加载
-    "lora": null,             // LoRA 微调配置。null = 不启用；{ "rank": 16, "alpha": 16.0 } = 启用
-    "log_file": null          // 训练指标日志文件路径。null = 不记录；Some = 记录到 CSV
+    "lora": null,             // LoRA 配置（目前未接入训练循环，见第 29 课）
+    "log_file": null,         // 训练指标日志文件路径。null = 不记录；Some = 记录到 CSV
+    "early_stop_patience": 0  // 早停耐心值。0 = 不启用；N = 连续 N 次评估不改善则停止
   }
 }
 ```
@@ -830,18 +903,19 @@ cargo run --features gpu -- demo
 | `min_lr` | float | `0.0003` | cosine 衰减的最低学习率。训练后期学习率衰减到此值 |
 | `warmup_steps` | int | `20` | 线性预热步数。前 N 步学习率从 0 线性升到 `max_lr`（≤ `steps`） |
 | `weight_decay` | float | `0.01` | AdamW 权重衰减。正则化防过拟合 |
-| `grad_clip` | float | `1.0` | 梯度裁剪。所有参数梯度的 L2 范数超过此值时等比缩放 |
+| `grad_clip` | float | `1000000.0` | 梯度裁剪。所有参数梯度的 L2 范数超过此值时等比缩放（默认值极大 ≈ 实际不裁剪，各预设配置会显式指定） |
 | `eval_every` | int | `100` | 每 N 步在验证集上评估 loss / 困惑度，并保存 `latest.ckpt` |
 | `eval_iters` | int | `20` | 评估时采样多少批取平均（减少随机波动） |
 | `tokenizer` | string | `"bpe"` | `"char"` = 字符级分词；`"bpe"` = 字节对编码 |
 | `bpe_vocab` | int | `512` | BPE 词表大小。仅当 `tokenizer = "bpe"` 时生效 |
-| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本或目录路径） |
+| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本或目录路径）。**代码默认值指向的 `data/sample.txt` 已不在仓库中，请显式指定 `data/alice.txt` 或 `data/corpus/` 目录**（`config.json` 已配好） |
 | `val_file` | string/null | `null` | 验证语料文件。`null` = 自动从训练文本末尾切约 10% |
 | `out_dir` | string | `"checkpoints"` | checkpoint 保存目录（自动创建） |
 | `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
 | `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
-| `lora` | object/null | `null` | LoRA 微调配置。`null` = 不启用；`{ "rank": 16, "alpha": 16.0 }` = 启用 LoRA |
-| `log_file` | string/null | `null` | 训练指标日志文件路径。`null` = 不记录；指定路径 = 每步记录 lr/loss/ppl/tok/s 到 CSV |
+| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0 }`。**目前只被校验并打印提示，尚未冻结主参数 / 注入适配层**（详见第 29 课） |
+| `log_file` | string/null | `null` | 训练指标日志文件路径。`null` = 不记录；指定路径 = 每步追加一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
+| `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
 
 ### 完整配置示例
 
@@ -914,27 +988,28 @@ llm_from_scratch/
 ├── Cargo.toml          # 依赖：仅工具库（serde_json / clap / windows-sys）+ 可选 wgpu
 ├── README.md           # 本文件
 ├── config.json         # 训练配置（模型超参 + 训练参数）
-├── data/               # 示例语料（data/alice.txt：公版《爱丽丝梦游仙境》）
+├── data/               # 语料：alice.txt（公版《爱丽丝梦游仙境》）、corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
+│                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）、corpus_perf/（性能测试用节选）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / demo / bench
+│   ├── main.rs         # CLI 入口：train / eval / generate / chat / finetune / preset / demo / bench
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）
 │   ├── checkpoint.rs   # checkpoint 保存 / 恢复
-│   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、18-19 课）
+│   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、23、25 课）
 │   ├── autograd.rs     # 自动微分：backward + 拓扑排序（第 2 课）
 │   ├── tensor.rs       # 张量运算（第 1、3-4 课）
-│   ├── gpu.rs          # GPU 计算后端（第 21 课，--features gpu）：WGSL 计算着色器
-│   ├── rope.rs         # RoPE 旋转位置编码（第 19 课）
+│   ├── gpu.rs          # GPU 计算后端（第 27 课，--features gpu）：WGSL 计算着色器
+│   ├── rope.rs         # RoPE 旋转位置编码（第 20 课）
 │   ├── rng.rs          # 随机数（第 5 课）
-│   ├── layers.rs       # 网络层（第 5、11 课）
+│   ├── layers.rs       # 网络层（第 5、11、19、21-22、29 课）
 │   ├── loss.rs         # 损失函数（第 6 课）
 │   ├── optim.rs        # 优化器（第 6、17 课）
 │   ├── module.rs       # 参数管理 trait（第 5 课）
 │   ├── tokenizer.rs    # 分词器（第 8 课）
-│   ├── model.rs        # GPT 模型：Transformer Block + 前向（第 11-12 课）
+│   ├── model.rs        # GPT 模型：Transformer Block + 前向（第 9-12、19 课）
 │   ├── data.rs         # 数据集（第 14 课）
-│   ├── train.rs        # 训练循环与学习率调度（第 13、20 课）
-│   └── sample.rs       # 推理与采样（第 15 课）
+│   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志（第 13、18、28 课）
+│   └── sample.rs       # 推理与采样（第 15、30 课）
 └── docs/               # 39 课教程文档（00-学习计划 + 01~39 各课）
 ```
 
@@ -958,18 +1033,21 @@ llm_from_scratch/
 > | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA、Flash Attention | ✅ |
 > | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
 > | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 📖 |
-> | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、LoRA 微调、交互式对话 | ✅ |
+> | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、微调工作流、交互式对话 | ✅ |
 
 ## 代码验证状态
 
-- **28 个单元测试全部通过**（`cargo test`）
-- 已知提示：`cargo build` / `cargo test` 各会报 1 条 `neg` / `mul` / `sum_last_dim` 的 `never used` 警告，
-  它们是给自动微分测试留的算子，非测试构建下未被调用，属既有情况，不影响功能
+- **29 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 38 个（详见 [§9 `cargo test`](#9-cargo-test--单元测试)）
+- 已知提示（`never used` 警告，不影响功能）：
+  - `cargo build`（非 gpu）报 3 条：`layers.rs` 的 `ln_params`、`gelu_weights`，`tensor.rs` 的 `external` / `mul` / `neg` / `sum_last_dim`
+  - `cargo build --features gpu` 报 2 条：`gpu.rs` 的 `GpuDispatchDiag.n`，`tensor.rs` 的 `mul` / `neg` / `sum_last_dim`
+  - 这些是给自动微分 / GPU 对照测试留的算子，非测试构建下未被调用；`cargo test` 构建里 `mul` / `sum_last_dim` 会被测试用到，只剩 `external` / `neg`
 - 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
   RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 4.14→0.16、文本生成正常
-- **工程化功能已全部集成**：LoRA 微调（`finetune`）、Beam Search（`generate --beam`）、交互式对话（`chat`）、
-  分词器持久化（`tokenizer.json`）、预设配置（`preset`）、训练指标日志（CSV）
+- **工程化功能已全部集成**：微调（`finetune`，当前为**全参微调**，LoRA 只做参数校验与提示）、
+  Beam Search（`generate --beam`）、交互式对话（`chat`）、分词器持久化（`tokenizer.json`）、
+  预设配置（`preset`）、训练指标日志（CSV）、早停（`early_stop_patience`）
 
 ## 性能优化与基准测试
 
@@ -1025,13 +1103,66 @@ cargo run --release -- bench --steps 30
 | 推理（KV cache） | ~591 tok/s | ~1129 tok/s | **约 1.9×** |
 | 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
 
-**正确性**：28 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+**正确性**：29 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§8 `bench`](#8-bench--性能基准) 与 [§10 GPU 章节](#10-gpu-加速可选-feature)。）
 
 ### 还能压的地方
 
-- `flash_attention` 目前按 `b*h` 单线程循环，可按 head 并行
-- KV cache 每步 `k()`/`v()` 会克隆整段历史，可改为共享缓冲
-- Beam Search 的打分目前累加原始 logit（非 log_softmax），语义上不够严格
+- `Tensor::flash_attention` 已改为矩阵乘内核（见 [第 24 课](docs/24-Flash-Attention.md)），
+  但**没有**分块与在线 softmax，显存仍是 O(T²)：长上下文时 P / dP 会完整占显存
+- GPU 注意力常驻链路的 `col_sum` / 共享内存树形归约与 CPU 求和顺序不同，
+  只做到相对误差 < 1e-3，未与 CPU 逐位对齐（其余 GPU 路径都是逐位一致）
+- 整叠常驻路径（`LLM_GPU_STACK=1`）虽然比逐子层常驻快约 12%，但默认关闭：
+  它的准入条件更严（要求所有层都是 LayerNorm + GELU MLP，任一层不满足就整条放弃），
+  且整叠中间量同时驻留显存，显存峰值更高
+- `KVCache::append` 已改为在 `Vec<f32>` 上就地 `extend`（不再每步重拼整段历史），
+  但 `k()` / `v()` 每步仍会克隆一次整段缓存（打分算子需要一个拥有所有权的 `Tensor`），可改为借用视图
+- Beam Search 的打分目前累加原始 logit（非 log_softmax），与「对数概率和」的严格语义有偏差
+
+### GPU matmul 内核：从 128×128 改到 64×64
+
+**根因**：原内核每个 workgroup 是 16×16 = 256 线程、输出 tile 128×128，每线程约 100 个寄存器。
+一块 SM 只塞得下 2 个这样的工作组，于是每次 `workgroupBarrier` 和每次全局 load 的等待都**无处躲藏**。
+改成 8×8 = 64 线程、tile 64×64（每线程仍是 8×8 = 64 个命名标量累加器）后，同一张 SM 能并存多得多的工作组，
+用一个组的访存去盖另一个组的等待。内层循环逐字未改，只把共享内存 stride 从 32 降到 16。
+
+**方法**：GPU 连续满载会降频，两次独立运行的结果能差 15%，所以标定必须**同进程内交替测量**
+（`mm_tile_ab_probe`），而不是跑两次二进制再比。
+
+训练真实形状上逐个体测（大 tile → 小 tile 交替，各 3 轮）：
+
+| 形状 | 大 tile | 小 tile | 小/大 |
+|------|---------|---------|-------|
+| PV fwd 512×512×32 b=32 | 20.91ms / 103 GF/s | **11.78ms / 182 GF/s** | 0.56 |
+| dV bwd 512×512×32 b=32 | 15.79 / 136 | **9.05 / 237** | 0.57 |
+| QKᵀ fwd 512×32×512 b=32 | 20.35 / 106 | **12.16 / 177** | 0.60 |
+| QKV/c_proj fwd 4096×128×128 | 7.86 / 137 | **5.60 / 192** | 0.71 |
+| dW proj bwd 128×4096×128 | 6.77 / 159 | 6.78 / 158 | 1.00 |
+| MLP w2 fwd 4096×512×128 | 8.89 / 242 | **7.04 / 305** | 0.79 |
+| dX proj bwd 4096×128×128 | 8.40 / 128 | **6.24 / 172** | 0.74 |
+| lm_head fwd 4096×128×8192 | 30.78 / 279 | **26.17 / 328** | 0.85 |
+
+**结论**：小 tile 在**每一个**形状上都不输、多数快一截——原本「大 tile 共享内存复用率更高，
+只该在 n 很小或 workgroup 数太少时才换小的」的假设被数据否掉了：连 n = 8192、完全没有 tile 浪费的形状也快 18%。
+
+端到端（同一二进制，用 `LLM_GPU_MM_SMALL` 切换，`n_embd=128 / 4 层 / block=512 / batch=8 / dropout=0`，各跑一次）：
+
+| 内核 | 稳态 ms/次提交（末尾 20 批） | 训练步时 tok/s | 总耗时 / 25 步 |
+|------|---------------------------|--------------|---------------|
+| 大 tile（`LLM_GPU_MM_SMALL=0`） | 26.44 / 29.00 | 6532 / 6814 | ~19s |
+| 小 tile（默认） | 23.43 / 25.13 | 7357 / 7631 | 16~18s |
+
+即端到端小 tile 约快 **9%**（两个配置的 loss 完全相同，都是 `8.9662`）。
+注意这两次是**跨进程**测量，会被 GPU 降频影响（本机可差 15%），
+所以 tile 的取舍结论以上面**同进程交替**测出的内核级对照为准，端到端数字只作旁证。
+
+正确性用 `gpu_matmul_small_tile_matches_big_tile_bits` 保证：4 种形状 × 4 种转置组合下
+两内核输出**逐位相同**（每个输出元素都按 k = 0,1,2,… 顺序累加，浮点加法不满足结合律，顺序一变就对不上）。
+用随机数据而非常数也是刻意的：常数在每步都精确无舍入，测不出求和顺序写错。
+
+**踩坑：按形状做消融实验有失效边界**。`LLM_GPU_ABLATE_MM=<形状谓词>` 能摘掉某个形状的 matmul 看步时差，
+但这只对「输出不进入后续依赖链」的形状成立——消融掉 m = 128 的权重梯度 matmul 后参数永远得不到更新，
+loss 直接变 NaN，整轮实验作废。
 
 ## 实现要点与踩坑记录
 
@@ -1078,5 +1209,5 @@ cargo run --release -- bench --steps 30
 - **人类对齐**（第 36 课）：RLHF (PPO) / DPO / GRPO，让模型"有用、无害、诚实"
 - **RAG 检索增强生成**（第 37 课）：向量检索 + LLM 生成，解决知识截止和幻觉问题
 - **分布式训练**（第 38 课）：数据并行、ZeRO、张量/流水线并行，训练百亿级模型
-- 长度外推：RoPE 配合 NTK-aware scaling、YaRN 等技巧（见第 19 课文档）
+- 长度外推：RoPE 配合 NTK-aware scaling、YaRN 等技巧（见第 20 课文档）
 - 更大的语料与模型规模（`config.json` 可直接调大，CPU 训练需耐心）

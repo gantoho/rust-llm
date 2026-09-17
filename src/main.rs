@@ -715,7 +715,7 @@ fn demo_bpe() {
     );
 }
 
-/// 演示 3（第 12-16、17-20 课）：训练小 GPT 并生成文本
+/// 演示 3（第 12-20、25 课）：训练小 GPT 并生成文本
 fn demo_gpt() {
     println!("=== 演示 3：训练小 GPT 并生成文本 ===");
 
@@ -726,7 +726,7 @@ fn demo_gpt() {
 
     let model = GPT::new(GPTConfig::tiny(vocab_size), &mut rng);
 
-    // 训练（第 13、17、20 课：训练循环 + AdamW + warmup/cosine 调度）
+    // 训练（第 13、17-18 课：训练循环 + AdamW + warmup/cosine 调度）
     let loader = DataLoader::new(CORPUS, &tokenizer, model.cfg.block_size, 8);
     let tcfg = config::TrainConfig {
         seed: 42,
@@ -754,7 +754,7 @@ fn demo_gpt() {
     );
     println!("  {}", out1);
 
-    // 生成（带 KV cache，第 18 课）
+    // 生成（带 KV cache，第 25 课）
     println!("\n  —— 生成 2（temperature=0.8, top-k=10, top-p=0.9, 带 KV cache）——");
     let out2 = generate(
         &model, &tokenizer, "The fox", 80, 0.8, 10, 0.9, true, &mut rng,
@@ -763,7 +763,7 @@ fn demo_gpt() {
     println!("\n  （KV cache 只改计算方式、不改生成分布，两者应高度一致）");
 }
 
-/// 演示 4（第 21 课）：GPU 加速（wgpu 计算着色器）
+/// 演示 4（第 27 课）：GPU 加速（wgpu 计算着色器）
 ///
 /// 仅 `--features gpu` 时编译。验证 GPU 算子正确性并对比性能；
 /// 训练/推理中的矩阵乘已自动走 GPU，失败时静默回退 CPU。

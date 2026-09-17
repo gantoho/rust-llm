@@ -1,9 +1,9 @@
 # 第 25 课：KV Cache —— 让逐 token 生成不再重复计算
 
-> 代码位置：[src/attention.rs](src/attention.rs)（`KVCache` / `MultiHeadAttention`）
-> 代码位置：[src/model.rs](src/model.rs)（`GPT::forward`）
-> 代码位置：[src/sample.rs](src/sample.rs)（`generate`）
-> 演示入口：[src/main.rs](src/main.rs)（演示 3：生成 1 / 生成 2）
+> 代码位置：[src/attention.rs](../src/attention.rs)（`KVCache` / `MultiHeadAttention`）
+> 代码位置：[src/model.rs](../src/model.rs)（`GPT::forward`）
+> 代码位置：[src/sample.rs](../src/sample.rs)（`generate`）
+> 演示入口：[src/main.rs](../src/main.rs)（演示 3：生成 1 / 生成 2）
 
 ---
 
@@ -47,25 +47,34 @@
 
 ## 3. KVCache 的结构
 
-`src/model.rs` 里的定义：
+`src/attention.rs` 里的定义：
 
 ```rust
-/// KV 缓存（第 18 课）：
+/// KV 缓存（第 25 课）：
 /// 生成第 N 个 token 时，前 N-1 个 token 的 K、V 不需要重算。
-/// 把每个注意力层的 K、V 存起来，每次只算新 token 的 K、V 并拼接。
+/// 把每个注意力层的 K、V 存起来，每次只算新 token 的 K、V 并追加。
+///
+/// 内部直接持有 `Vec<f32>` 缓存，append 时只把新块 extend 到末尾，
+/// 避免"每步克隆整段历史再拼接"的 O(T²) 开销。
 pub struct KVCache {
-    k: Option<Tensor>, // [1, T, D]
-    v: Option<Tensor>,
+    k: Rc<RefCell<Vec<f32>>>, // 行优先 [1, T, D] 展平
+    v: Rc<RefCell<Vec<f32>>>,
+    len: usize, // 已缓存的位置数 T
+    d: usize,   // 隐藏维 D，第一次 append 时确定
 }
 ```
 
-| 字段 | 形状 | 含义 |
+| 字段 | 类型 | 含义 |
 |------|------|------|
-| `k` | `[1, T, D]` | 该层已缓存的所有位置的 Key（T = 已缓存位置数） |
-| `v` | `[1, T, D]` | 该层已缓存的所有位置的 Value |
-| `Option` | —— | 空缓存 = `None`；一旦 append 过就一直是 `Some` |
+| `k` / `v` | `Rc<RefCell<Vec<f32>>>` | 该层已缓存的所有位置的 Key / Value，行优先展平成 `[1, T, D]` |
+| `len` | `usize` | 已缓存的位置数 T（不再靠 `shape()[1]` 反推） |
+| `d` | `usize` | 隐藏维 D，第一次 `append` 时从 `k.shape()[2]` 确定 |
 
-注意：**每个注意力层各有一个 `KVCache`**。`GPT::new_kv_cache` 返回 `Vec<KVCache>`，长度 = `n_layer`（本项目 2 层）：
+> 为什么不用 `Option<Tensor>` 直接存张量？因为推理时"追加一个新位置"如果走「取旧数据 → 拼新数据 → 重新包成张量」，
+> 每步都要把整段历史复制一遍，T 步累计 O(T²) 拷贝。把 `Vec<f32>` 放进 `RefCell` 里就地 `extend`，
+> 历史数据一次都不用动。`Rc` 是为了让 `GPT::forward` 这类只读者也能共享同一块缓存。
+
+注意：**每个注意力层各有一个 `KVCache`**。`GPT::new_kv_cache` 返回 `Vec<KVCache>`，长度 = `n_layer`：
 
 ```rust
 pub fn new_kv_cache(&self) -> Vec<KVCache> {
@@ -73,47 +82,52 @@ pub fn new_kv_cache(&self) -> Vec<KVCache> {
 }
 ```
 
-### 3.1 append：把新 K/V 拼到缓存尾部
+### 3.1 append：把新 K/V 追加到缓存尾部（当前实现）
 
 ```rust
-fn append_data(prev: &Option<Tensor>, cur: &Tensor) -> Tensor {
-    match prev {
-        Some(p) => {
-            let mut all = p.data();
-            all.extend(cur.data());
-            let d = cur.shape()[2];
-            Tensor::from_vec(all, vec![1, p.shape()[1] + 1, d])
-        }
-        None => cur.clone(),
-    }
-}
-
+/// 把新的 k/v 追加到缓存末尾（只拷贝新块，不复制历史数据）
 pub fn append(&mut self, k: &Tensor, v: &Tensor) {
-    self.k = Some(Self::append_data(&self.k, k));
-    self.v = Some(Self::append_data(&self.v, v));
+    assert_eq!(k.shape(), v.shape(), "K/V 形状必须一致");
+    assert_eq!(k.rank(), 3, "K/V 必须为 3D [1, T, D]，实际 {:?}", k.shape());
+    self.d = k.shape()[2];
+    self.k.borrow_mut().extend(k.data());
+    self.v.borrow_mut().extend(v.data());
+    self.len += k.shape()[1];
 }
 ```
 
-以 `[1, T, D]` 为例，`append_data` 做的事：
+做的事：
 
-1. 取旧缓存 `p` 的**数据**（`p.data()`，一维展平数组）；
-2. 把新 K/V 的数据 `cur.data()` 拼到末尾；
-3. 按 `[1, 旧长度+1, D]` 重新包成张量。
+1. 校验 K/V 形状一致且是 3D；
+2. 把新 K/V 的数据 `extend` 到各自的 `Vec<f32>` 末尾——**历史数据原地不动**；
+3. `len` 加上本次新增的位置数。
 
-> 细节：`cur` 在推理模式下形状是 `[1, 1, D]`（只算 1 个新位置），所以长度 +1；`d` 从 `cur.shape()[2]` 取。纯数据拼接，推理时无梯度，所以没有走任何 autograd 路径。
+> 反面教材（本项目**曾经**的写法）：把缓存存成 `Option<Tensor>`，每次 append 时
+> 「取旧数据 → `all.extend(cur.data())` → 重新包成张量」——每步都把整段历史复制一遍，
+> T 步累计 O(T²) 拷贝。改成在 `Vec<f32>` 上就地 `extend` 后，历史数据一次都不用动。
 
-### 3.2 seq_len：已缓存了多少位置
+> 细节：`cur` 在推理模式下形状是 `[1, 1, D]`（只算 1 个新位置），所以 `len` 每次 +1，
+> `d` 从 `k.shape()[2]` 取。纯数据追加，推理时无梯度，所以没有走任何 autograd 路径。
+
+### 3.2 seq_len 与 k()/v()
 
 ```rust
+/// 当前已缓存的位置数
 pub fn seq_len(&self) -> usize {
-    self.k.as_ref().map(|t| t.shape()[1]).unwrap_or(0)
+    self.len
 }
+
+/// 返回完整缓存张量 [1, T, D]（注意力打分需要读全量历史，这里克隆一次）
+pub fn k(&self) -> Tensor {
+    Tensor::from_vec(self.k.borrow().clone(), vec![1, self.len, self.d])
+}
+// v() 同理
 ```
 
-- 缓存为空（`None`）→ 0；
-- 否则返回 `k` 张量的第 1 维大小，即已缓存的位置数。
-
-它有两个用途（后面会看到）：一是 `GPT::forward` 用它算位置偏移 `base`；二是 `generate` 用它判断要不要停止。
+- `seq_len()` 直接返回 `len`。它有两个用途（后面会看到）：一是 `GPT::forward` 用它算位置偏移 `base`；二是 `generate` 用它判断要不要停止。
+- `k()` / `v()` 把展平缓存重新包成 `[1, T, D]` 张量供注意力打分使用。
+  这里**仍会克隆一次整段缓存**——因为打分算子是按「拥有所有权的 `Tensor`」写的；
+  想再省掉这一步，需要让算子支持借用视图，属于后续优化（见 README 的"还能压的地方"）。
 
 ---
 
@@ -124,14 +138,20 @@ pub fn seq_len(&self) -> usize {
 ```rust
 // 1. 投影得到 Q、K、V（Linear 输出是 2D [B*T, D]，恢复成 3D）
 let q = self.c_q.forward(x).reshape(vec![b, t, d]); // [B, T, D]
-let k = self.c_k.forward(x).reshape(vec![b, t, d]);
-let v = self.c_v.forward(x).reshape(vec![b, t, d]);
+let kv_dim = self.n_kv_head * head_dim;
+let k = self.c_k.forward(x).reshape(vec![b, t, kv_dim]); // [B, T, kv_dim]
+let v = self.c_v.forward(x).reshape(vec![b, t, kv_dim]);
 
-// 2. KV cache：拼接历史的 K/V（只影响 K、V 的长度）
+// 2. RoPE：对 Q/K 旋转（第 20 课），旋转发生在 append 之前，
+//    所以缓存里存的是"已旋转的 K"，历史位置直接复用、不再重算
+let (q, k) = q.reshape(vec![b * t, d])
+    .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions);
+
+// 3. KV cache：把本次新算的 K/V 追加到缓存，再取回全量历史
 let (k, v) = match kv_cache {
     Some(cache) => {
         cache.append(&k, &v);
-        (cache.k().unwrap(), cache.v().unwrap())
+        (cache.k(), cache.v()) // [1, t_total, D]
     }
     None => (k, v),
 };
@@ -143,13 +163,15 @@ let t_total = k.shape()[1];
 | 变量 | 无缓存 | 有缓存（推理） |
 |------|--------|----------------|
 | `q` | `[B, T, D]` | `[B, 1, D]`（只算新位置） |
-| `k` | `[B, T, D]` | `[B, t_total, D]` = 新 `[B,1,D]` 拼上缓存 |
-| `v` | `[B, T, D]` | `[B, t_total, D]` |
+| `k` | `[B, T, kv_dim]` | `[B, t_total, kv_dim]` = 新 `[B,1,kv_dim]` 追加到缓存 |
+| `v` | `[B, T, kv_dim]` | `[B, t_total, kv_dim]` |
 | `t_total` | = T | = 缓存长度 + 本次新增（本项目每次 +1） |
+
+> `kv_dim = n_kv_head × head_dim`（第 23 课 GQA）：`n_kv_head == n_head` 时就是标准 MHA 的 `D`。
 
 后续的拆头、注意力分数、softmax 等代码**一行都不用改**，因为它们是按 `t_total` 写的通用代码：
 
-- 拆头时 k/v 用 `t_total` 做 reshape（`vec![b, t_total, self.n_head, head_dim]`），q 仍用 `t`；
+- 拆头时 k/v 用 `t_total` 做 reshape（`vec![b, t_total, self.n_kv_head, head_dim]`，再按 `n_rep` 复制成 `n_head` 个头），q 仍用 `t`；
 - 分数 `scores = q.matmul(&kt).mul_scalar(scale)` 形状 `[B*H, t, t_total]`；
 - 因果掩码 mask 是 `[t, t_total]`，广播相加后 `softmax_last_dim()`，最后 `attn.matmul(&v)`。
 
@@ -324,7 +346,7 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 
 | 原因 | 说明 |
 |------|------|
-| 训练长度之外是外推区 | RoPE 对任意位置都能算出旋转角（没有"位置表"可言），但模型训练时只见过位置 `0..32`，超出后是**外推区**（第 19 课讲过），注意力分数可能畸变，输出质量断崖下跌 |
+| 训练长度之外是外推区 | RoPE 对任意位置都能算出旋转角（没有"位置表"可言），但模型训练时只见过位置 `0..32`，超出后是**外推区**（第 20 课讲过），注意力分数可能畸变，输出质量断崖下跌 |
 | 缓存无法"截断" | 全量模式可以用 `ids.len().saturating_sub(block_size)` 把窗口滑到最近 32 个 token；而 `KVCache` 只会 append、不会丢弃最早的位置（当前实现没有"弹掉开头"的操作） |
 | 上下文窗口硬上限 | `block_size` 是模型的设计上下文长度（每个训练样本最长 32 个位置），`generate` 用 `cache[0].seq_len() >= block_size` 把生成长度锁在训练见过的最长窗口内，不越界 |
 
@@ -338,16 +360,17 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 
 1. **严格验证分布不变**：在 `demo_gpt` 里用**相同的 prompt**（如都传 `"The fox"`）和**相同的 rng** 分别调 `generate(..., false, ...)` 与 `generate(..., true, ...)`，对比逐 token 输出是否一致。
 2. **打印缓存形状**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("cache seq_len = {}", cache.seq_len());`，观察它从 7 一路涨到 32 的过程。
-3. **把 `break` 条件去掉**：临时注释掉 `generate` 里的 `if use_kv_cache && cache[0].seq_len() >= block_size { break; }`，运行看会发生什么——体会位置编码表 `[32, D]` 的下界约束。
+3. **把 `break` 条件去掉**：临时注释掉 `generate` 里的 `if use_kv_cache && cache[0].seq_len() >= block_size { break; }`，运行看会发生什么——体会 RoPE 外推区（位置远超训练见过的 `0..32`）对生成质量的影响。
 4. **对比计算量**：全量模式第 k 步前向 k 个位置、缓存模式每步只前向 1 个位置。对 `block_size=32`、`max_new=80`，估算两种模式累计前向的位置总数各是多少。
-5. **（进阶）给 KVCache 加"截断"**：仿照全量模式的窗口滑动，给 `KVCache` 加一个 `truncate(len)` 方法（把 `k.data()` 裁到最近 `len` 个位置再包回张量），并在 `generate` 的缓存分支里每步调用它，让缓存模式也能像全量模式一样持续生成——对比改动前后的输出。
+5. **（进阶）给 KVCache 加"截断"**：仿照全量模式的窗口滑动，给 `KVCache` 加一个 `truncate(keep: usize)` 方法（把 `Vec<f32>` 前部多出来的 `(len - keep) * d` 个元素 `drain` 掉，并同步更新 `len`），并在 `generate` 的缓存分支里每步调用它，让缓存模式也能像全量模式一样持续生成——对比改动前后的输出。
 
 ---
 
 ## 10. 本课总结
 
 - 逐 token 生成时，历史位置的 K/V 每步都在被重复计算——全量模式累计 O(T²)，这是 KV Cache 要消灭的浪费
-- `KVCache` = 每层一份的 `(k, v)` 张量（`[1, T, D]`），`append` 纯数据拼接、`seq_len` 读已缓存长度
+- `KVCache` = 每层一份的 `Vec<f32>` 缓存（行优先展平的 `[1, T, D]`，外加 `len` / `d`），
+  `append` 就地 extend（不复制历史）、`seq_len` 读 `len`、`k()`/`v()` 包成张量（会克隆一次）
 - `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`GPT::forward` 用 `base` 修正位置编码与因果掩码
 - 流程对比：首次前向整个 prompt 填缓存 → 之后每步只前向 1 个 token；全量模式则是每步重算整个窗口
 - 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致

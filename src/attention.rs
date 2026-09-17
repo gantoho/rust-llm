@@ -1,10 +1,10 @@
-//! 多头注意力（第 9-10 课）与 KV Cache（第 18 课）
+//! 多头注意力（第 9-10 课）与 KV Cache（第 25 课）
 //!
 //! 注意力是 Transformer 的核心：让每个 token "关注"序列中其他 token，提取相关性。
 //!
 //! 本模块包含：
 //! - [`KVCache`]：推理时缓存历史 K/V，避免重复计算
-//! - [`MultiHeadAttention`]：多头自注意力 + RoPE 位置编码（第 19 课）
+//! - [`MultiHeadAttention`]：多头自注意力 + RoPE 位置编码（第 20 课）
 
 use crate::layers::Linear;
 use crate::module::Module;
@@ -13,7 +13,7 @@ use crate::tensor::Tensor;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// KV 缓存（第 18 课）：
+/// KV 缓存（第 25 课）：
 /// 生成第 N 个 token 时，前 N-1 个 token 的 K、V 不需要重算。
 /// 把每个注意力层的 K、V 存起来，每次只算新 token 的 K、V 并追加。
 ///
@@ -176,8 +176,9 @@ impl MultiHeadAttention {
             (k, v)
         };
 
-        // 5-7. Flash Attention：分块 + 在线 softmax，不显式构建完整的 scores 矩阵
-        //      O(T²) 显存 → O(T × block_size)，反向通过重算 P 节省显存
+        // 5-7. Flash Attention 融合算子：Q'·Kᵀ → softmax(+mask) → ·V 全走矩阵乘内核
+        //      （2026-09-16 重写，见 `Tensor::flash_attention`：数学等价，但不再做分块在线 softmax）
+        //      `block_size` 参数已失效；显存仍是 O(T²)（保留 P 供反向用）
         let out = Tensor::flash_attention(&q, &k, &v, mask, 32);
 
         // 8. 合并头回 [B, T, D]

@@ -2,7 +2,7 @@
 
 > **本课为前沿技术教程（纯文档，无配套代码实现）。**
 > 与本项目已有代码的关联：SFT 阶段可复用 `src/train.rs` 的训练循环和 `src/loss.rs` 的交叉熵损失；
-> DPO 损失可基于 `src/tensor.rs` 的现有算子（log_softmax、sigmoid）实现。
+> DPO 损失可基于 `src/tensor.rs` 的现有算子 `log_softmax_last_dim` 实现；注意该文件没有独立的 `sigmoid` 算子，它只在 `swiglu` 里以 `1/(1+exp(-x))` 内联（`src/tensor.rs:1103`），需要时可按同样方式手写。
 
 ---
 

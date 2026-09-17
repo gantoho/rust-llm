@@ -246,41 +246,79 @@ fn matmul_data(
     // - b 的一行、out 的一行都是**连续**访问，对缓存和自动向量化友好；
     // - 原 i-j-k 里 b[kk*n+j] 每步跨 n 个元素，命中率极差。
     // 每个输出元素仍在 kk 上按同样顺序累加，浮点结果与旧实现逐位一致。
-    out.par_chunks_mut(n)
+    //
+    // 2026-09-16 追加 **MC×NC 双重分块**（此前是"每行流一遍 B"，纯访存瓶颈）：
+    // 以输出头 m=4096,k=128,n=8192 为例，一张 4 MB 的 B 被反复流 4096 次
+    // ≈ 17 GB 访存，一次前向就把内存带宽打满 —— 整机有效算力只有 4 GFLOP/s，
+    // 实测瓶颈压根不是算力，是访存。分块后的数据复用：
+    // - b 的一条长 nc 的切片（nc×4 字节）留在 L1，被本块 MC 行**复用 MC 次**；
+    // - 输出块留在 L2/寄存器，整个 k 循环只出入内存一次。
+    // B 的访存量因此降到约 1/MC，matmul 从访存瓶颈变成算力瓶颈。
+    // 累加顺序仍是"每个输出元素按 kk 升序累加"，浮点结果与分块前**逐位一致**。
+    const MC: usize = 64; // 输出行块：一个 rayon 任务处理 64 行
+    const NC: usize = 512; // 输出列块：B 切片 512×4 = 2 KB，留在 L1 被 64 行复用
+
+    out.par_chunks_mut(MC * n)
         .enumerate()
-        .for_each(|(row, out_row)| {
-            let bi = row / m;
-            let i = row % m;
-            let a_base = (bi * m + i) * k;
-            let b_base = bi * k * n;
-            for kk in 0..k {
-                let a_v = a2[a_base + kk];
-                let b_row = &b2[b_base + kk * n..b_base + kk * n + n];
-                for (o, &b_v) in out_row.iter_mut().zip(b_row) {
-                    *o += a_v * b_v;
+        .for_each(|(blk, out_blk)| {
+            let rows = out_blk.len() / n;
+            let first_row = blk * MC;
+            // 行块可能跨 batch 边界，所以每行单独算 a/b 的基址
+            let mut a_bases = [0usize; MC];
+            let mut b_bases = [0usize; MC];
+            for r in 0..rows {
+                let grow = first_row + r;
+                let bi = grow / m;
+                a_bases[r] = (bi * m + grow % m) * k;
+                b_bases[r] = bi * k * n;
+            }
+            let mut acc = vec![0.0f32; rows * NC];
+            let mut nb = 0;
+            while nb < n {
+                let nc = NC.min(n - nb);
+                acc[..rows * nc].fill(0.0);
+                for kk in 0..k {
+                    for r in 0..rows {
+                        let a_v = a2[a_bases[r] + kk];
+                        let b_off = b_bases[r] + kk * n + nb;
+                        let b_row = &b2[b_off..b_off + nc];
+                        let acc_row = &mut acc[r * nc..r * nc + nc];
+                        for (o, &b_v) in acc_row.iter_mut().zip(b_row) {
+                            *o += a_v * b_v;
+                        }
+                    }
                 }
+                for r in 0..rows {
+                    let dst = r * n + nb;
+                    out_blk[dst..dst + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
+                }
+                nb += NC;
             }
         });
     out
 }
 
 /// 展平批矩阵转置：[B, rows, cols] -> [B, cols, rows]（CPU 回退用，GPU 路径不需要）
+///
+/// 按 batch 并行：注意力反向要转置的是 dS / P（[BH, T, T_total]，8.4M 元素），
+/// 串行版本单个转置就要几百毫秒，会成为反向的新瓶颈。
 fn transpose_flat(v: &[f32], rows: usize, cols: usize, batch: usize) -> Vec<f32> {
     let mut t = vec![0.0f32; batch * rows * cols];
-    for b in 0..batch {
+    t.par_chunks_mut(rows * cols).enumerate().for_each(|(b, chunk)| {
+        let src = &v[b * rows * cols..(b + 1) * rows * cols];
         for i in 0..rows {
-            for j in 0..cols {
-                t[(b * cols + j) * rows + i] = v[(b * rows + i) * cols + j];
+            let srow = &src[i * cols..(i + 1) * cols];
+            for (j, &s) in srow.iter().enumerate() {
+                chunk[j * rows + i] = s;
             }
         }
-    }
+    });
     t
 }
 
 /// 掩码 softmax 的 CPU 参考实现（GPU 不可用或数组太小时回退用）。
 /// mask 必须是输入的右后缀：行 r 的掩码偏移 mb = (r*d) % mask_numel。
 /// 并行：每行独立 softmax，行间无依赖。
-#[cfg_attr(not(test), allow(dead_code))]
 fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * d];
     out.par_chunks_mut(d).enumerate().for_each(|(r, chunk)| {
@@ -301,6 +339,41 @@ fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize
         }
     });
     out
+}
+
+/// flash attention 前向的中间状态：决定反向走「常驻显存」路径还是逐算子路径。
+enum AttnCache {
+    /// 逐算子/纯 CPU 路径产出的注意力概率 P（留在 CPU）
+    Cpu(Rc<Vec<f32>>),
+    /// 常驻显存路径：S 与 P 从未离开显存，反向也只回读 dQ/dK/dV
+    #[cfg(feature = "gpu")]
+    Gpu(Box<crate::gpu::AttnResident>),
+}
+
+/// 注意力前向的逐算子路径：S = Q'·Kᵀ → P = softmax(S + mask) → O = P·V。
+/// 每个算子各自做 GPU/CPU 分流（`matmul_data` / `gpu::softmax_mask`），返回 (O, P)。
+/// 常驻显存路径不可用时由 `flash_attention` 调用（也是 `LLM_GPU_PROBE` 录制形状时走的路径）。
+#[allow(clippy::too_many_arguments)]
+fn attn_forward_ops(
+    q_scaled: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: &[f32],
+    bh: usize,
+    t: usize,
+    t_total: usize,
+    head_dim: usize,
+) -> (Vec<f32>, Rc<Vec<f32>>) {
+    let scores = matmul_data(q_scaled, k, t, head_dim, t_total, bh, false, true);
+    let rows = bh * t;
+    let m_n = mask.len();
+    #[cfg(feature = "gpu")]
+    let attn = crate::gpu::softmax_mask(&scores, mask, rows, t_total, m_n)
+        .unwrap_or_else(|| masked_softmax_cpu(&scores, mask, rows, t_total, m_n));
+    #[cfg(not(feature = "gpu"))]
+    let attn = masked_softmax_cpu(&scores, mask, rows, t_total, m_n);
+    let out = matmul_data(&attn, v, t, t_total, head_dim, bh, false, false);
+    (out, Rc::new(attn))
 }
 
 /// 构造 matmul 的反向闭包（2D 与 3D 批量共用，batch=1 时 bi 循环退化）。
@@ -445,6 +518,72 @@ impl Tensor {
         self.grad.borrow().clone()
     }
 
+    /// 把「外部算好的梯度」乘 `scale` 后累加进本张量。
+    ///
+    /// 供 GPU 常驻显存路径使用：那些路径在显存里连续算完一整段前向/反向，
+    /// 只把边界上的梯度回读出来，由这里注回计算图继续传播。
+    pub fn accumulate_grad(&self, g: &[f32], scale: f32) {
+        let mut slot = self.grad.borrow_mut();
+        assert_eq!(
+            slot.len(),
+            g.len(),
+            "注入梯度长度不匹配：本张量 {} 个元素，注入 {} 个",
+            slot.len(),
+            g.len()
+        );
+        for (a, b) in slot.iter_mut().zip(g) {
+            *a += b * scale;
+        }
+    }
+
+    /// 构造一个标量 loss 张量，其反向由外部提供（`backward`），
+    /// 之后由 autograd 继续沿 `parents` 传播。
+    ///
+    /// 用于「反向公式解析已知、不必建图」的融合算子：例如输出头的交叉熵，
+    /// 其 dlogits 就是 softmax - onehot，直接在显存里算完即可，
+    /// 没必要为了回传梯度而把 33.6M 元素的 logits 拉回 CPU 建一张计算图。
+    pub fn external_scalar_loss(
+        value: f32,
+        parents: Vec<Tensor>,
+        backward: impl Fn() + 'static,
+    ) -> Tensor {
+        Tensor {
+            data: Rc::new(RefCell::new(vec![value])),
+            shape: vec![],
+            grad: Rc::new(RefCell::new(vec![0.0])),
+            requires_grad: true,
+            parents: Rc::new(parents),
+            backward: Some(Rc::new(backward)),
+        }
+    }
+
+    /// 构造一个「前向数据已由外部算好、反向也由外部提供」的张量。
+    ///
+    /// 供 GPU 常驻显存路径使用：那些路径在显存里连续算完一整段前向/反向，
+    /// 只把边界梯度回读出来，再由 `backward` 里调用 [`Tensor::accumulate_grad`]
+    /// 注回计算图（包括那些不在 `parents` 里的参数张量）。
+    ///
+    /// `backward` 是一个**工厂**而不是闭包本身：它拿到本张量自己的梯度槽，
+    /// 返回的闭包在 autograd 反向时被调用 —— 那一刻槽里已经攒好了上游梯度。
+    /// 之所以绕这一道，是因为闭包需要读自己的 grad，而梯度槽要等张量构造出来才存在。
+    pub fn external(
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        parents: Vec<Tensor>,
+        backward: impl FnOnce(Rc<RefCell<Vec<f32>>>) -> Box<dyn Fn()>,
+    ) -> Tensor {
+        let grad = Rc::new(RefCell::new(vec![0.0f32; data.len()]));
+        let f = backward(grad.clone());
+        Tensor {
+            data: Rc::new(RefCell::new(data)),
+            shape,
+            grad,
+            requires_grad: true,
+            parents: Rc::new(parents),
+            backward: Some(Rc::from(f)),
+        }
+    }
+
     pub fn zero_grad(&self) {
         let mut g = self.grad.borrow_mut();
         for v in g.iter_mut() {
@@ -492,10 +631,18 @@ impl Tensor {
             result.parents = Rc::new(vec![self.clone()]);
             result.backward = Some(Rc::new(move || {
                 let g = rg.borrow();
+                let g_ref: &[f32] = &g;
                 let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i];
-                }
+                // reshape 只改形状、不改元素顺序，所以梯度是 1:1 的逐元素累加。
+                // 按 4096 分块并行：输出头的 logits 是 [B*T, vocab] = 3355 万元素，
+                // 串行版单步要 ~0.4s（占单步 ~9%），是矩阵乘之外最大的纯访存热点。
+                sgm.par_chunks_mut(4096)
+                    .zip(g_ref.par_chunks(4096))
+                    .for_each(|(s, gg)| {
+                        for (a, &b) in s.iter_mut().zip(gg) {
+                            *a += b;
+                        }
+                    });
             }));
         }
         result
@@ -704,12 +851,38 @@ impl Tensor {
                 let g = rg.borrow();
                 let sd_b = sd.borrow();
                 let od_b = od.borrow();
-                if same_shape && Rc::ptr_eq(&sg, &og) {
-                    // 特例：同一张量参与运算（如 x*x、x/x），两条路径梯度叠加
-                    let mut sgm = sg.borrow_mut();
-                    for i in 0..g.len() {
-                        let (da, db) = back(sd_b[i], od_b[i]);
-                        sgm[i] += g[i] * (da + db);
+                let g_ref: &[f32] = &g;
+                let sd_ref: &[f32] = &sd_b;
+                let od_ref: &[f32] = &od_b;
+                if same_shape {
+                    // 形状相同 ⇒ 两侧索引都是恒等（见 broadcast_plan），可以按块并行。
+                    // 残差相加、x*x 这类占反向的大头，串行时单步 ~0.5s。
+                    if Rc::ptr_eq(&sg, &og) {
+                        // 同一张量参与运算（如 x*x、x/x），两条路径梯度叠加
+                        let mut sgm = sg.borrow_mut();
+                        sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
+                            let base = ci * 4096;
+                            for (j, s) in ch.iter_mut().enumerate() {
+                                let t = base + j;
+                                let (da, db) = back(sd_ref[t], od_ref[t]);
+                                *s += g_ref[t] * (da + db);
+                            }
+                        });
+                    } else {
+                        let mut sgm = sg.borrow_mut();
+                        let mut ogm = og.borrow_mut();
+                        sgm.par_chunks_mut(4096)
+                            .zip(ogm.par_chunks_mut(4096))
+                            .enumerate()
+                            .for_each(|(ci, (ca, cb))| {
+                                let base = ci * 4096;
+                                for (j, (sa, sb)) in ca.iter_mut().zip(cb.iter_mut()).enumerate() {
+                                    let t = base + j;
+                                    let (da, db) = back(sd_ref[t], od_ref[t]);
+                                    *sa += g_ref[t] * da;
+                                    *sb += g_ref[t] * db;
+                                }
+                            });
                     }
                 } else {
                     let mut sgm = sg.borrow_mut();
@@ -717,7 +890,7 @@ impl Tensor {
                     for t in 0..g.len() {
                         let ia = src_idx(t, &a_src_c);
                         let ib = src_idx(t, &b_src_c);
-                        let (da, db) = back(sd_b[ia], od_b[ib]);
+                        let (da, db) = back(sd_ref[ia], od_ref[ib]);
                         sgm[ia] += g[t] * da;
                         ogm[ib] += g[t] * db;
                     }
@@ -1434,37 +1607,31 @@ impl Tensor {
         result
     }
 
-    /// Flash Attention（前向）：分块 + 在线 softmax，不显式构建完整的 scores 矩阵。
+    /// 注意力（缩放点积 + 因果掩码）：O = softmax(Q·Kᵀ/√d + M) · V
     ///
-    /// 算法核心（Tri Dao 2023）：
-    /// 对 Q 按行分块（Br 行），对 K/V 按列分块（Bc 列），逐块计算：
+    /// **2026-09-16 重写（性能）**：原实现是"Flash Attention 分块 + 在线 softmax"的
+    /// 标量三重循环版本。逐算子插桩显示它占单步 78% 的时间（flash_f 4.6s + flash_b 8.7s
+    /// / 17.1s），有效算力只有 0.12~0.24 GFLOP/s，比 `matmul_data` 慢约 100 倍——
+    /// 瓶颈既不是访存也不是算法，而是没走上已经分块/向量化/可走 GPU 的矩阵乘内核。
+    ///
+    /// 现流程（数学上与标准 attention 完全一致）：
     /// ```text
-    /// for each Q block (Br rows):
-    ///     O_i = 0, m_i = -inf, l_i = 0
-    ///     for each K/V block (Bc cols):
-    ///         S_ij = Q_i · K_j^T / sqrt(d)     // [Br, Bc] 小矩阵
-    ///         S_ij += M_ij                       // 因果掩码
-    ///         m_new = max(m_i, rowmax(S_ij))
-    ///         P_ij = exp(S_ij - m_new)           // 数值稳定的 softmax
-    ///         l_new = exp(m_i - m_new) * l_i + rowsum(P_ij)
-    ///         O_i = exp(m_i - m_new) * O_i + P_ij · V_j
-    ///         m_i = m_new, l_i = l_new
-    ///     O_i = O_i / l_i                        // 最终归一化
+    /// Q' = Q / √d                       // 缩放挪到 Q 上，只要 524K 次乘法
+    /// S  = Q'·Kᵀ                        // matmul_data [BH,T,T_total]，一次算完
+    /// P  = softmax(S + M)               // 融合内核，每行一遍过
+    /// O  = P·V                          // matmul_data
     /// ```
+    /// 反向同样全用矩阵乘：dV = Pᵀ·dO、dP = dO·Vᵀ、dS = P⊙(dP - ΣdP·P)、
+    /// dQ = dS·K·scale、dK = dSᵀ·Q'。
     ///
-    /// **IO 复杂度**：标准 attention 需要读写 O(N² + Nd) 的 HBM 数据；
-    /// Flash Attention 通过 SRAM 分块，只需 O(N²d²/M) 次 HBM 访问（M = SRAM 大小）。
-    /// 在 GPU 上，这意味着不需要把完整的 T×T 注意力矩阵写到显存，速度提升 2-4×。
-    ///
-    /// **反向**：存储 P（注意力权重）和统计量 (m, l)，反向时用它们重建 softmax。
-    /// 虽然存储 P 仍是 O(T²)，但省掉了 scores 矩阵（同样是 O(T²)），且
-    /// 反向也不需要重建 scores，直接用 P 计算 dQ/dK/dV。
+    /// **代价**：P 与 dP 需要 O(T²) 的显存（原实现存 P 也已是 O(T²)），
+    /// 换来的是 6 次大矩阵乘走内核，单步注意力从 ~13.3s 降到亚秒级。
     ///
     /// - q: [B*H, T, head_dim]
     /// - k: [B*H, T_total, head_dim]
     /// - v: [B*H, T_total, head_dim]
     /// - mask: [T, T_total]（因果掩码，-inf 的位置屏蔽）
-    /// - block_size: 分块大小（默认 32，平衡 SRAM 使用和循环开销）
+    /// - _block_size: 兼容旧接口保留（现在的分块由 matmul_data 内部负责）
     ///
     /// 返回 out: [B*H, T, head_dim]
     pub fn flash_attention(
@@ -1472,7 +1639,7 @@ impl Tensor {
         k: &Tensor,
         v: &Tensor,
         mask: &Tensor,
-        block_size: usize,
+        _block_size: usize,
     ) -> Tensor {
         assert_eq!(q.rank(), 3, "flash_attention: Q 必须为 3D");
         assert_eq!(k.rank(), 3, "flash_attention: K 必须为 3D");
@@ -1484,7 +1651,6 @@ impl Tensor {
         assert_eq!(k.shape[0], bh, "K/V 的 batch*head 必须与 Q 一致");
 
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let bs = block_size.max(1);
         let md = mask.data.borrow();
         let mask_data: &[f32] = &md;
 
@@ -1492,116 +1658,39 @@ impl Tensor {
         let qd = q.data.borrow();
         let kd = k.data.borrow();
         let vd = v.data.borrow();
-        let q_ref: &[f32] = &qd;
-        let k_ref: &[f32] = &kd;
-        let v_ref: &[f32] = &vd;
 
-        // 前向输出和中间状态
-        let mut out_data = vec![0.0f32; bh * t * head_dim];
-        let mut attn_data = vec![0.0f32; bh * t * t_total]; // P（注意力权重），反向需要
-        let mut m_data = vec![f32::NEG_INFINITY; bh * t]; // 每行最大值
-        let mut l_data = vec![0.0f32; bh * t]; // 每行 exp 和
+        // 1) Q' = Q / √d：把缩放挪到 Q 上（只 524K 次乘法），
+        //    这样 S = Q'·Kᵀ 就是最终打分，softmax 内核不必带 scale 参数。
+        //    数学上等价于"先算 Q·Kᵀ 再乘 scale"，与标准实现逐位一致。
+        let mut q_scaled: Vec<f32> = qd.to_vec();
+        q_scaled.par_iter_mut().for_each(|v| *v *= scale);
 
-        // 分块计算：对每个 bh 独立处理
-        for b in 0..bh {
-            let q_off = b * t * head_dim;
-            let k_off = b * t_total * head_dim;
-            let out_off = b * t * head_dim;
-            let attn_off = b * t * t_total;
-            let m_off = b * t;
-            let score_buf = &mut vec![0.0f32; bs * bs]; // 复用的 scores 缓冲区
-
-            // Q 按行分块
-            for i_start in (0..t).step_by(bs) {
-                let i_end = (i_start + bs).min(t);
-                let br = i_end - i_start;
-
-                // K/V 按列分块
-                for j_start in (0..t_total).step_by(bs) {
-                    let j_end = (j_start + bs).min(t_total);
-                    let bc = j_end - j_start;
-
-                    // S_ij = Q_i · K_j^T / sqrt(d)，结果 [br, bc]
-                    for ri in 0..br {
-                        for cj in 0..bc {
-                            let mut s = 0.0f32;
-                            for h in 0..head_dim {
-                                s += q_ref[q_off + (i_start + ri) * head_dim + h]
-                                    * k_ref[k_off + (j_start + cj) * head_dim + h];
-                            }
-                            s *= scale;
-                            // 因果掩码
-                            let mask_idx = (i_start + ri) * t_total + (j_start + cj);
-                            s += mask_data[mask_idx];
-                            score_buf[ri * bc + cj] = s;
-                        }
-                    }
-
-                    // 在线 softmax 更新
-                    for ri in 0..br {
-                        let row = i_start + ri;
-                        // 1. 当前块的行最大值
-                        let mut block_max = f32::NEG_INFINITY;
-                        for cj in 0..bc {
-                            block_max = block_max.max(score_buf[ri * bc + cj]);
-                        }
-                        // 2. 全局最大值更新
-                        let m_old = m_data[m_off + row];
-                        let m_new = m_old.max(block_max);
-                        let rescale = (m_old - m_new).exp();
-                        // 3. 更新已累积量：**输出和历史 P 都要**跟着新的 max 缩放
-                        if m_old > f32::NEG_INFINITY {
-                            for h in 0..head_dim {
-                                out_data[out_off + row * head_dim + h] *= rescale;
-                            }
-                            // 关键：已存进 attn_data 的前序块 P 是 exp(s - m_old)，
-                            // 必须乘 rescale 换算成 exp(s - m_new)。
-                            // 否则同一行不同块用了不同的归一化基准，而末尾统一除以 l
-                            // （l 对应最终 max），前序块就会被整体放大
-                            // exp(m_final - m_old) 倍 —— 该因子随注意力变尖锐**指数增长**，
-                            // 反向的 dS = P·(dP - ΣdP·P) 随之指数爆炸（实测梯度 1500 步内
-                            // 从 0.67 涨到 5.8e6，而权重几乎没动，因为前向输出是正确的）。
-                            // 注意 rescale 乘的是「此前已存的 P」，不是本块刚算出的 p。
-                            for j in 0..j_start {
-                                attn_data[attn_off + row * t_total + j] *= rescale;
-                            }
-                        }
-                        // 4. 计算 P_ij 并累加
-                        // 存 exp(score - m_new)（本块的基准就是最新的 m_new），
-                        // 末尾统一除以 l 做归一化。
-                        let mut block_sum = 0.0f32;
-                        for cj in 0..bc {
-                            let p = (score_buf[ri * bc + cj] - m_new).exp();
-                            attn_data[attn_off + row * t_total + j_start + cj] = p;
-                            block_sum += p;
-                            for h in 0..head_dim {
-                                out_data[out_off + row * head_dim + h] +=
-                                    p * v_ref[k_off + (j_start + cj) * head_dim + h];
-                            }
-                        }
-                        // 5. 更新统计量
-                        l_data[m_off + row] = l_data[m_off + row] * rescale + block_sum;
-                        m_data[m_off + row] = m_new;
-                    }
-                }
-
-                // 6. 归一化：O_i = O_i / l_i
-                for ri in 0..br {
-                    let row = i_start + ri;
-                    let l = l_data[m_off + row];
-                    if l > 0.0 {
-                        let inv_l = 1.0 / l;
-                        for h in 0..head_dim {
-                            out_data[out_off + row * head_dim + h] *= inv_l;
-                        }
-                        // P 也需要归一化（反向要用）
-                        for j in 0..t_total {
-                            attn_data[attn_off + row * t_total + j] *= inv_l;
-                        }
-                    }
-                }
+        // 2)~4) 前向：优先走「常驻显存」路径。
+        //    S = Q'·Kᵀ → P = softmax(S+mask) → O = P·V 三个算子录进**一次提交**，
+        //    S（33.6MB）与 P（33.6MB）全程留在显存，只把 O（4.2MB）回读给 CPU，
+        //    P 的显存句柄随结果留到反向用 —— 逐算子路径要把 P 回读 33.6MB、下一步再原样传回，
+        //    一来一回 67MB/层/次纯属白跑（实测单步回读 1.46GB，91% 的时间花在等回读）。
+        //    失败（GPU 不可用/尺寸太小）自动回退下面的逐算子路径，数值行为不变。
+        #[cfg(feature = "gpu")]
+        let gpu_attn =
+            crate::gpu::attn_forward(&q_scaled, &kd, &vd, mask_data, bh, t, t_total, head_dim);
+        #[cfg(feature = "gpu")]
+        let (out_data, cache) = match gpu_attn {
+            Some(r) => {
+                let out = r.out.clone();
+                (out, AttnCache::Gpu(Box::new(r)))
             }
-        }
+            None => {
+                let (o, p) =
+                    attn_forward_ops(&q_scaled, &kd, &vd, mask_data, bh, t, t_total, head_dim);
+                (o, AttnCache::Cpu(p))
+            }
+        };
+        #[cfg(not(feature = "gpu"))]
+        let (out_data, cache) = {
+            let (o, p) = attn_forward_ops(&q_scaled, &kd, &vd, mask_data, bh, t, t_total, head_dim);
+            (o, AttnCache::Cpu(p))
+        };
 
         drop(qd);
         drop(kd);
@@ -1615,67 +1704,88 @@ impl Tensor {
             let sq = q.grad.clone();
             let sk = k.grad.clone();
             let sv = v.grad.clone();
-            let q_data = q.data.clone(); // clone Rc，不拷贝数据
             let k_data = k.data.clone();
             let v_data = v.data.clone();
-            let p = attn_data;
             result.parents = Rc::new(vec![q.clone(), k.clone(), v.clone()]);
             result.backward = Some(Rc::new(move || {
-                // 反向：dO = grad_output, 用 P 直接计算 dQ/dK/dV
-                // 正确的 softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]*P[i,k])
                 let g = rg.borrow();
-                let qd = q_data.borrow();
-                let kd = k_data.borrow();
+                // 常驻显存路径：dV/dP/dS/dQ/dK 五个算子录进一次提交，只回读 dQ/dK/dV（各 4.2MB）
+                #[cfg(feature = "gpu")]
+                if let AttnCache::Gpu(r) = &cache {
+                    if let Some((dq_out, dk_out, dv_out)) = r.backward(&g) {
+                        {
+                            let mut sgm = sq.borrow_mut();
+                            for (i, v) in dq_out.iter().enumerate() {
+                                sgm[i] += v * scale;
+                            }
+                        }
+                        {
+                            let mut sgm = sk.borrow_mut();
+                            for (i, v) in dk_out.iter().enumerate() {
+                                sgm[i] += v;
+                            }
+                        }
+                        {
+                            let mut sgm = sv.borrow_mut();
+                            for (i, v) in dv_out.iter().enumerate() {
+                                sgm[i] += v;
+                            }
+                        }
+                        return;
+                    }
+                }
+                // 逐算子（或纯 CPU）路径：P 在 CPU 上；常驻路径反向失败时把 P 回读出来兜底
+                let p: Rc<Vec<f32>> = match &cache {
+                    AttnCache::Cpu(p) => p.clone(),
+                    #[cfg(feature = "gpu")]
+                    AttnCache::Gpu(r) => {
+                        Rc::new(r.read_p().expect("常驻显存反向失败，回读 P 也失败"))
+                    }
+                };
+                // 反向：全部交给矩阵乘内核（旧的标量三重循环只有 0.24 GFLOP/s，慢 100 倍）
+                // softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]·P[i,k])
+                // 注意必须用 V 算 dP（out_i = Σ_j P_ij·V_j，故 ∂out_i/∂P_ij 的因子是 V_j）；
+                // 用 K 会让 dP/dS/dQ/dK 全部错误（实测 dQ 偏差 2.7 倍）。
+                let kd_b = k_data.borrow();
                 let vd_b = v_data.borrow();
-                let mut dq = sq.borrow_mut();
-                let mut dk = sk.borrow_mut();
-                let mut dv = sv.borrow_mut();
-                for b in 0..bh {
-                    let g_off = b * t * head_dim;
-                    let q_off = b * t * head_dim;
-                    let k_off = b * t_total * head_dim;
-                    let p_off = b * t * t_total;
-                    for i in 0..t {
-                        // 第一遍：计算 dP[i,j] = dO_i · V_j，同时累加 dV
-                        // 并计算 Σ_j dP[i,j] * P[i,j]（softmax Jacobian 修正项）
-                        let mut dp_arr = vec![0.0f32; t_total];
-                        for j in 0..t_total {
-                            let p_ij = p[p_off + i * t_total + j];
-                            // dV_j += P_ij · dO_i
-                            for h in 0..head_dim {
-                                dv[k_off + j * head_dim + h] +=
-                                    p_ij * g[g_off + i * head_dim + h];
-                            }
-                            // dP_ij = dO_i · V_j —— 必须用 V，不能用 K！
-                            // out_i = Σ_j P_ij·V_j，故 ∂out_i/∂P_ij 的因子是 V_j。
-                            // 用 K 会让 dP/dS/dQ/dK 全部错误（实测 dQ 偏差 2.7 倍）。
-                            let mut dp = 0.0f32;
-                            for h in 0..head_dim {
-                                dp += g[g_off + i * head_dim + h]
-                                    * vd_b[k_off + j * head_dim + h];
-                            }
-                            dp_arr[j] = dp;
-                        }
-                        // 计算修正项：Σ_j dP[i,j] * P[i,j]
-                        let mut dp_dot_p = 0.0f32;
-                        for j in 0..t_total {
-                            dp_dot_p += dp_arr[j] * p[p_off + i * t_total + j];
-                        }
-                        // 第二遍：dS[i,j] = P[i,j] * (dP[i,j] - dp_dot_p)，累加到 dQ/dK
-                        for j in 0..t_total {
-                            let p_ij = p[p_off + i * t_total + j];
-                            let ds = p_ij * (dp_arr[j] - dp_dot_p);
-                            // dQ_i += ds · K_j / sqrt(d)
-                            for h in 0..head_dim {
-                                dq[q_off + i * head_dim + h] +=
-                                    ds * kd[k_off + j * head_dim + h] * scale;
-                            }
-                            // dK_j += ds · Q_i / sqrt(d)
-                            for h in 0..head_dim {
-                                dk[k_off + j * head_dim + h] +=
-                                    ds * qd[q_off + i * head_dim + h] * scale;
-                            }
-                        }
+                // dV = Pᵀ·dO
+                let dv_out = matmul_data(&p, &g, t_total, t, head_dim, bh, true, false);
+                // dP = dO·Vᵀ
+                let mut ds = matmul_data(&g, &vd_b, t, head_dim, t_total, bh, false, true);
+                drop(g);
+                drop(vd_b);
+                // dS ← P ⊙ (dP - Σ_j dP·P)：逐行独立，按行并行（一行读两遍写一遍）
+                let p_ref: &[f32] = &p;
+                ds.par_chunks_mut(t_total).enumerate().for_each(|(r, drow)| {
+                    let base = r * t_total;
+                    let mut dot = 0.0f32;
+                    for j in 0..t_total {
+                        dot += drow[j] * p_ref[base + j];
+                    }
+                    for j in 0..t_total {
+                        drow[j] = p_ref[base + j] * (drow[j] - dot);
+                    }
+                });
+                // dQ = (dS·K)·scale（前向里 Q 先被缩成 Q' = Q·scale，故 dQ 要乘回来）；dK = dSᵀ·Q'
+                let dq_out = matmul_data(&ds, &kd_b, t, t_total, head_dim, bh, false, false);
+                let dk_out = matmul_data(&ds, &q_scaled, t_total, t, head_dim, bh, true, false);
+                drop(kd_b);
+                {
+                    let mut sgm = sq.borrow_mut();
+                    for (i, v) in dq_out.iter().enumerate() {
+                        sgm[i] += v * scale;
+                    }
+                }
+                {
+                    let mut sgm = sk.borrow_mut();
+                    for (i, v) in dk_out.iter().enumerate() {
+                        sgm[i] += v;
+                    }
+                }
+                {
+                    let mut sgm = sv.borrow_mut();
+                    for (i, v) in dv_out.iter().enumerate() {
+                        sgm[i] += v;
                     }
                 }
             }));
@@ -1771,26 +1881,35 @@ impl Tensor {
             self.shape[self.rank() - 1],
         );
         let sd = self.data.borrow();
+        let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; rows * d];
         // 存 softmax 值（反向需要）
         let mut softmax_data = vec![0.0f32; rows * d];
-        for r in 0..rows {
-            let mut maxv = f32::NEG_INFINITY;
-            for j in 0..d {
-                maxv = maxv.max(sd[r * d + j]);
-            }
-            let mut sum_exp = 0.0f32;
-            for j in 0..d {
-                let e = (sd[r * d + j] - maxv).exp();
-                softmax_data[r * d + j] = e;
-                sum_exp += e;
-            }
-            let log_sum = sum_exp.ln();
-            for j in 0..d {
-                softmax_data[r * d + j] /= sum_exp; // 归一化为 softmax 概率
-                out_data[r * d + j] = sd[r * d + j] - maxv - log_sum;
-            }
-        }
+        // 并行：每行独立做 log-sum-exp，行间无依赖。
+        // 输出头是 [B*T, vocab]（4096×8192 = 3355 万元素），单线程时这一步
+        // 占单步 ~11%（1.0s），是矩阵乘之外最大的热点。
+        out_data
+            .par_chunks_mut(d)
+            .zip(softmax_data.par_chunks_mut(d))
+            .enumerate()
+            .for_each(|(r, (orow, srow))| {
+                let base = r * d;
+                let mut maxv = f32::NEG_INFINITY;
+                for j in 0..d {
+                    maxv = maxv.max(sd_ref[base + j]);
+                }
+                let mut sum_exp = 0.0f32;
+                for j in 0..d {
+                    let e = (sd_ref[base + j] - maxv).exp();
+                    srow[j] = e;
+                    sum_exp += e;
+                }
+                let log_sum = sum_exp.ln();
+                for j in 0..d {
+                    srow[j] /= sum_exp; // 归一化为 softmax 概率
+                    orow[j] = sd_ref[base + j] - maxv - log_sum;
+                }
+            });
         drop(sd);
 
         let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
@@ -1799,17 +1918,19 @@ impl Tensor {
             let sg = self.grad.clone();
             result.parents = Rc::new(vec![self.clone()]);
             result.backward = Some(Rc::new(move || {
-                let g = rg.borrow();
+                let g: Vec<f32> = rg.borrow().to_vec();
                 let mut sgm = sg.borrow_mut();
-                for r in 0..rows {
+                // 并行：同样按行切分，行间无依赖（每一行只写自己的 d 个元素）
+                sgm.par_chunks_mut(d).enumerate().for_each(|(r, grow)| {
+                    let base = r * d;
                     let mut dot = 0.0;
                     for j in 0..d {
-                        dot += g[r * d + j];
+                        dot += g[base + j];
                     }
                     for i in 0..d {
-                        sgm[r * d + i] += g[r * d + i] - softmax_data[r * d + i] * dot;
+                        grow[i] += g[base + i] - softmax_data[base + i] * dot;
                     }
-                }
+                });
             }));
         }
         result
@@ -2445,6 +2566,141 @@ mod tests {
                 max_err / ref_mag < 1e-3,
                 "{name} 梯度不一致：最大绝对误差 {max_err}（参考量级 {ref_mag}）—— \
                  跨块 P 未随运行最大值同步缩放，反向已指数放大"
+            );
+        }
+    }
+
+    /// 常驻显存路径（`gpu::attn_forward` + `AttnResident::backward`）的数值校验。
+    ///
+    /// 为什么另起一个测试：上面两个 flash attention 测试用的是 (bh=1,t=4,d=2) 与 (2,16,8)
+    /// 这种极小形状，会被 `attn_resident_ok` 的尺寸守卫挡掉、回退到逐算子路径 —— 测不到新代码。
+    /// 这里的形状能过守卫（并在 GPU 可用时断言确实命中了常驻路径），
+    /// 参考值用**纯循环独立算一遍**、不依赖任何 Tensor 算子，因此前向与反向都验证得到。
+    #[test]
+    fn test_flash_attention_resident_path_matches_loop_reference() {
+        use crate::rng::Rng;
+        #[cfg(feature = "gpu")]
+        crate::gpu::init();
+
+        let (bh, t, tt, hd) = (16usize, 256usize, 256usize, 32usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut rng = Rng::new(11);
+
+        let q: Vec<f32> = (0..bh * t * hd).map(|_| rng.randn()).collect();
+        let k: Vec<f32> = (0..bh * tt * hd).map(|_| rng.randn()).collect();
+        let v: Vec<f32> = (0..bh * tt * hd).map(|_| rng.randn()).collect();
+        // 因果掩码 [t, tt]：j <= i 时为 0，其余 -inf
+        let mut mask = vec![f32::NEG_INFINITY; t * tt];
+        for i in 0..t {
+            for j in 0..=i.min(tt - 1) {
+                mask[i * tt + j] = 0.0;
+            }
+        }
+
+        // GPU 可用时必须真的走常驻路径，否则这个测试会静默退化成旧路径而失去意义
+        #[cfg(feature = "gpu")]
+        if crate::gpu::is_available() {
+            assert!(
+                crate::gpu::attn_resident_ok(bh, t, tt, hd, mask.len()),
+                "该形状未命中常驻显存路径，测试失去意义"
+            );
+        }
+
+        // ---- 纯循环参考实现：前向 O，以及损失 = sum(O) 的反向 ----
+        let rows = bh * t;
+        let mut p_ref = vec![0.0f32; rows * tt];
+        let mut o_ref = vec![0.0f32; bh * t * hd];
+        let mut dq_ref = vec![0.0f32; bh * t * hd];
+        let mut dk_ref = vec![0.0f32; bh * tt * hd];
+        let mut dv_ref = vec![0.0f32; bh * tt * hd];
+        for b in 0..bh {
+            for i in 0..t {
+                let r = b * t + i;
+                let mb = (r * tt) % (t * tt);
+                // 手写循环用 float 累加，与内核/rayon 的累加顺序不同 → 只比到 1e-3 相对量级
+                let mut srow = vec![0.0f32; tt];
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..tt {
+                    let mut acc = 0.0f32;
+                    for d in 0..hd {
+                        acc += q[r * hd + d] * k[(b * tt + j) * hd + d];
+                    }
+                    srow[j] = acc * scale + mask[mb + j];
+                    mx = mx.max(srow[j]);
+                }
+                let mut sum = 0.0f32;
+                for j in 0..tt {
+                    let e = (srow[j] - mx).exp();
+                    p_ref[r * tt + j] = e;
+                    sum += e;
+                }
+                for j in 0..tt {
+                    p_ref[r * tt + j] /= sum;
+                }
+                for d in 0..hd {
+                    let mut acc = 0.0f32;
+                    for j in 0..tt {
+                        acc += p_ref[r * tt + j] * v[(b * tt + j) * hd + d];
+                    }
+                    o_ref[r * hd + d] = acc;
+                }
+                // dO = 1 → dP[j] = Σ_d V[j,d]；dS[j] = P[j]·(dP[j] - Σ_j dP·P)
+                let mut dot = 0.0f32;
+                for j in 0..tt {
+                    let mut dp = 0.0f32;
+                    for d in 0..hd {
+                        dp += v[(b * tt + j) * hd + d];
+                    }
+                    dot += dp * p_ref[r * tt + j];
+                }
+                let mut ds = vec![0.0f32; tt];
+                for j in 0..tt {
+                    let mut dp = 0.0f32;
+                    for d in 0..hd {
+                        dp += v[(b * tt + j) * hd + d];
+                    }
+                    ds[j] = p_ref[r * tt + j] * (dp - dot);
+                }
+                // dQ = (dS·K)·scale；dK = dSᵀ·Q'（Q' = Q·scale）；dV = Pᵀ·dO
+                for d in 0..hd {
+                    let mut acc = 0.0f32;
+                    for j in 0..tt {
+                        acc += ds[j] * k[(b * tt + j) * hd + d];
+                    }
+                    dq_ref[r * hd + d] += acc * scale;
+                }
+                for j in 0..tt {
+                    for d in 0..hd {
+                        dk_ref[(b * tt + j) * hd + d] += ds[j] * q[r * hd + d] * scale;
+                        dv_ref[(b * tt + j) * hd + d] += p_ref[r * tt + j];
+                    }
+                }
+            }
+        }
+
+        // ---- 走 Tensor（GPU 可用时即常驻显存路径）----
+        let qt = Tensor::param(q, vec![bh, t, hd]);
+        let kt = Tensor::param(k, vec![bh, tt, hd]);
+        let vt = Tensor::param(v, vec![bh, tt, hd]);
+        let mt = Tensor::from_vec(mask, vec![t, tt]);
+        let out = Tensor::flash_attention(&qt, &kt, &vt, &mt, 64);
+        out.sum().backward();
+
+        for (name, a, b) in [
+            ("前向 O", &o_ref, &out.data()),
+            ("dQ", &dq_ref, &qt.grad()),
+            ("dK", &dk_ref, &kt.grad()),
+            ("dV", &dv_ref, &vt.grad()),
+        ] {
+            let max_err = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            let ref_mag = a.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+            assert!(
+                max_err / ref_mag < 1e-3,
+                "{name} 与纯循环参考不一致：最大绝对误差 {max_err}（参考量级 {ref_mag}）"
             );
         }
     }

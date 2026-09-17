@@ -1,8 +1,8 @@
 # 第 23 课：GQA 分组查询注意力 —— 推理时省显存的利器
 
-> 代码位置：[src/attention.rs](src/attention.rs)（`MultiHeadAttention` 支持 `n_kv_head`）
+> 代码位置：[src/attention.rs](../src/attention.rs)（`MultiHeadAttention` 支持 `n_kv_head`）
 >
-> 配置开关：`config.json` → `model.n_kv_head: 8`（0 = 标准 MHA）
+> 配置开关：`config.json` → `model.n_kv_head: 2`（示例值；仓库当前 `config.json` 里是 `0` = 标准 MHA，需手动改为 `2` 才能启用 GQA）
 
 ---
 
@@ -14,7 +14,7 @@
 
 ---
 
-## 2. KV Cache 回顾（第 18 课）
+## 2. KV Cache 回顾（第 25 课）
 
 推理时，每生成一个新 token，需要用到之前所有 token 的 K 和 V。
 

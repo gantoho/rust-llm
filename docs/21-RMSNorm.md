@@ -1,10 +1,10 @@
 # 第 21 课：RMSNorm —— 现代 LLM 的归一化标配
 
-> 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::rmsnorm` 融合算子）
-> 代码位置：[src/layers.rs](src/layers.rs)（`RMSNorm` 层、`NormLayer` 枚举）
-> 代码位置：[src/model.rs](src/model.rs)（`TransformerBlock` / `GPT` 使用 `NormLayer`）
+> 代码位置：[src/tensor.rs](../src/tensor.rs)（`Tensor::rmsnorm` 融合算子）
+> 代码位置：[src/layers.rs](../src/layers.rs)（`RMSNorm` 层、`NormLayer` 枚举）
+> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `GPT` 使用 `NormLayer`）
 >
-> 配置开关：`config.json` → `model.use_rmsnorm: true` 启用
+> 配置开关：`config.json` → `model.use_rmsnorm: true`（示例值；仓库当前 `config.json` 里是 `false`，需手动改为 `true` 才能启用 RMSNorm）
 
 ---
 

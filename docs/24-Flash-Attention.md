@@ -1,6 +1,6 @@
 # 第 24 课：Flash Attention —— 分块在线 softmax，GPU 显存救星
 
-> 代码位置：[src/tensor.rs](src/tensor.rs)（`Tensor::flash_attention` 融合算子）
+> 代码位置：[../src/tensor.rs](../src/tensor.rs)（`Tensor::flash_attention` 融合算子）
 >
 > 算法论文：*FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness* (Tri Dao, 2022)
 
@@ -75,6 +75,9 @@ O = O / l    # 最终归一化
 
 每块只需要更新三个标量（m, l, O），不需要保存完整 scores。
 
+> ⚠️ 本项目**没有**实现这一套在线 softmax —— 参见 [§6](#6-本项目的实现)：
+> 代码里的 `Tensor::flash_attention` 已经重写成「三次矩阵乘」的等价形式，数学结果相同，工程路线不同。
+
 ---
 
 ## 4. IO 复杂度分析
@@ -104,26 +107,91 @@ P_ij = exp(S_ij - m_i) / l_i
 
 ## 6. 本项目的实现
 
-本项目用纯 Rust 实现了 Flash Attention 的**前向 + 反向**（`Tensor::flash_attention`，`tensor.rs:1362`）：
+**先看清一件事**：本项目的注意力**数学上等价于**上面描述的 Flash Attention，但**工程实现走的是完全不同的路线** ——
+没有分块、没有在线 softmax，而是「把三个算子都换成矩阵乘内核」。
 
-- 前向：分块计算，在线 softmax，不构建完整 scores 矩阵
-- 反向：保存 P（归一化后的注意力权重），用块级循环计算 dQ/dK/dV
-- 单元测试：`test_flash_attention_matches_standard` 验证与标准注意力的数值一致性
+### 6.1 2026-09-16 的重写
 
-**集成状态**：`Tensor::flash_attention` 是独立的融合算子，当前**未接入**模型的注意力层
-（`MultiHeadAttention::forward` 使用的是 `Tensor::masked_softmax` 路径）。
-接入方式：在 `attention.rs` 的 scores 计算后，将 `scores.masked_softmax(mask).matmul(&v)` 替换为
-`scores.flash_attention(&v, mask)`。本课程重点是理解算法原理，接入留作练习。
+最初的实现就是标准的「分块 + 在线 softmax」标量三重循环版。逐算子插桩后发现它是**单步最大的瓶颈**：
 
-**注意**：本项目保存了完整的 P 矩阵（O(T²)），这在 GPU 实现中是可以避免的
-（反向时重新计算 P），但纯 CPU 实现中重算的开销太大，所以保留了 P。
+| 算子 | 耗时 | 有效算力 |
+|------|------|---------|
+| flash 前向 | 4.6s | 0.12~0.24 GFLOP/s |
+| flash 反向 | 8.7s | （同上） |
+| 单步合计 | 17.1s，其中注意力占 **78%** | 比 `matmul_data` 慢约 100 倍 |
+
+瓶颈既不是访存也不是算法，而是**没走上已经分块 / 向量化 / 可走 GPU 的矩阵乘内核**。
+于是重写为（[src/tensor.rs](../src/tensor.rs) `Tensor::flash_attention`）：
+
+```text
+Q' = Q / √d          // 缩放挪到 Q 上，只要 524K 次乘法
+S  = Q'·Kᵀ           // matmul_data [BH,T,T_total]，一次算完
+P  = softmax(S + M)  // 融合内核，每行一遍过
+O  = P·V             // matmul_data
+```
+
+反向同样全用矩阵乘：`dV = Pᵀ·dO`、`dP = dO·Vᵀ`、`dS = P⊙(dP - ΣdP·P)`、`dQ = dS·K·scale`、`dK = dSᵀ·Q'`。
+
+**代价与收益**：
+
+| | 旧实现（分块在线 softmax） | 现实现（matmul 重写） |
+|---|---|---|
+| 显存 | 存 P，O(T²) | 存 P 与 dP，仍是 O(T²) |
+| 单步注意力耗时 | ~13.3s | **亚秒级** |
+
+也就是说：**这是「用显存换速度」的反向操作** —— 省下来的显存本来就没被真正省掉（旧实现同样保存 P），
+所以直接换回矩阵乘内核。
+
+### 6.2 `block_size` 参数已失效
+
+`Tensor::flash_attention(q, k, v, mask, _block_size)` 的第 5 个参数**现在被忽略**（签名保留是为了兼容旧调用），
+分块交给 `matmul_data` 内部处理。`attention.rs:181` 传的 `32` 不再有任何含义。
+
+### 6.3 集成状态：已接入
+
+`MultiHeadAttention::forward`（[src/attention.rs](../src/attention.rs)）已经调用：
+
+```rust
+let out = Tensor::flash_attention(&q, &k, &v, mask, 32);
+```
+
+**不是**留作练习的独立算子 —— 训练与推理走的都是它。
+
+### 6.4 常驻显存路径（`--features gpu`）
+
+前向的 `S = Q'·Kᵀ → P = softmax(S+mask) → O = P·V` 三个算子会录进**一次提交**，
+S（33.6MB）与 P（33.6MB）全程留在显存，只把 O（4.2MB）回读给 CPU，P 的显存句柄留到反向用。
+反向的 `dV/dP/dS/dQ/dK` 同理一次提交，只回读 dQ/dK/dV（各 4.2MB）。
+
+不这么做的代价很直观：逐算子路径要把 P 回读 33.6MB、下一步再原样传回，一来一回 67MB/层/次纯属白跑
+（实测单步回读 1.46GB，91% 的时间花在等回读）。GPU 不可用或形状太小时自动回退逐算子 / CPU，数值行为不变。
+
+### 6.5 测试
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_flash_attention_matches_standard` | 前向 vs 标准注意力（`masked_softmax` + matmul）一致性 |
+| `test_flash_attention_backward_matches_standard` | 反向 dQ/dK/dV vs 标准注意力反向 |
+| `test_flash_attention_resident_path_matches_loop_reference` | GPU 常驻显存路径 vs 逐算子参考（仅 `--features gpu`） |
 
 ---
 
 ## 7. 关键要点
 
-- Flash Attention 通过分块计算避免构建完整的 T×T scores 矩阵
-- 在线 softmax 技巧：逐块更新最大值和总和，不需要全局信息
-- GPU 上速度提升 2-4×，显存从 O(N²) 降到 O(N)
-- 反向时重新计算 P（用保存的统计量），不需要存储完整 scores
+**论文侧（§1-5，Flash Attention 的原意）**
+
+- 通过分块计算避免构建完整的 T×T scores 矩阵，把 attention 的显存从 O(T²) 降到 O(T·d)
+- 在线 softmax 技巧：逐块更新 running max 与 running sum，不需要一次性看到整行
+- 反向时用保存的统计量（max、sum）重新计算 P，不需要存储完整 scores
 - Tri Dao 的论文是现代 LLM 训练的基石之一
+
+**本项目侧（§6，实际实现）**
+
+- 本项目**没有**实现分块与在线 softmax（[src/tensor.rs](../src/tensor.rs) `Tensor::flash_attention`），
+  参数 `_block_size` 已被忽略；显存仍是 **O(T²)**（P 与 dP 都完整保留给反向用）
+- 走的是「数学等价 + 换成矩阵乘内核」的路线：`Q'=Q/√d → S=Q'·Kᵀ → P=softmax(S+M) → O=P·V`，
+  反向同样全用矩阵乘；单步注意力耗时 ~13.3s → 亚秒级，这是本项目**最值得记住的一条经验**：
+  优化前先插桩，瓶颈常常不在算法而在「没走上已优化好的内核」
+- `--features gpu` 下前向/反向各录成一次提交，S（33.6MB）与 P（33.6MB）留在显存不回读，
+  只回读 O（4.2MB）；GPU 不可用或形状过小时自动回退，数值行为不变
+- 正确性由 3 个测试守住：前向、反向各对拍标准注意力，常驻显存路径对拍逐算子参考

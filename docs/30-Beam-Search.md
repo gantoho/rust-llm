@@ -1,6 +1,6 @@
 # 第 30 课：Beam Search —— 贪心搜索的升级版
 
-> 代码位置：[src/sample.rs](src/sample.rs)（`beam_search` 函数）
+> 代码位置：[src/sample.rs](../src/sample.rs)（`beam_search` 函数）
 >
 > 对比：第 15 课实现了 temperature + top-k + top-p 采样
 
@@ -99,7 +99,7 @@ score = Σ log P(token_i | context)
 final_score = log_prob / len^α
 ```
 
-- α = 0：不惩罚（默认）
+- α = 0：不惩罚（等价于不归一化，本项目 CLI 的默认值是 0.6）
 - α > 0：偏好长序列
 - α < 0：偏好短序列
 
@@ -171,7 +171,7 @@ cargo run --release -- generate --config config.json --prompt "The fox" --beam 8
 ## 8. 关键要点
 
 - Beam Search 维护 k 个候选，每步扩展后保留 top-k
-- 得分用累积 log 概率，避免数值下溢
+- 得分用累积 log 概率，避免数值下溢；但当前实现累加的是**原始 logit**（未取 log_softmax），属已知简化/待改进点
 - 长度惩罚 α 解决短序列天然得分高的偏置
 - 适合翻译、摘要等"精确"任务；不适合创意写作
 - 速度是采样的 k 倍（k = beam_size）

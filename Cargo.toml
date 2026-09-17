@@ -23,3 +23,9 @@ pollster = { version = "0.4", optional = true }
 [target.'cfg(windows)'.dependencies]
 # 仅用于把 Windows 控制台切到 UTF-8，避免中文输出乱码
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+[profile.release]
+# 训练热路径全在数学算子里，跨 crate 内联（LTO）+ 单 codegen 单元能再挤出几个百分点。
+# 代价是 release 构建变慢（wgpu 依赖树较大），训练本身不受影响。
+lto = "thin"
+codegen-units = 1
