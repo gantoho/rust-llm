@@ -102,9 +102,10 @@ impl AdamW {
         }
     }
 
-    /// 导出优化器状态（checkpoint 用）：(步数 t, 一阶动量 m, 二阶动量 v)
-    pub fn state(&self) -> (usize, Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        (self.t, self.m.clone(), self.v.clone())
+    /// 导出优化器状态（checkpoint 用）：(步数 t, 一阶动量 m, 二阶动量 v)。
+    /// 返回借用而非克隆：动量与参数同量级，保存时没必要再复制一份到内存里。
+    pub fn state(&self) -> (usize, &[Vec<f32>], &[Vec<f32>]) {
+        (self.t, &self.m, &self.v)
     }
 
     /// 恢复优化器状态（resume 用），长度必须与参数一致

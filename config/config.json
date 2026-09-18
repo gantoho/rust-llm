@@ -29,7 +29,7 @@
     "accum_steps": 1,
     "tokenizer_file": "checkpoints/zh/tokenizer.json",
     "lora": null,
-    "log_file": "logs/train.csv",
+    "log_file": "checkpoints/zh/train.csv",
     "early_stop_patience": 10
   }
 }

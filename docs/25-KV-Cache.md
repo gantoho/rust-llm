@@ -242,20 +242,22 @@ for _ in 0..max_new {
         // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
         // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
         if cache[0].seq_len() == 0 {
-            model.forward(ctx, 1, ctx.len(), Some(&mut cache))
+            model.forward(ctx, 1, ctx.len(), Some(&mut cache), false)
         } else {
-            model.forward(&ids[ids.len() - 1..], 1, 1, Some(&mut cache))
+            model.forward(&ids[ids.len() - 1..], 1, 1, Some(&mut cache), false)
         }
     } else {
         // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-        model.forward(ctx, 1, ctx.len(), None)
+        model.forward(ctx, 1, ctx.len(), None, false)
     };
 
     // 取最后一个位置的 logits
     let v = model.cfg.vocab_size;
     let n = logits.numel();
     let last_row = &logits.data()[n - v..];
-    let next = sample_token(last_row, temperature, top_k, top_p, rng);
+    // 重复惩罚的回看窗口（见第 15 课第 7 节）
+    let rep_start = ids.len().saturating_sub(opts.repetition_window);
+    let next = sample_token(last_row, opts, &ids[rep_start..], rng);
     ids.push(next);
 }
 ```
@@ -264,30 +266,32 @@ for _ in 0..max_new {
 
 | | 全量模式（无缓存） | KV cache 模式 |
 |---|---|---|
-| 首次前向 | `forward(ctx, 1, ctx.len(), None)` | `forward(ctx, 1, ctx.len(), Some(&mut cache))`：同样前向整个 prompt，但**把每层 K/V 顺手存进缓存** |
-| 之后每步 | `forward(ctx, 1, ctx.len(), None)`：整个上下文（截断到最近 32 个）重算 | `forward(&ids[ids.len()-1..], 1, 1, Some(&mut cache))`：**只喂最后一个 token**，K/V 从缓存取 |
+| 首次前向 | `forward(ctx, 1, ctx.len(), None, false)` | `forward(ctx, 1, ctx.len(), Some(&mut cache), false)`：同样前向整个 prompt，但**把每层 K/V 顺手存进缓存** |
+| 之后每步 | `forward(ctx, 1, ctx.len(), None, false)`：整个上下文（截断到最近 32 个）重算 | `forward(&ids[ids.len()-1..], 1, 1, Some(&mut cache), false)`：**只喂最后一个 token**，K/V 从缓存取 |
 | 上下文处理 | `ids.len().saturating_sub(block_size)` 截断，窗口可滑动 | 不截断，全量积累在缓存里 |
 | 停止条件 | 生成满 `max_new` 个 | 生成满 `max_new` 个，**或缓存长度达到 `block_size`** |
 | 每次前向的位置数 | 32（封顶后固定） | 首次 prompt 长度，之后恒为 1 |
 
-用流程图看第一次生成（prompt = "The fox"，7 个 token，max_new=80）：
+用流程图看 demo 的生成 1 / 生成 2（prompt = "Once upon a"，11 个 token，max_new=80）：
 
 ```
 cache 模式：                             全量模式：
 ───────────                             ───────────
-第 1 步：前向 ["The fox"(7个)]          第 1 步：前向 ["The fox"(7个)]
-         ↓ 填充缓存（7 个位置）                    ↓ 结果只取最后一行，丢弃其余
+第 1 步：前向 ["Once upon a"(11个)]     第 1 步：前向 ["Once upon a"(11个)]
+         ↓ 填充缓存（11 个位置）                   ↓ 结果只取最后一行，丢弃其余
          采样出第 1 个新 token
-第 2 步：前向 [最新 1 个]               第 2 步：前向 ["The fox" + 1个]（8 个）
-         ↓ 缓存 = 8 个位置                       ↓ 又从头算了一遍 7 个历史 K/V
-第 3 步：前向 [最新 1 个]               第 3 步：前向 [9 个]
-         ↓ 缓存 = 9 个位置                       ↓ 重复劳动越来越多
+第 2 步：前向 [最新 1 个]               第 2 步：前向 ["Once upon a" + 1个]（12 个）
+         ↓ 缓存 = 12 个位置                      ↓ 又从头算了一遍 11 个历史 K/V
+第 3 步：前向 [最新 1 个]               第 3 步：前向 [13 个]
+         ↓ 缓存 = 13 个位置                      ↓ 重复劳动越来越多
 ...                                    ...
-第 26 步：前向 [最新 1 个]              第 80 步：前向 [窗口内 32 个]
+第 22 步：前向 [最新 1 个]              第 80 步：前向 [窗口内 32 个]
          ↓ 缓存 = 32 个位置                      ↓ 80 个新 token 全部生成
-         采样出第 26 个新 token
-第 27 步：开头检查缓存 = 32 ≥ block_size → 停止
+         采样出第 22 个新 token
+第 23 步：开头检查缓存 = 32 ≥ block_size → 停止
 ```
+
+（第 1～22 步两个模式的输出逐 token 相同，所以 demo 里生成 2 是生成 1 的前缀；差别只在第 23 步 cache 模式停下、全量模式继续滑窗口。）
 
 > 取 logits 的细节：`generate` 只取输出张量的**最后一行**（`logits.data()[n - v..]`，v = vocab_size）。全量模式算了一整段序列，但生成只需要最后一个位置的预测——前半部分的计算全部是"浪费"；缓存模式干脆只算最后一行需要的东西，正是这种浪费的反面。
 
@@ -303,36 +307,50 @@ cache 模式：                             全量模式：
 
 用一句话概括：**缓存只是把"这次算完就扔"的中间结果留了下来，计算路径和数值一个都没变，所以分布必然不变。**
 
-代码注释也点明了这一点（`src/main.rs`）：
+代码注释也点明了这一点（`src/main.rs`），而且 demo 现在**自己做这个验证**：
 
 ```rust
-println!("\n  （KV cache 只改计算方式、不改生成分布，两者应高度一致）");
+let consistent = out_full.starts_with(&out_kv);
+println!(
+    "\n  KV cache 只改计算方式、不改生成分布：cache 输出应恰为全量输出的前缀 —— {}",
+    if consistent { "一致 ✓" } else { "不一致 ✗" }
+);
 ```
 
-> 演示里的"验证"其实是间接的：demo 用了两个不同的 prompt（"Once upon a" vs "The fox"）和同一个 rng 序列，所以两段输出文本不同是正常的。想严格验证"分布一致"，应该**用相同 prompt + 相同 rng 种子**分别跑 `use_kv_cache=false` 和 `true`，对比逐 token 输出是否逐位一致——这是动手练习 1。
+> 两次生成必须用**相同 prompt + 相同种子**（demo 里都是 `"Once upon a"` 和 `Rng::new(2024)`）。早先的 demo 用了两个不同 prompt（"Once upon a" vs "The fox"）再共用同一个 rng 序列，两段输出不同只是采样不同，**证明不了任何事**，属于反面教材。
+>
+> 为什么断言是"**前缀**"而不是"完全相等"？因为 cache 模式受 `block_size` 限制会提前结束（下一节），输出比全量模式短；但在它生成的那段里必须逐 token 相同。窗口内的严格相等由单元测试 `sample::tests::test_kv_cache_generate_matches_full` 守住，超窗口的"前缀"关系由 `test_kv_cache_output_is_prefix_of_full_beyond_window` 守住。
 
 ---
 
 ## 8. 上下文达到 block_size 后停止生成
 
-真实输出里能直接看到这个机制（第 16 课跑出来的）：
+真实输出里能直接看到这个机制（`cargo run --release -- demo`）：
 
 ```
-  —— 生成 2（temperature=0.8, top-k=10, top-p=0.9, 带 KV cache）——
-  The fox the hidden garden, whe li
+  —— 生成 2（同 prompt、同种子，带 KV cache）——
+  Once upon a time in a small villa
+
+  KV cache 只改计算方式、不改生成分布：cache 输出应恰为全量输出的前缀 —— 一致 ✓
 ```
 
-数一下："The fox" = 7 个 token，续写 ` the hidden garden, whe li` = 26 个 token，**输出共 7 + 26 = 33 个字符**。逐迭代看缓存怎么涨的：
+同时在 stderr 会打印一行警告，把"提前结束"这件事**说出来**（见本节末）：
+
+```
+[warn] KV cache 窗口已满（block_size=32），生成在 33 个 token 处提前结束；需要更长输出请缩短 prompt，或加 --no-kv-cache 改用全量前向（滑动窗口可继续生成）
+```
+
+数一下："Once upon a" = 11 个 token，续写 ` time in a small villa` = 22 个 token，**输出共 11 + 22 = 33 个字符**。逐迭代看缓存怎么涨的：
 
 | 迭代 | 前向内容 | 前向之后缓存长度 | 采样出新 token |
 |------|---------|----------------|----------------|
-| 第 1 步 | 整个 prompt（7 个） | 7 | 第 1 个 |
-| 第 2 步 | 最新 1 个 | 8 | 第 2 个 |
+| 第 1 步 | 整个 prompt（11 个） | 11 | 第 1 个 |
+| 第 2 步 | 最新 1 个 | 12 | 第 2 个 |
 | ... | ... | ... | ... |
-| 第 26 步 | 最新 1 个 | 32 | 第 26 个 |
-| 第 27 步 | ——（循环开头检查） | 32 ≥ 32 → **break** | —— |
+| 第 22 步 | 最新 1 个 | 32 | 第 22 个 |
+| 第 23 步 | ——（循环开头检查） | 32 ≥ 32 → **break** | —— |
 
-也就是说，生成到第 26 个新 token 后，下一次循环开头检查：
+也就是说，生成到第 22 个新 token 后，下一次循环开头检查：
 
 ```rust
 if use_kv_cache && cache[0].seq_len() >= block_size {
@@ -340,7 +358,9 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 }
 ```
 
-此时缓存（prompt 7 个 + 已前向的 25 个新 token）恰好等于 32 = block_size，直接跳出——所以 `max_new=80` 根本没跑完，输出戛然而止。注意最后采样的第 26 个 token 甚至**没有参与前向、也没进缓存**（它只是被采样并 push 进 `ids`，下一次循环就 break 了）。
+此时缓存（prompt 11 个 + 已前向的 21 个新 token）恰好等于 32 = block_size，直接跳出——所以 `max_new=80` 根本没跑完，输出戛然而止。注意最后采样的第 22 个 token 甚至**没有参与前向、也没进缓存**（它只是被采样并 push 进 `ids`，下一次循环就 break 了）。
+
+> 这种"静默变短"曾经是个坑：同一个 prompt 加不加 KV cache 会得到**不同长度**的输出，而使用者看不出原因。现在 `generate` 会在窗口写满时向 stderr 打印 `[warn]`，把限制显式暴露出来（`hit_window_limit` 标志 + `eprintln!`）。
 
 **为什么必须停？** 三个原因，都指向同一个根：
 
@@ -350,7 +370,7 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 | 缓存无法"截断" | 全量模式可以用 `ids.len().saturating_sub(block_size)` 把窗口滑到最近 32 个 token；而 `KVCache` 只会 append、不会丢弃最早的位置（当前实现没有"弹掉开头"的操作） |
 | 上下文窗口硬上限 | `block_size` 是模型的设计上下文长度（每个训练样本最长 32 个位置），`generate` 用 `cache[0].seq_len() >= block_size` 把生成长度锁在训练见过的最长窗口内，不越界 |
 
-对比全量模式的生成 1：prompt "Once upon a" = 12 个 token，每步窗口都滑到最近 32 个，所以 80 个新 token 全部生成完（`Once upon a to his friend, the wise old owl. One day, Red found a wold of colors and turned`）。
+对比全量模式的生成 1：同一个 prompt "Once upon a" = 11 个 token，每步窗口都滑到最近 32 个，所以 80 个新 token 全部生成完（`Once upon a time in a small village, there lived a curious little fox named Red. Every morn`）。
 
 > 真实 LLM 的 KV cache 比这复杂得多：支持"滑动窗口 + 丢弃最旧块"（如 Mistral 的 sliding window）、对缓存做量化压缩等。本项目的 `KVCache` 是最简版——**只拼不丢**，因此一旦填满就必须停止。把"丢了也能继续"留作动手练习 5。
 
@@ -358,8 +378,8 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 
 ## 9. 动手练习
 
-1. **严格验证分布不变**：在 `demo_gpt` 里用**相同的 prompt**（如都传 `"The fox"`）和**相同的 rng** 分别调 `generate(..., false, ...)` 与 `generate(..., true, ...)`，对比逐 token 输出是否一致。
-2. **打印缓存形状**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("cache seq_len = {}", cache.seq_len());`，观察它从 7 一路涨到 32 的过程。
+1. **在窗口内验证"完全相等"**：把 demo 的生成 2 改成 `max_new=20`（prompt 11 + 20 = 31 ≤ 32，全程不碰窗口上限），此时两次输出应**完全相等**而不只是前缀——把 `starts_with` 换成 `assert_eq!` 验证一下。
+2. **打印缓存形状**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("cache seq_len = {}", cache.seq_len());`，观察它从 11 一路涨到 32 的过程。
 3. **把 `break` 条件去掉**：临时注释掉 `generate` 里的 `if use_kv_cache && cache[0].seq_len() >= block_size { break; }`，运行看会发生什么——体会 RoPE 外推区（位置远超训练见过的 `0..32`）对生成质量的影响。
 4. **对比计算量**：全量模式第 k 步前向 k 个位置、缓存模式每步只前向 1 个位置。对 `block_size=32`、`max_new=80`，估算两种模式累计前向的位置总数各是多少。
 5. **（进阶）给 KVCache 加"截断"**：仿照全量模式的窗口滑动，给 `KVCache` 加一个 `truncate(keep: usize)` 方法（把 `Vec<f32>` 前部多出来的 `(len - keep) * d` 个元素 `drain` 掉，并同步更新 `len`），并在 `generate` 的缓存分支里每步调用它，让缓存模式也能像全量模式一样持续生成——对比改动前后的输出。
@@ -373,7 +393,7 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
   `append` 就地 extend（不复制历史）、`seq_len` 读 `len`、`k()`/`v()` 包成张量（会克隆一次）
 - `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`GPT::forward` 用 `base` 修正位置编码与因果掩码
 - 流程对比：首次前向整个 prompt 填缓存 → 之后每步只前向 1 个 token；全量模式则是每步重算整个窗口
-- 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致
-- 缓存模式只拼不丢，上下文达到 `block_size=32` 必须停止（训练长度外是 RoPE 外推区 + 缓存无法截断历史），真实输出里生成 2 止步于 32 个 token
+- 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致；demo 用**同 prompt + 同种子**自验证，单元测试守住"窗口内完全一致 / 超窗口仅是前缀"
+- 缓存模式只拼不丢，上下文达到 `block_size=32` 必须停止（训练长度外是 RoPE 外推区 + 缓存无法截断历史），真实输出里生成 2 止步于 33 个字符，并向 stderr 打印 `[warn]` 提示提前结束
 
 - 下一课：换掉正弦位置编码，用 RoPE（旋转位置编码）让位置信息融入注意力计算。

@@ -2517,8 +2517,8 @@ mod tests {
         let (bh, t, d, bs) = (2, 16, 8, 4); // t/bs = 4 个 K/V 块，确保跨块 max 更新
         let mut rng = Rng::new(7);
 
-        // 放大 Q/K 让 score 动态范围更大，从而**必然**出现「最大值出现在后续块」的行，
-        // 否则这些行的 P 基准碰巧一致，测试就抓不到 bug。
+        // 放大 Q/K 让 score 动态范围更大，从而更容易出现「最大值落在后续块」的行，
+        // 否则这些行的 P 基准容易碰巧一致，测试就抓不到 bug。
         let amp = 3.0f32;
         let q_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn() * amp).collect();
         let k_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn() * amp).collect();

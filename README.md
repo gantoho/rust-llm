@@ -39,9 +39,9 @@
 | GPT 模型 | `src/model.rs` | Transformer Block 堆叠、GPT 整体前向、checkpoint 参数名、**Dropout** |
 | 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样 |
 | 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**；另外实现了但未接入的 `MixedPrecision` 动态损失缩放 |
-| 采样 | `src/sample.rs` | temperature / top-k / top-p 采样，KV cache 推理，**Beam Search** |
+| 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search** |
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
-| Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
+| Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式 |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **finetune** / **preset** / demo / **bench** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
@@ -139,7 +139,24 @@ cargo run --release -- train [参数]
 - `final.ckpt` —— 训练结束时的 checkpoint
 - `tokenizer.json` —— 训练好的分词器（推理时自动加载，无需语料）
 
-**日志**：每步指标写入 `logs/train.csv`（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；控制台输出可用重定向存到 `logs/run.log`。
+**checkpoint 文件格式**（`LLMCP2`，自描述二进制）：
+
+```text
+魔数 "LLMCP2\n"（7 字节）
+u32 小端：JSON 头长度
+JSON 头：step、best_val_loss、模型配置、优化器步数 opt_t、参数元信息（名字 + 形状）
+参数数据块：按参数顺序拼接的 f32 小端
+一阶动量 m 数据块：与参数同样的顺序与形状（续训用）
+二阶动量 v 数据块：与参数同样的顺序与形状（续训用）
+```
+
+三段数据块等长（都是「参数总元素数 × 4」字节），所以**文件大小只由模型结构决定、与数值无关**。JSON 头里只有标量和元信息，占比极小——例如 144 万参数的模型，17.3MB 的存档里 JSON 头只有 1961 字节。
+
+注意 `.ckpt` 只是文件后缀，不代表内部格式。旧版（`LLMCP1`）的内容是「魔数 + **51.3MB JSON 文本头** + 7.4MB 二进制参数块」：**参数本来就是二进制**，被文本编码撑大的是**优化器状态**——`m` / `v` 当时是 JSON 头里的两个字段，一个 f32 平均要 13~14 字节（二进制只要 4 字节）。同一个 184 万参数的模型（`config/config.json`），58.6MB 的存档里 87% 都花在这上面，把 `m` / `v` 也改成数据块后降到 22.1MB。文本还有个隐患：JSON 没有 `NaN` / `Infinity` 字面量，`serde_json` 会把它写成 `null`，读回时直接反序列化失败——训练一发散，存档就变成读不回来的废文件。
+
+> `LLMCP2` 与旧格式不兼容，也不提供转换脚本（改格式只为存得更小、更稳），旧 `.ckpt` 请重新训练。
+
+**日志**：**每个评估点**（每 `eval_every` 步 + 最后一步）向 `logs/train.csv` 写一行（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；每次训练会覆盖该文件，要留档就一个实验配一个路径。控制台输出可用重定向存到 `logs/run.log`。
 
 **推理不需要语料文件**：训练完成后，`eval` / `generate` / `chat` 命令自动从 checkpoint 目录加载 `tokenizer.json`，不再需要 `train_file` 或语料。只需指定 `--ckpt` 即可：
 
@@ -274,6 +291,8 @@ cargo run --release -- generate [参数]
 | `--temperature <温度>` | float | `0.8` | 采样温度（>1 更随机，<1 更确定，0 = 贪心） |
 | `--top-k <数量>` | int | `40` | top-k 采样：只从概率最高的 k 个 token 里选 |
 | `--top-p <概率>` | float | `0.9` | top-p 采样：累积概率到 p 的最小集合 |
+| `--repetition-penalty <系数>` | float | `1.1` | 重复惩罚：>1 压低最近出现过的 token（`1.0` = 关闭） |
+| `--repetition-window <数量>` | int | `64` | 重复惩罚的回看窗口：只看最近 N 个 token（`0` = 关闭） |
 | `--seed <种子>` | int | `42` | 随机种子（相同种子 + 相同参数 = 相同输出） |
 | `--no-kv-cache` | flag | 关闭 | 禁用 KV cache（每个新 token 都全量前向，慢但省内存） |
 | `--beam <束宽>` | int | 无（不用） | Beam Search 束宽（通常 4-10），指定后使用确定性搜索 |
@@ -281,7 +300,13 @@ cargo run --release -- generate [参数]
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，推理时自动加载。
 
-**采样策略**：temperature 调整 → top-k 截断 → top-p 截断 → 按概率随机抽样
+**采样策略**：重复惩罚 → temperature 调整 → top-k 截断 → top-p 截断 → 按概率随机抽样
+
+**重复惩罚（repetition penalty）**：小模型容易陷入"太太太太太太……"这种自我强化的重复循环——
+一旦上下文里出现某个 token，注意力就让它成为下一个 token 的最优选择，采样怎么截断都跳不出去。
+惩罚的做法是：把最近 `--repetition-window` 个 token 的 logit 压低（正值除以系数、负值乘以系数），
+再走正常的 temperature/top-k/top-p。`1.0` 关闭，常用范围 `1.05~1.3`；调得太大会连"的""了"这类
+高频虚词一起压掉，句子反而散架。
 
 **示例**：
 
@@ -367,6 +392,19 @@ cargo run --release -- generate --config config/config.json --prompt "Once" --te
 
 # 极端随机（高温 + 禁用截断，可能产生不通顺文本，用于观察模型分布）
 cargo run --release -- generate --config config/config.json --prompt "The" --temperature 2.0 --top-k 0 --top-p 1.0 --max-new 30
+
+# ═══════════════════════════════════════════
+#  重复惩罚（--repetition-penalty）
+# ═══════════════════════════════════════════
+
+# 默认开启（1.1）：小模型长文本生成最常见的毛病是"某某某某某某……"卡住，惩罚能直接打断循环
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "我们" --max-new 200
+
+# 关掉对照：同一个种子下会坍缩成一长串重复字
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "我们" --max-new 200 --repetition-penalty 1.0
+
+# 加重惩罚 + 放大回看窗口（重复更顽固时用，太大则句子散架）
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "我们" --max-new 200 --repetition-penalty 1.3 --repetition-window 128
 
 # ═══════════════════════════════════════════
 #  随机种子控制（--seed）
@@ -477,6 +515,8 @@ cargo run --release -- chat [参数]
 | `--temperature <温度>` | float | `0.8` | 采样温度 |
 | `--top-k <数量>` | int | `40` | top-k 采样 |
 | `--top-p <概率>` | float | `0.9` | top-p 采样 |
+| `--repetition-penalty <系数>` | float | `1.1` | 重复惩罚（`1.0` = 关闭） |
+| `--repetition-window <数量>` | int | `64` | 重复惩罚的回看窗口（`0` = 关闭） |
 | `--max-new <数量>` | int | `200` | 每次生成的最大 token 数 |
 | `--seed <种子>` | int | `42` | 随机种子 |
 
@@ -582,8 +622,9 @@ cargo run --release -- demo
 1. **MLP 学习 XOR**（第 7 课）：验证神经网络 + 反向传播正确，训练后正确率 4/4（100%）
 2. **BPE 分词器**（第 8 课）：在示例语料上训练 BPE 词表（400 个 token），演示编码/解码往返
 3. **训练小 GPT 并生成文本**（第 12-20、25 课）：669 字符英文故事上训练 600 步，每 100 步记录一次
-   （loss `1.63 → 0.15`），然后用 temperature=0.8 / top-k=10 / top-p=0.9 生成文本，
-   分别演示无 KV cache 和带 KV cache 两种推理
+   （loss `1.63 → 0.15`），然后用 temperature=0.8 / top-k=10 / top-p=0.9 做三次生成：
+   生成 1 全量前向、生成 2 同 prompt + 同种子的 KV cache（输出应是生成 1 的前缀，用于验证
+   cache 不改生成分布）、生成 3 换个开头看小模型的泛化毛病
 4. **GPU 加速对比**（第 27 课，仅 `--features gpu`）：验证 CPU vs GPU 数值一致性，实测加速比
 
 **示例**：
@@ -691,8 +732,8 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **29 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
-合计 38 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
+默认构建运行 **31 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
+合计 40 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -715,6 +756,8 @@ cargo test test_softmax -- --nocapture
 | `test_dropout_masks_differ_across_calls` | Dropout 每次调用的掩码不同（种子确实在推进） |
 | `test_rotary` / `test_rotary_grad_exact` | RoPE 正交性 + 梯度精确验证 |
 | `test_kv_cache_matches_full_forward` | KV cache 推理 vs 全量前向一致性 |
+| `test_kv_cache_generate_matches_full` | 同 prompt + 同种子下，KV cache 生成 vs 全量生成逐 token 一致（窗口内） |
+| `test_kv_cache_output_is_prefix_of_full_beyond_window` | 超出缓存窗口时 KV cache 提前结束，输出仍是全量输出的前缀 |
 | `test_char_tokenizer_roundtrip` / `test_bpe_roundtrip` | 分词器编码/解码往返 |
 | `test_linear_regression_converges` | 线性回归收敛 |
 | `test_rng_deterministic` / `test_rng_range` / `test_choice_range` | 随机数生成器 |
@@ -916,7 +959,7 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 | `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
 | `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
 | `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0 }`。**目前只被校验并打印提示，尚未冻结主参数 / 注入适配层**（详见第 29 课） |
-| `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = 每步追加一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
+| `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = **每个评估点**（每 `eval_every` 步 + 最后一步）写一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`。无验证集时 `val_loss` / `ppl` 两列留空。**每次训练覆盖该文件**，不是追加 |
 | `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
 
 ### 完整配置示例
@@ -1060,7 +1103,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **29 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 38 个（详见 [§9 `cargo test`](#9-cargo-test--单元测试)）
+- **31 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 40 个（详见 [§9 `cargo test`](#9-cargo-test--单元测试)）
 - 已知提示（`never used` 警告，不影响功能）：
   - `cargo build`（非 gpu）报 3 条：`layers.rs` 的 `ln_params`、`gelu_weights`，`tensor.rs` 的 `external` / `mul` / `neg` / `sum_last_dim`
   - `cargo build --features gpu` 报 2 条：`gpu.rs` 的 `GpuDispatchDiag.n`，`tensor.rs` 的 `mul` / `neg` / `sum_last_dim`
@@ -1126,7 +1169,7 @@ cargo run --release -- bench --steps 30
 | 推理（KV cache） | ~591 tok/s | ~1129 tok/s | **约 1.9×** |
 | 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
 
-**正确性**：29 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+**正确性**：31 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
 （该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§8 `bench`](#8-bench--性能基准) 与 [§10 GPU 章节](#10-gpu-加速可选-feature)。）
 
 ### 还能压的地方
@@ -1216,6 +1259,11 @@ loss 直接变 NaN，整轮实验作废。
   结果 `test_masked_softmax_matches_chain` 直接越界 panic —— 反向闭包可能写入**不需要梯度**的父节点
   （`masked_softmax` 的 mask 就不参与求导，但闭包仍会往它的 grad 里累加）。
   结论：`grad` 缓冲必须始终按 `data` 全长分配，想省这块只能改闭包的写入逻辑，不能改分配策略。
+- **checkpoint 别用 JSON 存张量**：参数早就是 f32 二进制块了，但优化器动量 `m`/`v` 一开始是当 JSON 头里的
+  两个字段存的——一个 f32 要 13~14 字节（二进制 4 字节），184 万参数的模型存档 58.6MB 里 87% 是这么浪费的。
+  更糟的是 JSON 没有 `NaN`/`Infinity` 字面量，`serde_json` 会写成 `null`，读回直接反序列化失败——训练一发散
+  存档就报废。现在只把标量和元信息留在 JSON 头（且 `best_val_loss` 用 `Option` 表达"未产生"），
+  参数 / `m` / `v` 一律按 f32 小端写二进制块。
 - **推理建图是纯浪费**：模型参数的 `requires_grad` 恒为 `true`，若算子只用它决定是否建图，
   推理时也会一路把整张计算图（含 backward 闭包）建出来。加一个全局 `no_grad` 开关、
   把判断改走 `Tensor::req()` 后，推理提升 1.9~3.9×。

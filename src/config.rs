@@ -62,8 +62,9 @@ pub struct TrainConfig {
     /// LoRA 微调配置：Some(rank, alpha) 时冻结主模型，只训练 LoRA 层。
     /// rank 通常 4-64，alpha 通常 = rank。
     pub lora: Option<LoRAConfig>,
-    /// 训练指标日志文件路径：每步记录 step/lr/loss/ppl 到 CSV。
+    /// 训练指标日志文件路径：**每个评估点**（每 eval_every 步 + 最后一步）记录一行 step/lr/loss/ppl 到 CSV。
     /// 默认 `logs/train.csv`（日志目录自动创建）；显式设为 `null` 时不记录。
+    /// 注意每次训练会**覆盖**该文件（不是追加），要留档请一个实验用一个路径。
     pub log_file: Option<String>,
     /// 早停耐心值：验证 loss 连续 N 次评估不改善就提前终止训练。
     /// 0 = 不启用早停（默认）。

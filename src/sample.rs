@@ -5,34 +5,87 @@
 //! - temperature：缩放概率分布的"锐度"（<1 更确定，>1 更随机）
 //! - top-k：只在前 k 个概率最高的 token 里选
 //! - top-p（nucleus）：在累积概率达到 p 的最小集合里选
+//! - 重复惩罚（repetition penalty）：把最近出现过的 token 的 logit 压低，
+//!   抑制"同一 token 反复出现"的自我强化循环
 //!
-//! 结合使用：temperature 调整锐度 -> top-k/top-p 截断 -> 按概率随机抽样。
+//! 结合使用：重复惩罚 -> temperature 调整锐度 -> top-k/top-p 截断 -> 按概率随机抽样。
 
 use crate::model::GPT;
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
 
+/// 采样超参数（temperature / top-k / top-p / 重复惩罚）
+///
+/// 打包成一个结构体而不是一长串函数参数：`generate` 的入参本来就多，
+/// 再加两个标量会到 11 个，调用点也全部要跟着改。
+#[derive(Clone, Copy, Debug)]
+pub struct SampleOpts {
+    /// 采样温度（>1 更随机，<1 更确定）
+    pub temperature: f32,
+    /// top-k：只从概率最高的 k 个里选（0 = 不限制）
+    pub top_k: usize,
+    /// top-p：累计概率到 p 的最小集合（1.0 = 不限制）
+    pub top_p: f32,
+    /// 重复惩罚系数：> 1.0 生效（1.0 = 关闭）
+    pub repetition_penalty: f32,
+    /// 重复惩罚回看窗口：只看最近 N 个 token（0 = 关闭）
+    pub repetition_window: usize,
+}
+
+impl Default for SampleOpts {
+    fn default() -> Self {
+        SampleOpts {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            repetition_window: 64,
+        }
+    }
+}
+
 /// 从 logits 分布中采样一个 token
+///
+/// - `recent`：参与重复惩罚的 token（调用方按窗口截好，通常是"最近 N 个已生成的 token"）。
+///   传空切片即跳过惩罚。
 pub fn sample_token(
     logits: &[f32],
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
+    opts: &SampleOpts,
+    recent: &[usize],
     rng: &mut Rng,
 ) -> usize {
-    // 1. 除以 temperature 缩放（1e-5 是温度下限，防止 0 除）
-    let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature.max(1e-5)).collect();
-
-    // 2. 按分数从高到低排序
-    let mut items: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 3. top-k：只保留前 k 个
-    if top_k > 0 && items.len() > top_k {
-        items.truncate(top_k);
+    // 1. 重复惩罚：压低最近出现过的 token。
+    //    正值除以系数、负值乘以系数 —— 两种情况下数值都变小，因此更难被抽中。
+    //    作用在**原始 logit** 上、再统一做 temperature 缩放，与 HuggingFace 的处理顺序一致。
+    let mut penalized: Vec<f32> = logits.to_vec();
+    if opts.repetition_penalty > 1.0 {
+        for &id in recent {
+            if let Some(l) = penalized.get_mut(id) {
+                *l = if *l > 0.0 {
+                    *l / opts.repetition_penalty
+                } else {
+                    *l * opts.repetition_penalty
+                };
+            }
+        }
     }
 
-    // 4. softmax 得到概率
+    // 2. 除以 temperature 缩放（1e-5 是温度下限，防止 0 除）
+    let inv_temp = 1.0 / opts.temperature.max(1e-5);
+    for l in penalized.iter_mut() {
+        *l *= inv_temp;
+    }
+
+    // 3. 按分数从高到低排序
+    let mut items: Vec<(usize, f32)> = penalized.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 4. top-k：只保留前 k 个
+    if opts.top_k > 0 && items.len() > opts.top_k {
+        items.truncate(opts.top_k);
+    }
+
+    // 5. softmax 得到概率
     let max = items
         .iter()
         .map(|(_, v)| *v)
@@ -43,13 +96,13 @@ pub fn sample_token(
         *p /= sum;
     }
 
-    // 5. top-p：从高到低累加概率，直到超过 p，后面的全部丢弃
-    if top_p < 1.0 {
+    // 6. top-p：从高到低累加概率，直到超过 p，后面的全部丢弃
+    if opts.top_p < 1.0 {
         let mut cum = 0.0;
         let mut keep = items.len();
         for (i, p) in probs.iter().enumerate() {
             cum += p;
-            if cum >= top_p {
+            if cum >= opts.top_p {
                 keep = i + 1;
                 break;
             }
@@ -62,7 +115,7 @@ pub fn sample_token(
         }
     }
 
-    // 6. 按概率随机抽样
+    // 7. 按概率随机抽样
     let mut u = rng.next_f32();
     for (i, p) in probs.iter().enumerate() {
         if u < *p {
@@ -77,15 +130,14 @@ pub fn sample_token(
 ///
 /// - prompt: 起始文本
 /// - max_new: 最多生成多少个新 token
+/// - opts: 采样超参数（含重复惩罚）
 /// - use_kv_cache: 是否使用 KV cache 加速（第 18 课）
 pub fn generate(
     model: &GPT,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_new: usize,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
+    opts: &SampleOpts,
     use_kv_cache: bool,
     rng: &mut Rng,
 ) -> String {
@@ -96,10 +148,13 @@ pub fn generate(
     }
     // 仅在使用 KV cache 时才分配缓存，全量模式不浪费内存
     let mut cache = use_kv_cache.then(|| model.new_kv_cache());
+    // 缓存窗口写满时是否提前结束（全量模式会滑动窗口继续，KV cache 做不到）
+    let mut hit_window_limit = false;
 
     for _ in 0..max_new {
         // KV cache 模式：上下文总长达到 block_size 就停（缓存无法像全量模式那样截断历史）
         if cache.as_ref().is_some_and(|c| c[0].seq_len() >= block_size) {
+            hit_window_limit = true;
             break;
         }
         // 只保留最近的 block_size 个 token（全量模式需要）
@@ -127,8 +182,25 @@ pub fn generate(
         let v = model.cfg.vocab_size;
         let n = logits.numel();
         let last_row = &logits.data()[n - v..];
-        let next = sample_token(last_row, temperature, top_k, top_p, rng);
+        // 重复惩罚的回看窗口：只看最近 N 个 token（含 prompt），更早的不再计入。
+        // 窗口过大时高频 token 会被持续压低，可能影响语句的连贯性。
+        let recent = if opts.repetition_window == 0 {
+            &[][..]
+        } else {
+            let start = ids.len().saturating_sub(opts.repetition_window);
+            &ids[start..]
+        };
+        let next = sample_token(last_row, opts, recent, rng);
         ids.push(next);
+    }
+
+    if hit_window_limit {
+        // 不能静默变短：同一个 prompt 加不加 KV cache 会得到不同长度，用户必须知情
+        eprintln!(
+            "[warn] KV cache 窗口已满（block_size={block_size}），生成在 {} 个 token 处提前结束；\
+             需要更长输出请缩短 prompt，或加 --no-kv-cache 改用全量前向（滑动窗口可继续生成）",
+            ids.len()
+        );
     }
 
     tokenizer.decode(&ids)
@@ -231,4 +303,106 @@ pub fn beam_search(
         .unwrap();
 
     tokenizer.decode(&best.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::GPTConfig;
+
+    fn tiny_setup() -> (GPT, Tokenizer) {
+        let corpus = "the quick brown fox jumps over the lazy dog, and then runs away.";
+        let tokenizer = Tokenizer::char(corpus);
+        let mut rng = Rng::new(7);
+        let model = GPT::new(GPTConfig::tiny(tokenizer.vocab_size()), &mut rng);
+        (model, tokenizer)
+    }
+
+    fn opts() -> SampleOpts {
+        SampleOpts {
+            temperature: 0.8,
+            top_k: 10,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            repetition_window: 64,
+        }
+    }
+
+    /// KV cache 只改注意力的计算方式（增量 vs 全量），不改生成分布：
+    /// 同 prompt + 同种子、且总长不超 `block_size` 时，两种模式应逐 token 一致。
+    #[test]
+    fn test_kv_cache_generate_matches_full() {
+        let (model, tokenizer) = tiny_setup();
+        // tiny 的 block_size = 32：prompt 3 + 生成 20 = 23 ≤ 32，全程在缓存窗口内
+        let mut rng_full = Rng::new(1234);
+        let full = generate(&model, &tokenizer, "the", 20, &opts(), false, &mut rng_full);
+        let mut rng_cache = Rng::new(1234);
+        let cached = generate(&model, &tokenizer, "the", 20, &opts(), true, &mut rng_cache);
+
+        assert_eq!(full, cached, "窗口内的 KV cache 生成应与全量前向逐 token 一致");
+    }
+
+    /// 缓存窗口写满后 KV cache 模式会提前结束，全量模式靠滑动窗口继续生成。
+    /// 两者长度不同是有意为之（见 `generate` 里的 `hit_window_limit` 警告），
+    /// 但 cache 的输出应是全量输出的**前缀**：只变短，内容不变。
+    #[test]
+    fn test_kv_cache_output_is_prefix_of_full_beyond_window() {
+        let (model, tokenizer) = tiny_setup();
+        let mut rng_full = Rng::new(1234);
+        let full = generate(&model, &tokenizer, "the", 60, &opts(), false, &mut rng_full);
+        let mut rng_cache = Rng::new(1234);
+        let cached = generate(&model, &tokenizer, "the", 60, &opts(), true, &mut rng_cache);
+
+        assert!(
+            cached.chars().count() < full.chars().count(),
+            "超出窗口时 cache 模式应提前结束，输出比全量短"
+        );
+        assert!(
+            full.starts_with(&cached),
+            "超出窗口时 cache 输出应仍是全量输出的前缀：\nfull   = {full}\ncached = {cached}"
+        );
+    }
+
+    /// 重复惩罚要把"最近出现过"的 token 压下去。
+    /// temperature 取极小值让采样退化成近似贪心，断言才是确定性的。
+    /// （回看窗口是 `generate` 按 `repetition_window` 截好 `recent` 后传进来的，
+    ///   所以 `sample_token` 只认拿到的 `recent`。）
+    #[test]
+    fn test_repetition_penalty_suppresses_recent_token() {
+        let near_greedy = |penalty: f32| SampleOpts {
+            temperature: 0.05,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: penalty,
+            repetition_window: 8,
+        };
+
+        // id=1 领先 id=2 一点点；惩罚 2.0 之后 4.0/2.0 = 2.0 < 3.9，id=2 反超
+        let logits = vec![0.0, 4.0, 3.9];
+        let mut rng = Rng::new(1);
+        for _ in 0..10 {
+            assert_eq!(
+                sample_token(&logits, &near_greedy(1.0), &[1], &mut rng),
+                1,
+                "关闭惩罚时应选 argmax"
+            );
+            assert_eq!(
+                sample_token(&logits, &near_greedy(2.0), &[1], &mut rng),
+                2,
+                "惩罚后应由 id=2 反超"
+            );
+        }
+
+        // 负 logit 要**乘小**（-3.0 -> -6.0）而不是变大：于是 id=0 的 -4.0 反超
+        let neg = vec![-4.0, -3.0];
+        let mut rng = Rng::new(2);
+        for _ in 0..10 {
+            assert_eq!(sample_token(&neg, &near_greedy(1.0), &[1], &mut rng), 1);
+            assert_eq!(
+                sample_token(&neg, &near_greedy(2.0), &[1], &mut rng),
+                0,
+                "负 logit 也应被压低"
+            );
+        }
+    }
 }

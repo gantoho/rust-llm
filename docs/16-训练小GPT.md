@@ -45,16 +45,31 @@ fn demo_gpt() {
     };
     train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
 
-    // 生成（无 cache）
-    println!("\n  —— 生成 1（temperature=0.8, top-k=10, top-p=0.9, 无 KV cache）——");
-    let out1 = generate(&model, &tokenizer, "Once upon a", 80, 0.8, 10, 0.9, false, &mut rng);
-    println!("  {}", out1);
+    // 生成 1（无 cache）：全量前向用滑动窗口，可以生成超过 block_size 的长文本
+    // 三次生成共用同一套采样参数（含重复惩罚，见第 15 课第 7 节）
+    let opts = SampleOpts { top_k: 10, ..SampleOpts::default() };
+    println!("\n  —— 生成 1（prompt=Once upon a, 无 KV cache，全量前向）——");
+    let mut rng_full = Rng::new(2024);
+    let out_full = generate(&model, &tokenizer, "Once upon a", 80, &opts, false, &mut rng_full);
+    println!("  {out_full}");
 
-    // 生成（带 KV cache，第 25 课）
-    println!("\n  —— 生成 2（temperature=0.8, top-k=10, top-p=0.9, 带 KV cache）——");
-    let out2 = generate(&model, &tokenizer, "The fox", 80, 0.8, 10, 0.9, true, &mut rng);
-    println!("  {}", out2);
-    println!("\n  （KV cache 只改计算方式、不改生成分布，两者应高度一致）");
+    // 生成 2（带 KV cache，第 25 课）：同 prompt + 同种子，验证 cache 不改变生成分布
+    println!("\n  —— 生成 2（同 prompt、同种子，带 KV cache）——");
+    let mut rng_kv = Rng::new(2024);
+    let out_kv = generate(&model, &tokenizer, "Once upon a", 80, &opts, true, &mut rng_kv);
+    println!("  {out_kv}");
+
+    let consistent = out_full.starts_with(&out_kv);
+    println!(
+        "\n  KV cache 只改计算方式、不改生成分布：cache 输出应恰为全量输出的前缀 —— {}",
+        if consistent { "一致 ✓" } else { "不一致 ✗" }
+    );
+
+    // 生成 3：换一个语料里没出现过的开头，看小模型的真实泛化水平
+    println!("\n  —— 生成 3（prompt=The fox，换开头看泛化）——");
+    let mut rng_fox = Rng::new(2024);
+    let out_fox = generate(&model, &tokenizer, "The fox", 80, &opts, false, &mut rng_fox);
+    println!("  {out_fox}");
 }
 ```
 
@@ -297,16 +312,22 @@ lr
 真实生成结果（`cargo run --release -- demo` 原样输出）：
 
 ```
-  —— 生成 1（temperature=0.8, top-k=10, top-p=0.9, 无 KV cache）——
+  —— 生成 1（prompt=Once upon a, 无 KV cache，全量前向）——
   Once upon a time in a small village, there lived a curious little fox named Red. Every morn
 
-  —— 生成 2（temperature=0.8, top-k=10, top-p=0.9, 带 KV cache）——
-  The foxcimed at Re folox named th
+  —— 生成 2（同 prompt、同种子，带 KV cache）——
+  Once upon a time in a small villa
+
+  KV cache 只改计算方式、不改生成分布：cache 输出应恰为全量输出的前缀 —— 一致 ✓
+
+  —— 生成 3（prompt=The fox，换开头看泛化）——
+  The foxcirs wlot. tche thethe ox neve uve powensid wal vith ao the ge here hethe garden
 ```
 
-（生成 2 用的是另一个 prompt "The fox"，且因缓存模式上下文达到 block_size=32 提前停止，第 25 课会专门讲；生成 1 在无缓存模式下把 80 个新字符完整生成完了。）
+读这段输出：
 
-读这段输出：模型学会了故事的结构——"Once upon a time..." 开头、"in a small village, there lived a curious little fox named Red" 几乎完整复现语料原文、主谓宾、句号逗号。**字面上"像样"，但仔细读全是毛病**：生成 2 的 "The foxcimed at Re folox named th" 语法不通、句子戛然而止（block_size 截断）。这就是下一节要回答的问题。
+- **生成 1 vs 生成 2 是严格对照**：同一个 prompt、同一个种子（`Rng::new(2024)`），只切换 `use_kv_cache`。生成 2 是生成 1 的前缀（`Once upon a time in a small villa`），证明 KV cache 只改计算方式、不改生成分布。生成 2 更短是因为缓存窗口（`block_size=32`）填满后必须停止——全量模式能滑动窗口继续，cache 模式不能，第 25 课第 8 节专讲，运行时也会打印 `[warn]` 提示。
+- **生成 3 才暴露真实水平**：换一个语料里没出现过的开头，"The foxcirs wlot. tche thethe ox neve..." 语法不通、词都拼不成（生成 3 用全量前向，没有被缓存窗口截断，所以这些毛病全是模型自己的）。
 
 ---
 

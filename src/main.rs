@@ -40,7 +40,7 @@ use model::{GPT, GPTConfig};
 use module::Module;
 use optim::{Optimizer, SGD};
 use rng::Rng;
-use sample::generate;
+use sample::{SampleOpts, generate};
 use tensor::Tensor;
 use tokenizer::{BPETokenizer, CharTokenizer, Tokenizer};
 
@@ -61,6 +61,8 @@ fn main() {
             temperature,
             top_k,
             top_p,
+            repetition_penalty,
+            repetition_window,
             seed,
             no_kv_cache,
             beam,
@@ -71,9 +73,13 @@ fn main() {
             tokenizer.as_deref(),
             &prompt,
             max_new,
-            temperature,
-            top_k,
-            top_p,
+            SampleOpts {
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                repetition_window,
+            },
             seed,
             no_kv_cache,
             beam,
@@ -87,6 +93,8 @@ fn main() {
             temperature,
             top_k,
             top_p,
+            repetition_penalty,
+            repetition_window,
             max_new,
             seed,
         } => cmd_chat(
@@ -94,9 +102,13 @@ fn main() {
             ckpt.as_deref(),
             tokenizer.as_deref(),
             &system,
-            temperature,
-            top_k,
-            top_p,
+            SampleOpts {
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                repetition_window,
+            },
             max_new,
             seed,
         ),
@@ -310,9 +322,7 @@ fn cmd_generate(
     tokenizer_path: Option<&str>,
     prompt: &str,
     max_new: usize,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
+    opts: SampleOpts,
     seed: u64,
     no_kv_cache: bool,
     beam: Option<usize>,
@@ -344,23 +354,15 @@ fn cmd_generate(
         // 采样生成
         let use_kv_cache = !no_kv_cache;
         println!(
-            "生成（temperature={} top-k={} top-p={}，KV cache {}）：",
-            temperature,
-            top_k,
-            top_p,
+            "生成（temperature={} top-k={} top-p={} 重复惩罚={}（窗口 {}），KV cache {}）：",
+            opts.temperature,
+            opts.top_k,
+            opts.top_p,
+            opts.repetition_penalty,
+            opts.repetition_window,
             if use_kv_cache { "开" } else { "关" }
         );
-        let out = generate(
-            &model,
-            &tokenizer,
-            prompt,
-            max_new,
-            temperature,
-            top_k,
-            top_p,
-            use_kv_cache,
-            &mut rng,
-        );
+        let out = generate(&model, &tokenizer, prompt, max_new, &opts, use_kv_cache, &mut rng);
         println!("{}", out);
     }
 }
@@ -372,9 +374,7 @@ fn cmd_chat(
     ckpt_path: Option<&str>,
     tokenizer_path: Option<&str>,
     system: &str,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
+    opts: SampleOpts,
     max_new: usize,
     seed: u64,
 ) {
@@ -385,7 +385,10 @@ fn cmd_chat(
     let mut rng = Rng::new(seed);
 
     println!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
-    println!("参数：temperature={} top-k={} top-p={}", temperature, top_k, top_p);
+    println!(
+        "参数：temperature={} top-k={} top-p={} 重复惩罚={}（窗口 {}）",
+        opts.temperature, opts.top_k, opts.top_p, opts.repetition_penalty, opts.repetition_window
+    );
     if !system.is_empty() {
         println!("系统提示：{}", system);
     }
@@ -423,9 +426,7 @@ fn cmd_chat(
             &tokenizer,
             &prompt,
             max_new,
-            temperature,
-            top_k,
-            top_p,
+            &opts,
             true, // 始终使用 KV cache 加速
             &mut rng,
         );
@@ -596,11 +597,12 @@ fn cmd_bench(steps: usize, gen_tokens: usize) {
         reps: usize,
     ) -> f64 {
         let mut rng = Rng::new(42);
-        let _ = generate(model, tokenizer, prompt, n, 0.8, 40, 0.9, use_kv, &mut rng);
+        let opts = SampleOpts::default();
+        let _ = generate(model, tokenizer, prompt, n, &opts, use_kv, &mut rng);
         let mut best = f64::INFINITY;
         for _ in 0..reps {
             let t = Instant::now();
-            let _ = generate(model, tokenizer, prompt, n, 0.8, 40, 0.9, use_kv, &mut rng);
+            let _ = generate(model, tokenizer, prompt, n, &opts, use_kv, &mut rng);
             best = best.min(t.elapsed().as_secs_f64());
         }
         best
@@ -744,28 +746,40 @@ fn demo_gpt() {
     };
     train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
 
-    // 生成（无 cache）
-    println!("\n  —— 生成 1（temperature=0.8, top-k=10, top-p=0.9, 无 KV cache）——");
-    let out1 = generate(
-        &model,
-        &tokenizer,
-        "Once upon a",
-        80,
-        0.8,
-        10,
-        0.9,
-        false,
-        &mut rng,
-    );
-    println!("  {}", out1);
+    // 生成 1（无 cache）：全量前向用滑动窗口，可以生成超过 block_size 的长文本
+    // 三次生成共用同一套采样参数（含重复惩罚），否则差异分不清是 cache 还是采样造成的
+    let opts = SampleOpts {
+        top_k: 10,
+        repetition_penalty: 1.1,
+        repetition_window: 64,
+        ..SampleOpts::default()
+    };
+    println!("\n  —— 生成 1（prompt=Once upon a, 无 KV cache，全量前向）——");
+    let mut rng_full = Rng::new(2024);
+    let out_full = generate(&model, &tokenizer, "Once upon a", 80, &opts, false, &mut rng_full);
+    println!("  {out_full}");
 
-    // 生成（带 KV cache，第 25 课）
-    println!("\n  —— 生成 2（temperature=0.8, top-k=10, top-p=0.9, 带 KV cache）——");
-    let out2 = generate(
-        &model, &tokenizer, "The fox", 80, 0.8, 10, 0.9, true, &mut rng,
+    // 生成 2（带 KV cache，第 25 课）：**必须用同一个 prompt 和同一个种子**，否则两次输出
+    // 不同只是采样不同，证明不了 cache 的正确性。
+    // 注意 cache 模式受 block_size 限制：缓存填满后无法像全量模式那样滑动窗口，
+    // 会在窗口边界提前结束并打印 [warn]（这是当前实现的有意限制，见第 25 课第 8 节）。
+    println!("\n  —— 生成 2（同 prompt、同种子，带 KV cache）——");
+    let mut rng_kv = Rng::new(2024);
+    let out_kv = generate(&model, &tokenizer, "Once upon a", 80, &opts, true, &mut rng_kv);
+    println!("  {out_kv}");
+
+    let consistent = out_full.starts_with(&out_kv);
+    println!(
+        "\n  KV cache 只改计算方式、不改生成分布：cache 输出应恰为全量输出的前缀 —— {}",
+        if consistent { "一致 ✓" } else { "不一致 ✗" }
     );
-    println!("  {}", out2);
-    println!("\n  （KV cache 只改计算方式、不改生成分布，两者应高度一致）");
+
+    // 生成 3：换一个训练语料里没出现过的开头，观察小模型的真实水平（第 16 课第 7 节）。
+    // 用全量前向，这样输出的毛病都归模型自己，不会被缓存窗口截断搅混。
+    println!("\n  —— 生成 3（prompt=The fox，换开头看泛化）——");
+    let mut rng_fox = Rng::new(2024);
+    let out_fox = generate(&model, &tokenizer, "The fox", 80, &opts, false, &mut rng_fox);
+    println!("  {out_fox}");
 }
 
 /// 演示 4（第 27 课）：GPU 加速（wgpu 计算着色器）

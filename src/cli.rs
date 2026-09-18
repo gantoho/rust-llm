@@ -77,6 +77,12 @@ pub enum Cmd {
         /// top-p 采样：累计概率到 p 的最小集合
         #[arg(long, default_value_t = 0.9)]
         top_p: f32,
+        /// 重复惩罚系数：>1 压低最近出现过的 token（1.0 = 关闭）
+        #[arg(long, default_value_t = 1.1)]
+        repetition_penalty: f32,
+        /// 重复惩罚的回看窗口：只看最近 N 个 token（0 = 关闭）
+        #[arg(long, default_value_t = 64)]
+        repetition_window: usize,
         /// 随机种子
         #[arg(long, default_value_t = 42)]
         seed: u64,
@@ -113,6 +119,12 @@ pub enum Cmd {
         /// top-p 采样
         #[arg(long, default_value_t = 0.9)]
         top_p: f32,
+        /// 重复惩罚系数：>1 压低最近出现过的 token（1.0 = 关闭）
+        #[arg(long, default_value_t = 1.1)]
+        repetition_penalty: f32,
+        /// 重复惩罚的回看窗口：只看最近 N 个 token（0 = 关闭）
+        #[arg(long, default_value_t = 64)]
+        repetition_window: usize,
         /// 每次生成的最大 token 数
         #[arg(long, default_value_t = 200)]
         max_new: usize,
