@@ -124,36 +124,50 @@ pub struct BPETokenizer {
 impl BPETokenizer {
     /// 在语料上训练 BPE，目标词表大小 = 256 + 合并次数
     pub fn train(corpus: &str, target_vocab: usize) -> Self {
+        // 语料过长时采样，避免 BPE 训练耗时过长
+        let max_train_bytes: usize = 1_000_000; // 1MB 足以学到良好的合并规则
+        let train_bytes = if corpus.len() > max_train_bytes {
+            println!("  语料 {} 字节，采样前 {} 字节用于 BPE 训练", corpus.len(), max_train_bytes);
+            &corpus.as_bytes()[..max_train_bytes]
+        } else {
+            corpus.as_bytes()
+        };
+        Self::train_bytes(train_bytes, target_vocab)
+    }
+
+    fn train_bytes(data: &[u8], target_vocab: usize) -> Self {
         assert!(target_vocab >= 256, "BPE 词表至少 256（字节级）");
-        // 初始：每个 token 就是一个字节
         let mut vocab: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
         let mut merges: Vec<(u16, u16)> = Vec::new();
+        let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
 
-        // 语料 -> 字节 -> id 序列
-        let mut ids: Vec<u16> = corpus.as_bytes().iter().map(|&b| b as u16).collect();
+        let target_merges = target_vocab - 256;
+        let log_interval = if target_merges >= 20 { target_merges / 20 } else { 1 };
 
         while vocab.len() < target_vocab {
-            // 1. 统计相邻 pair 频率
+            // 统计相邻 pair 频率（每次重新扫描，但语料已采样到1MB）
             let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
             for pair in ids.windows(2) {
                 *pair_freq.entry((pair[0], pair[1])).or_insert(0) += 1;
             }
-            // 2. 找最高频的 pair（频率相同取 pair 值小者，保证确定性）
-            let Some(&best) = pair_freq
+            // 找最高频 pair（频率相同取 pair 值小者，保证确定性）
+            let best = match pair_freq
                 .iter()
                 .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                .map(|(k, _)| k)
-            else {
-                break; // 没有可合并的 pair 了
+                .map(|(&k, _)| k)
+            {
+                Some(pair) => pair,
+                None => break,
             };
-            // 3. 合并：新符号 = 两个符号的字节拼接
+
+            // 创建新 token
             let new_id = vocab.len() as u16;
             let mut new_bytes = vocab[best.0 as usize].clone();
             new_bytes.extend_from_slice(&vocab[best.1 as usize]);
             vocab.push(new_bytes);
             merges.push(best);
 
-            // 4. 替换 ids 中所有该 pair
+            // 合并 ids 中所有该 pair（单次扫描重建）
             let mut new_ids: Vec<u16> = Vec::with_capacity(ids.len());
             let mut i = 0;
             while i < ids.len() {
@@ -166,7 +180,14 @@ impl BPETokenizer {
                 }
             }
             ids = new_ids;
+
+            let merge_count = merges.len();
+            if merge_count % log_interval == 0 || merge_count <= 5 {
+                println!("  BPE 进度: {}/{} 次合并, 词表 {}, 序列长度 {}",
+                    merge_count, target_merges, vocab.len(), ids.len());
+            }
         }
+        println!("  BPE 训练完成: {} 次合并, 词表 {}", merges.len(), vocab.len());
 
         BPETokenizer { merges, vocab }
     }

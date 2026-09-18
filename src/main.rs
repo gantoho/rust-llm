@@ -203,9 +203,14 @@ fn init_console_utf8() {}
 /// `expect_vocab = 0` 表示不校验（训练时词表由分词器决定）。
 fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: usize) -> Tokenizer {
     let tok = if let Some(ref path) = tcfg.tokenizer_file {
-        let loaded = Tokenizer::load(path);
-        println!("已从 {} 加载分词器（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
-        loaded
+        if std::path::Path::new(path).exists() {
+            let loaded = Tokenizer::load(path);
+            println!("已从 {} 加载分词器（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+            loaded
+        } else {
+            println!("分词器文件 {} 不存在，从语料训练新分词器", path);
+            Tokenizer::from_name(&tcfg.tokenizer, train_text, tcfg.bpe_vocab)
+        }
     } else {
         Tokenizer::from_name(&tcfg.tokenizer, train_text, tcfg.bpe_vocab)
     };
@@ -237,11 +242,10 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
     let tokenizer = build_tokenizer(tcfg, &train_text, 0); // 训练时词表由分词器决定
 
     // 训练完成后保存分词器（out_dir 不存在时 save 会自动创建）
-    if tcfg.tokenizer_file.is_none() {
-        let tok_path = format!("{}/tokenizer.json", tcfg.out_dir);
-        tokenizer.save(&tok_path);
-        println!("分词器已保存到 {tok_path}");
-    }
+    let tok_path = tcfg.tokenizer_file.clone()
+        .unwrap_or_else(|| format!("{}/tokenizer.json", tcfg.out_dir));
+    tokenizer.save(&tok_path);
+    println!("分词器已保存到 {tok_path}");
 
     // 词表大小 0 表示"由分词器决定"
     let mut model_cfg = cfg.model.clone();
