@@ -230,7 +230,13 @@ impl BPETokenizer {
                 .unwrap_or_else(|| panic!("decode 遇到越界 token id {id}（词表大小 {}）", self.vocab.len()));
             bytes.extend_from_slice(tok);
         }
-        String::from_utf8_lossy(&bytes).to_string()
+        match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
+                skip_invalid_utf8(e.as_bytes())
+            }
+        }
     }
 
     /// 保存到文件（JSON 格式）
@@ -373,6 +379,53 @@ impl Tokenizer {
             other => panic!("未知分词器类型 '{}'（可选：char / bpe）", other),
         }
     }
+}
+
+/// 跳过非法 UTF-8 字节，只保留合法部分（不用无意义的替换字符）
+fn skip_invalid_utf8(bytes: &[u8]) -> String {
+    let mut result = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 尝试从位置 i 开始解码一个合法的 UTF-8 字符
+        if let Some((ch, len)) = decode_utf8_char(&bytes[i..]) {
+            result.push(ch);
+            i += len;
+        } else {
+            // 跳过这个非法字节（不插入任何字符）
+            i += 1;
+        }
+    }
+    result
+}
+
+/// 尝试从字节切片开头解码一个 UTF-8 字符，返回 (字符, 字节数)
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let b = bytes[0];
+    let (code, len) = if b < 0x80 {
+        (b as u32, 1)
+    } else if b & 0xE0 == 0xC0 {
+        (b as u32 & 0x1F, 2)
+    } else if b & 0xF0 == 0xE0 {
+        (b as u32 & 0x0F, 3)
+    } else if b & 0xF8 == 0xF0 {
+        (b as u32 & 0x07, 4)
+    } else {
+        return None; // 非法起始字节
+    };
+    if bytes.len() < len {
+        return None;
+    }
+    let mut cp = code;
+    for &b in &bytes[1..len] {
+        if b & 0xC0 != 0x80 {
+            return None; // 非法续字节
+        }
+        cp = (cp << 6) | (b as u32 & 0x3F);
+    }
+    char::from_u32(cp).map(|c| (c, len))
 }
 
 // ==================== 测试 ====================

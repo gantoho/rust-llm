@@ -236,13 +236,19 @@ pub fn decode(&self, ids: &[usize]) -> String {
             .unwrap_or_else(|| panic!("decode 遇到越界 token id {id}（词表大小 {}）", self.vocab.len()));
         bytes.extend_from_slice(tok);
     }
-    String::from_utf8_lossy(&bytes).to_string()
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
+            skip_invalid_utf8(e.as_bytes())
+        }
+    }
 }
 ```
 
 - `vocab[id]`：id → 字节序列（0~255 是单字节，256+ 是合并出来的多字节序列）
 - 越界 id 用 `vocab.get(id)` 拦截：带下标信息的 panic 提示（decode 也会因传入非法 id 报错，不再是"永不失败"）
-- `String::from_utf8_lossy`：万一拼出非法 UTF-8，用替换字符 `�` 顶替而不是 panic
+- `skip_invalid_utf8`：万一拼出非法 UTF-8，跳过无效字节只保留合法部分（不插入无意义的替换字符），并在 stderr 打印警告
 
 > 完整闭环：`decode(encode("lowest new")) == "lowest new"`（单元测试 `test_bpe_roundtrip` 验证）。
 
@@ -254,7 +260,7 @@ pub fn decode(&self, ids: &[usize]) -> String {
 |------|--------|---------|-----------|
 | 训练 train | 从语料学合并规则 | 统计 pair → 合并最高频 → 替换（循环至目标词表大小） | `merges`（规则）+ `vocab`（字节序列）|
 | 编码 encode | 对新文本按规则贪心合并 | 按规则优先级（merges 顺序）单趟扫描替换 | 一串 token id |
-| 解码 decode | id → 字节序列拼接 | `vocab[id]` 逐个拼接 + `from_utf8_lossy` | 还原的文本 |
+| 解码 decode | id → 字节序列拼接 | `vocab[id]` 逐个拼接 + `skip_invalid_utf8` 跳过非法字节 | 还原的文本 |
 
 三者关系：**编码必须复现训练时的合并顺序**，解码只是查表，所以编码、解码天然互逆，`decode(encode(x)) == x`。
 
