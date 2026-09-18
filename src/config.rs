@@ -1,10 +1,38 @@
-//! 训练配置（`config.json`）
+//! 训练配置（`config/config.json`）
 //!
-//! 用 serde 序列化，`cargo run -- train --config config.json` 加载。
+//! 用 serde 序列化，`cargo run -- train --config config/config.json` 加载。
 //! 缺省字段自动取 [`Config::default`]，模型超参数在 `model` 里，训练流程参数在 `train` 里。
+//!
+//! 目录约定：配置文件放 `config/`、权重放 `checkpoints/`、日志放 `logs/`（见下方常量）。
+//! 所有产物路径在写盘前都会经过 [`ensure_parent_dir`] 自动建目录，产物不会散落到仓库根目录。
 
 use crate::model::GPTConfig;
 use serde::{Deserialize, Serialize};
+
+/// 默认配置文件路径（放在 `config/` 目录，保持仓库根目录整洁）
+pub const DEFAULT_CONFIG_PATH: &str = "config/config.json";
+/// 默认权重输出目录（checkpoint 与 `tokenizer.json` 都写在这里）
+pub const DEFAULT_OUT_DIR: &str = "checkpoints";
+/// 默认训练指标日志文件（CSV，训练时自动创建 `logs/` 目录）
+pub const DEFAULT_LOG_FILE: &str = "logs/train.csv";
+
+/// 确保目录本身存在（checkpoint 目录、日志目录等），不存在则递归创建。
+pub fn ensure_dir(dir: &str) {
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("创建目录 {dir} 失败: {e}"));
+}
+
+/// 写文件前确保其父目录存在：`logs/train.csv` → 自动创建 `logs/`。
+///
+/// 配置 / 权重 / 日志三类产物在落盘前都调用这里，所以把 `out_dir`、`log_file`
+/// 改成任意嵌套路径（如 `outputs/run1/logs/train.csv`）也能自动建目录。
+/// `path` 不含目录部分（如 `train.csv`）时不做任何事。
+pub fn ensure_parent_dir(path: &str) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_dir(&parent.to_string_lossy());
+        }
+    }
+}
 
 /// 训练流程参数
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,7 +52,7 @@ pub struct TrainConfig {
     pub bpe_vocab: usize,         // BPE 目标词表大小（= 256 字节 + 合并数）
     pub train_file: String,       // 训练语料文件
     pub val_file: Option<String>, // 验证语料文件；None 时自动从训练文本末尾切 10%
-    pub out_dir: String,          // checkpoint 输出目录
+    pub out_dir: String,          // checkpoint 输出目录（默认 checkpoints/）
     /// 梯度累积步数：每 accum_steps 步小 batch 才做一次 optimizer.step()。
     /// 有效 batch_size = batch_size * accum_steps。1 = 不累积（默认）。
     pub accum_steps: usize,
@@ -34,8 +62,8 @@ pub struct TrainConfig {
     /// LoRA 微调配置：Some(rank, alpha) 时冻结主模型，只训练 LoRA 层。
     /// rank 通常 4-64，alpha 通常 = rank。
     pub lora: Option<LoRAConfig>,
-    /// 训练指标日志文件路径：每步记录 lr/loss/ppl 到 CSV。
-    /// None 时不记录。Some(path) 时记录到指定文件。
+    /// 训练指标日志文件路径：每步记录 step/lr/loss/ppl 到 CSV。
+    /// 默认 `logs/train.csv`（日志目录自动创建）；显式设为 `null` 时不记录。
     pub log_file: Option<String>,
     /// 早停耐心值：验证 loss 连续 N 次评估不改善就提前终止训练。
     /// 0 = 不启用早停（默认）。
@@ -66,11 +94,11 @@ impl Default for TrainConfig {
             bpe_vocab: 512,
             train_file: "data/sample.txt".to_string(),
             val_file: None,
-            out_dir: "checkpoints".to_string(),
+            out_dir: DEFAULT_OUT_DIR.to_string(),
             accum_steps: 1,
             tokenizer_file: None,
             lora: None,
-            log_file: None,
+            log_file: Some(DEFAULT_LOG_FILE.to_string()),
             early_stop_patience: 0,
         }
     }
@@ -264,6 +292,7 @@ impl Config {
     pub fn save(&self, path: &str) {
         let json = serde_json::to_string_pretty(self)
             .expect("序列化配置失败");
+        ensure_parent_dir(path);
         std::fs::write(path, json)
             .unwrap_or_else(|e| panic!("无法写入配置文件 {path}: {e}"));
     }

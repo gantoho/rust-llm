@@ -299,7 +299,7 @@ tok.save("tokenizer.json");
 let tok = BPETokenizer::load("tokenizer.json");
 ```
 
-`config.json` 中通过 `tokenizer_file` 字段控制：
+`config/config.json` 中通过 `tokenizer_file` 字段控制：
 
 ```jsonc
 {

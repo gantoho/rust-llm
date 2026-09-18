@@ -2,7 +2,7 @@
 
 > 代码位置：[src/attention.rs](../src/attention.rs)（`MultiHeadAttention` 支持 `n_kv_head`）
 >
-> 配置开关：`config.json` → `model.n_kv_head: 2`（示例值；仓库当前 `config.json` 里是 `0` = 标准 MHA，需手动改为 `2` 才能启用 GQA）
+> 配置开关：`config/config.json` → `model.n_kv_head: 2`（示例值；仓库当前 `config/config.json` 里是 `0` = 标准 MHA，需手动改为 `2` 才能启用 GQA）
 
 ---
 

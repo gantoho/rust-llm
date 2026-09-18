@@ -1,12 +1,12 @@
 //! 从零实现大语言模型（纯 Rust，不依赖深度学习框架）
 //!
 //! 用法（cli 子命令）：
-//! - `cargo run --release -- train    --config config.json [--resume checkpoints/latest.ckpt]`
-//! - `cargo run --release -- eval     --config config.json [--ckpt checkpoints/latest.ckpt]`
-//! - `cargo run --release -- generate --config config.json [--ckpt ...] --prompt "Once" --max-new 100`
-//! - `cargo run --release -- chat     --config config.json [--ckpt ...] [--system "..."]`
-//! - `cargo run --release -- finetune --config config.json --pretrained ckpt [--lora-rank 16]`
-//! - `cargo run --release -- preset   [--name small] [--output config.json]`
+//! - `cargo run --release -- train    --config config/config.json [--resume checkpoints/latest.ckpt]`
+//! - `cargo run --release -- eval     --config config/config.json [--ckpt checkpoints/latest.ckpt]`
+//! - `cargo run --release -- generate --config config/config.json [--ckpt ...] --prompt "Once" --max-new 100`
+//! - `cargo run --release -- chat     --config config/config.json [--ckpt ...] [--system "..."]`
+//! - `cargo run --release -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]`
+//! - `cargo run --release -- preset   [--name small] [--output config/config.json]`
 //! - `cargo run --release -- demo`    # 教学演示（XOR / BPE / 内置语料小 GPT）
 //!
 //! 配套教程文档见 `docs/` 目录。
@@ -140,7 +140,7 @@ fn resolve_ckpt<'a>(ckpt: Option<&'a str>, out_dir: &str) -> std::borrow::Cow<'a
 ///
 /// 分词器加载策略（按优先级）：
 /// 1. `tokenizer_path` 参数（用户通过 --tokenizer 显式指定）
-/// 2. `tcfg.tokenizer_file`（config.json 中配置的路径）
+/// 2. `tcfg.tokenizer_file`（config/config.json 中配置的路径）
 /// 3. 自动查找 `{out_dir}/tokenizer.json`（训练时自动保存的）
 /// 4. 最后才从语料训练（需要 train_file 存在）
 fn load_model_and_tokenizer(
@@ -213,7 +213,7 @@ fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: u
         assert_eq!(
             tok.vocab_size(),
             expect_vocab,
-            "分词器词表（{}）与模型/checkpoint（{}）不一致：请确认 config.json 与训练时保持一致",
+            "分词器词表（{}）与模型/checkpoint（{}）不一致：请确认 config/config.json 与训练时保持一致",
             tok.vocab_size(),
             expect_vocab
         );
@@ -221,7 +221,7 @@ fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: u
     tok
 }
 
-/// 训练：`train --config config.json [--resume ckpt]`
+/// 训练：`train --config config/config.json [--resume ckpt]`
 fn cmd_train(config_path: &str, resume: Option<&str>) {
     let cfg = Config::load(config_path);
     let tcfg = &cfg.train;
@@ -236,10 +236,9 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
     let val_text = tcfg.val_file.as_deref().map(read_text);
     let tokenizer = build_tokenizer(tcfg, &train_text, 0); // 训练时词表由分词器决定
 
-    // 训练完成后保存分词器
+    // 训练完成后保存分词器（out_dir 不存在时 save 会自动创建）
     if tcfg.tokenizer_file.is_none() {
         let tok_path = format!("{}/tokenizer.json", tcfg.out_dir);
-        std::fs::create_dir_all(&tcfg.out_dir).expect("创建 checkpoint 目录失败");
         tokenizer.save(&tok_path);
         println!("分词器已保存到 {tok_path}");
     }
@@ -299,7 +298,7 @@ fn cmd_eval(config_path: &str, ckpt_path: Option<&str>, tokenizer_path: Option<&
     );
 }
 
-/// 生成：`generate --config config.json --ckpt ckpt --prompt "..."`
+/// 生成：`generate --config config/config.json --ckpt ckpt --prompt "..."`
 #[allow(clippy::too_many_arguments)]
 fn cmd_generate(
     config_path: &str,
@@ -566,6 +565,7 @@ fn cmd_bench(steps: usize, gen_tokens: usize) {
         min_lr: 6e-5,
         warmup_steps: (steps / 10).max(1),
         eval_every: steps + 1, // 基准不评估，避免干扰计时
+        log_file: None,        // 基准不落盘
         ..config::TrainConfig::default()
     };
     let t0 = Instant::now();
@@ -735,6 +735,7 @@ fn demo_gpt() {
         max_lr: 3e-3,
         warmup_steps: 50,
         eval_every: 100,
+        log_file: None, // 演示不落盘
         ..config::TrainConfig::default()
     };
     train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);

@@ -3,7 +3,7 @@
 > 代码位置：[src/tensor.rs](../src/tensor.rs)（`Tensor::dropout` 算子）
 > 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `GPT` 中的 dropout 调用）
 >
-> 配置开关：`config.json` → `model.dropout: 0.1`（推荐值 0.1~0.3）
+> 配置开关：`config/config.json` → `model.dropout: 0.1`（推荐值 0.1~0.3）
 
 ---
 

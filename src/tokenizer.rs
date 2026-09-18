@@ -325,8 +325,9 @@ impl Tokenizer {
         }
     }
 
-    /// 保存分词器到文件
+    /// 保存分词器到文件（父目录不存在时自动创建）
     pub fn save(&self, path: &str) {
+        crate::config::ensure_parent_dir(path);
         match self {
             Tokenizer::Char(t) => t.save(path),
             Tokenizer::Bpe(t) => t.save(path),

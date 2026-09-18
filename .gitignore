@@ -1,11 +1,14 @@
 /target
 .trae
-# 训练产物：checkpoint 目录与临时日志
-/checkpoints
-/checkpoints*
-# 备份用的 checkpoint 目录（如 ckpt_240kb / ckpt_preflashfix），单个 100MB+
-/ckpt_*
-config*.json
+
+# ── 产物目录约定：配置放 config/，权重放 checkpoints/，日志放 logs/ ──
+# 默认配置需要跟踪，实验配置（config_probe*.json 等）不入库
+/config/*.json
+!/config/config.json
+# 权重目录：checkpoint（latest / best / final）与 tokenizer.json，单个文件可达 100MB+
+/checkpoints/
+# 日志目录：训练指标 CSV（logs/train.csv）与重定向出来的运行日志
+/logs/
 *.log
 # 重定向出来的 stderr 文件（如 probe.err）
 *.err

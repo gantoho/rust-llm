@@ -4,7 +4,7 @@
 > 代码位置：[src/layers.rs](../src/layers.rs)（`SwiGLUMLP` 层、`MLPEnum` 枚举）
 > 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` 使用 `MLPEnum`）
 >
-> 配置开关：`config.json` → `model.use_swiglu: true`（示例值；仓库当前 `config.json` 里是 `false`，需手动改为 `true` 才能启用 SwiGLU）
+> 配置开关：`config/config.json` → `model.use_swiglu: true`（示例值；仓库当前 `config/config.json` 里是 `false`，需手动改为 `true` 才能启用 SwiGLU）
 
 ---
 

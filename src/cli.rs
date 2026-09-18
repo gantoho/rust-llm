@@ -1,15 +1,17 @@
 //! 命令行入口（clap）
 //!
 //! ```text
-//! cargo run -- train    --config config.json [--resume checkpoints/latest.ckpt]
-//! cargo run -- eval     --config config.json [--ckpt checkpoints/latest.ckpt]
-//! cargo run -- generate --config config.json [--ckpt ...] [--prompt "Once"] [--max-new 100] ...
-//! cargo run -- chat     --config config.json [--ckpt ...] [--system "..."]
-//! cargo run -- finetune --config config.json --pretrained ckpt [--lora-rank 16]
-//! cargo run -- preset   [--name small] [--output config.json]
+//! cargo run -- train    --config config/config.json [--resume checkpoints/latest.ckpt]
+//! cargo run -- eval     --config config/config.json [--ckpt checkpoints/latest.ckpt]
+//! cargo run -- generate --config config/config.json [--ckpt ...] [--prompt "Once"] [--max-new 100] ...
+//! cargo run -- chat     --config config/config.json [--ckpt ...] [--system "..."]
+//! cargo run -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]
+//! cargo run -- preset   [--name small] [--output config/config.json]
 //! cargo run -- demo     # 教学演示（XOR + BPE + 内置语料小 GPT）
 //! cargo run -- bench    # 性能基准（固定小模型测训练 / 推理吞吐）
 //! ```
+//!
+//! 目录约定：配置在 `config/`、权重在 `checkpoints/`、日志在 `logs/`（见 [`crate::config`] 的常量）。
 
 use clap::{Parser, Subcommand};
 
@@ -28,10 +30,10 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// 训练模型（超参数与数据路径见 config.json）
+    /// 训练模型（超参数与数据路径见 config/config.json）
     Train {
         /// 配置文件路径
-        #[arg(long, default_value = "config.json")]
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         config: String,
         /// 从已有 checkpoint 继续训练
         #[arg(long)]
@@ -40,7 +42,7 @@ pub enum Cmd {
     /// 在验证集上评估模型：loss 与困惑度（perplexity）
     Eval {
         /// 配置文件路径
-        #[arg(long, default_value = "config.json")]
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         config: String,
         /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
         #[arg(long)]
@@ -52,7 +54,7 @@ pub enum Cmd {
     /// 用训练好的模型生成文本
     Generate {
         /// 配置文件路径
-        #[arg(long, default_value = "config.json")]
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         config: String,
         /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
         #[arg(long)]
@@ -91,7 +93,7 @@ pub enum Cmd {
     /// 交互式对话模式：持续输入提示词，模型逐个生成回复
     Chat {
         /// 配置文件路径
-        #[arg(long, default_value = "config.json")]
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         config: String,
         /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
         #[arg(long)]
@@ -121,7 +123,7 @@ pub enum Cmd {
     /// LoRA 微调：冻结预训练模型，只训练低秩适配层
     Finetune {
         /// 配置文件路径
-        #[arg(long, default_value = "config.json")]
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         config: String,
         /// 预训练模型 checkpoint
         #[arg(long)]
@@ -145,7 +147,7 @@ pub enum Cmd {
         #[arg(long, default_value = "small")]
         name: String,
         /// 输出配置文件路径
-        #[arg(long, default_value = "config.json")]
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         output: String,
     },
     /// 教学演示：XOR + BPE + 内置语料小 GPT

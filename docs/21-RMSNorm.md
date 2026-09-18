@@ -4,7 +4,7 @@
 > 代码位置：[src/layers.rs](../src/layers.rs)（`RMSNorm` 层、`NormLayer` 枚举）
 > 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `GPT` 使用 `NormLayer`）
 >
-> 配置开关：`config.json` → `model.use_rmsnorm: true`（示例值；仓库当前 `config.json` 里是 `false`，需手动改为 `true` 才能启用 RMSNorm）
+> 配置开关：`config/config.json` → `model.use_rmsnorm: true`（示例值；仓库当前 `config/config.json` 里是 `false`，需手动改为 `true` 才能启用 RMSNorm）
 
 ---
 
@@ -119,7 +119,7 @@ pub enum NormLayer {
 }
 ```
 
-调用方不需要关心具体用哪种归一化，`config.json` 里的 `use_rmsnorm` 控制选择。
+调用方不需要关心具体用哪种归一化，`config/config.json` 里的 `use_rmsnorm` 控制选择。
 
 ### 6.3 并行化
 

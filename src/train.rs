@@ -268,6 +268,8 @@ impl MetricsLogger {
     fn new(path: Option<&str>) -> Self {
         use std::io::Write;
         let file = path.map(|p| {
+            // 日志目录（默认 logs/）不存在时自动创建，避免用户手动 mkdir
+            crate::config::ensure_parent_dir(p);
             let mut f = std::fs::File::create(p)
                 .unwrap_or_else(|e| panic!("无法创建日志文件 {p}: {e}"));
             writeln!(f, "step,lr,train_loss,val_loss,ppl,tokens_per_sec")
@@ -471,7 +473,6 @@ pub fn train_gpt(
             // 否则最后一次评估会从日志里消失，且 latest.ckpt 停留在上一次评估
             //（断点续训会拿到落后一个 eval 周期的过期权重）。真正 break 在块末尾。
             if let Some(dir) = out_dir {
-                std::fs::create_dir_all(dir).expect("创建 checkpoint 目录失败");
                 checkpoint::save(
                     &format!("{dir}/latest.ckpt"),
                     model,

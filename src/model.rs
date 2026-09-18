@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// LayerNorm 数值稳定常数（防止方差为 0 时除零）
 const LN_EPS: f32 = 1e-5;
 
-/// 模型配置（`config.json` 里可调，缺省字段用 [`GPTConfig::default`]）
+/// 模型配置（`config/config.json` 里可调，缺省字段用 [`GPTConfig::default`]）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GPTConfig {

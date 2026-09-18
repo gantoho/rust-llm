@@ -25,11 +25,11 @@
     "bpe_vocab": 8192,
     "train_file": "data/corpus_zh/",
     "val_file": null,
-    "out_dir": "checkpoints_zh",
+    "out_dir": "checkpoints/zh",
     "accum_steps": 1,
-    "tokenizer_file": "checkpoints_zh/tokenizer.json",
+    "tokenizer_file": "checkpoints/zh/tokenizer.json",
     "lora": null,
-    "log_file": null,
+    "log_file": "logs/train.csv",
     "early_stop_patience": 10
   }
 }

@@ -1,7 +1,7 @@
 # 第 31 课：Scaling Laws（缩放定律）
 
 > **本课为前沿技术教程（纯文档，无配套代码实现）。**
-> 与本项目已有代码的关联：可通过修改 `config.json` 的 `n_embd` / `n_layer` / `block_size` /
+> 与本项目已有代码的关联：可通过修改 `config/config.json` 的 `n_embd` / `n_layer` / `block_size` /
 > `batch_size` / `steps` 来验证 Scaling Laws 的幂律关系。
 
 ---

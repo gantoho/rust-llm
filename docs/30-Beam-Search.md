@@ -147,10 +147,10 @@ Beam Search 中每个 beam 的 KV Cache 独立，需要为每个 beam 维护一�
 
 ```bash
 # 基础 Beam Search（beam_size=5）
-cargo run --release -- generate --config config.json --prompt "The fox" --beam 5 --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "The fox" --beam 5 --max-new 100
 
 # 带长度惩罚的 Beam Search（偏好长序列）
-cargo run --release -- generate --config config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
 ```
 
 ### 7.2 参数说明

@@ -152,16 +152,16 @@ let optimizer = AdamW::new(trainable, lr=1e-4);
 
 ```bash
 # 加载预训练权重做全参微调（1000 步）
-cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
 
 # 指定步数与学习率
-cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt \
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt \
     --steps 2000 --lr 5e-5
 ```
 
 ### 8.2 配置文件方式
 
-也可以在 `config.json` 中配置 LoRA（当前仅用于打印提示，供将来接入训练循环）：
+也可以在 `config/config.json` 中配置 LoRA（当前仅用于打印提示，供将来接入训练循环）：
 
 ```jsonc
 {
@@ -179,7 +179,7 @@ cargo run --release -- finetune --config config.json --pretrained checkpoints/be
 **当前 `finetune` 的实际流程**：
 
 1. 加载预训练 checkpoint（`--pretrained` 参数）
-2. 用 `config.json` 里的数据与超参数做常规全参微调（`train::train_gpt`）
+2. 用 `config/config.json` 里的数据与超参数做常规全参微调（`train::train_gpt`）
 3. 保存 checkpoint（全部参数都被更新）
 
 **LoRA 接入训练循环后应有的流程**：

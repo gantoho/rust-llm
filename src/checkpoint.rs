@@ -47,6 +47,8 @@ pub struct Checkpoint {
 
 /// 保存 checkpoint：模型参数 + 优化器状态 + 元信息
 pub fn save(path: &str, model: &GPT, opt: &AdamW, step: usize, best_val_loss: f32) {
+    // 权重目录（默认 checkpoints/）不存在时自动创建，保证产物不会落到根目录
+    crate::config::ensure_parent_dir(path);
     let named = model.named_parameters();
     let (opt_t, opt_m, opt_v) = opt.state();
     let params = named

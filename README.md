@@ -40,7 +40,7 @@
 | 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样 |
 | 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**；另外实现了但未接入的 `MixedPrecision` 动态损失缩放 |
 | 采样 | `src/sample.rs` | temperature / top-k / top-p 采样，KV cache 推理，**Beam Search** |
-| 配置 | `src/config.rs` | `config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
+| 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final） |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **finetune** / **preset** / demo / **bench** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
@@ -73,7 +73,7 @@
 # ═══════════════════════════════════════════
 #  最简方式：训练 + 生成（推理不需要语料）
 # ═══════════════════════════════════════════
-cargo run --release -- train --config config.json
+cargo run --release -- train --config config/config.json
 # 训练完成后，推理只需 checkpoint，分词器自动加载
 cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
 
@@ -83,8 +83,8 @@ cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "The" --ma
 #  使用预设配置（推荐）
 # ═══════════════════════════════════════════
 # 生成中等模型配置（LLaMA 风格，~15M 参数）
-cargo run --release -- preset --name medium --output config_medium.json
-cargo run --release -- train --config config_medium.json
+cargo run --release -- preset --name medium --output config/config_medium.json
+cargo run --release -- train --config config/config_medium.json
 
 # ═══════════════════════════════════════════
 #  交互式对话（训练后直接对话，无需语料）
@@ -94,7 +94,7 @@ cargo run --release -- chat --ckpt checkpoints/best.ckpt
 # ═══════════════════════════════════════════
 #  微调（加载预训练模型，当前为全参微调；LoRA 尚未接入训练循环）
 # ═══════════════════════════════════════════
-cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
 
 # ═══════════════════════════════════════════
 #  教学演示（验证所有算法正确性）
@@ -122,12 +122,12 @@ cargo run --release -- train [参数]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--config <路径>` | string | `config.json` | 配置文件路径（模型超参 + 训练参数） |
+| `--config <路径>` | string | `config/config.json` | 配置文件路径（模型超参 + 训练参数） |
 | `--resume <路径>` | string | 无 | 从已有 checkpoint 续训（恢复参数、优化器状态、步数） |
 
 **训练流程**：
 1. 读取配置文件，构建分词器（char / bpe）
-2. 构建 GPT 模型（参数量由 `config.json` 的 `model` 段决定）
+2. 构建 GPT 模型（参数量由 `config/config.json` 的 `model` 段决定）
 3. 加载训练语料，自动切分训练集 / 验证集
 4. 每 `eval_every` 步：在验证集上评估 loss / 困惑度，保存 `latest.ckpt`
 5. 验证 loss 刷新最优时额外保存 `best.ckpt`
@@ -139,11 +139,13 @@ cargo run --release -- train [参数]
 - `final.ckpt` —— 训练结束时的 checkpoint
 - `tokenizer.json` —— 训练好的分词器（推理时自动加载，无需语料）
 
+**日志**：每步指标写入 `logs/train.csv`（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；控制台输出可用重定向存到 `logs/run.log`。
+
 **推理不需要语料文件**：训练完成后，`eval` / `generate` / `chat` 命令自动从 checkpoint 目录加载 `tokenizer.json`，不再需要 `train_file` 或语料。只需指定 `--ckpt` 即可：
 
 ```bash
 # 训练
-cargo run --release -- train --config config.json
+cargo run --release -- train --config config/config.json
 # 推理（只需 checkpoint，分词器自动加载）
 cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
 cargo run --release -- chat --ckpt checkpoints/best.ckpt
@@ -152,7 +154,7 @@ cargo run --release -- eval --ckpt checkpoints/best.ckpt
 
 **分词器加载优先级**：
 1. `--tokenizer` 参数（命令行显式指定）
-2. `config.json` 的 `tokenizer_file` 字段
+2. `config/config.json` 的 `tokenizer_file` 字段
 3. `{out_dir}/tokenizer.json`（训练时自动保存的，推荐）
 4. 从 `train_file` 语料训练（兜底，不推荐）
 
@@ -160,29 +162,29 @@ cargo run --release -- eval --ckpt checkpoints/best.ckpt
 
 ```bash
 # ── 基础训练 ──
-# 用默认 config.json 训练（BPE 分词、2000 步、batch=8）
-cargo run --release -- train --config config.json
+# 用默认 config/config.json 训练（BPE 分词、2000 步、batch=8）
+cargo run --release -- train --config config/config.json
 
 # ── 断点续训 ──
 # 从最近的 checkpoint 继续（恢复参数、优化器状态、步数）
-cargo run --release -- train --config config.json --resume checkpoints/latest.ckpt
+cargo run --release -- train --config config/config.json --resume checkpoints/latest.ckpt
 
 # 从最优 checkpoint 续训（继续微调）
-cargo run --release -- train --config config.json --resume checkpoints/best.ckpt
+cargo run --release -- train --config config/config.json --resume checkpoints/best.ckpt
 
 # ── GPU 加速训练 ──
 # 开启 wgpu 计算着色器（NVIDIA / Intel 核显），失败自动回退 CPU
-cargo run --release --features gpu -- train --config config.json
+cargo run --release --features gpu -- train --config config/config.json
 
 # GPU 加速 + 断点续训
-cargo run --release --features gpu -- train --config config.json --resume checkpoints/latest.ckpt
+cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/latest.ckpt
 
-# ── 不同模型规模的训练（修改 config.json）──
+# ── 不同模型规模的训练（修改 config/config.json）──
 # 小模型（教学用，秒级完成）：n_embd=64, n_layer=2, block_size=32
 # 中模型（几分钟）：n_embd=256, n_layer=4, block_size=256
 # 大模型（需要耐心）：n_embd=512, n_layer=8, block_size=256
 
-# ── 不同分词器（修改 config.json 的 tokenizer 字段）──
+# ── 不同分词器（修改 config/config.json 的 tokenizer 字段）──
 # 字符级分词（小数据集，词表小）
 #   "tokenizer": "char"
 # BPE 分词（大数据集，压缩率高）
@@ -190,7 +192,7 @@ cargo run --release --features gpu -- train --config config.json --resume checkp
 # BPE 大词表（更好的子词覆盖）
 #   "tokenizer": "bpe", "bpe_vocab": 1024
 
-# ── 不同训练策略（修改 config.json）──
+# ── 不同训练策略（修改 config/config.json）──
 # 快速验证（50 步，确认代码能跑通）
 #   "steps": 50, "eval_every": 10
 # 标准训练（2000 步，loss 充分收敛）
@@ -217,7 +219,7 @@ cargo run --release -- eval [参数]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--config <路径>` | string | `config.json` | 配置文件路径 |
+| `--config <路径>` | string | `config/config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 
@@ -233,25 +235,25 @@ cargo run --release -- eval --ckpt checkpoints/best.ckpt
 
 # ── 基础评估 ──
 # 评估最新 checkpoint（默认 checkpoints/latest.ckpt）
-cargo run --release -- eval --config config.json
+cargo run --release -- eval --config config/config.json
 
 # ── 评估不同 checkpoint ──
 # 评估最优 checkpoint
-cargo run --release -- eval --config config.json --ckpt checkpoints/best.ckpt
+cargo run --release -- eval --config config/config.json --ckpt checkpoints/best.ckpt
 
 # 评估最终 checkpoint
-cargo run --release -- eval --config config.json --ckpt checkpoints/final.ckpt
+cargo run --release -- eval --config config/config.json --ckpt checkpoints/final.ckpt
 
 # 评估指定路径的 checkpoint
-cargo run --release -- eval --config config.json --ckpt /path/to/my_model.ckpt
+cargo run --release -- eval --config config/config.json --ckpt /path/to/my_model.ckpt
 
 # ── 评估不同模型配置 ──
 # 用不同的 config 评估（config 决定模型架构，必须与 checkpoint 训练时一致）
-cargo run --release -- eval --config config_llama.json
-cargo run --release -- eval --config config_large.json --ckpt checkpoints/best.ckpt
+cargo run --release -- eval --config config/config_llama.json
+cargo run --release -- eval --config config/config_large.json --ckpt checkpoints/best.ckpt
 
 # ── GPU 加速评估 ──
-cargo run --release --features gpu -- eval --config config.json
+cargo run --release --features gpu -- eval --config config/config.json
 ```
 
 ---
@@ -264,7 +266,7 @@ cargo run --release -- generate [参数]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--config <路径>` | string | `config.json` | 配置文件路径 |
+| `--config <路径>` | string | `config/config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--prompt <文本>` | string | `""`（空） | 初始提示词（模型从这里开始续写） |
@@ -294,114 +296,114 @@ cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Alice was
 # ═══════════════════════════════════════════
 
 # 用默认参数生成（temperature=0.8, top-k=40, top-p=0.9）
-cargo run --release -- generate --config config.json --prompt "Alice was" --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "Alice was" --max-new 100
 
 # 指定 checkpoint 生成
-cargo run --release -- generate --config config.json --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 200
+cargo run --release -- generate --config config/config.json --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 200
 
 # 空 prompt（模型自由发挥）
-cargo run --release -- generate --config config.json --max-new 50
+cargo run --release -- generate --config config/config.json --max-new 50
 
 # ═══════════════════════════════════════════
 #  采样温度控制（--temperature）
 # ═══════════════════════════════════════════
 
 # 贪心解码（temperature→0，每次输出完全相同，最高确定性）
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.01 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.01 --max-new 50
 
 # 低温采样（保守，输出较确定，适合事实性文本）
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.3 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.3 --max-new 50
 
 # 默认温度（平衡创造性和连贯性）
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.8 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.8 --max-new 50
 
 # 高温采样（更随机、更有创造性，可能出现不通顺的文本）
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 1.5 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 1.5 --max-new 50
 
 # ═══════════════════════════════════════════
 #  Top-k 采样控制（--top-k）
 # ═══════════════════════════════════════════
 
 # top-k=1（等价于贪心，只选概率最高的 token）
-cargo run --release -- generate --config config.json --prompt "The" --top-k 1 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-k 1 --max-new 30
 
 # top-k=10（较保守，只从 top-10 候选中选）
-cargo run --release -- generate --config config.json --prompt "The" --top-k 10 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-k 10 --max-new 30
 
 # top-k=40（默认，较平衡）
-cargo run --release -- generate --config config.json --prompt "The" --top-k 40 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-k 40 --max-new 30
 
 # top-k=100（较开放，候选更多）
-cargo run --release -- generate --config config.json --prompt "The" --top-k 100 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-k 100 --max-new 30
 
 # top-k=0（禁用 top-k，不限制候选数量，完全依赖 top-p）
-cargo run --release -- generate --config config.json --prompt "The" --top-k 0 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-k 0 --max-new 30
 
 # ═══════════════════════════════════════════
 #  Top-p (nucleus) 采样控制（--top-p）
 # ═══════════════════════════════════════════
 
 # top-p=0.5（较保守，只从累积概率前 50% 的 token 中选）
-cargo run --release -- generate --config config.json --prompt "The" --top-p 0.5 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-p 0.5 --max-new 30
 
 # top-p=0.9（默认，较平衡）
-cargo run --release -- generate --config config.json --prompt "The" --top-p 0.9 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-p 0.9 --max-new 30
 
 # top-p=1.0（禁用 top-p，不限制候选范围，完全依赖 top-k）
-cargo run --release -- generate --config config.json --prompt "The" --top-p 1.0 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --top-p 1.0 --max-new 30
 
 # ═══════════════════════════════════════════
 #  组合使用（temperature + top-k + top-p）
 # ═══════════════════════════════════════════
 
 # 确定性输出（低温 + 小 top-k，适合代码/事实生成）
-cargo run --release -- generate --config config.json --prompt "def" --temperature 0.2 --top-k 5 --top-p 0.8 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "def" --temperature 0.2 --top-k 5 --top-p 0.8 --max-new 50
 
 # 平衡输出（默认参数，适合一般文本续写）
-cargo run --release -- generate --config config.json --prompt "Once" --temperature 0.8 --top-k 40 --top-p 0.9 --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "Once" --temperature 0.8 --top-k 40 --top-p 0.9 --max-new 100
 
 # 创意输出（高温 + 大 top-k + 大 top-p，适合创意写作）
-cargo run --release -- generate --config config.json --prompt "Once" --temperature 1.2 --top-k 100 --top-p 0.95 --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "Once" --temperature 1.2 --top-k 100 --top-p 0.95 --max-new 100
 
 # 极端随机（高温 + 禁用截断，可能产生不通顺文本，用于观察模型分布）
-cargo run --release -- generate --config config.json --prompt "The" --temperature 2.0 --top-k 0 --top-p 1.0 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The" --temperature 2.0 --top-k 0 --top-p 1.0 --max-new 30
 
 # ═══════════════════════════════════════════
 #  随机种子控制（--seed）
 # ═══════════════════════════════════════════
 
 # 相同种子 = 相同输出（可复现）
-cargo run --release -- generate --config config.json --prompt "Hello" --seed 42 --max-new 30
-cargo run --release -- generate --config config.json --prompt "Hello" --seed 42 --max-new 30  # 输出与上面完全相同
+cargo run --release -- generate --config config/config.json --prompt "Hello" --seed 42 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "Hello" --seed 42 --max-new 30  # 输出与上面完全相同
 
 # 不同种子 = 不同输出（同一分布的不同采样）
-cargo run --release -- generate --config config.json --prompt "Hello" --seed 1 --max-new 30
-cargo run --release -- generate --config config.json --prompt "Hello" --seed 999 --max-new 30  # 输出不同
+cargo run --release -- generate --config config/config.json --prompt "Hello" --seed 1 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "Hello" --seed 999 --max-new 30  # 输出不同
 
 # ═══════════════════════════════════════════
 #  可复现性说明（相同命令 = 相同输出，这是刻意设计）
 # ═══════════════════════════════════════════
 
 # 相同命令执行两次，输出完全一致（可复现）：
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 50
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 50
 # ↑ 两次输出一模一样，因为：固定种子 + 确定性权重 + CPU f32 确定性计算
 
 # 换种子 → 不同的采样路径 → 不同的文本：
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 50
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 99 --max-new 50
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 1234 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 99 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 1234 --max-new 50
 # ↑ 三次输出各不相同（同一分布的不同采样）
 
 # 提高温度 → 更大的随机性 → 输出变化更大：
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.2 --top-k 20 --seed 7 --max-new 50
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.8 --top-k 20 --seed 7 --max-new 50
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 1.5 --top-k 20 --seed 7 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.2 --top-k 20 --seed 7 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.8 --top-k 20 --seed 7 --max-new 50
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 1.5 --top-k 20 --seed 7 --max-new 50
 # ↑ 同一种子，温度从低到高，输出从保守到随机
 
 # temperature→0 等价于贪心解码，无论什么种子输出都一样（不走随机采样）：
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.01 --top-k 1 --seed 7 --max-new 30
-cargo run --release -- generate --config config.json --prompt "The fox" --temperature 0.01 --top-k 1 --seed 99 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.01 --top-k 1 --seed 7 --max-new 30
+cargo run --release -- generate --config config/config.json --prompt "The fox" --temperature 0.01 --top-k 1 --seed 99 --max-new 30
 # ↑ 两次输出完全相同（贪心模式下种子无效，总是选概率最高的 token）
 
 # 与 ChatGPT 等商用模型的区别：
@@ -414,46 +416,46 @@ cargo run --release -- generate --config config.json --prompt "The fox" --temper
 # ═══════════════════════════════════════════
 
 # 默认开启 KV cache（推荐，推理速度快）
-cargo run --release -- generate --config config.json --prompt "Once" --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "Once" --max-new 100
 
 # 禁用 KV cache（每个 token 都全量前向，慢但结果一致，用于调试对比）
-cargo run --release -- generate --config config.json --prompt "Once" --max-new 100 --no-kv-cache
+cargo run --release -- generate --config config/config.json --prompt "Once" --max-new 100 --no-kv-cache
 
 # ═══════════════════════════════════════════
 #  使用不同 checkpoint 生成
 # ═══════════════════════════════════════════
 
 # 使用最新 checkpoint（默认）
-cargo run --release -- generate --config config.json --prompt "The key"
+cargo run --release -- generate --config config/config.json --prompt "The key"
 
 # 使用验证 loss 最优的 checkpoint
-cargo run --release -- generate --config config.json --ckpt checkpoints/best.ckpt --prompt "The key" --max-new 100
+cargo run --release -- generate --config config/config.json --ckpt checkpoints/best.ckpt --prompt "The key" --max-new 100
 
 # 使用训练结束时的 checkpoint
-cargo run --release -- generate --config config.json --ckpt checkpoints/final.ckpt --prompt "The key" --max-new 100
+cargo run --release -- generate --config config/config.json --ckpt checkpoints/final.ckpt --prompt "The key" --max-new 100
 
 # 使用自定义路径的 checkpoint
-cargo run --release -- generate --config config.json --ckpt /path/to/custom.ckpt --prompt "The key" --max-new 100
+cargo run --release -- generate --config config/config.json --ckpt /path/to/custom.ckpt --prompt "The key" --max-new 100
 
 # ═══════════════════════════════════════════
 #  Beam Search 生成（确定性，质量更高）
 # ═══════════════════════════════════════════
 
 # Beam Search（beam_size=5），确定性输出，质量优于随机采样
-cargo run --release -- generate --config config.json --prompt "The fox" --beam 5 --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "The fox" --beam 5 --max-new 100
 
 # Beam Search + 长度惩罚（偏好长序列）
-cargo run --release -- generate --config config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
+cargo run --release -- generate --config config/config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
 
 # ═══════════════════════════════════════════
 #  GPU 加速生成
 # ═══════════════════════════════════════════
 
 # GPU 加速推理（大模型时明显提速）
-cargo run --release --features gpu -- generate --config config.json --prompt "Once upon a" --max-new 200
+cargo run --release --features gpu -- generate --config config/config.json --prompt "Once upon a" --max-new 200
 
 # GPU + 自定义参数
-cargo run --release --features gpu -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --max-new 150 --seed 7
+cargo run --release --features gpu -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --max-new 150 --seed 7
 ```
 
 ---
@@ -468,7 +470,7 @@ cargo run --release -- chat [参数]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--config <路径>` | string | `config.json` | 配置文件路径 |
+| `--config <路径>` | string | `config/config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--system <文本>` | string | `""` | 系统提示词（在每次输入前附加） |
@@ -510,7 +512,7 @@ cargo run --release -- finetune [参数]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--config <路径>` | string | `config.json` | 配置文件路径 |
+| `--config <路径>` | string | `config/config.json` | 配置文件路径 |
 | `--pretrained <路径>` | string | 必填 | 预训练模型 checkpoint |
 | `--lora-rank <秩>` | int | `16` | LoRA 秩（低秩维度，通常 4-64） |
 | `--lora-alpha <系数>` | float | `16.0` | LoRA 缩放因子 α（通常 = rank） |
@@ -521,10 +523,10 @@ cargo run --release -- finetune [参数]
 
 ```bash
 # ── 基础微调 ──
-cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
 
 # ── 自定义步数与学习率 ──
-cargo run --release -- finetune --config config.json --pretrained checkpoints/best.ckpt \
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt \
     --steps 2000 --lr 5e-5
 ```
 
@@ -541,7 +543,7 @@ cargo run --release -- preset [参数]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--name <名称>` | string | `small` | 预设名称（small / medium / large） |
-| `--output <路径>` | string | `config.json` | 输出配置文件路径 |
+| `--output <路径>` | string | `config/config.json` | 输出配置文件路径 |
 
 **预设说明**：
 
@@ -555,16 +557,16 @@ cargo run --release -- preset [参数]
 
 ```bash
 # ── 生成小模型配置 ──
-cargo run --release -- preset --name small --output config_small.json
+cargo run --release -- preset --name small --output config/config_small.json
 
 # ── 生成中等模型配置（LLaMA 风格）──
-cargo run --release -- preset --name medium --output config_medium.json
+cargo run --release -- preset --name medium --output config/config_medium.json
 
 # ── 生成大模型配置 ──
-cargo run --release -- preset --name large --output config_large.json
+cargo run --release -- preset --name large --output config/config_large.json
 
 # ── 然后用生成的配置训练 ──
-cargo run --release -- train --config config_medium.json
+cargo run --release -- train --config config/config_medium.json
 ```
 
 ---
@@ -748,19 +750,19 @@ cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
 # ── 所有子命令都支持 --features gpu ──
 
 # GPU 加速训练
-cargo run --release --features gpu -- train --config config.json
+cargo run --release --features gpu -- train --config config/config.json
 
 # GPU 加速训练 + 断点续训
-cargo run --release --features gpu -- train --config config.json --resume checkpoints/latest.ckpt
+cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/latest.ckpt
 
 # GPU 加速评估
-cargo run --release --features gpu -- eval --config config.json
+cargo run --release --features gpu -- eval --config config/config.json
 
 # GPU 加速生成
-cargo run --release --features gpu -- generate --config config.json --prompt "Once upon a" --max-new 200
+cargo run --release --features gpu -- generate --config config/config.json --prompt "Once upon a" --max-new 200
 
 # GPU 加速生成 + 自定义采样参数
-cargo run --release --features gpu -- generate --config config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 150
+cargo run --release --features gpu -- generate --config config/config.json --prompt "The fox" --temperature 0.5 --top-k 20 --seed 7 --max-new 150
 
 # GPU 加速演示（含 CPU vs GPU 正确性验证 + 性能对比）
 cargo run --release --features gpu -- demo
@@ -831,7 +833,7 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 
 ---
 
-## 配置文件完整参考（`config.json`）
+## 配置文件完整参考（`config/config.json`）
 
 配置文件分为 `model`（模型超参）和 `train`（训练参数）两个段。缺省字段自动取默认值。
 
@@ -884,11 +886,11 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "bpe_vocab": 512,         // BPE 目标词表大小（= 256 字节 + 合并数）
     "train_file": "data/alice.txt", // 训练语料文件路径（支持目录路径，自动合并 .txt 文件）
     "val_file": null,         // 验证语料文件路径。null = 自动从训练文本末尾切 10%
-    "out_dir": "checkpoints", // checkpoint 输出目录
+    "out_dir": "checkpoints", // checkpoint 输出目录（权重 + tokenizer.json）
     "accum_steps": 1,         // 梯度累积步数。有效 batch = batch_size × accum_steps
     "tokenizer_file": null,   // 分词器文件路径。null = 从语料训练并保存；Some = 从文件加载
     "lora": null,             // LoRA 配置（目前未接入训练循环，见第 29 课）
-    "log_file": null,         // 训练指标日志文件路径。null = 不记录；Some = 记录到 CSV
+    "log_file": "logs/train.csv", // 训练指标日志。null = 不记录；默认 logs/train.csv（自动建目录）
     "early_stop_patience": 0  // 早停耐心值。0 = 不启用；N = 连续 N 次评估不改善则停止
   }
 }
@@ -908,13 +910,13 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 | `eval_iters` | int | `20` | 评估时采样多少批取平均（减少随机波动） |
 | `tokenizer` | string | `"bpe"` | `"char"` = 字符级分词；`"bpe"` = 字节对编码 |
 | `bpe_vocab` | int | `512` | BPE 词表大小。仅当 `tokenizer = "bpe"` 时生效 |
-| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本或目录路径）。**代码默认值指向的 `data/sample.txt` 已不在仓库中，请显式指定 `data/alice.txt` 或 `data/corpus/` 目录**（`config.json` 已配好） |
+| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本或目录路径）。**代码默认值指向的 `data/sample.txt` 已不在仓库中，请显式指定 `data/alice.txt` 或 `data/corpus/` 目录**（`config/config.json` 已配好） |
 | `val_file` | string/null | `null` | 验证语料文件。`null` = 自动从训练文本末尾切约 10% |
-| `out_dir` | string | `"checkpoints"` | checkpoint 保存目录（自动创建） |
+| `out_dir` | string | `"checkpoints"` | 权重输出目录：checkpoint（latest / best / final）与 `tokenizer.json` 都写在这里。目录不存在时自动创建 |
 | `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
 | `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
 | `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0 }`。**目前只被校验并打印提示，尚未冻结主参数 / 注入适配层**（详见第 29 课） |
-| `log_file` | string/null | `null` | 训练指标日志文件路径。`null` = 不记录；指定路径 = 每步追加一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
+| `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = 每步追加一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
 | `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
 
 ### 完整配置示例
@@ -987,13 +989,18 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 llm_from_scratch/
 ├── Cargo.toml          # 依赖：仅工具库（serde_json / clap / windows-sys）+ 可选 wgpu
 ├── README.md           # 本文件
-├── config.json         # 训练配置（模型超参 + 训练参数）
+├── config/             # 配置文件目录
+│   └── config.json     #   默认训练配置（模型超参 + 训练参数），其他实验配置如 config_probe*.json
+├── checkpoints/        # 权重目录（自动创建）：latest.ckpt / best.ckpt / final.ckpt / tokenizer.json
+│   ├── perf/           #   各实验按 out_dir 分成子目录，如 checkpoints/zh、checkpoints/probe_b2
+│   └── ...
+├── logs/               # 日志目录（自动创建）：训练指标 CSV（train.csv）与重定向出来的运行日志
 ├── data/               # 语料：alice.txt（公版《爱丽丝梦游仙境》）、corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
 │                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）、corpus_perf/（性能测试用节选）
 ├── src/
 │   ├── main.rs         # CLI 入口：train / eval / generate / chat / finetune / preset / demo / bench
 │   ├── cli.rs          # 命令行定义（clap）
-│   ├── config.rs       # 配置加载（serde）
+│   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）
 │   ├── checkpoint.rs   # checkpoint 保存 / 恢复
 │   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、23、25 课）
 │   ├── autograd.rs     # 自动微分：backward + 拓扑排序（第 2 课）
@@ -1012,6 +1019,22 @@ llm_from_scratch/
 │   └── sample.rs       # 推理与采样（第 15、30 课）
 └── docs/               # 39 课教程文档（00-学习计划 + 01~39 各课）
 ```
+
+### 产物目录约定（自动创建，无需手动 mkdir）
+
+| 产物 | 默认位置 | 由谁决定 | 说明 |
+|------|----------|----------|------|
+| 配置文件 | `config/config.json` | `--config` / `--output` | 所有子命令的配置默认路径；`preset --output` 写同类路径 |
+| 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json` |
+| 训练指标日志 | `logs/train.csv` | `train.log_file` | CSV：`step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
+| 运行日志 | `logs/` | 用户重定向 | 如 `cargo run --release -- train --config config/config.json *> logs/run.log` |
+
+实现方式：`src/config.rs` 提供 `ensure_parent_dir()` / `ensure_dir()`，并在**每个写盘出口**调用——
+`Config::save()`（配置）、`checkpoint::save()`（权重）、`Tokenizer::save()`（分词器）、`MetricsLogger::new()`（日志）。
+因此把 `out_dir`、`log_file` 改成任意嵌套路径（如 `outputs/run1/logs/train.csv`）也会自动建好目录，
+产物不会再散落到仓库根目录。
+
+> Windows 上 PowerShell 的 `*>` 可以同时重定向 stdout/stderr；CSV 指标日志由程序自己写入，不需要重定向。
 
 ## 学习路线
 
@@ -1210,4 +1233,4 @@ loss 直接变 NaN，整轮实验作废。
 - **RAG 检索增强生成**（第 37 课）：向量检索 + LLM 生成，解决知识截止和幻觉问题
 - **分布式训练**（第 38 课）：数据并行、ZeRO、张量/流水线并行，训练百亿级模型
 - 长度外推：RoPE 配合 NTK-aware scaling、YaRN 等技巧（见第 20 课文档）
-- 更大的语料与模型规模（`config.json` 可直接调大，CPU 训练需耐心）
+- 更大的语料与模型规模（`config/config.json` 可直接调大，CPU 训练需耐心）
