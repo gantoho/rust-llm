@@ -116,14 +116,14 @@ B = 0 → ΔW = BA = 0
 // 1. 加载预训练模型
 let model = load_pretrained("llama-7b");
 
-// 2. 给 Q/K/V 投影注入 LoRA
-let lora_q = inject_lora(&model.attn.c_q, rank=16, alpha=16.0, &mut rng);
-let lora_k = inject_lora(&model.attn.c_k, rank=16, alpha=16.0, &mut rng);
-let lora_v = inject_lora(&model.attn.c_v, rank=16, alpha=16.0, &mut rng);
+// 2. 给 Q/K/V 投影注入 LoRA（`inject_lora(linear, rank, alpha, rng) -> LoRA`）
+let lora_q = inject_lora(&model.attn.c_q, 16, 16.0, &mut rng);
+let lora_k = inject_lora(&model.attn.c_k, 16, 16.0, &mut rng);
+let lora_v = inject_lora(&model.attn.c_v, 16, 16.0, &mut rng);
 
 // 3. 只训练 LoRA 参数（冻结的 W 不参与梯度计算）
 let trainable = [lora_q.a, lora_q.b, lora_k.a, lora_k.b, ...];
-let optimizer = AdamW::new(trainable, lr=1e-4);
+let optimizer = AdamW::new(1e-4, trainable, 0.0);   // (lr, params, weight_decay)
 
 // 4. 推理时合并：W' = W + (α/r) · B · A
 ```

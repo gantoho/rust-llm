@@ -203,10 +203,10 @@ RoPE 和这个流程是无缝衔接的：
 新 token 的绝对位置 = 缓存长度 base + 它在当前窗口里的下标 j
 ```
 
-`base`（已缓存的位置数）由 `GPT::forward` 算出来传给每层（第 25 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
+`base`（已缓存的位置数）由 `GPT::forward_core` 算出来传给每层（第 25 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
 
 ```rust
-// src/model.rs（GPT::forward）：base = 缓存长度
+// src/model.rs（GPT::forward_core）：base = 缓存长度
 let base = kv_cache
     .as_ref()
     .map(|c| c.first().map(|k| k.seq_len()).unwrap_or(0))

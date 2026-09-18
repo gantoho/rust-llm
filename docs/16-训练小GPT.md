@@ -81,7 +81,7 @@ fn demo_gpt() {
 | 2. 建模型 | `GPT::new(GPTConfig::tiny(vocab_size), &mut rng)` | 用 tiny 配置（n_embd=64、n_head=4、n_layer=2、block_size=32）初始化模型 |
 | 3. 造数据 | `DataLoader::new(CORPUS, &tokenizer, 32, 8)` | 把 669 字符的语料切成 token 序列，按 block_size=32 切块、batch_size=8 |
 | 4. 训练 | `train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, ...)` | 600 步，峰值学习率 3e-3，前 50 步 warmup，每 100 步打印一次（其余参数取 `TrainConfig::default()`） |
-| 5. 生成 | `generate(..., "Once upon a", 80, 0.8, 10, 0.9, false, ...)` | 给定开头，最多续写 80 个字符 |
+| 5. 生成 | `generate(&model, &tokenizer, "Once upon a", 80, &opts, false, &mut rng)` | 给定开头，最多续写 80 个字符（采样参数打包在 `opts: SampleOpts` 里） |
 
 > 注意：训练用的是字符级分词器，所以"1 个字符 = 1 个 token"，语料 669 个字符就是 669 个 token。这让后面的数字（32、80）可以直接按"字符数"理解。
 
@@ -178,7 +178,7 @@ step   600 | lr 0.000300 | loss 0.1513 | 3731 tok/s
 | 列 | 含义 | 从哪来 |
 |----|------|--------|
 | `step` | 训练步数（从 1 开始数，日志显示 100、200、…、600） | `train_gpt` 打印的是 `step + 1` |
-| `lr` | 打印时刻 `scheduler` 里的学习率 | `scheduler.lr()`，且是在本步 `scheduler.step()` **之后**读取的（`src/train.rs:448` → `:504`）——即"下一步要用"的 lr，不是本步已用的 `cur_lr` |
+| `lr` | 打印时刻 `scheduler` 里的学习率 | `scheduler.lr()`，且是在本步 `scheduler.step()` **之后**读取的（`src/train.rs:450` → `:505` / `:515`）——即"下一步要用"的 lr，不是本步已用的 `cur_lr` |
 | `loss` | 本步 batch 的平均交叉熵 | `forward_loss(&model, &x, &y, b, t, accum)`（内部调用 `cross_entropy_loss`，返回的是未缩放的原始 loss） |
 | `tok/s` | 训练吞吐：已处理 token 数 ÷ 已耗时 | `tps = steps_done × batch_size × block_size / elapsed` |
 
@@ -296,18 +296,19 @@ lr
 
 ## 6. 生成文本与采样参数
 
-训练 600 步后调用 `generate`（`src/sample.rs`），参数 `(prompt, max_new=80, temperature=0.8, top_k=10, top_p=0.9)`。
+训练 600 步后调用 `generate`（`src/sample.rs`），采样参数打包成 `SampleOpts { temperature: 0.8, top_k: 10, top_p: 0.9, repetition_penalty: 1.1, repetition_window: 64 }`（demo 里只显式覆盖 `top_k`，其余取默认值）。
 
-`sample_token` 内部的 6 步采样管线：
+`sample_token` 内部的 7 步采样管线：
 
 | 步骤 | 代码 | 作用 |
 |------|------|------|
-| 1. 温度缩放 | `l / temperature.max(1e-5)` | 除以 0.8：logits 变大 → softmax 更"锐利"，更敢选高概率 token |
-| 2. 排序 | `items.sort_by(...)` | 按分数从高到低排 |
-| 3. top-k | `items.truncate(top_k)` | 只留前 10 个 |
-| 4. softmax | `(*v - max).exp()` 再归一化 | 把截断后的分数变成概率 |
-| 5. top-p | 累积概率到 0.9 截断 | 进一步砍掉长尾低概率 token，再归一化 |
-| 6. 抽样 | `rng.next_f32()` 按概率累积选取 | 有随机性地选一个 token |
+| 1. 重复惩罚 | 最近出现过的 token：正 logit 除以系数、负 logit 乘以系数 | 压低刚说过的字，防止卡在"太太太太……" |
+| 2. 温度缩放 | `*l *= 1.0 / opts.temperature.max(1e-5)` | 除以 0.8：logits 变大 → softmax 更"锐利"，更敢选高概率 token |
+| 3. 排序 | `items.sort_by(...)` | 按分数从高到低排 |
+| 4. top-k | `items.truncate(opts.top_k)` | 只留前 10 个 |
+| 5. softmax | `(*v - max).exp()` 再归一化 | 把截断后的分数变成概率 |
+| 6. top-p | 累积概率到 0.9 截断 | 进一步砍掉长尾低概率 token，再归一化 |
+| 7. 抽样 | `rng.next_f32()` 按概率累积选取 | 有随机性地选一个 token |
 
 真实生成结果（`cargo run --release -- demo` 原样输出）：
 

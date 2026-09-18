@@ -26,7 +26,7 @@ Cargo.toml      wgpu / pollster 为可选依赖（feature = "gpu"）
 src/gpu.rs      GPU 上下文 + 19 个 WGSL 计算入口 + 「逐算子」与「常驻录制」两条路径
 src/tensor.rs   matmul / scale / add / relu / softmax 的分流点；
                 accumulate_grad / external / external_scalar_loss —— 常驻路径回注梯度的入口
-src/model.rs    TransformerBlock::forward、GPT::forward 里的常驻链路接线
+src/model.rs    TransformerBlock::forward、GPT::forward_core 里的常驻链路接线
 src/train.rs    第一步打印 dispatch 分解、结尾打印稳态与「matmul 分流：GPU x / CPU y」
 ```
 
@@ -76,8 +76,20 @@ src/train.rs    第一步打印 dispatch 分解、结尾打印稳态与「matmul
 > **为什么把 heads_split 和 RoPE 合并**：重排本身是纯搬数据（访存型，GPU 不擅长），
 > 但既然要把 Q/K 搬一遍，就顺手把旋转做掉，省一次 4.2MB 的往返。
 
-参数统一走 16 字节 uniform：`struct Params { p0: u32, p1: u32, p2: u32, p3: u32 }`
-（f32 标量用 `bitcast<f32>` 传位模式）。
+参数统一走 16 字节对齐的 uniform：WGSL 里 uniform 数组的 stride 必须是 16 字节，所以参数不用 `array<u32, 6>`（会被摊成 96 字节），而是写成 6 个独立 u32 字段（共 24 字节）：
+
+```wgsl
+struct Params {
+    p0: u32, // batch（scale/add/relu 时 = len）
+    p1: u32, // m
+    p2: u32, // k
+    p3: u32, // n
+    p4: u32, // a 转置标志（1 = 物理 a 是 [B,K,M]）
+    p5: u32, // b 转置标志（1 = 物理 b 是 [B,N,K]）
+}
+```
+
+（f32 标量用 `bitcast<f32>` 传位模式。不同着色器复用同一布局，个别字段暂时空着不用。）
 
 ---
 

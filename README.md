@@ -31,6 +31,7 @@
 |------|------|------|
 | 张量运算 | `src/tensor.rs` | Tensor 结构体、广播、逐元素/标量运算、matmul、softmax、permute、gather |
 | 自动微分 | `src/autograd.rs` | backward 反向传播、拓扑排序（计算图 → 梯度流） |
+| 模块接口 | `src/module.rs` | `Module` trait：参数收集的统一接口（`parameters()`） |
 | RoPE 位置编码 | `src/rope.rs` | 旋转位置编码：把相对位置揉进 Q/K 向量 |
 | 神经网络层 | `src/layers.rs` | Linear、LayerNorm、**RMSNorm**、Embedding、ReLU/GELU/Tanh、**SwiGLU**、**LoRA** |
 | 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减） |
@@ -237,7 +238,7 @@ cargo run --release -- eval [参数]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--config <路径>` | string | `config/config.json` | 配置文件路径 |
-| `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 
 **评估指标**：
@@ -251,7 +252,7 @@ cargo run --release -- eval [参数]
 cargo run --release -- eval --ckpt checkpoints/best.ckpt
 
 # ── 基础评估 ──
-# 评估最新 checkpoint（默认 checkpoints/latest.ckpt）
+# 不传 --ckpt 时用 {out_dir}/latest.ckpt（config/config.json 的 out_dir 是 checkpoints/zh）
 cargo run --release -- eval --config config/config.json
 
 # ── 评估不同 checkpoint ──
@@ -284,7 +285,7 @@ cargo run --release -- generate [参数]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--config <路径>` | string | `config/config.json` | 配置文件路径 |
-| `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--prompt <文本>` | string | `""`（空） | 初始提示词（模型从这里开始续写） |
 | `--max-new <数量>` | int | `100` | 最多生成的新 token 数 |
@@ -509,7 +510,7 @@ cargo run --release -- chat [参数]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--config <路径>` | string | `config/config.json` | 配置文件路径 |
-| `--ckpt <路径>` | string | `checkpoints/latest.ckpt` | checkpoint 文件路径 |
+| `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--system <文本>` | string | `""` | 系统提示词（在每次输入前附加） |
 | `--temperature <温度>` | float | `0.8` | 采样温度 |
@@ -617,7 +618,7 @@ cargo run --release -- train --config config/config_medium.json
 cargo run --release -- demo
 ```
 
-无参数。依次运行 4 个教学演示：
+无参数。依次运行 3 个教学演示（启用 `--features gpu` 时追加第 4 个 GPU 演示）：
 
 1. **MLP 学习 XOR**（第 7 课）：验证神经网络 + 反向传播正确，训练后正确率 4/4（100%）
 2. **BPE 分词器**（第 8 课）：在示例语料上训练 BPE 词表（400 个 token），演示编码/解码往返
@@ -732,8 +733,8 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **31 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
-合计 40 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
+默认构建运行 **35 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
+合计 44 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -760,6 +761,10 @@ cargo test test_softmax -- --nocapture
 | `test_kv_cache_output_is_prefix_of_full_beyond_window` | 超出缓存窗口时 KV cache 提前结束，输出仍是全量输出的前缀 |
 | `test_char_tokenizer_roundtrip` / `test_bpe_roundtrip` | 分词器编码/解码往返 |
 | `test_linear_regression_converges` | 线性回归收敛 |
+| `test_repetition_penalty_suppresses_recent_token` | 重复惩罚确实压低最近出现过的 token（正负 logit 都验证） |
+| `test_save_load_roundtrip_is_bit_exact` | checkpoint 保存/恢复后参数逐位一致 |
+| `test_load_params_skips_optimizer_state` | 只加载参数时跳过优化器状态（`eval` / `generate` 路径） |
+| `test_non_finite_values_survive_roundtrip` | NaN / ±Inf 能原样保存并读回（二进制格式的收益） |
 | `test_rng_deterministic` / `test_rng_range` / `test_choice_range` | 随机数生成器 |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
@@ -922,7 +927,7 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "min_lr": 3e-4,           // cosine 衰减的最低学习率
     "warmup_steps": 20,       // 线性预热步数（从 0 线性升到 max_lr）
     "weight_decay": 0.01,     // AdamW 权重衰减系数
-    "grad_clip": 1.0,         // 梯度裁剪阈值（梯度总范数超过此值时等比缩放）
+    "grad_clip": 1000000.0,   // 梯度裁剪阈值（梯度总范数超过此值时等比缩放；默认极大值 = 实际上不裁剪）
     "eval_every": 100,        // 每 N 步评估一次验证集（同时保存 latest checkpoint）
     "eval_iters": 20,         // 评估时采样的批数（取平均减少方差）
     "tokenizer": "bpe",       // 分词器类型："char"（字符级）或 "bpe"（字节对编码）
@@ -1030,10 +1035,10 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 
 ```
 llm_from_scratch/
-├── Cargo.toml          # 依赖：仅工具库（serde_json / clap / windows-sys）+ 可选 wgpu
+├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / windows-sys + 可选 wgpu / pollster
 ├── README.md           # 本文件
 ├── config/             # 配置文件目录
-│   └── config.json     #   默认训练配置（模型超参 + 训练参数），其他实验配置如 config_probe*.json
+│   └── config.json     #   默认训练配置（模型超参 + 训练参数）
 ├── checkpoints/        # 权重目录（自动创建）：latest.ckpt / best.ckpt / final.ckpt / tokenizer.json
 │   ├── perf/           #   各实验按 out_dir 分成子目录，如 checkpoints/zh、checkpoints/probe_b2
 │   └── ...
@@ -1103,14 +1108,14 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **31 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 40 个（详见 [§9 `cargo test`](#9-cargo-test--单元测试)）
+- **35 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 44 个（详见 [§9 `cargo test`](#9-cargo-test--单元测试)）
 - 已知提示（`never used` 警告，不影响功能）：
   - `cargo build`（非 gpu）报 3 条：`layers.rs` 的 `ln_params`、`gelu_weights`，`tensor.rs` 的 `external` / `mul` / `neg` / `sum_last_dim`
   - `cargo build --features gpu` 报 2 条：`gpu.rs` 的 `GpuDispatchDiag.n`，`tensor.rs` 的 `mul` / `neg` / `sum_last_dim`
   - 这些是给自动微分 / GPU 对照测试留的算子，非测试构建下未被调用；`cargo test` 构建里 `mul` / `sum_last_dim` 会被测试用到，只剩 `external` / `neg`
 - 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
   RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛
-- **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 4.14→0.16、文本生成正常
+- **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 1.63→0.15、文本生成正常
 - **工程化功能已全部集成**：微调（`finetune`，当前为**全参微调**，LoRA 只做参数校验与提示）、
   Beam Search（`generate --beam`）、交互式对话（`chat`）、分词器持久化（`tokenizer.json`）、
   预设配置（`preset`）、训练指标日志（CSV）、早停（`early_stop_patience`）
@@ -1169,7 +1174,7 @@ cargo run --release -- bench --steps 30
 | 推理（KV cache） | ~591 tok/s | ~1129 tok/s | **约 1.9×** |
 | 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
 
-**正确性**：31 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+**正确性**：35 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
 （该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§8 `bench`](#8-bench--性能基准) 与 [§10 GPU 章节](#10-gpu-加速可选-feature)。）
 
 ### 还能压的地方

@@ -111,7 +111,27 @@ BPE（Byte Pair Encoding，字节对编码）源自数据压缩算法，规则�
 
 ## 5. BPE 训练：train()
 
-### 5.1 初始化：字节级词表
+### 5.1 语料采样：超过 1MB 就截断
+
+BPE 训练的主循环每次合并都要**重新扫描整个语料**统计 pair 频率，语料一大就会慢得离谱。所以 `train()` 先做一次上限截断，再交给内部实现：
+
+```rust
+pub fn train(corpus: &str, target_vocab: usize) -> Self {
+    // 语料过长时采样，避免 BPE 训练耗时过长
+    let max_train_bytes: usize = 1_000_000; // 1MB 足以学到良好的合并规则
+    let train_bytes = if corpus.len() > max_train_bytes {
+        println!("  语料 {} 字节，采样前 {} 字节用于 BPE 训练", corpus.len(), max_train_bytes);
+        &corpus.as_bytes()[..max_train_bytes]
+    } else {
+        corpus.as_bytes()
+    };
+    Self::train_bytes(train_bytes, target_vocab)
+}
+```
+
+注意截断点是**字节**而不是字符，可能落在一个多字节 UTF-8 字符中间——这对字节级 BPE 没有影响（字节序列本身就是它的输入）。
+
+### 5.2 初始化：字节级词表
 
 ```rust
 assert!(target_vocab >= 256, "BPE 词表至少 256（字节级）");
@@ -120,7 +140,7 @@ let mut vocab: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
 let mut merges: Vec<(u16, u16)> = Vec::new();
 
 // 语料 -> 字节 -> id 序列
-let mut ids: Vec<u16> = corpus.as_bytes().iter().map(|&b| b as u16).collect();
+let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
 ```
 
 初始词表 = **256 个字节**（0~255），每个 token 恰好是一个字节。为什么用字节而不是字符？
@@ -129,7 +149,7 @@ let mut ids: Vec<u16> = corpus.as_bytes().iter().map(|&b| b as u16).collect();
 - 中文等多语言文本也能直接编码（一个汉字是 3 个字节）
 - GPT-2 等真实模型用的就是字节级 BPE
 
-### 5.2 训练主循环：统计 → 选择 → 合并 → 替换
+### 5.3 训练主循环：统计 → 选择 → 合并 → 替换
 
 ```rust
 while vocab.len() < target_vocab {

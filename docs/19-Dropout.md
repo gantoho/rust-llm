@@ -95,7 +95,13 @@ x = Dropout(TokenEmbedding(tokens))
 
 ### 6.1 mask 生成
 
-用项目自带的 xorshift64* RNG 生成随机 mask，保证可复现（固定种子）。
+用一条**独立的随机流**生成 mask，与模型初始化/采样用的 `Rng` 分开：
+
+- 每个线程一个 `thread_local` 计数器，每调用一次 dropout 就推进一个常数；
+- 再用 splitmix64 finalizer 把计数器的低位规律性打散，避免相邻种子生成相关序列；
+- 最后跑 xorshift64* 得到 `[0,1)` 的均匀数。
+
+这样同一权重参数的 dropout 在每个训练步拿到的是**不同**的 mask，而不是每步重复同一张（详见 `src/tensor.rs:1968-1989`）。
 
 ### 6.2 训练/推理切换
 

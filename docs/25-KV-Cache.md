@@ -1,7 +1,7 @@
 # 第 25 课：KV Cache —— 让逐 token 生成不再重复计算
 
 > 代码位置：[src/attention.rs](../src/attention.rs)（`KVCache` / `MultiHeadAttention`）
-> 代码位置：[src/model.rs](../src/model.rs)（`GPT::forward`）
+> 代码位置：[src/model.rs](../src/model.rs)（`GPT::forward` / `forward_core`）
 > 代码位置：[src/sample.rs](../src/sample.rs)（`generate`）
 > 演示入口：[src/main.rs](../src/main.rs)（演示 3：生成 1 / 生成 2）
 
@@ -124,7 +124,7 @@ pub fn k(&self) -> Tensor {
 // v() 同理
 ```
 
-- `seq_len()` 直接返回 `len`。它有两个用途（后面会看到）：一是 `GPT::forward` 用它算位置偏移 `base`；二是 `generate` 用它判断要不要停止。
+- `seq_len()` 直接返回 `len`。它有两个用途（后面会看到）：一是 `forward_core` 用它算位置偏移 `base`；二是 `generate` 用它判断要不要停止。
 - `k()` / `v()` 把展平缓存重新包成 `[1, T, D]` 张量供注意力打分使用。
   这里**仍会克隆一次整段缓存**——因为打分算子是按「拥有所有权的 `Tensor`」写的；
   想再省掉这一步，需要让算子支持借用视图，属于后续优化（见 README 的"还能压的地方"）。
@@ -142,16 +142,22 @@ let kv_dim = self.n_kv_head * head_dim;
 let k = self.c_k.forward(x).reshape(vec![b, t, kv_dim]); // [B, T, kv_dim]
 let v = self.c_v.forward(x).reshape(vec![b, t, kv_dim]);
 
-// 2. RoPE：对 Q/K 旋转（第 20 课），旋转发生在 append 之前，
-//    所以缓存里存的是"已旋转的 K"，历史位置直接复用、不再重算
-let (q, k) = q.reshape(vec![b * t, d])
+// 2. RoPE：Q/K 按 head_dim 旋转（GQA 时 K 只有 n_kv_head 个头）；
+//    旋转发生在 append 之前，所以缓存里存的是"已旋转的 K"，历史位置直接复用、不再重算
+let mut positions = Vec::with_capacity(b * t);
+for _ in 0..b {
+    positions.extend(base..base + t);
+}
+let (q, k) = q
+    .reshape(vec![b * t, d])
     .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions);
+let (q, k) = (q.reshape(vec![b, t, d]), k.reshape(vec![b, t, kv_dim]));
 
 // 3. KV cache：把本次新算的 K/V 追加到缓存，再取回全量历史
 let (k, v) = match kv_cache {
     Some(cache) => {
         cache.append(&k, &v);
-        (cache.k(), cache.v()) // [1, t_total, D]
+        (cache.k(), cache.v()) // [1, t_total, kv_dim]
     }
     None => (k, v),
 };
@@ -179,23 +185,32 @@ let t_total = k.shape()[1];
 
 ---
 
-## 5. GPT::forward 里的 base 偏移
+## 5. `base` 偏移：位置与掩码
 
-推理模式下，新 token 的位置不再是"序列内的第 j 个"，而是"全局的第 base + j 个"。`GPT::forward` 这样处理：
+推理模式下，新 token 的位置不再是"序列内的第 j 个"，而是"全局的第 base + j 个"。`base` 在 `GPT::forward_core` 里算出来（`src/model.rs:528-531`）：
 
 ```rust
-// 2. 位置编码：KV cache 推理时，当前位置从缓存长度开始
+// base = KV cache 模式下已缓存的位置数：新 token 的绝对位置 = base + 窗口内下标 j
 let base = kv_cache
     .as_ref()
     .map(|c| c.first().map(|k| k.seq_len()).unwrap_or(0))
     .unwrap_or(0);
+```
+
+它随后有两个用途。
+
+**用途 ①：传给注意力内部的 RoPE**（`src/attention.rs:135-138`）。位置序列在这里生成，`rotary_pair` 据此旋转 Q/K：
+
+```rust
 let mut positions = Vec::with_capacity(b * t);
 for _ in 0..b {
-    for j in 0..t {
-        positions.push(base + j);
-    }
+    positions.extend(base..base + t);
 }
-...
+```
+
+**用途 ②：构造因果掩码**（`forward_core` 内）：
+
+```rust
 // 3. 因果掩码：scores 形状 [B*H, T, T_total]，广播 mask [T, T_total]
 let t_total = t + base;
 let mut mask_data = vec![0.0f32; t * t_total];
@@ -216,7 +231,7 @@ for i in 0..t {
 
 > 为什么掩码的下界是 `base`：新 token 在全局序列里的下标从 `base` 开始（`i=0` 对应全局 `base`），所以它能看全局 `0..=base`（全是缓存里的历史）+ 自己，不能看 `base+1` 之后（未来）。这和全量模式的因果性完全一致。
 
-训练时 `kv_cache` 传 `None`（`src/train.rs` 里 `model.forward(&x, b, t, None)`），因为训练时权重每步都在变、历史 K/V 没有复用价值，缓存反而白占内存。
+训练时 `kv_cache` 传 `None`（`src/train.rs:201` 里 `model.forward(&x, b, t, None, false)`），因为训练时权重每步都在变、历史 K/V 没有复用价值，缓存反而白占内存。
 
 ---
 
@@ -227,47 +242,61 @@ for i in 0..t {
 ```rust
 let block_size = model.cfg.block_size;
 let mut ids = tokenizer.encode(prompt);
-let mut cache = model.new_kv_cache();
+if ids.is_empty() { ids.push(0); }                             // 空 prompt 兜底
+let mut cache = use_kv_cache.then(|| model.new_kv_cache());    // 只有用 cache 才分配
+let mut hit_window_limit = false;
 
 for _ in 0..max_new {
     // KV cache 模式：上下文总长达到 block_size 就停（缓存无法像全量模式那样截断历史）
-    if use_kv_cache && cache[0].seq_len() >= block_size {
+    if cache.as_ref().is_some_and(|c| c[0].seq_len() >= block_size) {
+        hit_window_limit = true;
         break;
     }
     // 只保留最近的 block_size 个 token（全量模式需要）
     let start = ids.len().saturating_sub(block_size);
     let ctx = &ids[start..];
 
-    let logits = if use_kv_cache {
-        // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
-        // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-        if cache[0].seq_len() == 0 {
-            model.forward(ctx, 1, ctx.len(), Some(&mut cache), false)
+    // 推理不需要反向：no_grad 下不挂计算图、不分配梯度缓冲
+    let logits = crate::tensor::no_grad(|| {
+        if use_kv_cache {
+            // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
+            // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
+            let c = cache.as_mut().unwrap();
+            if c[0].seq_len() == 0 {
+                model.forward(ctx, 1, ctx.len(), Some(c), false)
+            } else {
+                model.forward(&ids[ids.len() - 1..], 1, 1, Some(c), false)
+            }
         } else {
-            model.forward(&ids[ids.len() - 1..], 1, 1, Some(&mut cache), false)
+            // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
+            model.forward(ctx, 1, ctx.len(), None, false)
         }
-    } else {
-        // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-        model.forward(ctx, 1, ctx.len(), None, false)
-    };
+    });
 
     // 取最后一个位置的 logits
     let v = model.cfg.vocab_size;
     let n = logits.numel();
     let last_row = &logits.data()[n - v..];
-    // 重复惩罚的回看窗口（见第 15 课第 7 节）
-    let rep_start = ids.len().saturating_sub(opts.repetition_window);
-    let next = sample_token(last_row, opts, &ids[rep_start..], rng);
+    // 重复惩罚的回看窗口（见第 15 课第 7 节）；窗口 0 = 不惩罚
+    let recent = if opts.repetition_window == 0 {
+        &[][..]
+    } else {
+        &ids[ids.len().saturating_sub(opts.repetition_window)..]
+    };
+    let next = sample_token(last_row, opts, recent, rng);
     ids.push(next);
 }
+
+// 窗口写满导致提前结束时，向 stderr 打印 [warn]（见第 8 节）
+if hit_window_limit { /* eprintln!(...) */ }
 ```
 
 两种模式逐项对比：
 
 | | 全量模式（无缓存） | KV cache 模式 |
 |---|---|---|
-| 首次前向 | `forward(ctx, 1, ctx.len(), None, false)` | `forward(ctx, 1, ctx.len(), Some(&mut cache), false)`：同样前向整个 prompt，但**把每层 K/V 顺手存进缓存** |
-| 之后每步 | `forward(ctx, 1, ctx.len(), None, false)`：整个上下文（截断到最近 32 个）重算 | `forward(&ids[ids.len()-1..], 1, 1, Some(&mut cache), false)`：**只喂最后一个 token**，K/V 从缓存取 |
+| 首次前向 | `forward(ctx, 1, ctx.len(), None, false)` | `forward(ctx, 1, ctx.len(), Some(c), false)`：同样前向整个 prompt，但**把每层 K/V 顺手存进缓存** |
+| 之后每步 | `forward(ctx, 1, ctx.len(), None, false)`：整个上下文（截断到最近 32 个）重算 | `forward(&ids[ids.len()-1..], 1, 1, Some(c), false)`：**只喂最后一个 token**，K/V 从缓存取 |
 | 上下文处理 | `ids.len().saturating_sub(block_size)` 截断，窗口可滑动 | 不截断，全量积累在缓存里 |
 | 停止条件 | 生成满 `max_new` 个 | 生成满 `max_new` 个，**或缓存长度达到 `block_size`** |
 | 每次前向的位置数 | 32（封顶后固定） | 首次 prompt 长度，之后恒为 1 |
@@ -353,7 +382,8 @@ println!(
 也就是说，生成到第 22 个新 token 后，下一次循环开头检查：
 
 ```rust
-if use_kv_cache && cache[0].seq_len() >= block_size {
+if cache.as_ref().is_some_and(|c| c[0].seq_len() >= block_size) {
+    hit_window_limit = true;
     break;
 }
 ```
@@ -380,7 +410,7 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 
 1. **在窗口内验证"完全相等"**：把 demo 的生成 2 改成 `max_new=20`（prompt 11 + 20 = 31 ≤ 32，全程不碰窗口上限），此时两次输出应**完全相等**而不只是前缀——把 `starts_with` 换成 `assert_eq!` 验证一下。
 2. **打印缓存形状**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("cache seq_len = {}", cache.seq_len());`，观察它从 11 一路涨到 32 的过程。
-3. **把 `break` 条件去掉**：临时注释掉 `generate` 里的 `if use_kv_cache && cache[0].seq_len() >= block_size { break; }`，运行看会发生什么——体会 RoPE 外推区（位置远超训练见过的 `0..32`）对生成质量的影响。
+3. **把 `break` 条件去掉**：临时注释掉 `generate` 里的 `if cache.as_ref().is_some_and(|c| c[0].seq_len() >= block_size) { break; }`，运行看会发生什么——体会 RoPE 外推区（位置远超训练见过的 `0..32`）对生成质量的影响。
 4. **对比计算量**：全量模式第 k 步前向 k 个位置、缓存模式每步只前向 1 个位置。对 `block_size=32`、`max_new=80`，估算两种模式累计前向的位置总数各是多少。
 5. **（进阶）给 KVCache 加"截断"**：仿照全量模式的窗口滑动，给 `KVCache` 加一个 `truncate(keep: usize)` 方法（把 `Vec<f32>` 前部多出来的 `(len - keep) * d` 个元素 `drain` 掉，并同步更新 `len`），并在 `generate` 的缓存分支里每步调用它，让缓存模式也能像全量模式一样持续生成——对比改动前后的输出。
 
@@ -391,7 +421,7 @@ if use_kv_cache && cache[0].seq_len() >= block_size {
 - 逐 token 生成时，历史位置的 K/V 每步都在被重复计算——全量模式累计 O(T²)，这是 KV Cache 要消灭的浪费
 - `KVCache` = 每层一份的 `Vec<f32>` 缓存（行优先展平的 `[1, T, D]`，外加 `len` / `d`），
   `append` 就地 extend（不复制历史）、`seq_len` 读 `len`、`k()`/`v()` 包成张量（会克隆一次）
-- `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`GPT::forward` 用 `base` 修正位置编码与因果掩码
+- `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`GPT::forward_core` 用 `base` 修正位置编码与因果掩码
 - 流程对比：首次前向整个 prompt 填缓存 → 之后每步只前向 1 个 token；全量模式则是每步重算整个窗口
 - 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致；demo 用**同 prompt + 同种子**自验证，单元测试守住"窗口内完全一致 / 超窗口仅是前缀"
 - 缓存模式只拼不丢，上下文达到 `block_size=32` 必须停止（训练长度外是 RoPE 外推区 + 缓存无法截断历史），真实输出里生成 2 止步于 33 个字符，并向 stderr 打印 `[warn]` 提示提前结束

@@ -238,13 +238,11 @@ for (i, block) in self.blocks.iter().enumerate() {
     x = block.forward(&x, &mask, cache, base, training);
 }
 
-// 5. 最终归一化 + 输出头（权重绑定：lm_head 复用 tok_emb.table 的转置）
-let x = self.ln_f.forward(&x);
-let x = x.reshape(vec![b * t, d]);
-x.matmul(&self.tok_emb.table.transpose())
+// 5. 最终归一化（输出头不在这里，由 forward 补上）
+self.ln_f.forward(&x).reshape(vec![b * t, d])
 ```
 
-> 上面是逐算子的主路径。源码里还有 GPU 常驻显存的快路（`src/model.rs:382-572`）：`forward_hidden` 复用同一条 `forward_core` 但只返回到 `ln_f` 之后的 hidden `[B*T, d]`，`head_weight` 暴露输出头权重 `tok_emb.table`，两者配合把 `hidden @ Wᵀ` 与交叉熵一起放进显存算，避免把 `[B*T, vocab]` 的 logits 拉回 CPU；整叠 Block 的 `blocks_resident` 则把「LN → Attention → 残差 → LN → MLP → 残差」整段录进一次提交。它们只在启用 `gpu` feature、且训练模式（无 KV cache、`base == 0`）下生效，条件不满足就回落到上面的主路径，数值行为不变。
+> 上面是逐算子的主路径。源码里还有 GPU 常驻显存的快路（`src/model.rs:382-572`）：`forward_hidden` 复用同一条 `forward_core` 但只返回到 `ln_f` 之后的 hidden `[B*T, d]`，`head_weight` 暴露输出头权重 `tok_emb.table`，两者配合把 `hidden @ Wᵀ` 与交叉熵一起放进显存算，避免把 `[B*T, vocab]` 的 logits 拉回 CPU；整叠 Block 的 `blocks_resident` 则把「LN → Attention → 残差 → LN → MLP → 残差」整段录进一次提交。它们只在启用 `gpu` feature、且训练模式（无 KV cache、`base == 0`）下生效；其中 `blocks_resident` 还需要显式设 `LLM_GPU_STACK=1` 才会开启（默认关闭，用 `LLM_GPU_STACK` 复现对照实验），条件不满足就回落到上面的主路径，数值行为不变。
 
 `forward` 本体只有一行（`src/model.rs:365-376`）：
 
@@ -256,7 +254,7 @@ self.forward_core(idx, b, t, kv_cache, training)
 
 几个容易忽略的细节：
 
-1. **位置信息来自 RoPE 而不是相加**：第 11 课的做法是 `x = tok + pos_emb`（把正弦位置向量加进去）；第 20 课之后改为在注意力内部对 Q/K 做旋转（`rotary_pair`），`GPT::forward` 不再需要 `pos_emb` 表，只把 `base` 传给各层——KV cache 推理时，新 token 的绝对位置是 `base + j`（第 25 课）。
+1. **位置信息来自 RoPE 而不是相加**：第 11 课的做法是 `x = tok + pos_emb`（把正弦位置向量加进去）；第 20 课之后改为在注意力内部对 Q/K 做旋转（`rotary_pair`），`forward_core` 不再需要 `pos_emb` 表，只把 `base` 传给各层——KV cache 推理时，新 token 的绝对位置是 `base + j`（第 25 课）。
 2. **因果掩码的构造**：`j > i + base` 的位置设为 `-inf`。也就是说第 i 个 token 只能看到"它自己和它前面的"（含 KV cache 里的历史位置），未来位置在 softmax 后概率为 0——保证模型只能预测下一个词、不能偷看答案。
 3. **权重绑定的输出头**：`tok_emb.table` 是 `[V, D]`，它的转置 `[D, V]` 恰好可以把 `[D]` 向量打分成 `[V]` 个词的分数（"第 i 行 = 第 i 个词的嵌入"与当前向量做点积）。这与 GPT 的"输入输出共享词嵌入"做法一致，省掉了一份独立的 `lm_head` 参数（第 5.2 节参数量里会体现）。
 

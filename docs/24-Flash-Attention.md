@@ -145,7 +145,7 @@ O  = P·V             // matmul_data
 ### 6.2 `block_size` 参数已失效
 
 `Tensor::flash_attention(q, k, v, mask, _block_size)` 的第 5 个参数**现在被忽略**（签名保留是为了兼容旧调用），
-分块交给 `matmul_data` 内部处理。`attention.rs:181` 传的 `32` 不再有任何含义。
+分块交给 `matmul_data` 内部处理。`attention.rs:182` 传的 `32` 不再有任何含义。
 
 ### 6.3 集成状态：已接入
 
