@@ -20,7 +20,7 @@
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
 - **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、梯度累积、Beam Search。
-- **真实可用**：加载预训练权重微调、交互式对话、分词器持久化、训练指标日志、预设模型配置。
+- **真实可用**：加载预训练权重微调、交互式对话、分词器持久化、训练指标日志、运行日志（每次训练/推理自动存档）、预设模型配置。
 - **教学实现（尚未接入训练循环）**：LoRA 层与 `MixedPrecision` 动态损失缩放都有完整实现和文档，
   但都还没接进 `train_gpt`——`finetune` 目前是常规全参微调，见 [§5](#5-finetune--加载预训练权重微调) 与第 26 / 29 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
@@ -157,7 +157,9 @@ JSON 头：step、best_val_loss、模型配置、优化器步数 opt_t、参数�
 
 > `LLMCP2` 与旧格式不兼容，也不提供转换脚本（改格式只为存得更小、更稳），旧 `.ckpt` 请重新训练。
 
-**日志**：**每个评估点**（每 `eval_every` 步 + 最后一步）向 `logs/train.csv` 写一行（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；每次训练会覆盖该文件，要留档就一个实验配一个路径。控制台输出可用重定向存到 `logs/run.log`。
+**日志**：**每个评估点**（每 `eval_every` 步 + 最后一步）向 `logs/train.csv` 写一行（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；每次训练会覆盖该文件，要留档就一个实验配一个路径。
+
+**运行日志**：`train` / `finetune` / `eval` / `generate` / `chat` 五个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
 
 **推理不需要语料文件**：训练完成后，`eval` / `generate` / `chat` 命令自动从 checkpoint 目录加载 `tokenizer.json`，不再需要 `train_file` 或语料。只需指定 `--ckpt` 即可：
 
@@ -1042,13 +1044,15 @@ llm_from_scratch/
 ├── checkpoints/        # 权重目录（自动创建）：latest.ckpt / best.ckpt / final.ckpt / tokenizer.json
 │   ├── perf/           #   各实验按 out_dir 分成子目录，如 checkpoints/zh、checkpoints/probe_b2
 │   └── ...
-├── logs/               # 日志目录（自动创建）：训练指标 CSV（train.csv）与重定向出来的运行日志
+├── logs/               # 日志目录（自动创建）：运行日志（每次 train/eval/generate/chat/finetune 各一份）
+│                       #      与训练指标 CSV（train.csv，由 train.log_file 指定）
 ├── data/               # 语料：alice.txt（公版《爱丽丝梦游仙境》）、corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
 │                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）、corpus_perf/（性能测试用节选）
 ├── src/
 │   ├── main.rs         # CLI 入口：train / eval / generate / chat / finetune / preset / demo / bench
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）
+│   ├── runlog.rs       # 运行日志：每次训练 / 推理自动写 logs/{操作}_{时间戳}.log（命令行 + 完整配置 + 过程输出）
 │   ├── checkpoint.rs   # checkpoint 保存 / 恢复
 │   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、23、25 课）
 │   ├── autograd.rs     # 自动微分：backward + 拓扑排序（第 2 课）
@@ -1075,14 +1079,15 @@ llm_from_scratch/
 | 配置文件 | `config/config.json` | `--config` / `--output` | 所有子命令的配置默认路径；`preset --output` 写同类路径 |
 | 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json` |
 | 训练指标日志 | `logs/train.csv` | `train.log_file` | CSV：`step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
-| 运行日志 | `logs/` | 用户重定向 | 如 `cargo run --release -- train --config config/config.json *> logs/run.log` |
+| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `finetune` / `eval` / `generate` / `chat` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出 |
 
 实现方式：`src/config.rs` 提供 `ensure_parent_dir()` / `ensure_dir()`，并在**每个写盘出口**调用——
-`Config::save()`（配置）、`checkpoint::save()`（权重）、`Tokenizer::save()`（分词器）、`MetricsLogger::new()`（日志）。
-因此把 `out_dir`、`log_file` 改成任意嵌套路径（如 `outputs/run1/logs/train.csv`）也会自动建好目录，
-产物不会再散落到仓库根目录。
+`Config::save()`（配置）、`checkpoint::save()`（权重）、`Tokenizer::save()`（分词器）、`MetricsLogger::new()`（指标 CSV）、
+`runlog::start()`（运行日志）。因此把 `out_dir`、`log_file` 改成任意嵌套路径（如 `outputs/run1/logs/train.csv`）
+也会自动建好目录，产物不会再散落到仓库根目录。
 
-> Windows 上 PowerShell 的 `*>` 可以同时重定向 stdout/stderr；CSV 指标日志由程序自己写入，不需要重定向。
+> Windows 上 PowerShell 的 `*>` 可以把控制台输出重定向到文件；但运行日志已由程序自动写入 `logs/`，
+> 含完整命令与配置，通常不需要再手动重定向。
 
 ## 学习路线
 
@@ -1118,7 +1123,7 @@ llm_from_scratch/
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 1.63→0.15、文本生成正常
 - **工程化功能已全部集成**：微调（`finetune`，当前为**全参微调**，LoRA 只做参数校验与提示）、
   Beam Search（`generate --beam`）、交互式对话（`chat`）、分词器持久化（`tokenizer.json`）、
-  预设配置（`preset`）、训练指标日志（CSV）、早停（`early_stop_patience`）
+  预设配置（`preset`）、训练指标日志（CSV）、运行日志（`logs/{操作}_{时间戳}.log`）、早停（`early_stop_patience`）
 
 ## 性能优化与基准测试
 

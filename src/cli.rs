@@ -12,6 +12,9 @@
 //! ```
 //!
 //! 目录约定：配置在 `config/`、权重在 `checkpoints/`、日志在 `logs/`（见 [`crate::config`] 的常量）。
+//!
+//! 其中 `train` / `finetune` / `eval` / `generate` / `chat` 每次运行都会自动在 `logs/` 下
+//! 写一份 `{操作}_{时间戳}.log` 运行日志（完整命令行 + 完整配置 + 过程输出），见 [`crate::runlog`]。
 
 use clap::{Parser, Subcommand};
 

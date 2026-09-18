@@ -318,7 +318,7 @@ pub fn train_gpt(
         start_step = ckpt.step;
         best_val_loss = ckpt.best_val_loss;
         scheduler.set_step(start_step);
-        println!(
+        logln!(
             "已从 {path} 恢复：step={}，best_val_loss={:.4}",
             start_step, best_val_loss
         );
@@ -328,7 +328,7 @@ pub fn train_gpt(
     let batch_size = loader.batch_size();
     let param_count: usize = params.iter().map(|p| p.numel()).sum();
     let _trainable_count = param_count; // LoRA 模式下会更少（但这里简化处理）
-    println!(
+    logln!(
         "开始训练：{}（vocab={}）模型参数 {} | 语料 {} tokens（训练 {} / 验证 {}）| batch={} block={}",
         tokenizer.kind(),
         model.cfg.vocab_size,
@@ -340,7 +340,7 @@ pub fn train_gpt(
         block_size,
     );
     if cfg.lora.is_some() {
-        println!("LoRA 微调模式：rank={} alpha={}", 
+        logln!("LoRA 微调模式：rank={} alpha={}", 
             cfg.lora.as_ref().unwrap().rank,
             cfg.lora.as_ref().unwrap().alpha,
         );
@@ -350,7 +350,7 @@ pub fn train_gpt(
     let log_path = cfg.log_file.as_deref();
     let mut metrics = MetricsLogger::new(log_path);
     if log_path.is_some() {
-        println!("训练指标将记录到 {}", log_path.unwrap());
+        logln!("训练指标将记录到 {}", log_path.unwrap());
     }
 
     // GPU dispatch 开销分解：必须等首步的真实 dispatch 跑完才有数据可打印，
@@ -371,7 +371,7 @@ pub fn train_gpt(
     let mut no_improve_count = 0usize; // 早停计数器
     let patience = cfg.early_stop_patience; // 0 = 不启用
     if patience > 0 {
-        println!("[info] 早停已启用：patience={}（连续 {} 次评估不改善则停止）", patience, patience);
+        logln!("[info] 早停已启用：patience={}（连续 {} 次评估不改善则停止）", patience, patience);
     }
     let mut final_loss = f32::INFINITY;
     let train_t0 = std::time::Instant::now();
@@ -420,7 +420,7 @@ pub fn train_gpt(
                         p.grad.borrow().iter().map(|g| g * g).sum::<f32>()
                     }).sum::<f32>().sqrt();
                     let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
-                    println!(
+                    logln!(
                         "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | fwd {:.0}ms bwd {:.0}ms | {:.0}s | ~{:.0}s",
                         step + 1, cfg.steps, loss.item(), raw_norm, clipped, scheduler.lr(),
                         steps_per_sec, tps, fwd_ms, bwd_ms, elapsed, remaining
@@ -499,7 +499,7 @@ pub fn train_gpt(
             match val_loss {
                 Some(v) => {
                     let marker = if is_best { " *" } else { "" };
-                    println!(
+                    logln!(
                         "step {:>5} | lr {:.6} | loss {:.4} | val {:.4} (ppl {:.1}) | {:.0} tok/s{marker}",
                         step + 1,
                         scheduler.lr(),
@@ -509,7 +509,7 @@ pub fn train_gpt(
                         tps
                     );
                 }
-                None => println!(
+                None => logln!(
                     "step {:>5} | lr {:.6} | loss {:.4} | {:.0} tok/s",
                     step + 1,
                     scheduler.lr(),
@@ -520,7 +520,7 @@ pub fn train_gpt(
 
             // 至此 checkpoint 已保存、指标已记录、评估行已打印，可以安全早停
             if should_stop {
-                println!(
+                logln!(
                     "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
                     patience, best_val_loss, step + 1
                 );
@@ -542,7 +542,7 @@ pub fn train_gpt(
             last_step_done,
             best_val_loss,
         );
-        println!(
+        logln!(
             "[done] checkpoint 已保存到 {dir}/ | 总耗时 {:.0}s | {:.2}s/步（共 {} 步）",
             elapsed,
             elapsed / steps_done as f64,
@@ -555,7 +555,7 @@ pub fn train_gpt(
         // 于是分解永远打不出来。收尾再兜一次，保证任何长度的跑都能看到诊断。
         crate::gpu::flush_diag_log();
         let (gpu_calls, cpu_calls) = crate::gpu::stats();
-        println!("[done] matmul 分流：GPU {} / CPU {}", gpu_calls, cpu_calls);
+        logln!("[done] matmul 分流：GPU {} / CPU {}", gpu_calls, cpu_calls);
     }
     if best_val_loss.is_finite() {
         best_val_loss

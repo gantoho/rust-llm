@@ -7,7 +7,7 @@
 !/config/config.json
 # 权重目录：checkpoint（latest / best / final）与 tokenizer.json，单个文件可达 100MB+
 /checkpoints/
-# 日志目录：训练指标 CSV（logs/train.csv）与重定向出来的运行日志
+# 日志目录：训练指标 CSV（logs/train.csv）与每次训练/推理自动生成的运行日志（logs/{操作}_{时间戳}.log）
 /logs/
 *.log
 # 重定向出来的 stderr 文件（如 probe.err）

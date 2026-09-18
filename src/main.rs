@@ -10,6 +10,13 @@
 //! - `cargo run --release -- demo`    # 教学演示（XOR / BPE / 内置语料小 GPT）
 //!
 //! 配套教程文档见 `docs/` 目录。
+//!
+//! 每次训练 / 推理都会自动在 `logs/` 下生成一份运行日志（文件名含操作名与毫秒级时间），
+//! 内容包含完整命令行、完整配置与全部过程输出，见 [`runlog`]。
+
+// `runlog` 里的 `logln!` 宏要覆盖后面所有模块，必须最先声明并带 #[macro_use]
+#[macro_use]
+mod runlog;
 
 mod attention;
 mod autograd;
@@ -45,6 +52,7 @@ use tensor::Tensor;
 use tokenizer::{BPETokenizer, CharTokenizer, Tokenizer};
 
 fn main() {
+    runlog::mark_start(); // 记下命令开始执行的时刻，作为运行日志总耗时的基准
     init_console_utf8();
     #[cfg(feature = "gpu")]
     gpu::init();
@@ -168,7 +176,7 @@ fn load_model_and_tokenizer(
             assert_eq!(loaded.vocab_size(), ckpt.model.vocab_size,
                 "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), ckpt.model.vocab_size);
         }
-        println!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        logln!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
         loaded
     } else {
         load_tokenizer_for_inference(tcfg, ckpt.model.vocab_size)
@@ -188,7 +196,7 @@ fn load_tokenizer_for_inference(tcfg: &config::TrainConfig, expect_vocab: usize)
             assert_eq!(loaded.vocab_size(), expect_vocab,
                 "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), expect_vocab);
         }
-        println!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        logln!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
         return loaded;
     }
     // 2. 自动查找训练时保存的 tokenizer.json
@@ -199,7 +207,7 @@ fn load_tokenizer_for_inference(tcfg: &config::TrainConfig, expect_vocab: usize)
             assert_eq!(loaded.vocab_size(), expect_vocab,
                 "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), expect_vocab);
         }
-        println!("分词器：从 {} 加载（{}，词表 {}）", auto_path, loaded.kind(), loaded.vocab_size());
+        logln!("分词器：从 {} 加载（{}，词表 {}）", auto_path, loaded.kind(), loaded.vocab_size());
         return loaded;
     }
     // 3. 都没有，从语料训练（兜底）
@@ -217,10 +225,10 @@ fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: u
     let tok = if let Some(ref path) = tcfg.tokenizer_file {
         if std::path::Path::new(path).exists() {
             let loaded = Tokenizer::load(path);
-            println!("已从 {} 加载分词器（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+            logln!("已从 {} 加载分词器（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
             loaded
         } else {
-            println!("分词器文件 {} 不存在，从语料训练新分词器", path);
+            logln!("分词器文件 {} 不存在，从语料训练新分词器", path);
             Tokenizer::from_name(&tcfg.tokenizer, train_text, tcfg.bpe_vocab)
         }
     } else {
@@ -240,13 +248,23 @@ fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: u
 
 /// 训练：`train --config config/config.json [--resume ckpt]`
 fn cmd_train(config_path: &str, resume: Option<&str>) {
+    let log_path = runlog::start("train");
+    println!("运行日志：{log_path}");
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            ("resume", resume.unwrap_or("无（从头训练）").to_string()),
+        ],
+    );
     let cfg = Config::load(config_path);
+    runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
     #[cfg(feature = "gpu")]
     if gpu::is_available() {
-        println!("GPU: {}（{}）", gpu::name(), gpu::backend());
+        logln!("GPU: {}（{}）", gpu::name(), gpu::backend());
     } else {
-        println!("未检测到可用 GPU，本次训练走 CPU");
+        logln!("未检测到可用 GPU，本次训练走 CPU");
     }
 
     let train_text = load_text(&tcfg.train_file);
@@ -257,7 +275,7 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
     let tok_path = tcfg.tokenizer_file.clone()
         .unwrap_or_else(|| format!("{}/tokenizer.json", tcfg.out_dir));
     tokenizer.save(&tok_path);
-    println!("分词器已保存到 {tok_path}");
+    logln!("分词器已保存到 {tok_path}");
 
     // 词表大小 0 表示"由分词器决定"
     let mut model_cfg = cfg.model.clone();
@@ -267,6 +285,30 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
 
     let mut rng = Rng::new(tcfg.seed);
     let model = GPT::new(model_cfg.clone(), &mut rng);
+    let param_count: usize = model.parameters().iter().map(|p| p.numel()).sum();
+    runlog::fields(
+        "数据与模型",
+        &[
+            ("训练语料", tcfg.train_file.clone()),
+            (
+                "验证语料",
+                tcfg.val_file
+                    .clone()
+                    .unwrap_or_else(|| "（未配置，自动从训练文本末尾切 10%）".to_string()),
+            ),
+            (
+                "分词器",
+                format!("{}（词表 {}）→ {tok_path}", tokenizer.kind(), tokenizer.vocab_size()),
+            ),
+            ("模型结构", format!("{model_cfg:?}")),
+            ("模型参数", format!("{param_count}")),
+            ("输出目录", tcfg.out_dir.clone()),
+            (
+                "指标 CSV",
+                tcfg.log_file.clone().unwrap_or_else(|| "不记录".to_string()),
+            ),
+        ],
+    );
     let loader = DataLoader::from_texts(
         &train_text,
         val_text.as_deref(),
@@ -274,7 +316,7 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
         model_cfg.block_size,
         tcfg.batch_size,
     );
-    train::train_gpt(
+    let best = train::train_gpt(
         &model,
         &tokenizer,
         &loader,
@@ -283,13 +325,30 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
         resume,
         &mut rng,
     );
+    runlog::append(&format!("训练结束：best val loss = {best:.4}"));
+    runlog::finish();
 }
 
 /// 评估：在验证集上计算 loss 与困惑度
 fn cmd_eval(config_path: &str, ckpt_path: Option<&str>, tokenizer_path: Option<&str>) {
+    let log_path = runlog::start("eval");
+    println!("运行日志：{log_path}");
     let cfg = Config::load(config_path);
+    runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            ("checkpoint", ckpt_path.to_string()),
+            (
+                "分词器文件",
+                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+            ),
+            ("评估批数", tcfg.eval_iters.to_string()),
+        ],
+    );
     let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed, tokenizer_path);
 
     let train_text = load_text(&tcfg.train_file);
@@ -304,7 +363,7 @@ fn cmd_eval(config_path: &str, ckpt_path: Option<&str>, tokenizer_path: Option<&
 
     let mut eval_rng = Rng::new(tcfg.seed); // 固定种子，结果可复现
     let loss = train::eval_loss(&model, &loader, tcfg.eval_iters, &mut eval_rng);
-    println!(
+    logln!(
         "评估 step {}：val_loss {:.4} | perplexity {:.2}（{} 个 token 的验证集上采 {} 批）",
         ckpt.step,
         loss,
@@ -312,6 +371,7 @@ fn cmd_eval(config_path: &str, ckpt_path: Option<&str>, tokenizer_path: Option<&
         loader.num_val_tokens(),
         tcfg.eval_iters
     );
+    runlog::finish();
 }
 
 /// 生成：`generate --config config/config.json --ckpt ckpt --prompt "..."`
@@ -328,19 +388,58 @@ fn cmd_generate(
     beam: Option<usize>,
     length_penalty: f32,
 ) {
+    let log_path = runlog::start("generate");
+    println!("运行日志：{log_path}");
     let cfg = Config::load(config_path);
+    runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
-    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
     let mut rng = Rng::new(seed);
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
+            (
+                "分词器文件",
+                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+            ),
+            ("模型结构", format!("{:?}", ckpt.model)),
+            ("prompt", format!("{prompt:?}")),
+            ("max_new", max_new.to_string()),
+            ("seed", seed.to_string()),
+            (
+                "生成方式",
+                match beam {
+                    Some(b) => format!("Beam Search（beam_size={b}，length_penalty={length_penalty}）"),
+                    None => "采样".to_string(),
+                },
+            ),
+            ("temperature", opts.temperature.to_string()),
+            ("top_k", opts.top_k.to_string()),
+            ("top_p", opts.top_p.to_string()),
+            (
+                "重复惩罚",
+                format!("{}（回看窗口 {}）", opts.repetition_penalty, opts.repetition_window),
+            ),
+            (
+                "KV cache",
+                match beam {
+                    Some(_) => "不适用（Beam Search 走全量前向）".to_string(),
+                    None => if no_kv_cache { "关（每次全量前向）" } else { "开" }.to_string(),
+                },
+            ),
+        ],
+    );
 
-    if let Some(beam_size) = beam {
+    let out = if let Some(beam_size) = beam {
         // Beam Search 生成
-        println!(
+        logln!(
             "Beam Search 生成（beam_size={} length_penalty={}）：",
             beam_size, length_penalty
         );
-        let out = sample::beam_search(
+        sample::beam_search(
             &model,
             &tokenizer,
             prompt,
@@ -348,12 +447,11 @@ fn cmd_generate(
             beam_size,
             length_penalty,
             &mut rng,
-        );
-        println!("{}", out);
+        )
     } else {
         // 采样生成
         let use_kv_cache = !no_kv_cache;
-        println!(
+        logln!(
             "生成（temperature={} top-k={} top-p={} 重复惩罚={}（窗口 {}），KV cache {}）：",
             opts.temperature,
             opts.top_k,
@@ -362,9 +460,11 @@ fn cmd_generate(
             opts.repetition_window,
             if use_kv_cache { "开" } else { "关" }
         );
-        let out = generate(&model, &tokenizer, prompt, max_new, &opts, use_kv_cache, &mut rng);
-        println!("{}", out);
-    }
+        generate(&model, &tokenizer, prompt, max_new, &opts, use_kv_cache, &mut rng)
+    };
+    logln!("{out}");
+    runlog::append(&format!("[done] 输出总长 {} 字符（含 prompt）", out.chars().count()));
+    runlog::finish();
 }
 
 /// 交互式对话模式
@@ -378,27 +478,54 @@ fn cmd_chat(
     max_new: usize,
     seed: u64,
 ) {
+    let log_path = runlog::start("chat");
+    println!("运行日志：{log_path}");
     let cfg = Config::load(config_path);
+    runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
-    let (model, tokenizer, _ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
     let mut rng = Rng::new(seed);
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
+            (
+                "分词器文件",
+                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+            ),
+            ("模型结构", format!("{:?}", ckpt.model)),
+            ("系统提示", if system.is_empty() { "无".to_string() } else { system.to_string() }),
+            ("每轮最大新 token", max_new.to_string()),
+            ("seed", seed.to_string()),
+            ("temperature", opts.temperature.to_string()),
+            ("top_k", opts.top_k.to_string()),
+            ("top_p", opts.top_p.to_string()),
+            (
+                "重复惩罚",
+                format!("{}（回看窗口 {}）", opts.repetition_penalty, opts.repetition_window),
+            ),
+            ("KV cache", "开".to_string()),
+        ],
+    );
 
-    println!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
-    println!(
+    logln!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
+    logln!(
         "参数：temperature={} top-k={} top-p={} 重复惩罚={}（窗口 {}）",
         opts.temperature, opts.top_k, opts.top_p, opts.repetition_penalty, opts.repetition_window
     );
     if !system.is_empty() {
-        println!("系统提示：{}", system);
+        logln!("系统提示：{}", system);
     }
-    println!("---");
+    logln!("---");
 
     let mut context_history = if !system.is_empty() {
         system.to_string()
     } else {
         String::new()
     };
+    let mut turn = 0usize;
 
     loop {
         print!("> ");
@@ -413,6 +540,7 @@ fn cmd_chat(
         if input == ":quit" || input == ":exit" || input.is_empty() {
             break;
         }
+        turn += 1;
 
         // 构造 prompt：历史 + 当前输入
         let prompt = if context_history.is_empty() {
@@ -420,6 +548,7 @@ fn cmd_chat(
         } else {
             format!("{}\n{}", context_history, input)
         };
+        runlog::append(&format!("\n[第 {turn} 轮] 输入：{input}"));
 
         let out = generate(
             &model,
@@ -440,7 +569,8 @@ fn cmd_chat(
         } else {
             &out
         };
-        println!("{}", response);
+        logln!("{response}");
+        runlog::append(&format!("[第 {turn} 轮] 输出：{response}"));
 
         // 更新历史上下文（截断到 block_size 以内的字符数）
         context_history = format!("{}\n{}\n{}", prompt, input, response);
@@ -452,6 +582,8 @@ fn cmd_chat(
             }
         }
     }
+    runlog::append(&format!("\n对话结束：共 {} 轮", turn));
+    runlog::finish();
 }
 
 /// LoRA 微调：加载预训练模型，冻结主参数，只训练 LoRA 层
@@ -463,6 +595,8 @@ fn cmd_finetune(
     steps: usize,
     lr: f32,
 ) {
+    let log_path = runlog::start("finetune");
+    println!("运行日志：{log_path}");
     let mut cfg = Config::load(config_path);
     // 设置 LoRA 配置
     cfg.train.lora = Some(config::LoRAConfig {
@@ -473,8 +607,10 @@ fn cmd_finetune(
     cfg.train.max_lr = lr;
     cfg.train.min_lr = lr * 0.1;
 
+    // 日志记的是**覆盖 CLI 参数之后**的最终配置（这才是本次实际使用的配置）
+    runlog::json(&format!("完整配置（{config_path} + CLI 覆盖后）"), &cfg);
     let tcfg = &cfg.train;
-    println!(
+    logln!(
         "LoRA 微调：rank={} alpha={} steps={} lr={}",
         lora_rank, lora_alpha, steps, lr
     );
@@ -486,11 +622,26 @@ fn cmd_finetune(
     // 打印模型信息
     let total_params: usize = model.parameters().iter().map(|p| p.numel()).sum();
     let lora_params = 2 * lora_rank * ckpt.model.n_embd * 3; // Q/K/V 各一个 LoRA
-    println!(
+    logln!(
         "模型参数：{}（冻结）| LoRA 参数：{}（可训练，占 {:.1}%）",
         total_params,
         lora_params,
         100.0 * lora_params as f32 / total_params as f32
+    );
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            (
+                "预训练权重",
+                format!("{pretrained_path}（step {}）", ckpt.step),
+            ),
+            ("预训练模型结构", format!("{:?}", ckpt.model)),
+            ("LoRA rank / alpha", format!("{lora_rank} / {lora_alpha}")),
+            ("总参数 / 可训练参数", format!("{total_params} / {lora_params}")),
+            ("训练语料", tcfg.train_file.clone()),
+            ("输出目录", tcfg.out_dir.clone()),
+        ],
     );
 
     let mut rng = Rng::new(tcfg.seed);
@@ -501,7 +652,7 @@ fn cmd_finetune(
         ckpt.model.block_size,
         tcfg.batch_size,
     );
-    train::train_gpt(
+    let best = train::train_gpt(
         &model,
         &tokenizer,
         &loader,
@@ -510,6 +661,8 @@ fn cmd_finetune(
         None,
         &mut rng,
     );
+    runlog::append(&format!("微调结束：best val loss = {best:.4}"));
+    runlog::finish();
 }
 
 /// 生成预设配置文件
