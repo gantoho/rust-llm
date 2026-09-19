@@ -15,14 +15,14 @@
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
 - **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、39 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善。
-- **工程化完整**：CLI 子命令（train / eval / generate / chat / finetune / preset / demo / bench）、
+- **工程化完整**：CLI 子命令（train / eval / generate / chat / sft / finetune / preset / demo / bench）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
 - **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、梯度累积、Beam Search。
 - **真实可用**：加载预训练权重微调、交互式对话、分词器持久化、训练指标日志、运行日志（每次训练/推理自动存档）、预设模型配置。
 - **教学实现（尚未接入训练循环）**：LoRA 层与 `MixedPrecision` 动态损失缩放都有完整实现和文档，
-  但都还没接进 `train_gpt`——`finetune` 目前是常规全参微调，见 [§5](#5-finetune--加载预训练权重微调) 与第 26 / 29 课。
+  但都还没接进 `train_gpt`——`finetune` 目前是常规全参微调，见 [§6](#6-finetune--加载预训练权重微调) 与第 26 / 29 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
 ### 包含的功能（对应 39 课）
@@ -38,12 +38,12 @@
 | 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），**save/load 持久化**，配置可切换；生成时做 UTF-8 约束，不会拼出乱码字符 |
 | 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、KV Cache、**GQA 分组查询注意力** |
 | GPT 模型 | `src/model.rs` | Transformer Block 堆叠、GPT 整体前向、checkpoint 参数名、**Dropout** |
-| 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样 |
-| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**；另外实现了但未接入的 `MixedPrecision` 动态损失缩放 |
-| 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search** |
-| 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** |
+| 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样；**SFT 对话语料解析 + loss 掩码** |
+| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**；另外实现了但未接入的 `MixedPrecision` 动态损失缩放 |
+| 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search**，**停止标记** |
+| 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式 |
-| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **finetune** / **preset** / demo / **bench** |
+| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **sft** / **finetune** / **preset** / demo / **bench** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
@@ -93,6 +93,12 @@ cargo run --release -- train --config config/config_medium.json
 cargo run --release -- chat --ckpt checkpoints/best.ckpt
 
 # ═══════════════════════════════════════════
+#  监督微调（把只会续写的预训练模型教会"应答"）
+# ═══════════════════════════════════════════
+cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt
+cargo run --release -- chat --ckpt checkpoints/zh-sft/best.ckpt   # 之后用 SFT 权重对话
+
+# ═══════════════════════════════════════════
 #  微调（加载预训练模型，当前为全参微调；LoRA 尚未接入训练循环）
 # ═══════════════════════════════════════════
 cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
@@ -113,7 +119,7 @@ cargo run --release -- bench --steps 30
 
 ## 命令行完整参考
 
-程序提供 8 个子命令：`train` / `eval` / `generate` / `chat` / `finetune` / `preset` / `demo` / `bench`。
+程序提供 9 个子命令：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` / `preset` / `demo` / `bench`。
 
 ### 1. `train` —— 训练模型
 
@@ -522,8 +528,13 @@ cargo run --release -- chat [参数]
 | `--repetition-window <数量>` | int | `64` | 重复惩罚的回看窗口（`0` = 关闭） |
 | `--max-new <数量>` | int | `200` | 每次生成的最大 token 数 |
 | `--seed <种子>` | int | `42` | 随机种子 |
+| `--prompt-format <模板>` | string | `sft` | `sft` = 用与 `sft` 子命令一致的对话模板拼 prompt（模型才会"回答"）；`raw` = 直接把历史拼给模型 |
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，对话时自动加载。
+
+**`--prompt-format`**：默认 `sft`，prompt 会被拼成训练时的模板形态（`用户：` / `助手：`，见 [§5](#5-sft--监督微调把续写变成应答)），
+并在模型吐出 `（结束）` 或 `用户：` 时停下——这样它接的是"该我回答了"的位置，而且不会顺着模板继续编下一轮提问。
+**未做过 SFT 的预训练权重请用 `--prompt-format raw`**：它没见过这套标记，套上模板只会更差。
 
 **上下文预算**：`block_size` 是「system prompt + 对话历史 + 本轮生成」三者共用的窗口。分配优先级依次是：
 system prompt 永远保留（它是序列开头的位置锚点），本轮生成预留 `--max-new` 个 token，剩下的额度给对话历史。
@@ -544,7 +555,109 @@ cargo run --release -- chat --ckpt checkpoints/best.ckpt --temperature 1.0 --max
 
 ---
 
-### 5. `finetune` —— 加载预训练权重微调
+### 5. `sft` —— 监督微调：把"续写"变成"应答"
+
+```bash
+cargo run --release -- sft [参数]
+```
+
+预训练的目标是"预测下一个 token"、语料是连续文本切片，所以模型学到的唯一行为就是**接着往下写**：
+你问它「1+1 等于几」，它会把这句话当成小说开头继续编下去。要让它"回答"，就得给它
+「提问 → 回答」的监督信号——这就是 SFT（监督微调）。
+
+与 `train` 的区别只有**数据与 loss**，训练循环完全共用：
+
+| | `train`（预训练） | `sft`（监督微调） |
+|---|---|---|
+| 样本 | 语料切片 | 对话（若干轮问答） |
+| 参与 loss 的位置 | 全部 | **只有回答段**（提问与角色标记被掩码屏蔽） |
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config <路径>` | string | `config/config.json` | 配置文件路径 |
+| `--pretrained <路径>` | string | 必填 | 预训练 checkpoint（SFT 必须从预训练权重出发） |
+| `--sft-file <路径>` | string | 用 config 的 `train.sft_file` | SFT 语料，逗号分隔，每项可为文件、目录或含 `*` 的路径 |
+| `--steps <步数>` | int | 用 config 的 `train.steps` | 微调步数 |
+| `--lr <学习率>` | float | config `train.max_lr` 的 **1/10** | 峰值学习率 |
+| `--out-dir <目录>` | string | `{config 的 out_dir}-sft` | 输出目录 |
+
+**输出目录默认带 `-sft` 后缀**：绝不写回 `out_dir`，否则会覆盖预训练攒下的 `latest.ckpt` / `best.ckpt`
+和整条 loss 曲线，SFT 效果不好就再也回不去了。指标 CSV 同理（写到 `{out_dir}/sft.csv`）。
+
+**学习率默认取预训练配置的 1/10**：SFT 是在已收敛的权重上继续训，用预训练那种步长会把预训练
+攒下的语言能力一起冲掉。显式传 `--lr` 时以你给的为准。
+
+**评估间隔会按步数自动收窄**：配置里的 `eval_every`（默认 200）是给预训练上万步用的，
+直接套在几百步的 SFT 上会把整段训练压成"只在最后评估一次"——`best.ckpt` 退化成 `final.ckpt`，
+早停也永远等不到第二次评估。所以实际取 `min(eval_every, steps/10)`。
+
+**`best.ckpt` 与 `final.ckpt` 都要试**：SFT 语料通常很小（本项目 89 段对话 / 18432 token，
+切 10% 当验证区），验证区与训练区同分布，于是 val 曲线往往**头几十步就见底**，之后
+train_loss 继续降而 val_loss 回升——`best.ckpt` 恰好是那个"刚开始像样"的欠训练快照。
+实测 `best.ckpt`（val 4.8569 @ step 50）聊出来的句子比 `final.ckpt`（train 2.5437 @ step 250）
+更散；`final.ckpt` 反而把中文助手的应答句式学得更足。两个都在输出目录里，各聊几句再定。
+
+**语料格式**：行首写角色标记，识别这些前缀（同一文件里混用两套也行）：
+
+```text
+用户：你好
+助手：你好！有什么可以帮你的？
+（空行分隔不同的对话）
+
+A: 吃了吗
+B: 吃了
+
+面试官：请介绍一下你自己。
+应聘者：我是一名后端工程师。
+```
+
+- 固定标签 `用户` / `助手` / `A` / `B` 有明确含义。
+- **人名标签**（`陈教授：` / `面试官：` / `张伟：`）按「该文件里谁先说」判定：第一个出现的算提问方。
+  它只在**整份文件 ≥90% 的非空行都是角色行、且说话人只有两个**时才启用——这样即使把
+  `sft_file` 指向混杂目录，也不会把小说正文（`秦琼道：……`）当成对话喂进来。
+- 不带角色标记的文本整体跳过。
+- 每段对话末尾的 `（结束）` 由程序自动补，**不用自己写**。
+
+**模板标记只用预训练语料里出现过的字**（自定义模板时同样适用）：`#` 在 4.7M 字的中文语料里
+只出现 2 次，它的 embedding 基本没被训过，模板一带上 `### ` 就会把模型推进 ASCII 乱码模式
+（实测基座模型输出 `'何人？」621.-----2..3E8188`）。所以模板用的是 `用户：` / `助手：` / `（结束）`，
+不是 `### 用户：` 这种 Markdown 风格标记；`【】` 同理不能用在标记里（也只出现 2 次）。
+
+**示例**：
+
+```bash
+# ── 基础 SFT（步数用 config 的，学习率用 config lr 的 1/10）──
+cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt
+
+# ── 指定语料与步数 ──
+cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt \
+    --sft-file "data/corpus/zh_dialogue_*.txt,data/sft/" --steps 300 --lr 1e-4
+
+# ── 训练完对话（--prompt-format 默认就是 sft）──
+cargo run --release -- chat --ckpt checkpoints/zh-sft/best.ckpt --max-new 60
+cargo run --release -- chat --ckpt checkpoints/zh-sft/final.ckpt --max-new 60
+```
+
+效果对照（`chat --temperature 0.3`，同一条输入「你好」）：
+
+| 权重 | 输出 | 行为 |
+|---|---|---|
+| 基座（`--prompt-format raw`） | `了？"那孩子們一碗。"` …接着往下写 | **续写**：把提问当小说开头 |
+| SFT `final.ckpt` | `我要这个月费。我们有限。您的账户用。` | **应答**：短句、现代中文、答完收尾 |
+
+> ⚠️ **能力上限**：SFT 只负责把"续写"扭成"应答"（学会角色位置、答完收尾），它教不出知识——
+> 模型知不知道「1+1 等于几」是预训练阶段决定的，而本项目默认模型只有 ~1.8M 参数、语料 ~4.7M 字，
+> 与真实 LLM 差了若干个数量级。要答得对，得先把预训练做够。
+>
+> 这不是猜测：基座自己的验证集 loss 从 step 4000 起就卡在 **6.2（ppl ≈ 500）**不再下降，
+> 4000→9600 步几乎原地踏步——它的"流利"主要来自把训练语料背下来，换个领域（明清小说 → 现代汉语问答）
+> 就没有可迁移能力。所以 SFT 后的句子虽然换成了助手的口吻（`当然可以帮…有什么？`、`您的账户`、
+> `行李额` 都确实来自 SFT 语料里的 technical_support / banking / travel 三段对话），
+> 但内容接不上问题本身。
+
+---
+
+### 6. `finetune` —— 加载预训练权重微调
 
 ```bash
 cargo run --release -- finetune [参数]
@@ -579,7 +692,7 @@ cargo run --release -- finetune --config config/config.json --pretrained checkpo
 
 ---
 
-### 6. `preset` —— 生成预设配置
+### 7. `preset` —— 生成预设配置
 
 ```bash
 cargo run --release -- preset [参数]
@@ -618,7 +731,7 @@ cargo run --release -- train --config config/config_medium.json
 
 ---
 
-### 7. `demo` —— 教学演示
+### 8. `demo` —— 教学演示
 
 ```bash
 cargo run --release -- demo
@@ -651,7 +764,7 @@ cargo run -- demo
 
 ---
 
-### 8. `bench` —— 性能基准
+### 9. `bench` —— 性能基准
 
 ```bash
 cargo run --release -- bench [参数]
@@ -710,7 +823,7 @@ cargo run --release -- bench --steps 30
 
 ---
 
-### 9. `cargo test` —— 单元测试
+### 10. `cargo test` —— 单元测试
 
 ```bash
 # ── 运行全部测试 ──
@@ -796,7 +909,7 @@ cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
 
 ---
 
-### 10. GPU 加速（可选 feature）
+### 11. GPU 加速（可选 feature）
 
 默认构建**不启用 GPU**，保持依赖轻量。通过 `--features gpu` 开启 wgpu 计算着色器加速：
 
@@ -1117,7 +1230,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **35 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 44 个（详见 [§9 `cargo test`](#9-cargo-test--单元测试)）
+- **48 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 57 个（详见 [§10 `cargo test`](#10-cargo-test--单元测试)）
 - 已知提示（`never used` 警告，不影响功能）：
   - `cargo build`（非 gpu）报 3 条：`layers.rs` 的 `ln_params`、`gelu_weights`，`tensor.rs` 的 `external` / `mul` / `neg` / `sum_last_dim`
   - `cargo build --features gpu` 报 2 条：`gpu.rs` 的 `GpuDispatchDiag.n`，`tensor.rs` 的 `mul` / `neg` / `sum_last_dim`
@@ -1183,8 +1296,8 @@ cargo run --release -- bench --steps 30
 | 推理（KV cache） | ~591 tok/s | ~1129 tok/s | **约 1.9×** |
 | 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
 
-**正确性**：35 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
-（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§8 `bench`](#8-bench--性能基准) 与 [§10 GPU 章节](#10-gpu-加速可选-feature)。）
+**正确性**：48 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§9 `bench`](#9-bench--性能基准) 与 [§11 GPU 章节](#11-gpu-加速可选-feature)。）
 
 ### 还能压的地方
 
@@ -1281,6 +1394,18 @@ loss 直接变 NaN，整轮实验作废。
 - **推理建图是纯浪费**：模型参数的 `requires_grad` 恒为 `true`，若算子只用它决定是否建图，
   推理时也会一路把整张计算图（含 backward 闭包）建出来。加一个全局 `no_grad` 开关、
   把判断改走 `Tensor::req()` 后，推理提升 1.9~3.9×。
+- **SFT 的 loss 掩码要右移一位对齐**：窗口里 `y[i] = tokens[start+1+i]`，所以第 `i` 个位置的掩码
+  要看**目标 token 所在的位置** `sup[start+1+i]`，而不是输入位置 `sup[start+i]`。少移这一位，
+  整个批次的监督信号会整体错开一个 token——loss 照降、形状全对，极难从结果看出来。
+- **SFT 模板标记只用语料里出现过的字**：`#` 在 4.7M 字的中文语料里只出现 2 次，它的 embedding
+  基本没被训过，模板一带上 `### ` 就把模型推进 ASCII/数字乱码模式（实测基座输出
+  `'何人？」621.-----2..3E8188`）。模板用 `用户：` / `助手：` / `（结束）` 而不是 Markdown 风格标记；
+  `【】` 同理不能用（也只出现 2 次）。加特殊 token 也能解，但会给已有 checkpoint 带来
+  "embedding 行数对不上"的兼容问题，字节级 BPE 本来就能编码任意 UTF-8 字符串，不必动词表。
+- **SFT 的说话人角色是文件级属性**：人名标签（`陈教授：` / `面试官：`）没有固定含义，按"该文件里
+  谁先说"判定；**跨文件共用一张表会把后面文件的角色弄反**，所以加载时要保留文件边界
+  （`load_texts` 而不是拼成一份）。人名标签只在整份文件 ≥90% 非空行是角色行、且说话人只有两个时
+  才启用——否则小说正文（`秦琼道：……`）会被当成对话喂进来。
 
 ## 后续方向
 

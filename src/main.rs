@@ -5,6 +5,7 @@
 //! - `cargo run --release -- eval     --config config/config.json [--ckpt checkpoints/latest.ckpt]`
 //! - `cargo run --release -- generate --config config/config.json [--ckpt ...] --prompt "Once" --max-new 100`
 //! - `cargo run --release -- chat     --config config/config.json [--ckpt ...] [--system "..."]`
+//! - `cargo run --release -- sft      --config config/config.json --pretrained ckpt [--sft-file "..."]`
 //! - `cargo run --release -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]`
 //! - `cargo run --release -- preset   [--name small] [--output config/config.json]`
 //! - `cargo run --release -- demo`    # 教学演示（XOR / BPE / 内置语料小 GPT）
@@ -40,7 +41,10 @@ mod train;
 
 use cli::{Cli, Cmd};
 use config::Config;
-use data::{CORPUS, DataLoader, load_text};
+use data::{
+    BatchSource, CORPUS, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, load_text,
+    load_texts,
+};
 use layers::{Linear, tanh};
 use loss::cross_entropy_loss;
 use model::{GPT, GPTConfig};
@@ -87,6 +91,7 @@ fn main() {
                 top_p,
                 repetition_penalty,
                 repetition_window,
+                stop: &[],
             },
             seed,
             no_kv_cache,
@@ -105,6 +110,7 @@ fn main() {
             repetition_window,
             max_new,
             seed,
+            prompt_format,
         } => cmd_chat(
             &config,
             ckpt.as_deref(),
@@ -116,9 +122,26 @@ fn main() {
                 top_p,
                 repetition_penalty,
                 repetition_window,
+                stop: &[],
             },
             max_new,
             seed,
+            &prompt_format,
+        ),
+        Cmd::Sft {
+            config,
+            pretrained,
+            sft_file,
+            steps,
+            lr,
+            out_dir,
+        } => cmd_sft(
+            &config,
+            &pretrained,
+            sft_file.as_deref(),
+            steps,
+            lr,
+            out_dir.as_deref(),
         ),
         Cmd::Finetune {
             config,
@@ -486,6 +509,38 @@ fn trim_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
     String::new()
 }
 
+/// SFT 模板下的历史裁剪：以 `SFT_USER` 为切点按**轮**丢，而不是按行。
+///
+/// 按行丢会把某轮拦腰截断（历史里一行只是回答中的一句），留下半截上下文。
+/// 每轮都以 `SFT_USER` 开头，从它的位置切就天然对齐到轮边界。
+fn trim_sft_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
+    if history.is_empty() || tokenizer.encode(history).len() <= budget {
+        return history.to_string();
+    }
+    for (pos, _) in history.match_indices(SFT_USER) {
+        let candidate = &history[pos..];
+        if tokenizer.encode(candidate).len() <= budget {
+            return candidate.to_string();
+        }
+    }
+    String::new()
+}
+
+/// SFT 模板下的停止标记：模型答完会自己吐 `（结束）`；
+/// 万一没学会收尾，它就会顺着模板编下一轮提问，所以 `用户：` 也是停止标记。
+const SFT_STOP: &[&str] = &[SFT_END, SFT_USER];
+
+/// 把 `i` 向前收敛到最近的字符边界（`String` 按字节切片时用，避免切出非法 UTF-8）
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// 交互式对话模式
 #[allow(clippy::too_many_arguments)]
 fn cmd_chat(
@@ -496,12 +551,20 @@ fn cmd_chat(
     opts: SampleOpts,
     max_new: usize,
     seed: u64,
+    prompt_format: &str,
 ) {
     let log_path = runlog::start("chat");
     println!("运行日志：{log_path}");
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
+    // SFT 模板：prompt 按训练时的对话模板拼，模型才会"回答"而不是"续写"。
+    // 没做过 SFT 的预训练权重用这个模板只会一脸茫然（它没见过这些标记），要 `--prompt-format raw`。
+    let use_sft = prompt_format == "sft";
+    let mut opts = opts;
+    if use_sft {
+        opts.stop = SFT_STOP;
+    }
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
     let (model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
     let mut rng = Rng::new(seed);
@@ -516,6 +579,7 @@ fn cmd_chat(
             ),
             ("模型结构", format!("{:?}", ckpt.model)),
             ("系统提示", if system.is_empty() { "无".to_string() } else { system.to_string() }),
+            ("prompt 模板", prompt_format.to_string()),
             ("每轮最大新 token", max_new.to_string()),
             ("seed", seed.to_string()),
             ("temperature", opts.temperature.to_string()),
@@ -592,13 +656,26 @@ fn cmd_chat(
         }
         turn += 1;
 
-        // 构造 prompt：system + 历史 + 当前输入。
+        // 构造 prompt：system + 历史 + 本轮。
         // system 固定在序列最前面并独立于裁剪，历史按 **token** 裁剪（不是字节/字符），
         // 并给本轮生成留够 max_new 个 token。
-        let n_input = tokenizer.encode(input).len();
-        // 历史预算 = 输入预算 - system（含其后 '\n'）- 本轮输入 - 历史与输入之间的 '\n'
-        let history_budget = prompt_budget.saturating_sub(n_system_prefix + n_input + 1);
-        let history = trim_history(&tokenizer, &context_history, history_budget);
+        //
+        // 本轮追加到 prompt 末尾的内容：raw 模式就是输入本身；
+        // SFT 模式下要补上角色标记，并且**停在「助手：」这一行之后**——
+        // 这正是训练时"轮到模型说话"的位置，模型才会接着写回答，而不是继续续写前文。
+        let tail = if use_sft {
+            format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n")
+        } else {
+            input.to_string()
+        };
+        let n_tail = tokenizer.encode(&tail).len();
+        // 历史预算 = 输入预算 - system（含其后 '\n'）- 本轮追加内容 - 历史与它之间的 '\n'
+        let history_budget = prompt_budget.saturating_sub(n_system_prefix + n_tail + 1);
+        let history = if use_sft {
+            trim_sft_history(&tokenizer, &context_history, history_budget)
+        } else {
+            trim_history(&tokenizer, &context_history, history_budget)
+        };
         if history.len() < context_history.len() {
             let n_before = tokenizer.encode(&context_history).len();
             let n_after = tokenizer.encode(&history).len();
@@ -633,7 +710,7 @@ fn cmd_chat(
             prompt.push_str(&history);
             prompt.push('\n');
         }
-        prompt.push_str(input);
+        prompt.push_str(&tail);
         runlog::append(&format!("\n[第 {turn} 轮] 输入：{input}"));
 
         let n_prompt = tokenizer.encode(&prompt).len();
@@ -655,31 +732,162 @@ fn cmd_chat(
         );
 
         // 只打印新生成的部分（去掉 prompt 前缀）
-        // 用 is_char_boundary 确保不在多字节字符中间截断（UTF-8 安全）
-        let response = if out.len() > prompt.len() {
-            let start = prompt.len();
-            let start = if out.is_char_boundary(start) { start } else { start + 1 };
-            out[start..].trim()
-        } else {
-            &out
-        };
+        let start = floor_char_boundary(&out, prompt.len());
+        let response = out[start..].trim();
         logln!("{response}");
         runlog::append(&format!("[第 {turn} 轮] 输出：{response}"));
 
-        // 更新历史：历史 = 旧历史 + 本轮输入 + 本轮回复（不含 system，它单独拼接）。
+        // 更新历史：历史 = 旧历史 + 本轮问答（不含 system，它单独拼接）。
         // 不要重复拼 `input`：prompt 里已含本轮输入，那会让每轮输入在窗口里占两份。
-        // 长度控制交给下一轮开头的 `trim_history`（按真实 token 数裁剪）。
+        // 长度控制交给下一轮开头的裁剪（按真实 token 数、SFT 模式下按轮）。
         context_history = history;
         if !context_history.is_empty() {
             context_history.push('\n');
         }
-        context_history.push_str(input);
-        if !response.is_empty() {
-            context_history.push('\n');
-            context_history.push_str(response);
+        if use_sft {
+            // 写成模板形态，下一轮就能被 `trim_sft_history` 按轮切开
+            context_history.push_str(&format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n{response}"));
+        } else {
+            context_history.push_str(input);
+            if !response.is_empty() {
+                context_history.push('\n');
+                context_history.push_str(response);
+            }
         }
     }
     runlog::append(&format!("\n对话结束：共 {} 轮", turn));
+    runlog::finish();
+}
+
+/// 监督微调（SFT）：用「提问→回答」语料教只会续写的预训练模型"回答"。
+///
+/// 与 `train` 的区别只有数据与 loss：样本是对话，且**只有回答段参与 loss**
+///（提问与角色标记被掩码屏蔽，见 [`data::SftLoader`]）。训练循环本身完全共用。
+fn cmd_sft(
+    config_path: &str,
+    pretrained_path: &str,
+    sft_file: Option<&str>,
+    steps: Option<usize>,
+    lr: Option<f32>,
+    out_dir: Option<&str>,
+) {
+    let log_path = runlog::start("sft");
+    println!("运行日志：{log_path}");
+    let mut cfg = Config::load(config_path);
+
+    // 步数与学习率：CLI 优先，其次配置文件。
+    // 学习率**不**默认沿用预训练量级：SFT 是在已收敛的权重上继续训，
+    // 用预训练的步长会把预训练攒下的语言能力一起冲掉（实测几百步就退化成乱码）。
+    // 未显式指定时取配置里 max_lr 的 1/10，并把实际取值记进日志。
+    if let Some(s) = steps {
+        cfg.train.steps = s;
+    }
+    let (max_lr, lr_source) = match lr {
+        Some(l) => (l, "--lr 指定".to_string()),
+        None => (
+            cfg.train.max_lr / 10.0,
+            "--lr 未指定，取 config max_lr 的 1/10".to_string(),
+        ),
+    };
+    cfg.train.max_lr = max_lr;
+    cfg.train.min_lr = max_lr * 0.1;
+    // 预热太长会让 SFT 大部分步数都耗在爬坡上
+    cfg.train.warmup_steps = cfg.train.warmup_steps.min(cfg.train.steps / 10).max(1);
+    // 评估间隔按步数收窄：配置里那是给预训练（上万步）的值，直接用在几百步的 SFT 上，
+    // 会把整段训练压成"只在最后评估一次"——best.ckpt 退化成 final.ckpt，
+    // 连续不改善才触发的早停也永远等不到第二次评估。收到约 1/10 就有十条曲线可看。
+    cfg.train.eval_every = cfg.train.eval_every.min(cfg.train.steps / 10).max(1);
+
+    let sft_paths = sft_file
+        .map(str::to_string)
+        .or_else(|| cfg.train.sft_file.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "未指定 SFT 语料：用 --sft-file，或在 {config_path} 里设置 train.sft_file"
+            )
+        });
+
+    // 输出目录默认加 `-sft` 后缀：绝不能直接写回 tcfg.out_dir，
+    // 那会覆盖预训练攒下的 latest.ckpt / best.ckpt —— SFT 效果不好就再也回不去了。
+    // 指标 CSV 同理，否则会把预训练那条 loss 曲线整条抹掉。
+    let out_dir = match out_dir {
+        Some(d) => d.to_string(),
+        None => format!("{}-sft", cfg.train.out_dir),
+    };
+    cfg.train.log_file = Some(format!("{out_dir}/sft.csv"));
+
+    runlog::json(&format!("完整配置（{config_path} + CLI 覆盖后）"), &cfg);
+    let tcfg = &cfg.train;
+
+    let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed, None);
+    // 语料可能散在多处，用逗号分隔（支持目录与 `*` 通配）。
+    // 按文件加载而不是拼成一份：说话人角色是文件级属性，拼接会让后面文件的角色弄反。
+    let sft_texts = load_texts(&sft_paths);
+
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            (
+                "预训练权重",
+                format!("{pretrained_path}（step {}）", ckpt.step),
+            ),
+            ("预训练模型结构", format!("{:?}", ckpt.model)),
+            ("SFT 语料", sft_paths.clone()),
+            (
+                "步数 / 学习率",
+                format!("{} / {}（{lr_source}）", tcfg.steps, tcfg.max_lr),
+            ),
+            ("输出目录", out_dir.clone()),
+            ("prompt 模板", format!("{SFT_USER} … {SFT_ASSISTANT} … {SFT_END}")),
+        ],
+    );
+
+    let mut rng = Rng::new(tcfg.seed);
+    let loader = SftLoader::from_texts(
+        &sft_texts,
+        &tokenizer,
+        ckpt.model.block_size,
+        tcfg.batch_size,
+    );
+    logln!(
+        "SFT 语料：{} 段对话，打包 {} token | 监督位置（回答段）占 {:.1}%",
+        loader.num_conversations(),
+        loader.num_tokens(),
+        100.0 * loader.supervised_ratio(),
+    );
+    if loader.supervised_ratio() < 0.05 {
+        logln!(
+            "[warn] 监督位置只有 {:.1}%，训练信号很稀——语料里提问与标记远多于回答",
+            100.0 * loader.supervised_ratio()
+        );
+    }
+
+    let best = train::train_gpt(
+        &model,
+        &tokenizer,
+        &loader,
+        tcfg,
+        Some(&out_dir),
+        None,
+        &mut rng,
+    );
+
+    // 把分词器一并放进输出目录，这个目录就是自包含的，推理时不必再指回预训练目录
+    tokenizer.save(&format!("{out_dir}/tokenizer.json"));
+
+    runlog::append(&format!("SFT 结束：best val loss = {best:.4}"));
+    logln!("SFT 完成，best val loss = {best:.4}");
+    // 两个 checkpoint 都给出，因为 SFT 语料往往很小：验证区与训练区同分布，val 曲线
+    // 常在头几十步就见底，之后 train 还在降而 val 回升——`best.ckpt` 取的是那个
+    // 「刚开始像样」的快照，`final.ckpt` 反而把回答的句式学得更足。
+    // 哪个更好只有自己聊两句才知道，所以两个都列出来。
+    logln!(
+        "用下面的命令对话（{SFT_ASSISTANT} 之后的模板会自动拼好）；\
+         建议 best.ckpt 与 final.ckpt 各聊几句再定——语料小时 final 常常更「会答」：\n  \
+         cargo run --release -- chat --ckpt {out_dir}/best.ckpt --tokenizer {out_dir}/tokenizer.json\n  \
+         cargo run --release -- chat --ckpt {out_dir}/final.ckpt --tokenizer {out_dir}/tokenizer.json"
+    );
     runlog::finish();
 }
 

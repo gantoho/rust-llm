@@ -19,8 +19,8 @@
 //! - LoRA 微调模式：冻结主模型，只训练 LoRA 层
 
 use crate::config::TrainConfig;
-use crate::data::DataLoader;
-use crate::loss::cross_entropy_loss;
+use crate::data::BatchSource;
+use crate::loss::cross_entropy_loss_masked;
 use crate::model::GPT;
 use crate::module::{Module, zero_grad_all};
 use crate::optim::{AdamW, Optimizer};
@@ -191,15 +191,15 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
 /// 在验证集上评估：平均 loss（perplexity = e^loss）
 ///
 /// `eval_iters` 批的平均，调用方用固定种子的 Rng 可保证结果可复现。
-pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut Rng) -> f32 {
+pub fn eval_loss(model: &GPT, loader: &dyn BatchSource, eval_iters: usize, rng: &mut Rng) -> f32 {
     zero_grad_all(model); // 评估前清零梯度，避免残留影响
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
-        let (x, y) = loader.eval_batch(rng);
+        let (x, y, mask) = loader.eval_batch(rng);
         // 评估只做前向，无需建图：no_grad 下省掉整张计算图
         let loss = crate::tensor::no_grad(|| {
             let logits = model.forward(&x, loader.batch_size(), loader.block_size(), None, false);
-            cross_entropy_loss(&logits, &y)
+            cross_entropy_loss_masked(&logits, &y, mask.as_deref())
         });
         total += loss.item();
     }
@@ -215,10 +215,15 @@ pub fn eval_loss(model: &GPT, loader: &DataLoader, eval_iters: usize, rng: &mut 
 /// 交叉熵对 logits 的梯度是解析式的（softmax - onehot），不依赖上游梯度，
 /// 所以不必为中间那段建计算图：直接算好边界上的梯度、注入图上的张量即可，
 /// autograd 会从这些张量继续往前传播。
+///
+/// `mask` 为 SFT 的 loss 掩码（`None` = 全位置参与）。带掩码时**不走**常驻显存路径：
+/// 那条路径的 GPU 交叉熵核不接受逐位置权重，硬走会悄悄把掩码丢掉，
+/// 变成"以为在按回答算 loss、其实整个窗口都在算"。宁可慢一点，也不能错。
 fn forward_loss(
     model: &GPT,
     x: &[usize],
     y: &[usize],
+    mask: Option<&[bool]>,
     batch_size: usize,
     block_size: usize,
     accum: usize,
@@ -228,7 +233,7 @@ fn forward_loss(
     let inv_accum = 1.0 / accum as f32;
 
     #[cfg(feature = "gpu")]
-    if crate::tensor::grad_enabled() {
+    if mask.is_none() && crate::tensor::grad_enabled() {
         let rows = batch_size * block_size;
         let d = hidden.shape()[1];
         let vocab = head.shape()[0];
@@ -247,7 +252,7 @@ fn forward_loss(
 
     // 回落：逐算子路径，输出头照旧走 Tensor 算子
     let logits = hidden.matmul(&head.transpose());
-    let loss = cross_entropy_loss(&logits, y);
+    let loss = cross_entropy_loss_masked(&logits, y, mask);
     if accum == 1 {
         return loss;
     }
@@ -294,6 +299,9 @@ impl MetricsLogger {
 
 /// 训练函数（支持验证评估与 checkpoint）
 ///
+/// `loader` 用 [`BatchSource`] 抽象，预训练（[`crate::data::DataLoader`]）与
+/// SFT（[`crate::data::SftLoader`]）共用这段循环——差别只在采样出的批次带不带 loss 掩码。
+///
 /// - `out_dir = None` 时不保存 checkpoint（demo 用）
 /// - `resume_from = Some(path)` 时从 checkpoint 续训（恢复参数、优化器状态与步数）
 ///
@@ -301,7 +309,7 @@ impl MetricsLogger {
 pub fn train_gpt(
     model: &GPT,
     tokenizer: &Tokenizer,
-    loader: &DataLoader,
+    loader: &dyn BatchSource,
     cfg: &TrainConfig,
     out_dir: Option<&str>,
     resume_from: Option<&str>,
@@ -381,12 +389,12 @@ pub fn train_gpt(
     // 实际完成到的步数：早停会提前退出，结尾统计与 final.ckpt 都不能用 cfg.steps
     let mut last_step_done = start_step;
     for step in start_step..cfg.steps {
-        // 1. 采样 batch
-        let (x, y) = loader.sample_batch(rng);
+        // 1. 采样 batch（SFT 语料会额外带回 loss 掩码）
+        let (x, y, mask) = loader.sample_batch(rng);
 
         // 2. 前向 + 损失（梯度累积时反向按 1/accum 缩放）
         let t_seg = std::time::Instant::now();
-        let loss = forward_loss(&model, &x, &y, batch_size, block_size, accum);
+        let loss = forward_loss(&model, &x, &y, mask.as_deref(), batch_size, block_size, accum);
         let fwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
 
         // 3. 反向（梯度自动累加到现有梯度上）

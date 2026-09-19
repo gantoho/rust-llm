@@ -30,6 +30,7 @@
     "tokenizer_file": "checkpoints/zh/tokenizer.json",
     "lora": null,
     "log_file": "checkpoints/zh/train.csv",
-    "early_stop_patience": 10
+    "early_stop_patience": 10,
+    "sft_file": "data/corpus/zh_dialogue_*.txt,data/sft/"
   }
 }

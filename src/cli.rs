@@ -5,6 +5,7 @@
 //! cargo run -- eval     --config config/config.json [--ckpt checkpoints/latest.ckpt]
 //! cargo run -- generate --config config/config.json [--ckpt ...] [--prompt "Once"] [--max-new 100] ...
 //! cargo run -- chat     --config config/config.json [--ckpt ...] [--system "..."]
+//! cargo run -- sft      --config config/config.json --pretrained ckpt [--sft-file "..."]
 //! cargo run -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]
 //! cargo run -- preset   [--name small] [--output config/config.json]
 //! cargo run -- demo     # 教学演示（XOR + BPE + 内置语料小 GPT）
@@ -13,7 +14,7 @@
 //!
 //! 目录约定：配置在 `config/`、权重在 `checkpoints/`、日志在 `logs/`（见 [`crate::config`] 的常量）。
 //!
-//! 其中 `train` / `finetune` / `eval` / `generate` / `chat` 每次运行都会自动在 `logs/` 下
+//! 其中 `train` / `sft` / `finetune` / `eval` / `generate` / `chat` 每次运行都会自动在 `logs/` 下
 //! 写一份 `{操作}_{时间戳}.log` 运行日志（完整命令行 + 完整配置 + 过程输出），见 [`crate::runlog`]。
 
 use clap::{Parser, Subcommand};
@@ -134,6 +135,31 @@ pub enum Cmd {
         /// 随机种子
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// prompt 模板：`sft` = 与 `sft` 子命令训练时一致的对话模板（模型才会"回答"）；
+        /// `raw` = 直接把历史拼给模型（只有预训练权重、未做过 SFT 时用）
+        #[arg(long, value_parser = ["sft", "raw"], default_value = "sft")]
+        prompt_format: String,
+    },
+    /// 监督微调（SFT）：用「提问→回答」语料把只会续写的预训练模型教会应答
+    Sft {
+        /// 配置文件路径
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
+        config: String,
+        /// 预训练 checkpoint（SFT 必须从预训练权重出发）
+        #[arg(long)]
+        pretrained: String,
+        /// SFT 语料路径（逗号分隔，可含 `*` 通配）；缺省用 config 里的 train.sft_file
+        #[arg(long)]
+        sft_file: Option<String>,
+        /// 微调步数（缺省用 config 里的 train.steps）
+        #[arg(long)]
+        steps: Option<usize>,
+        /// 峰值学习率（缺省用 config 里的 train.max_lr；SFT 通常要比预训练小一个量级）
+        #[arg(long)]
+        lr: Option<f32>,
+        /// 输出目录（缺省 `{config 的 out_dir}-sft`，避免覆盖预训练权重）
+        #[arg(long)]
+        out_dir: Option<String>,
     },
     /// LoRA 微调：冻结预训练模型，只训练低秩适配层
     Finetune {

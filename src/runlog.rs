@@ -65,7 +65,7 @@ fn with_log(f: impl FnOnce(&mut RunLog)) {
 
 /// 创建本次运行的日志文件并写入头部，返回日志路径。
 ///
-/// `op` 为操作名（`train` / `finetune` / `eval` / `generate` / `chat`），用作文件名前缀。
+/// `op` 为操作名（`train` / `sft` / `finetune` / `eval` / `generate` / `chat`），用作文件名前缀。
 /// 文件名时间戳与头部「开始时间」都取命令开始执行的时刻（见 [`mark_start`]）。
 /// 重复调用只保留第一次创建的日志文件。
 pub fn start(op: &str) -> String {

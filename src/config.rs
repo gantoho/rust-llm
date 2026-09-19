@@ -69,6 +69,11 @@ pub struct TrainConfig {
     /// 早停耐心值：验证 loss 连续 N 次评估不改善就提前终止训练。
     /// 0 = 不启用早停（默认）。
     pub early_stop_patience: usize,
+    /// SFT（监督微调）语料路径：以 `,` 分隔，每项可以是文件、目录或以 `*` 通配的路径。
+    ///
+    /// 只对 `sft` 子命令有意义。语料按对话解析：行首带角色标记的算一轮问答，
+    /// 不带任何角色标记的文本会被整体跳过（所以指向混杂目录也不会把小说正文喂进来）。
+    pub sft_file: Option<String>,
 }
 
 /// LoRA 微调配置
@@ -101,6 +106,7 @@ impl Default for TrainConfig {
             lora: None,
             log_file: Some(DEFAULT_LOG_FILE.to_string()),
             early_stop_patience: 0,
+            sft_file: None,
         }
     }
 }

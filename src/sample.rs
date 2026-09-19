@@ -30,6 +30,12 @@ pub struct SampleOpts {
     pub repetition_penalty: f32,
     /// 重复惩罚回看窗口：只看最近 N 个 token（0 = 关闭）
     pub repetition_window: usize,
+    /// 生成到其中任意一个字符串出现就停下，结果**不含**该标记。
+    ///
+    /// 用 `&'static [&'static str]` 而不是 `Vec<String>`：停止标记就是模板常量
+    ///（见 [`crate::data::SFT_END`]），编译期就知道；这样 `SampleOpts` 仍是 `Copy`，
+    /// 每次生成也不必为字符串分配内存。
+    pub stop: &'static [&'static str],
 }
 
 impl Default for SampleOpts {
@@ -40,6 +46,7 @@ impl Default for SampleOpts {
             top_p: 0.9,
             repetition_penalty: 1.1,
             repetition_window: 64,
+            stop: &[],
         }
     }
 }
@@ -130,7 +137,7 @@ pub fn sample_token(
 ///
 /// - prompt: 起始文本
 /// - max_new: 最多生成多少个新 token
-/// - opts: 采样超参数（含重复惩罚）
+/// - opts: 采样超参数（含重复惩罚与停止标记 `opts.stop`）
 /// - use_kv_cache: 是否使用 KV cache 加速（第 18 课）
 pub fn generate(
     model: &GPT,
@@ -205,22 +212,42 @@ pub fn generate(
         };
         let next = sample_token(row, opts, recent, rng);
         ids.push(next);
+
+        // 命中停止标记就收：SFT 模板下模型答完会自己吐「（结束）」，
+        // 不截断的话它会顺着模板继续编下一轮提问（"回答后面跟提问"在训练语料里到处都是）。
+        //
+        // 只在**新生成的部分**里查找：prompt 自己就含「用户：」（模板的一部分），
+        // 对整个字符串搜索会立刻在 prompt 里命中，结果返回空白。
+        // 每步解码一次整串：长度上限就是 block_size，这点开销远小于一次前向。
+        if !opts.stop.is_empty() {
+            let text = tokenizer.decode(&ids);
+            if let Some(generated) = text.get(prompt.len()..) {
+                if let Some(rel) = opts.stop.iter().filter_map(|s| generated.find(s)).min() {
+                    return text[..prompt.len() + rel].trim_end().to_string();
+                }
+            }
+        }
     }
 
     if hit_window_limit {
-        // 不能静默变短：同一个 prompt 加不加 KV cache 会得到不同长度，用户必须知情。
-        // 打到 stderr 而不是 stdout —— stdout 是生成结果（`generate` 子命令可能被重定向到文件），
-        // 但同时也写进运行日志，否则事后复盘看不到"这次生成为什么变短了"。
-        let msg = format!(
-            "[warn] KV cache 窗口已满（block_size={block_size}），生成在 {} 个 token 处提前结束；\
-             需要更长输出请缩短 prompt，或加 --no-kv-cache 改用全量前向（滑动窗口可继续生成）",
-            ids.len()
-        );
-        eprintln!("{msg}");
-        crate::runlog::append(&msg);
+        warn_window_full(block_size, ids.len());
     }
 
     tokenizer.decode(&ids)
+}
+
+/// 生成被窗口截断时的告警。
+///
+/// 不能静默变短：同一个 prompt 加不加 KV cache 会得到不同长度，用户必须知情。
+/// 打到 stderr 而不是 stdout —— stdout 是生成结果（`generate` 子命令可能被重定向到文件），
+/// 但同时也写进运行日志，否则事后复盘看不到"这次生成为什么变短了"。
+fn warn_window_full(block_size: usize, n_ids: usize) {
+    let msg = format!(
+        "[warn] KV cache 窗口已满（block_size={block_size}），生成在 {n_ids} 个 token 处提前结束；\
+         需要更长输出请缩短 prompt，或加 --no-kv-cache 改用全量前向（滑动窗口可继续生成）"
+    );
+    eprintln!("{msg}");
+    crate::runlog::append(&msg);
 }
 
 /// Beam Search 生成：维护 `beam_size` 个候选序列，每步扩展后保留 top-k。
@@ -399,6 +426,7 @@ mod tests {
             top_p: 0.9,
             repetition_penalty: 1.1,
             repetition_window: 64,
+            stop: &[],
         }
     }
 
@@ -449,6 +477,7 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: penalty,
             repetition_window: 8,
+            stop: &[],
         };
 
         // id=1 领先 id=2 一点点；惩罚 2.0 之后 4.0/2.0 = 2.0 < 3.9，id=2 反超
