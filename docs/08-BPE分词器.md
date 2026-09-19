@@ -259,8 +259,20 @@ pub fn decode(&self, ids: &[usize]) -> String {
     match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
-            skip_invalid_utf8(e.as_bytes())
+            let bytes = e.as_bytes();
+            match utf8_pending(bytes) {
+                // 合法前缀：末尾停在字符中间（半个汉字），丢掉不完整的尾部字节
+                Some(tail) => {
+                    let keep = bytes.len() - tail.len();
+                    String::from_utf8(bytes[..keep].to_vec())
+                        .expect("前缀已被 utf8_pending 判定为完整 UTF-8")
+                }
+                // 非法字节：不该出现，保留警告便于定位
+                None => {
+                    eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
+                    skip_invalid_utf8(bytes)
+                }
+            }
         }
     }
 }
@@ -268,9 +280,58 @@ pub fn decode(&self, ids: &[usize]) -> String {
 
 - `vocab[id]`：id → 字节序列（0~255 是单字节，256+ 是合并出来的多字节序列）
 - 越界 id 用 `vocab.get(id)` 拦截：带下标信息的 panic 提示（decode 也会因传入非法 id 报错，不再是"永不失败"）
-- `skip_invalid_utf8`：万一拼出非法 UTF-8，跳过无效字节只保留合法部分（不插入无意义的替换字符），并在 stderr 打印警告
+- **末尾半个字符**：生成按 token 数（`max_new`）截断时，最后一个 token 可能只覆盖某个字符的一部分，此时末尾几个字节凑不成字符——丢掉它们返回前面完整的部分。这是"按 token 截断"的固有结果（中文一个字 3 字节，停半个字的概率并不低），不是错误，所以**不打印警告**
+- `skip_invalid_utf8`：真正的非法字节（如 [E4] 后面直接跟 ASCII）会跳过无效字节只保留合法部分，并在 stderr 打印警告；中间位置的乱码已由 7.1 的采样约束排除，走到这里就说明有 bug
 
 > 完整闭环：`decode(encode("lowest new")) == "lowest new"`（单元测试 `test_bpe_roundtrip` 验证）。
+
+### 7.1 生成时的 UTF-8 约束（推理专用）
+
+训练时 `decode(encode(x)) == x` 永远成立，但**推理不一样**：模型是从 logits 里自由采样的，可能挑中"半个汉字"的 token。
+
+字节级词表里 0~255 是单字节，所以必然存在这些 token：
+
+```text
+id 228 -> [E4]        "中"（E4 B8 AD）的首字节
+id 184 -> [B8]        中间字节
+id 173 -> [AD]        末尾字节
+```
+
+碎片一旦乱序（比如 [E4] 后面直接跟 ASCII），拼出来的字节流就不是合法 UTF-8，`decode` 只能丢弃无效字节并打印警告——**文字会缺字、乱码，且已经无法补救**。
+
+正确做法是在**采样前**就把它们排除，而不是等拼完再擦屁股：
+
+| 位置 | 函数 | 作用 |
+|------|------|------|
+| `src/tokenizer.rs` | `utf8_pending(bytes)` | 判断字节串是否仍是**合法的 UTF-8 前缀**（允许停在字符中间，如 `E4 B8`）；返回未拼完的尾部字节，`None` 表示已非法 |
+| `src/sample.rs` | `pending_tail(vocab, ids)` | 从已生成的 token 反推末尾未拼完的字节（最多 3 字节，需回看末尾几个 token） |
+| `src/sample.rs` | `mask_illegal_utf8(logits, vocab, pending)` | 把"接上后不再合法"的 token 的 logit 置为 `-inf`，采样时自然抽不到 |
+
+```rust
+// src/sample.rs（generate / beam_search 每步采样前）
+let row: &[f32] = match vocab_bytes {
+    Some(vocab) => {
+        masked.clear();
+        masked.extend_from_slice(last_row);
+        mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, &ids));
+        &masked
+    }
+    None => last_row, // char 分词器每个 token 都是完整字符，无需约束
+};
+```
+
+等价于"把这些 token 的概率设为 0 后重新归一化"：温度、top-k / top-p、重复惩罚的顺序都不受影响，只是候选集变小了。代价是每步多一次 O(词表大小) 的字节检查（8192 词表约几十微秒），换来**生成的字节流在任何位置都不会出现乱码**。
+
+约束保证的是"每一步接上后仍是合法前缀"，所以还剩最后一种情况：生成到 `max_new` 停下来时，末尾可能正好是"半个字符"（前缀合法，但整个字节流不是完整的 UTF-8）。这不是乱码，只是被 token 数截断了，`decode` 会把尾部这几个字节丢掉（见第 7 节）。
+
+因此 `decode` 的两种兜底各司其职：
+
+| 情况 | 现象 | 处理 |
+|------|------|------|
+| 末尾停在半个字符 | `from_utf8` 报 `incomplete ... from index N`，N = 完整部分长度 | 丢掉尾部字节，**不报警**（正常现象） |
+| 中间出现非法字节 | `from_utf8` 报 `invalid ... from index N`，N < 长度 | 跳过无效字节 + stderr 警告（采样约束已排除，出现即 bug） |
+
+> `char` 分词器不受影响：它的每个 token 就是一个完整字符，`vocab_bytes()` 返回 `None`，跳过整个约束。
 
 ---
 
@@ -280,7 +341,8 @@ pub fn decode(&self, ids: &[usize]) -> String {
 |------|--------|---------|-----------|
 | 训练 train | 从语料学合并规则 | 统计 pair → 合并最高频 → 替换（循环至目标词表大小） | `merges`（规则）+ `vocab`（字节序列）|
 | 编码 encode | 对新文本按规则贪心合并 | 按规则优先级（merges 顺序）单趟扫描替换 | 一串 token id |
-| 解码 decode | id → 字节序列拼接 | `vocab[id]` 逐个拼接 + `skip_invalid_utf8` 跳过非法字节 | 还原的文本 |
+| 解码 decode | id → 字节序列拼接 | `vocab[id]` 逐个拼接；末尾半个字符丢掉，非法字节跳过（见第 7 节） | 还原的文本 |
+| 生成约束 | 采样时剔除"半个字符" | `utf8_pending` + `mask_illegal_utf8`（见 7.1） | 生成的字节流中间不会出现乱码 |
 
 三者关系：**编码必须复现训练时的合并顺序**，解码只是查表，所以编码、解码天然互逆，`decode(encode(x)) == x`。
 

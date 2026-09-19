@@ -221,6 +221,11 @@ impl BPETokenizer {
     }
 
     /// token id 序列 -> 文本
+    ///
+    /// 生成被 token 数（`max_new`）截断时，最后一个 token 可能只覆盖某个字符的一部分，
+    /// 此时末尾几个字节凑不成字符：**丢掉它们**返回前面完整的部分。
+    /// 这是"按 token 截断"的固有结果，不是错误，因此不打印警告。
+    /// 真正的非法字节（采样阶段已由 UTF-8 约束排除，见 `crate::sample`）才会报警。
     pub fn decode(&self, ids: &[usize]) -> String {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
@@ -233,8 +238,20 @@ impl BPETokenizer {
         match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
-                skip_invalid_utf8(e.as_bytes())
+                let bytes = e.as_bytes();
+                match utf8_pending(bytes) {
+                    // 合法前缀：只是末尾停在字符中间（半个汉字），丢掉不完整的尾部字节
+                    Some(tail) => {
+                        let keep = bytes.len() - tail.len();
+                        String::from_utf8(bytes[..keep].to_vec())
+                            .expect("前缀已被 utf8_pending 判定为完整 UTF-8")
+                    }
+                    // 非法字节：不该出现，保留警告便于定位
+                    None => {
+                        eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
+                        skip_invalid_utf8(bytes)
+                    }
+                }
             }
         }
     }
@@ -344,6 +361,16 @@ impl Tokenizer {
         }
     }
 
+    /// 词表中每个 token 的字节序列，供生成时做 UTF-8 约束（见 [`utf8_pending`]）。
+    ///
+    /// `char` 分词器每个 token 都是完整字符，不可能拼出非法 UTF-8，因此返回 `None`。
+    pub fn vocab_bytes(&self) -> Option<&[Vec<u8>]> {
+        match self {
+            Tokenizer::Char(_) => None,
+            Tokenizer::Bpe(t) => Some(&t.vocab),
+        }
+    }
+
     /// 类型名（打印用）："char" / "bpe"
     pub fn kind(&self) -> &'static str {
         match self {
@@ -425,7 +452,51 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
         }
         cp = (cp << 6) | (b as u32 & 0x3F);
     }
+    // 每种字节长度都有码点下限，低于下限的是"过长编码"（如 C0 80 表示 U+0000），同样非法
+    let min = match len {
+        1 => 0,
+        2 => 0x80,
+        3 => 0x800,
+        _ => 0x1_0000,
+    };
+    if cp < min {
+        return None;
+    }
     char::from_u32(cp).map(|c| (c, len))
+}
+
+/// 判断字节串是否是**合法的 UTF-8 前缀**（允许停在某个字符中间，如 `E4 B8` 之于"中"）。
+///
+/// - `Some(尾部字节)`：合法前缀，`尾部字节` 是尚未拼完的部分（空切片 = 正好停在字符边界）
+/// - `None`：已经出现非法字节
+///
+/// 字节级 BPE 生成时用它做约束：只有结果仍返回 `Some` 的 token 才允许被采样到。
+pub fn utf8_pending(bytes: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if let Some((_, len)) = decode_utf8_char(rest) {
+            i += len; // 完整字符，继续往后
+            continue;
+        }
+        // 解不出完整字符：只有"字节数还不够 + 已有的续字节都合法"才是合法前缀，
+        // 长度够了还解不出来（含过长编码、代理区码点）就是非法字节。
+        let b = rest[0];
+        let expect = if b & 0xE0 == 0xC0 {
+            2
+        } else if b & 0xF0 == 0xE0 {
+            3
+        } else if b & 0xF8 == 0xF0 {
+            4
+        } else {
+            return None; // 续字节或非法起始字节开头
+        };
+        if rest.len() >= expect || rest[1..].iter().any(|&x| x & 0xC0 != 0x80) {
+            return None;
+        }
+        return Some(rest);
+    }
+    Some(&[])
 }
 
 // ==================== 测试 ====================
@@ -457,5 +528,40 @@ mod tests {
             "high-frequency 子词应被压缩，实际 {} 个 token",
             ids_low.len()
         );
+    }
+
+    #[test]
+    fn test_utf8_pending_accepts_only_legal_prefix() {
+        let zhong = "中".as_bytes(); // E4 B8 AD
+        // 完整字符 / 纯 ASCII：停在字符边界，尾部为空
+        assert_eq!(utf8_pending(b"abc").map(<[u8]>::len), Some(0));
+        assert_eq!(utf8_pending(zhong).map(<[u8]>::len), Some(0));
+        // 少一字节：合法的不完整前缀，尾部就是这两个字节
+        assert_eq!(utf8_pending(&zhong[..2]).map(<[u8]>::len), Some(2));
+        assert_eq!(utf8_pending(&zhong[..1]).map(<[u8]>::len), Some(1));
+        // ASCII 跟在未完成的字符后面 → 非法
+        assert_eq!(utf8_pending(&[zhong[0], b'A']).map(<[u8]>::len), None);
+        // 孤立的续字节 → 非法
+        assert_eq!(utf8_pending(&[0x80]).map(<[u8]>::len), None);
+        // 过长编码（C0 80 表示 U+0000）→ 非法
+        assert_eq!(utf8_pending(&[0xC0, 0x80]).map(<[u8]>::len), None);
+        // 非法起始字节（F8 以上）→ 非法
+        assert_eq!(utf8_pending(&[0xF8]).map(<[u8]>::len), None);
+        // 三字节编码落在代理区（ED A0 80）→ 非法
+        assert_eq!(utf8_pending(&[0xED, 0xA0, 0x80]).map(<[u8]>::len), None);
+    }
+
+    /// 生成被 token 数截断时，末尾可能只有"半个汉字"，decode 应丢掉它而不是报错。
+    #[test]
+    fn test_decode_drops_incomplete_tail() {
+        let tok = BPETokenizer::train("中文测试中文测试", 300);
+        let mut ids = tok.encode("中");
+        ids.push(0xE4); // 再补一个"中"的首字节：凑不成字符
+        assert_eq!(tok.decode(&ids), "中", "末尾不完整的字节应被丢弃");
+
+        // 末尾凑成"半个字符"（E4 B8 是"中"的前两字节）时同样处理
+        let mut ids = tok.encode("测试");
+        ids.extend_from_slice(&[0xE4, 0xB8]);
+        assert_eq!(tok.decode(&ids), "测试");
     }
 }

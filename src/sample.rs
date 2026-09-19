@@ -150,6 +150,9 @@ pub fn generate(
     let mut cache = use_kv_cache.then(|| model.new_kv_cache());
     // 缓存窗口写满时是否提前结束（全量模式会滑动窗口继续，KV cache 做不到）
     let mut hit_window_limit = false;
+    // 字节级 BPE 的 UTF-8 约束：词表里有"半个汉字"，采样前要把它们排除（char 分词器返回 None）
+    let vocab_bytes = tokenizer.vocab_bytes();
+    let mut masked: Vec<f32> = Vec::new();
 
     for _ in 0..max_new {
         // KV cache 模式：上下文总长达到 block_size 就停（缓存无法像全量模式那样截断历史）
@@ -182,6 +185,16 @@ pub fn generate(
         let v = model.cfg.vocab_size;
         let n = logits.numel();
         let last_row = &logits.data()[n - v..];
+        // 只允许"接上后仍是合法 UTF-8 前缀"的 token，否则会拼出半个字符
+        let row: &[f32] = match vocab_bytes {
+            Some(vocab) => {
+                masked.clear();
+                masked.extend_from_slice(last_row);
+                mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, &ids));
+                &masked
+            }
+            None => last_row,
+        };
         // 重复惩罚的回看窗口：只看最近 N 个 token（含 prompt），更早的不再计入。
         // 窗口过大时高频 token 会被持续压低，可能影响语句的连贯性。
         let recent = if opts.repetition_window == 0 {
@@ -190,7 +203,7 @@ pub fn generate(
             let start = ids.len().saturating_sub(opts.repetition_window);
             &ids[start..]
         };
-        let next = sample_token(last_row, opts, recent, rng);
+        let next = sample_token(row, opts, recent, rng);
         ids.push(next);
     }
 
@@ -241,6 +254,9 @@ pub fn beam_search(
 
     // 每个 beam: (token_ids, cumulative_log_prob)
     let mut beams: Vec<(Vec<usize>, f64)> = vec![(prompt_ids, 0.0)];
+    // 字节级 BPE 的 UTF-8 约束（同 generate：排除"半个汉字"的 token）
+    let vocab_bytes = tokenizer.vocab_bytes();
+    let mut masked: Vec<f32> = Vec::new();
 
     for _step in 0..max_new {
         let mut candidates: Vec<(Vec<usize>, f64)> = Vec::new();
@@ -260,11 +276,22 @@ pub fn beam_search(
             let logits = crate::tensor::no_grad(|| model.forward(ctx, 1, ctx.len(), None, false));
             let n = logits.numel();
             let last_row = &logits.data()[n - vocab_size..];
+            // 只允许"接上后仍是合法 UTF-8 前缀"的 token
+            let row: &[f32] = match vocab_bytes {
+                Some(vocab) => {
+                    masked.clear();
+                    masked.extend_from_slice(last_row);
+                    mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, ids));
+                    &masked
+                }
+                None => last_row,
+            };
 
             // 找 top-beam_size 个候选 token
-            let mut scored: Vec<(usize, f64)> = last_row
+            let mut scored: Vec<(usize, f64)> = row
                 .iter()
                 .enumerate()
+                .filter(|(_, l)| l.is_finite()) // 被屏蔽的 -inf 直接跳过
                 .map(|(i, &l)| (i, *score + l as f64))
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -303,6 +330,49 @@ pub fn beam_search(
         .unwrap();
 
     tokenizer.decode(&best.0)
+}
+
+// ==================== 生成时的 UTF-8 约束 ====================
+
+/// 把"接上后不再是合法 UTF-8 前缀"的 token 的 logit 置为 `-inf`，采样时自然抽不到。
+///
+/// 字节级 BPE 的词表里有"半个汉字"（如只含 `E4` 或 `B8`）。训练时它们能拼回原文，
+/// 但推理是模型自由采样的，碎片一旦乱序就会拼出非法 UTF-8（表现为丢字、乱码）。
+/// 这里在采样前剪掉这些 token：数学上等价于把这些 token 的概率设为 0 后重新归一化。
+///
+/// `pending` 是当前字节流末尾未拼完的字节（见 [`pending_tail`]）。
+fn mask_illegal_utf8(logits: &mut [f32], vocab: &[Vec<u8>], pending: &[u8]) {
+    let mut buf: Vec<u8> = Vec::with_capacity(pending.len() + 4);
+    for (id, logit) in logits.iter_mut().enumerate() {
+        let Some(tok) = vocab.get(id) else { continue };
+        buf.clear();
+        buf.extend_from_slice(pending);
+        buf.extend_from_slice(tok);
+        if crate::tokenizer::utf8_pending(&buf).is_none() {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// 算出已生成 token 序列末尾"未拼完的字节"（最多 3 字节，UTF-8 单字符最长 4 字节）。
+///
+/// 只需回看末尾几个 token：取满 8 个（每个至少 1 字节）必然覆盖最近的字符边界。
+fn pending_tail(vocab: &[Vec<u8>], ids: &[usize]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    for &id in ids.iter().rev().take(8) {
+        let Some(tok) = vocab.get(id) else { continue };
+        let mut head = tok.clone();
+        head.extend_from_slice(&buf);
+        buf = head;
+    }
+    // buf 的开头可能落在上一个字符中间（token 本身可以从非字符边界开始），
+    // 因此从前往后找第一个能解析成合法前缀的位置。
+    for j in 0..buf.len() {
+        if let Some(rest) = crate::tokenizer::utf8_pending(&buf[j..]) {
+            return rest.to_vec();
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -404,5 +474,44 @@ mod tests {
                 "负 logit 也应被压低"
             );
         }
+    }
+
+    /// 字节级 BPE 的"半个汉字"token 必须在采样前屏蔽，否则会拼出非法 UTF-8。
+    #[test]
+    fn test_utf8_mask_blocks_half_char_tokens() {
+        let tok = Tokenizer::bpe("中文测试中文测试中文测试", 300);
+        let vocab = tok.vocab_bytes().expect("BPE 是字节级词表");
+        let a = b'A' as usize; // 单字节 token id 0..255 恒等于字节值
+
+        // 停在"中"的首字节 E4 上：此时接 ASCII 会立刻拼出非法序列
+        let mut logits = vec![0.0f32; tok.vocab_size()];
+        mask_illegal_utf8(&mut logits, vocab, &[0xE4]);
+        assert!(logits[a].is_infinite(), "ASCII 接在多字节字符中间应被屏蔽");
+        assert!(logits[0xB8].is_finite(), "合法的续字节应保留");
+
+        // 停在字符边界上：ASCII 合法，孤立的续字节非法
+        let mut logits = vec![0.0f32; tok.vocab_size()];
+        mask_illegal_utf8(&mut logits, vocab, &[]);
+        assert!(logits[a].is_finite(), "字符边界上 ASCII 合法");
+        assert!(logits[0x80].is_infinite(), "孤立的续字节应被屏蔽");
+    }
+
+    /// 从已生成 token 反推"未拼完的字节"：token 可以从非字符边界开始，需从前往后找合法的起点。
+    #[test]
+    fn test_pending_tail_detects_incomplete_char() {
+        let tok = Tokenizer::bpe("中文测试中文测试中文测试", 300);
+        let vocab = tok.vocab_bytes().unwrap();
+        let zhong = "中".as_bytes(); // E4 B8 AD
+
+        assert_eq!(pending_tail(vocab, &[0x41]), Vec::<u8>::new(), "ASCII 后无未完成字节");
+        assert_eq!(pending_tail(vocab, &[0xE4]), zhong[..1].to_vec());
+        assert_eq!(pending_tail(vocab, &[0xE4, 0xB8]), zhong[..2].to_vec());
+        assert_eq!(
+            pending_tail(vocab, &[0xE4, 0xB8, 0xAD]),
+            Vec::<u8>::new(),
+            "完整字符不应残留 pending"
+        );
+        // 序列从"中"的续字节开始（真实场景里前面还有 E4），也要能定位到 E4
+        assert_eq!(pending_tail(vocab, &[0x41, 0xB8, 0xAD, 0xE4]), zhong[..1].to_vec());
     }
 }
