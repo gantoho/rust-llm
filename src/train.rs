@@ -335,7 +335,6 @@ pub fn train_gpt(
     let block_size = loader.block_size();
     let batch_size = loader.batch_size();
     let param_count: usize = params.iter().map(|p| p.numel()).sum();
-    let _trainable_count = param_count; // LoRA 模式下会更少（但这里简化处理）
     logln!(
         "开始训练：{}（vocab={}）模型参数 {} | 语料 {} tokens（训练 {} / 验证 {}）| batch={} block={}",
         tokenizer.kind(),
@@ -347,10 +346,14 @@ pub fn train_gpt(
         batch_size,
         block_size,
     );
-    if cfg.lora.is_some() {
-        logln!("LoRA 微调模式：rank={} alpha={}", 
-            cfg.lora.as_ref().unwrap().rank,
-            cfg.lora.as_ref().unwrap().alpha,
+    // 配置里带了 LoRA 段只说明"想用 LoRA"，训练循环并没有据此冻结或注入任何东西。
+    // 这里如实说清楚，别让人以为可训练参数量真的降下来了（见 docs/29-LoRA低秩适配.md）。
+    if let Some(lora) = cfg.lora.as_ref() {
+        logln!(
+            "[warn] 配置里有 LoRA（rank={} alpha={}），但训练循环尚未接入 LoRA：\
+             主参数不会冻结、适配层不会注入，下面训练的是**全部参数**",
+            lora.rank,
+            lora.alpha,
         );
     }
 

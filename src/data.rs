@@ -136,7 +136,7 @@ impl DataLoader {
         let tokens = tokenizer.encode(text);
         assert!(
             tokens.len() > block_size,
-            "语料太短，无法切出完整序列（{} < {}）",
+            "语料太短，无法切出完整序列（{} <= {}，必须严格大于 block_size）",
             tokens.len(),
             block_size
         );
@@ -162,7 +162,7 @@ impl DataLoader {
         let mut tokens = tokenizer.encode(train_text);
         assert!(
             tokens.len() > block_size,
-            "训练语料太短，无法切出完整序列（{} < {}）",
+            "训练语料太短，无法切出完整序列（{} <= {}，必须严格大于 block_size）",
             tokens.len(),
             block_size
         );
@@ -531,7 +531,7 @@ impl SftLoader {
         let (tokens, sup) = build_sft_stream(tokenizer, &convs);
         assert!(
             tokens.len() > block_size,
-            "SFT 语料太短，无法切出完整序列（{} < {}）",
+            "SFT 语料太短，无法切出完整序列（{} <= {}，必须严格大于 block_size）",
             tokens.len(),
             block_size
         );

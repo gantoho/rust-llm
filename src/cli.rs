@@ -6,7 +6,7 @@
 //! cargo run -- generate --config config/config.json [--ckpt ...] [--prompt "Once"] [--max-new 100] ...
 //! cargo run -- chat     --config config/config.json [--ckpt ...] [--system "..."]
 //! cargo run -- sft      --config config/config.json --pretrained ckpt [--sft-file "..."]
-//! cargo run -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]
+//! cargo run -- finetune --config config/config.json --pretrained ckpt [--steps 1000] [--lr 1e-4]
 //! cargo run -- preset   [--name small] [--output config/config.json]
 //! cargo run -- demo     # 教学演示（XOR + BPE + 内置语料小 GPT）
 //! cargo run -- bench    # 性能基准（固定小模型测训练 / 推理吞吐）
@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
     about = "从零实现的 GPT 语言模型（算法纯手写，零深度学习框架依赖）",
     long_about = "一个完整的 GPT 语言模型训练与推理框架，全部算法纯 Rust 手写实现。\n\
                    支持 GPT-2 和 LLaMA 风格架构（RoPE、RMSNorm、SwiGLU、GQA）、\n\
-                   KV Cache 加速推理、LoRA 微调、Beam Search 生成、GPU 加速等。"
+                   KV Cache 加速推理、监督微调（SFT）、Beam Search 生成、GPU 加速等。"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -154,14 +154,14 @@ pub enum Cmd {
         /// 微调步数（缺省用 config 里的 train.steps）
         #[arg(long)]
         steps: Option<usize>,
-        /// 峰值学习率（缺省用 config 里的 train.max_lr；SFT 通常要比预训练小一个量级）
+        /// 峰值学习率（缺省用 config 里 train.max_lr 的 1/10；SFT 要比预训练小一个量级才不冲掉已有能力）
         #[arg(long)]
         lr: Option<f32>,
         /// 输出目录（缺省 `{config 的 out_dir}-sft`，避免覆盖预训练权重）
         #[arg(long)]
         out_dir: Option<String>,
     },
-    /// LoRA 微调：冻结预训练模型，只训练低秩适配层
+    /// 加载预训练权重微调（当前是**全参微调**：LoRA 参数只做校验与预估，尚未接入训练循环）
     Finetune {
         /// 配置文件路径
         #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
@@ -169,10 +169,10 @@ pub enum Cmd {
         /// 预训练模型 checkpoint
         #[arg(long)]
         pretrained: String,
-        /// LoRA 秩（低秩维度，通常 4-64）
+        /// LoRA 秩（通常 4-64）。⚠️ 尚未接入训练循环，只影响日志里的参数占比预估
         #[arg(long, default_value_t = 16)]
         lora_rank: usize,
-        /// LoRA 缩放因子 α（通常 = rank）
+        /// LoRA 缩放因子 α（通常 = rank）。⚠️ 同上，不参与训练
         #[arg(long, default_value_t = 16.0)]
         lora_alpha: f32,
         /// 微调步数

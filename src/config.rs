@@ -59,8 +59,11 @@ pub struct TrainConfig {
     /// 分词器文件路径：Some 时从文件加载（跳过训练），None 时从语料训练并保存。
     /// 训练完成后自动保存到 `{out_dir}/tokenizer.json`。
     pub tokenizer_file: Option<String>,
-    /// LoRA 微调配置：Some(rank, alpha) 时冻结主模型，只训练 LoRA 层。
-    /// rank 通常 4-64，alpha 通常 = rank。
+    /// LoRA 微调配置：Some(rank, alpha) 时**只做参数校验与影响日志里的预估**。
+    ///
+    /// ⚠️ LoRA 尚未接入 `train_gpt`：主模型不会被冻结、适配层也不会被注入，
+    /// 训练的实际是全部参数。rank 通常 4-64，alpha 通常 = rank。
+    /// 原理与完整实现见 `docs/29-LoRA低秩适配.md`。
     pub lora: Option<LoRAConfig>,
     /// 训练指标日志文件路径：**每个评估点**（每 eval_every 步 + 最后一步）记录一行 step/lr/loss/ppl 到 CSV。
     /// 默认 `logs/train.csv`（日志目录自动创建）；显式设为 `null` 时不记录。
@@ -98,7 +101,7 @@ impl Default for TrainConfig {
             eval_iters: 20,
             tokenizer: "bpe".to_string(),
             bpe_vocab: 512,
-            train_file: "data/sample.txt".to_string(),
+            train_file: "data/alice.txt".to_string(),
             val_file: None,
             out_dir: DEFAULT_OUT_DIR.to_string(),
             accum_steps: 1,
@@ -183,7 +186,10 @@ impl Config {
     ///
     /// - 4 层 Transformer，隐藏维度 256，8 头注意力
     /// - 上下文长度 128，BPE 词表 512
-    /// - 约 ~2M 参数，CPU 上几分钟即可完成训练
+    /// - 约 3.3M 参数，CPU 上几分钟即可完成训练
+    ///
+    /// 参数量口径：`词嵌入(vocab×d)` + `每层(注意力 Q/K/V/O + MLP + 归一化)` × 层数 + `ln_f`。
+    /// 模型用 RoPE，**没有可学习的位置嵌入表**，所以没有 `block_size×d` 那一项。
     pub fn preset_small() -> Config {
         Config {
             model: GPTConfig {
@@ -214,7 +220,7 @@ impl Config {
     /// - 8 层 Transformer，隐藏维度 512，8 头注意力
     /// - 上下文长度 256，BPE 词表 2048
     /// - 支持 GQA（4 KV heads）、RMSNorm、SwiGLU（LLaMA 风格）
-    /// - 约 ~15M 参数，GPU 推荐
+    /// - 约 26M 参数，GPU 推荐
     pub fn preset_medium() -> Config {
         Config {
             model: GPTConfig {
@@ -250,7 +256,7 @@ impl Config {
     /// - 12 层 Transformer，隐藏维度 768，12 头注意力
     /// - 上下文长度 512，BPE 词表 4096
     /// - 支持 GQA（4 KV heads）、RMSNorm、SwiGLU、Dropout
-    /// - 约 ~85M 参数，需要 GPU
+    /// - 约 79M 参数，需要 GPU
     pub fn preset_large() -> Config {
         Config {
             model: GPTConfig {

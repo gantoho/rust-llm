@@ -566,6 +566,9 @@ impl Tensor {
     /// `backward` 是一个**工厂**而不是闭包本身：它拿到本张量自己的梯度槽，
     /// 返回的闭包在 autograd 反向时被调用 —— 那一刻槽里已经攒好了上游梯度。
     /// 之所以绕这一道，是因为闭包需要读自己的 grad，而梯度槽要等张量构造出来才存在。
+    ///
+    /// 调用点只在 `model.rs` 的 gpu 常驻路径里，不带 gpu feature 时是"死代码"，别删。
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub fn external(
         data: Vec<f32>,
         shape: Vec<usize>,
@@ -791,14 +794,21 @@ impl Tensor {
         self.binary(other, |a, b| a - b, |_, _| (1.0, -1.0))
     }
 
+    /// 逐元素乘法。与 [`Tensor::div`] 一样属于"算子集完整性"的保留项：
+    /// 训练路径走的是 `*` 运算符重载，这里的方法版没有调用点。
+    #[allow(dead_code)]
     pub fn mul(&self, other: &Tensor) -> Tensor {
         // ∂c/∂a = b，∂c/∂b = a
         self.binary(other, |a, b| a * b, |a, b| (b, a))
     }
 
+    /// 逐元素除法。保留项，理由同 [`Tensor::mul`]。
     #[allow(dead_code)]
     pub fn div(&self, other: &Tensor) -> Tensor {
-        self.binary(other, |a, b| a / b, |a, b| { let s = b + 1e-8; (1.0 / s, -a / (s * s)) })
+        // 反向必须与前向 `a / b` 严格对应（∂/∂a = 1/b，∂/∂b = -a/b²）。
+        // 给 b 加 `1e-8` 会让梯度与自己的前向不一致——教学代码里宁可得到 ±inf，
+        // 也不要一个"看起来没事但数学上是错的"梯度。
+        self.binary(other, |a, b| a / b, |a, b| (1.0 / b, -a / (b * b)))
     }
 
     /// 通用逐元素二元运算（含广播）+ 反向传播
@@ -942,6 +952,9 @@ impl Tensor {
     // ---------- 激活函数（一元运算） ----------
 
     /// 取负：c = -x，∂x = -g
+    ///
+    /// 保留项：属于"算子集完整性"（教学对照用），当前训练/推理路径没有调用点。
+    #[allow(dead_code)]
     pub fn neg(&self) -> Tensor {
         let data = self.data.borrow().iter().map(|a| -a).collect();
         let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
@@ -1298,6 +1311,10 @@ impl Tensor {
 
     /// 沿最后一维求和，**保持维度**：[..., D] -> [..., 1]
     /// 反向：梯度广播回最后一维
+    ///
+    /// 保留项：属于"算子集完整性"（教学对照用），当前没有调用点
+    /// （需要求和的路径各自用了更专门的融合算子）。
+    #[allow(dead_code)]
     pub fn sum_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "sum_last_dim 需要至少 1 维");
         let (pre, d) = (

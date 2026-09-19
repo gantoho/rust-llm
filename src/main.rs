@@ -819,6 +819,15 @@ fn cmd_sft(
     runlog::json(&format!("完整配置（{config_path} + CLI 覆盖后）"), &cfg);
     let tcfg = &cfg.train;
 
+    // SFT 是"带 loss mask 的"训练，GPU 的常驻输出头路径不吃逐位置权重，整段会回落到
+    // 逐算子路径。实测这条回落路径比纯 CPU 还慢（MX150：392 tok/s vs CPU 780 tok/s），
+    // 长跑还会崩。用户多半是照着预训练的命令加 `--features gpu` 过来的，所以要说清楚。
+    #[cfg(feature = "gpu")]
+    logln!(
+        "提示：SFT 的 loss 带逐位置掩码，GPU 常驻输出头路径不可用，会回落到逐算子路径——\
+         实测比纯 CPU 更慢。建议改用不带 `--features gpu` 的构建跑 SFT。"
+    );
+
     let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed, None);
     // 语料可能散在多处，用逗号分隔（支持目录与 `*` 通配）。
     // 按文件加载而不是拼成一份：说话人角色是文件级属性，拼接会让后面文件的角色弄反。
@@ -916,8 +925,10 @@ fn cmd_finetune(
     runlog::json(&format!("完整配置（{config_path} + CLI 覆盖后）"), &cfg);
     let tcfg = &cfg.train;
     logln!(
-        "LoRA 微调：rank={} alpha={} steps={} lr={}",
-        lora_rank, lora_alpha, steps, lr
+        "微调（全参更新）：steps={steps} lr={lr}｜--lora-rank/--lora-alpha 传了 {} / {}，\
+         但 LoRA 尚未接入训练循环，本次不冻结主参数",
+        lora_rank,
+        lora_alpha
     );
 
     let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed, None);
@@ -925,10 +936,18 @@ fn cmd_finetune(
     let val_text = tcfg.val_file.as_deref().map(read_text);
 
     // 打印模型信息
+    //
+    // ⚠️ 如实说明：LoRA 尚未接入训练循环。`--lora-rank/--lora-alpha` 只做校验与预估，
+    // 既不冻结主参数、也不注入适配层，本次训练的**就是全部参数**。这里绝不能打印
+    // "冻结 / 可训练比例"——那会让人以为显存和可训练参数量真的降下来了。
+    // LoRA 原理与完整实现见 `docs/29-LoRA低秩适配.md`。
     let total_params: usize = model.parameters().iter().map(|p| p.numel()).sum();
-    let lora_params = 2 * lora_rank * ckpt.model.n_embd * 3; // Q/K/V 各一个 LoRA
+    // 预估口径：Q/K/V 各一个 LoRA，两个低秩矩阵（r×d 与 d×r），逐层累加。
+    // 未考虑 GQA 下 K/V 的输出维更小，所以只是量级参考。
+    let lora_params = 2 * lora_rank * ckpt.model.n_embd * 3 * ckpt.model.n_layer;
     logln!(
-        "模型参数：{}（冻结）| LoRA 参数：{}（可训练，占 {:.1}%）",
+        "模型参数：{}（本次**全部**参与训练）| LoRA rank={lora_rank} 未接入，\
+         接入后约 {} 个（{:.1}%）",
         total_params,
         lora_params,
         100.0 * lora_params as f32 / total_params as f32
@@ -942,8 +961,12 @@ fn cmd_finetune(
                 format!("{pretrained_path}（step {}）", ckpt.step),
             ),
             ("预训练模型结构", format!("{:?}", ckpt.model)),
-            ("LoRA rank / alpha", format!("{lora_rank} / {lora_alpha}")),
-            ("总参数 / 可训练参数", format!("{total_params} / {lora_params}")),
+            (
+                "LoRA rank / alpha",
+                format!("{lora_rank} / {lora_alpha}（未接入训练循环，仅校验与预估）"),
+            ),
+            ("总参数", total_params.to_string()),
+            ("LoRA 预估参数", lora_params.to_string()),
             ("训练语料", tcfg.train_file.clone()),
             ("输出目录", tcfg.out_dir.clone()),
         ],

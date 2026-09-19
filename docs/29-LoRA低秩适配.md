@@ -152,10 +152,10 @@ let optimizer = AdamW::new(1e-4, trainable, 0.0);   // (lr, params, weight_decay
 
 ```bash
 # 加载预训练权重做全参微调（1000 步）
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt
 
 # 指定步数与学习率
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt \
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt \
     --steps 2000 --lr 5e-5
 ```
 

@@ -551,7 +551,8 @@ impl GPT {
         //
         //    仍然默认关闭：整叠的准入条件更严——要求**所有** Block 都满足常驻条件
         //    （LayerNorm + GELU MLP），任一层不满足就整条路径放弃；逐子层则是哪个子层
-        //    不满足就只回退那一个。想复现对照实验或追求吞吐时设 `LLM_GPU_STACK=1` 打开。
+        //    不满足就只回退那一个。想复现对照实验或追求吞吐时设环境变量
+        //    `LLM_GPU_STACK`（**只要设置了就生效**，值本身不参与判断，`is_some`）。
         #[cfg(feature = "gpu")]
         if kv_cache.is_none() && base == 0 && std::env::var_os("LLM_GPU_STACK").is_some() {
             if let Some(out) = self.blocks_resident(&x, &mask, b, t, training) {

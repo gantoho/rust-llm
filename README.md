@@ -64,7 +64,7 @@
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
-| 工程化完善 | `docs/39-工程化完善.md` | 8 个 CLI 子命令、分词器序列化、预设配置、微调工作流、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
+| 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
 
 ## 快速开始
 
@@ -75,22 +75,23 @@
 #  最简方式：训练 + 生成（推理不需要语料）
 # ═══════════════════════════════════════════
 cargo run --release -- train --config config/config.json
+# 权重写到 config.train.out_dir，config/config.json 里配的是 checkpoints/zh
 # 训练完成后，推理只需 checkpoint，分词器自动加载
-cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "Once upon a" --max-new 100
 
-cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "The" --max-new 200
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "The" --max-new 200
 
 # ═══════════════════════════════════════════
 #  使用预设配置（推荐）
 # ═══════════════════════════════════════════
-# 生成中等模型配置（LLaMA 风格，~15M 参数）
+# 生成中等模型配置（LLaMA 风格，~26M 参数）
 cargo run --release -- preset --name medium --output config/config_medium.json
 cargo run --release -- train --config config/config_medium.json
 
 # ═══════════════════════════════════════════
 #  交互式对话（训练后直接对话，无需语料）
 # ═══════════════════════════════════════════
-cargo run --release -- chat --ckpt checkpoints/best.ckpt
+cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt
 
 # ═══════════════════════════════════════════
 #  监督微调（把只会续写的预训练模型教会"应答"）
@@ -101,7 +102,7 @@ cargo run --release -- chat --ckpt checkpoints/zh-sft/best.ckpt   # 之后用 SF
 # ═══════════════════════════════════════════
 #  微调（加载预训练模型，当前为全参微调；LoRA 尚未接入训练循环）
 # ═══════════════════════════════════════════
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt
 
 # ═══════════════════════════════════════════
 #  教学演示（验证所有算法正确性）
@@ -165,17 +166,18 @@ JSON 头：step、best_val_loss、模型配置、优化器步数 opt_t、参数�
 
 **日志**：**每个评估点**（每 `eval_every` 步 + 最后一步）向 `logs/train.csv` 写一行（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；每次训练会覆盖该文件，要留档就一个实验配一个路径。
 
-**运行日志**：`train` / `finetune` / `eval` / `generate` / `chat` 五个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
+**运行日志**：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` 六个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
 
-**推理不需要语料文件**：训练完成后，`eval` / `generate` / `chat` 命令自动从 checkpoint 目录加载 `tokenizer.json`，不再需要 `train_file` 或语料。只需指定 `--ckpt` 即可：
+**分词器自动加载；`eval` 仍需要语料**：`eval` / `generate` / `chat` 都会从 checkpoint 目录自动加载 `tokenizer.json`（不必再指定分词器）。其中 **`generate` / `chat` 只依赖 checkpoint，不需要语料**；但 **`eval` 要算验证集 loss，仍会读配置里的 `train_file`**（或 `val_file`），所以它的 `--config` 必须指向语料还在的原配置：
 
 ```bash
 # 训练
 cargo run --release -- train --config config/config.json
 # 推理（只需 checkpoint，分词器自动加载）
-cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 100
-cargo run --release -- chat --ckpt checkpoints/best.ckpt
-cargo run --release -- eval --ckpt checkpoints/best.ckpt
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "Once upon a" --max-new 100
+cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt
+# 评估（还需语料：从默认 config/config.json 的 train_file 读）
+cargo run --release -- eval --ckpt checkpoints/zh/best.ckpt
 ```
 
 **分词器加载优先级**：
@@ -188,27 +190,28 @@ cargo run --release -- eval --ckpt checkpoints/best.ckpt
 
 ```bash
 # ── 基础训练 ──
-# 用默认 config/config.json 训练（BPE 分词、2000 步、batch=8）
+# 用默认 config/config.json 训练（BPE 词表 8192、4000 步、batch=8、out_dir=checkpoints/zh）
 cargo run --release -- train --config config/config.json
 
 # ── 断点续训 ──
 # 从最近的 checkpoint 继续（恢复参数、优化器状态、步数）
-cargo run --release -- train --config config/config.json --resume checkpoints/latest.ckpt
+cargo run --release -- train --config config/config.json --resume checkpoints/zh/latest.ckpt
 
 # 从最优 checkpoint 续训（继续微调）
-cargo run --release -- train --config config/config.json --resume checkpoints/best.ckpt
+cargo run --release -- train --config config/config.json --resume checkpoints/zh/best.ckpt
 
 # ── GPU 加速训练 ──
 # 开启 wgpu 计算着色器（NVIDIA / Intel 核显），失败自动回退 CPU
 cargo run --release --features gpu -- train --config config/config.json
 
 # GPU 加速 + 断点续训
-cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/latest.ckpt
+cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/zh/latest.ckpt
 
-# ── 不同模型规模的训练（修改 config/config.json）──
-# 小模型（教学用，秒级完成）：n_embd=64, n_layer=2, block_size=32
+# ── 不同模型规模的训练（修改 config/config.json，或用 preset 生成）──
+# 小模型（教学用，秒级完成）：n_embd=64, n_layer=2, block_size=32（GPTConfig 的默认值）
 # 中模型（几分钟）：n_embd=256, n_layer=4, block_size=256
 # 大模型（需要耐心）：n_embd=512, n_layer=8, block_size=256
+# 不想手改就直接用预设：preset small(256维/4层/128上下文) / medium(512维/8层) / large(768维/12层)
 
 # ── 不同分词器（修改 config/config.json 的 tokenizer 字段）──
 # 字符级分词（小数据集，词表小）
@@ -256,8 +259,8 @@ cargo run --release -- eval [参数]
 **示例**：
 
 ```bash
-# ── 最简评估（只需 checkpoint，分词器自动加载）──
-cargo run --release -- eval --ckpt checkpoints/best.ckpt
+# ── 最简评估（分词器自动加载，但语料仍要从配置里读）──
+cargo run --release -- eval --ckpt checkpoints/zh/best.ckpt
 
 # ── 基础评估 ──
 # 不传 --ckpt 时用 {out_dir}/latest.ckpt（config/config.json 的 out_dir 是 checkpoints/zh）
@@ -265,18 +268,19 @@ cargo run --release -- eval --config config/config.json
 
 # ── 评估不同 checkpoint ──
 # 评估最优 checkpoint
-cargo run --release -- eval --config config/config.json --ckpt checkpoints/best.ckpt
+cargo run --release -- eval --config config/config.json --ckpt checkpoints/zh/best.ckpt
 
 # 评估最终 checkpoint
-cargo run --release -- eval --config config/config.json --ckpt checkpoints/final.ckpt
+cargo run --release -- eval --config config/config.json --ckpt checkpoints/zh/final.ckpt
 
 # 评估指定路径的 checkpoint
 cargo run --release -- eval --config config/config.json --ckpt /path/to/my_model.ckpt
 
 # ── 评估不同模型配置 ──
-# 用不同的 config 评估（config 决定模型架构，必须与 checkpoint 训练时一致）
-cargo run --release -- eval --config config/config_llama.json
-cargo run --release -- eval --config config/config_large.json --ckpt checkpoints/best.ckpt
+# 用不同的 config 评估（config 决定模型架构，必须与 checkpoint 训练时一致）。
+# 仓库里只有 config/config.json，其余配置要先 `preset` 生成，例如：
+cargo run --release -- preset --name large --output config/config_large.json
+cargo run --release -- eval --config config/config_large.json --ckpt checkpoints/latest.ckpt
 
 # ── GPU 加速评估 ──
 cargo run --release --features gpu -- eval --config config/config.json
@@ -323,7 +327,7 @@ cargo run --release -- generate [参数]
 # ═══════════════════════════════════════════
 #  最简推理（只需 checkpoint，无需 config 和语料）
 # ═══════════════════════════════════════════
-cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Alice was" --max-new 100
+cargo run --release -- generate --ckpt checkpoints/zh/best.ckpt --prompt "Alice was" --max-new 100
 
 # ═══════════════════════════════════════════
 #  基础生成
@@ -333,7 +337,7 @@ cargo run --release -- generate --ckpt checkpoints/best.ckpt --prompt "Alice was
 cargo run --release -- generate --config config/config.json --prompt "Alice was" --max-new 100
 
 # 指定 checkpoint 生成
-cargo run --release -- generate --config config/config.json --ckpt checkpoints/best.ckpt --prompt "Once upon a" --max-new 200
+cargo run --release -- generate --config config/config.json --ckpt checkpoints/zh/best.ckpt --prompt "Once upon a" --max-new 200
 
 # 空 prompt（模型自由发挥）
 cargo run --release -- generate --config config/config.json --max-new 50
@@ -476,10 +480,10 @@ cargo run --release -- generate --config config/config.json --prompt "Once" --ma
 cargo run --release -- generate --config config/config.json --prompt "The key"
 
 # 使用验证 loss 最优的 checkpoint
-cargo run --release -- generate --config config/config.json --ckpt checkpoints/best.ckpt --prompt "The key" --max-new 100
+cargo run --release -- generate --config config/config.json --ckpt checkpoints/zh/best.ckpt --prompt "The key" --max-new 100
 
 # 使用训练结束时的 checkpoint
-cargo run --release -- generate --config config/config.json --ckpt checkpoints/final.ckpt --prompt "The key" --max-new 100
+cargo run --release -- generate --config config/config.json --ckpt checkpoints/zh/final.ckpt --prompt "The key" --max-new 100
 
 # 使用自定义路径的 checkpoint
 cargo run --release -- generate --config config/config.json --ckpt /path/to/custom.ckpt --prompt "The key" --max-new 100
@@ -544,13 +548,13 @@ system prompt 永远保留（它是序列开头的位置锚点），本轮生成
 
 ```bash
 # ── 最简对话（只需 checkpoint，无需 config 和语料）──
-cargo run --release -- chat --ckpt checkpoints/best.ckpt
+cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt
 
 # ── 带系统提示的对话 ──
-cargo run --release -- chat --ckpt checkpoints/best.ckpt --system "You are a helpful assistant."
+cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt --system "You are a helpful assistant."
 
 # ── 创意对话（高温采样）──
-cargo run --release -- chat --ckpt checkpoints/best.ckpt --temperature 1.0 --max-new 300
+cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt --temperature 1.0 --max-new 300
 ```
 
 ---
@@ -584,12 +588,15 @@ cargo run --release -- sft [参数]
 **输出目录默认带 `-sft` 后缀**：绝不写回 `out_dir`，否则会覆盖预训练攒下的 `latest.ckpt` / `best.ckpt`
 和整条 loss 曲线，SFT 效果不好就再也回不去了。指标 CSV 同理（写到 `{out_dir}/sft.csv`）。
 
-**学习率默认取预训练配置的 1/10**：SFT 是在已收敛的权重上继续训，用预训练那种步长会把预训练
-攒下的语言能力一起冲掉。显式传 `--lr` 时以你给的为准。
+**学习率默认取预训练配置的 1/10，`min_lr` 跟着变成它的 1/10**：SFT 是在已收敛的权重上继续训，
+用预训练那种步长会把预训练攒下的语言能力一起冲掉。显式传 `--lr` 时以你给的为准，
+此时 `min_lr` 仍按 `max_lr × 0.1` 重算（cosine 衰减的终值跟着峰值走，不会出现 min > max）。
 
-**评估间隔会按步数自动收窄**：配置里的 `eval_every`（默认 200）是给预训练上万步用的，
-直接套在几百步的 SFT 上会把整段训练压成"只在最后评估一次"——`best.ckpt` 退化成 `final.ckpt`，
-早停也永远等不到第二次评估。所以实际取 `min(eval_every, steps/10)`。
+**评估间隔与预热步数都会按步数自动收窄**：配置里的 `eval_every`（`config/config.json` 里是 200）
+和 `warmup_steps`（300）都是给预训练上万步用的。`eval_every` 直接套在几百步的 SFT 上会把整段训练
+压成"只在最后评估一次"——`best.ckpt` 退化成 `final.ckpt`，早停也永远等不到第二次评估；
+`warmup_steps` 太长则会让大部分步数都耗在爬坡上。所以实际取
+`eval_every = min(eval_every, steps/10)`、`warmup_steps = min(warmup_steps, steps/10).max(1)`。
 
 **`best.ckpt` 与 `final.ckpt` 都要试**：SFT 语料通常很小（本项目 89 段对话 / 18432 token，
 切 10% 当验证区），验证区与训练区同分布，于是 val 曲线往往**头几十步就见底**，之后
@@ -688,10 +695,10 @@ cargo run --release -- finetune [参数]
 
 ```bash
 # ── 基础微调 ──
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt
 
 # ── 自定义步数与学习率 ──
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/best.ckpt \
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt \
     --steps 2000 --lr 5e-5
 ```
 
@@ -714,9 +721,16 @@ cargo run --release -- preset [参数]
 
 | 预设 | 参数量 | 架构 | 适合场景 |
 |------|--------|------|----------|
-| `small` | ~2M | GPT-2 风格（4层，256维） | 学习/演示，CPU 几分钟 |
-| `medium` | ~15M | LLaMA 风格（8层，512维，GQA） | 中等语料，推荐 GPU |
-| `large` | ~85M | LLaMA 风格（12层，768维，GQA） | 较大语料，需要 GPU |
+| `small` | ~3.3M | GPT-2 风格（4层，256维，block=128，BPE 512） | 学习/演示，CPU 几分钟 |
+| `medium` | ~26M | LLaMA 风格（8层，512维，GQA，RMSNorm+SwiGLU） | 中等语料，推荐 GPU |
+| `large` | ~79M | LLaMA 风格（12层，768维，GQA，RMSNorm+SwiGLU） | 较大语料，需要 GPU |
+
+> 参数量口径：`词嵌入(vocab×d)` + `每层(注意力 Q/K/V/O + MLP + 归一化)` × 层数 + `ln_f`。
+> 模型用 RoPE，**没有可学习的位置嵌入表**，所以不含 `block_size×d` 那一项。
+> 词表大小由语料训练出的分词器决定（`vocab_size: 0`），实际参数会随语料略有浮动。
+>
+> 预设生成的配置沿用 `TrainConfig` 的默认值，`out_dir` 是 `checkpoints`（仓库自带的
+> `config/config.json` 才被改成了 `checkpoints/zh`）；`train_file` 默认 `data/alice.txt`。
 
 **示例**：
 
@@ -884,8 +898,10 @@ cargo test test_softmax -- --nocapture
 | `test_kv_cache_generate_matches_full` | 同 prompt + 同种子下，KV cache 生成 vs 全量生成逐 token 一致（窗口内） |
 | `test_kv_cache_output_is_prefix_of_full_beyond_window` | 超出缓存窗口时 KV cache 提前结束，输出仍是全量输出的前缀 |
 | `test_char_tokenizer_roundtrip` / `test_bpe_roundtrip` | 分词器编码/解码往返 |
+| `test_utf8_pending_accepts_only_legal_prefix` / `test_decode_drops_incomplete_tail` | 字节级 BPE 的 UTF-8 约束：只接受合法的字节前缀、解码时丢掉不完整尾部 |
 | `test_linear_regression_converges` | 线性回归收敛 |
 | `test_repetition_penalty_suppresses_recent_token` | 重复惩罚确实压低最近出现过的 token（正负 logit 都验证） |
+| `test_utf8_mask_blocks_half_char_tokens` / `test_pending_tail_detects_incomplete_char` | 采样时的 UTF-8 约束：屏蔽"半个汉字"的 token、识别未收尾的字符 |
 | `test_save_load_roundtrip_is_bit_exact` | checkpoint 保存/恢复后参数逐位一致 |
 | `test_load_params_skips_optimizer_state` | 只加载参数时跳过优化器状态（`eval` / `generate` 路径） |
 | `test_non_finite_values_survive_roundtrip` | NaN / ±Inf 能原样保存并读回（二进制格式的收益） |
@@ -930,7 +946,7 @@ cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
 cargo run --release --features gpu -- train --config config/config.json
 
 # GPU 加速训练 + 断点续训
-cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/latest.ckpt
+cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/zh/latest.ckpt
 
 # GPU 加速评估
 cargo run --release --features gpu -- eval --config config/config.json
@@ -996,10 +1012,14 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 
 | 模型规模 | n_embd | 推荐 | 原因 |
 |----------|--------|------|------|
-| small（~2M） | 256 | **GPU** | FLOPs 阈值已调低至 5000 万，QKV/MLP 投影走 GPU |
-| medium（~15M） | 512 | **GPU** | 矩阵更大，GPU 加速明显 |
-| large（~85M） | 768 | **GPU** | 矩阵够大，GPU 充分利用 |
+| small（~3.3M） | 256 | **GPU** | FLOPs 阈值已调低至 5000 万，QKV/MLP 投影走 GPU |
+| medium（~26M） | 512 | **GPU** | 矩阵更大，GPU 加速明显 |
+| large（~79M） | 768 | **GPU** | 矩阵够大，GPU 充分利用 |
 | xlarge（~300M） | 1024+ | **GPU** | 矩阵足够大，GPU 加速显著 |
+
+> ⚠️ **只有预训练（`train`）适合开 GPU**：SFT 的 loss 带逐位置掩码，常驻输出头路径不吃逐位置权重，
+> 会整段回落到逐算子路径——实测（MX150）比纯 CPU 还慢（392 tok/s vs 780 tok/s），长跑还会崩。
+> `sft` 子命令检测到 gpu feature 时会打印这条提示，跑 SFT 请用不带 `--features gpu` 的构建。
 
 **分流策略**：FLOPs < 5000 万的矩阵走 CPU（如注意力头内积），其余走 GPU。训练结束时打印 `matmul 分流：GPU X / CPU Y`
 
@@ -1068,7 +1088,8 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "tokenizer_file": null,   // 分词器文件路径。null = 从语料训练并保存；Some = 从文件加载
     "lora": null,             // LoRA 配置（目前未接入训练循环，见第 29 课）
     "log_file": "logs/train.csv", // 训练指标日志。null = 不记录；默认 logs/train.csv（自动建目录）
-    "early_stop_patience": 0  // 早停耐心值。0 = 不启用；N = 连续 N 次评估不改善则停止
+    "early_stop_patience": 0,  // 早停耐心值。0 = 不启用；N = 连续 N 次评估不改善则停止
+    "sft_file": null          // SFT 语料（逗号分隔，可为文件/目录/含 * 的路径）。只被 `sft` 子命令读取
   }
 }
 ```
@@ -1087,47 +1108,72 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 | `eval_iters` | int | `20` | 评估时采样多少批取平均（减少随机波动） |
 | `tokenizer` | string | `"bpe"` | `"char"` = 字符级分词；`"bpe"` = 字节对编码 |
 | `bpe_vocab` | int | `512` | BPE 词表大小。仅当 `tokenizer = "bpe"` 时生效 |
-| `train_file` | string | `"data/sample.txt"` | 训练语料文件路径（纯文本或目录路径）。**代码默认值指向的 `data/sample.txt` 已不在仓库中，请显式指定 `data/alice.txt` 或 `data/corpus/` 目录**（`config/config.json` 已配好） |
+| `train_file` | string | `"data/alice.txt"` | 训练语料文件路径（纯文本或目录路径，目录会合并其中的 `.txt`）。仓库自带语料见 `data/`，`config/config.json` 里指向 `data/corpus_zh/` |
 | `val_file` | string/null | `null` | 验证语料文件。`null` = 自动从训练文本末尾切约 10% |
 | `out_dir` | string | `"checkpoints"` | 权重输出目录：checkpoint（latest / best / final）与 `tokenizer.json` 都写在这里。目录不存在时自动创建 |
 | `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
 | `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
-| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0 }`。**目前只被校验并打印提示，尚未冻结主参数 / 注入适配层**（详见第 29 课） |
+| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0 }`。**目前只做参数校验与预估并打印一行提示，既不冻结主参数、也不注入适配层**——`finetune` 实际训练的是全部参数（详见 [§6](#6-finetune--加载预训练权重微调) 与第 29 课） |
 | `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = **每个评估点**（每 `eval_every` 步 + 最后一步）写一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`。无验证集时 `val_loss` / `ppl` 两列留空。**每次训练覆盖该文件**，不是追加 |
 | `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
+| `sft_file` | string/null | `null` | SFT（监督微调）语料路径，逗号分隔，每项可以是文件、目录或含 `*` 的路径。**只被 `sft` 子命令读取**；`sft --sft-file` 优先于它。命令行未指定且这里也是 `null` 时 `sft` 直接报错 |
 
-### 完整配置示例
+### 完整配置示例（仓库当前 `config/config.json`）
 
-```json
+```jsonc
 {
   "model": {
-    "vocab_size": 0,
-    "n_embd": 256,
-    "n_head": 8,
+    "vocab_size": 0,        // 0 = 词表大小由分词器训练结果决定
+    "n_embd": 128,
+    "n_head": 4,
     "n_layer": 4,
-    "block_size": 256,
-    "n_kv_head": 0,
-    "use_rmsnorm": false,
+    "block_size": 512,
+    "n_kv_head": 0,         // 0 = 标准 MHA
+    "use_rmsnorm": false,   // GPT-2 风格（LayerNorm + GELU）
     "use_swiglu": false,
-    "dropout": 0.0
+    "dropout": 0.1
   },
   "train": {
     "seed": 42,
-    "batch_size": 16,
-    "steps": 2000,
-    "max_lr": 6e-4,
-    "min_lr": 6e-5,
-    "warmup_steps": 50,
-    "weight_decay": 0.01,
+    "batch_size": 8,
+    "steps": 4000,
+    "max_lr": 5e-4,
+    "min_lr": 5e-5,
+    "warmup_steps": 300,
+    "weight_decay": 0.1,
     "grad_clip": 1.0,
-    "eval_every": 250,
+    "eval_every": 200,
     "eval_iters": 20,
     "tokenizer": "bpe",
-    "bpe_vocab": 512,
-    "train_file": "data/alice.txt",
+    "bpe_vocab": 8192,
+    "train_file": "data/corpus_zh/",
     "val_file": null,
-    "out_dir": "checkpoints",
-    "accum_steps": 1
+    "out_dir": "checkpoints/zh",
+    "accum_steps": 1,
+    "tokenizer_file": "checkpoints/zh/tokenizer.json",
+    "lora": null,
+    "log_file": "checkpoints/zh/train.csv",
+    "early_stop_patience": 10,
+    "sft_file": "data/corpus/zh_dialogue_*.txt,data/sft/"
+  }
+}
+```
+
+这是仓库里唯一自带、且**已经跑过完整训练**的配置：中文语料 + BPE 8192 词表 + 4000 步，
+产物落在 `checkpoints/zh/`。上面示例里的 `checkpoints/zh/...` 路径都对应它。
+
+### 最小配置示例（其余字段取默认值）
+
+```json
+{
+  "train": {
+    "steps": 2000,
+    "batch_size": 16,
+    "max_lr": 6e-4,
+    "min_lr": 6e-5,
+    "warmup_steps": 100,
+    "eval_every": 250,
+    "train_file": "data/alice.txt"
   }
 }
 ```
@@ -1168,15 +1214,18 @@ llm_from_scratch/
 ├── README.md           # 本文件
 ├── config/             # 配置文件目录
 │   └── config.json     #   默认训练配置（模型超参 + 训练参数）
-├── checkpoints/        # 权重目录（自动创建）：latest.ckpt / best.ckpt / final.ckpt / tokenizer.json
-│   ├── perf/           #   各实验按 out_dir 分成子目录，如 checkpoints/zh、checkpoints/probe_b2
-│   └── ...
-├── logs/               # 日志目录（自动创建）：运行日志（每次 train/eval/generate/chat/finetune 各一份）
-│                       #      与训练指标 CSV（train.csv，由 train.log_file 指定）
-├── data/               # 语料：alice.txt（公版《爱丽丝梦游仙境》）、corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
-│                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）、corpus_perf/（性能测试用节选）
+├── checkpoints/        # 权重目录（自动创建）；各实验按 out_dir 分成子目录
+│   ├── zh/             #   本仓库已训好的中文权重：latest/best/final.ckpt + tokenizer.json + train.csv
+│   ├── zh-sft/         #   `sft` 的默认输出（{out_dir}-sft），不会覆盖上面的预训练权重
+│   └── ...             #   其他实验目录，如 checkpoints/perf、checkpoints/probe_b2
+├── logs/               # 日志目录（自动创建）：运行日志（每次 train/eval/generate/chat/sft/finetune 各一份）
+│                       #      与训练指标 CSV（由 train.log_file 指定，本项目配的是 checkpoints/zh/train.csv）
+├── data/               # 语料：alice.txt（公版《爱丽丝梦游仙境》）
+│                       #      corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
+│                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）
+│                       #      corpus_perf/（性能测试用节选）、sft/（SFT 问答语料 zh_qa.txt）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / chat / finetune / preset / demo / bench
+│   ├── main.rs         # CLI 入口：train / eval / generate / chat / sft / finetune / preset / demo / bench
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）
 │   ├── runlog.rs       # 运行日志：每次训练 / 推理自动写 logs/{操作}_{时间戳}.log（命令行 + 完整配置 + 过程输出）
@@ -1193,8 +1242,8 @@ llm_from_scratch/
 │   ├── module.rs       # 参数管理 trait（第 5 课）
 │   ├── tokenizer.rs    # 分词器（第 8 课）
 │   ├── model.rs        # GPT 模型：Transformer Block + 前向（第 9-12、19 课）
-│   ├── data.rs         # 数据集（第 14 课）
-│   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志（第 13、18、28 课）
+│   ├── data.rs         # 数据集 + SFT 对话解析与 loss 掩码（第 14 课）
+│   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）
 │   └── sample.rs       # 推理与采样（第 15、30 课）
 └── docs/               # 39 课教程文档（00-学习计划 + 01~39 各课）
 ```
@@ -1204,9 +1253,9 @@ llm_from_scratch/
 | 产物 | 默认位置 | 由谁决定 | 说明 |
 |------|----------|----------|------|
 | 配置文件 | `config/config.json` | `--config` / `--output` | 所有子命令的配置默认路径；`preset --output` 写同类路径 |
-| 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json` |
+| 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json`；`sft` 另写 `{out_dir}-sft`，`finetune` 写回 `{out_dir}` |
 | 训练指标日志 | `logs/train.csv` | `train.log_file` | CSV：`step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
-| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `finetune` / `eval` / `generate` / `chat` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出 |
+| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `eval` / `generate` / `chat` / `sft` / `finetune` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出 |
 
 实现方式：`src/config.rs` 提供 `ensure_parent_dir()` / `ensure_dir()`，并在**每个写盘出口**调用——
 `Config::save()`（配置）、`checkpoint::save()`（权重）、`Tokenizer::save()`（分词器）、`MetricsLogger::new()`（指标 CSV）、
@@ -1236,20 +1285,22 @@ llm_from_scratch/
 > | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA、Flash Attention | ✅ |
 > | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
 > | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 📖 |
-> | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、微调工作流、交互式对话 | ✅ |
+> | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、微调工作流、SFT 监督微调、交互式对话 | ✅ |
 
 ## 代码验证状态
 
 - **48 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 57 个（详见 [§10 `cargo test`](#10-cargo-test--单元测试)）
-- 已知提示（`never used` 警告，不影响功能）：
-  - `cargo build`（非 gpu）报 3 条：`layers.rs` 的 `ln_params`、`gelu_weights`，`tensor.rs` 的 `external` / `mul` / `neg` / `sum_last_dim`
-  - `cargo build --features gpu` 报 2 条：`gpu.rs` 的 `GpuDispatchDiag.n`，`tensor.rs` 的 `mul` / `neg` / `sum_last_dim`
-  - 这些是给自动微分 / GPU 对照测试留的算子，非测试构建下未被调用；`cargo test` 构建里 `mul` / `sum_last_dim` 会被测试用到，只剩 `external` / `neg`
+- **`cargo build` 与 `cargo build --features gpu` 均零警告**：为教学对照保留、当前训练/推理路径没有调用点的算子
+  （`Tensor::mul` / `neg` / `sum_last_dim` / `div`、`Tensor::external`、`NormLayer::ln_params`、`Gelu::gelu_weights`）
+  都按调用条件标了 `#[allow(dead_code)]` / `#[cfg_attr(not(feature = "gpu"), allow(dead_code))]`，并在注释里写明保留理由，
+  所以不带 gpu feature 编译时也不会冒出一堆 `never used` 噪声
 - 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
-  RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛
+  RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛、
+  重复惩罚、checkpoint 二进制往返（含 NaN/±Inf）、**SFT 对话解析 / loss 掩码对齐 / 批次形状**
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 1.63→0.15、文本生成正常
-- **工程化功能已全部集成**：微调（`finetune`，当前为**全参微调**，LoRA 只做参数校验与提示）、
-  Beam Search（`generate --beam`）、交互式对话（`chat`）、分词器持久化（`tokenizer.json`）、
+- **工程化功能已全部集成**：监督微调（`sft`，带 loss 掩码，默认输出到 `{out_dir}-sft`，不覆盖预训练权重）、
+  微调（`finetune`，当前为**全参微调**，LoRA 只做参数校验与预估并如实打印提示）、
+  Beam Search（`generate --beam`）、交互式对话（`chat`，含 `--prompt-format sft/raw`）、分词器持久化（`tokenizer.json`）、
   预设配置（`preset`）、训练指标日志（CSV）、运行日志（`logs/{操作}_{时间戳}.log`）、早停（`early_stop_patience`）
 
 ## 性能优化与基准测试
@@ -1320,7 +1371,9 @@ cargo run --release -- bench --steps 30
   且整叠中间量同时驻留显存，显存峰值更高
 - `KVCache::append` 已改为在 `Vec<f32>` 上就地 `extend`（不再每步重拼整段历史），
   但 `k()` / `v()` 每步仍会克隆一次整段缓存（打分算子需要一个拥有所有权的 `Tensor`），可改为借用视图
-- Beam Search 的打分目前累加原始 logit（非 log_softmax），与「对数概率和」的严格语义有偏差
+- Beam Search（`sample::beam_search`）目前**不用 KV cache**：每一步都对每个 beam 做一次全量前向
+  （`beam_size × max_new` 次前向），长文本时是主要开销。打分已按 `log_softmax` 后累加对数概率
+  （此前累加原始 logit，既没归一化、又让长度惩罚方向与文档相反，已修正），但仍是 O(beam×T) 的重算
 
 ### GPU matmul 内核：从 128×128 改到 64×64
 
@@ -1404,6 +1457,11 @@ loss 直接变 NaN，整轮实验作废。
 - **推理建图是纯浪费**：模型参数的 `requires_grad` 恒为 `true`，若算子只用它决定是否建图，
   推理时也会一路把整张计算图（含 backward 闭包）建出来。加一个全局 `no_grad` 开关、
   把判断改走 `Tensor::req()` 后，推理提升 1.9~3.9×。
+- **Beam Search 要累加对数概率而不是原始 logit**：`log_softmax` 会把 logit 归一化成合法分布的对数
+  （各项 ≤ 0、序列越长和越小），除以 `len^α` 才有"平均每 token 的对数概率"的含义。原先直接累加原始
+  logit 既没归一化（剪枝会系统性偏向"logit 整体偏大"的路径），又让长度惩罚方向与参数文档相反。
+  注意 `log_softmax` 要先减去行内最大值做数值稳定化；被掩码的 `-inf` 在 `exp(-inf - max) = 0`，
+  不参与配分函数也不影响结果。
 - **SFT 的 loss 掩码要右移一位对齐**：窗口里 `y[i] = tokens[start+1+i]`，所以第 `i` 个位置的掩码
   要看**目标 token 所在的位置** `sup[start+1+i]`，而不是输入位置 `sup[start+i]`。少移这一位，
   整个批次的监督信号会整体错开一个 token——loss 照降、形状全对，极难从结果看出来。

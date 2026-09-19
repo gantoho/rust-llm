@@ -257,12 +257,16 @@ fn warn_window_full(block_size: usize, n_ids: usize) {
 /// - Beam Search 是确定性的（给定 seed），总选择全局最优的 k 条路径
 /// - 生成质量更高，但多样性更低
 ///
-/// 返回 top-1 序列（log 概率最高的完整序列）。
+/// 返回按长度惩罚选出的最佳序列。
 ///
 /// - beam_size: 束宽（通常 4-10），越大搜索越充分，但越慢
 /// - length_penalty: 长度惩罚指数 α（0 = 不惩罚，>0 偏好长序列，<0 偏好短序列）
 ///   最终分数 = log_prob / len^α（Google NMT 的公式）
-#[allow(dead_code)] // 教学实现：Beam Search 完整可用，通过 sample::beam_search 调用
+///
+/// 累加的必须是 **log 概率**而不是原始 logit：log_softmax 会把 logit 归一化成一个
+/// 合法分布的对数（各项 ≤ 0，序列越长和越小），除以 `len^α` 才有"平均每 token 的对数概率"
+/// 的含义。直接累加原始 logit 得到的数没有归一化，剪枝会系统性偏向"logit 整体偏大"的
+/// 路径，长度惩罚也会得到与注释相反的效果。
 pub fn beam_search(
     model: &GPT,
     tokenizer: &Tokenizer,
@@ -318,12 +322,28 @@ pub fn beam_search(
                 None => last_row,
             };
 
+            // 先 log_softmax 成对数概率再累加（用 max 减去最大值做数值稳定化）。
+            // 被屏蔽的 token 是 -inf，`exp(-inf - max) = 0`，不参与配分函数也不影响结果。
+            let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_z: f64 = if max_logit.is_finite() {
+                max_logit as f64
+                    + row
+                        .iter()
+                        .map(|&l| ((l - max_logit) as f64).exp())
+                        .sum::<f64>()
+                        .ln()
+            } else {
+                // 整个词表都被屏蔽（理论上不会发生）：下面 scored 必为空，
+                // 这里给 0 只是避免 `-inf - -inf` 算出 NaN。
+                0.0
+            };
+
             // 找 top-beam_size 个候选 token
             let mut scored: Vec<(usize, f64)> = row
                 .iter()
                 .enumerate()
                 .filter(|(_, l)| l.is_finite()) // 被屏蔽的 -inf 直接跳过
-                .map(|(i, &l)| (i, *score + l as f64))
+                .map(|(i, &l)| (i, *score + (l as f64 - log_z)))
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(beam_size);
@@ -348,9 +368,10 @@ pub fn beam_search(
         }
     }
 
-    // 按长度惩罚后的分数选最佳
-    // 不过我们这里简单返回 log_prob 最高的
-    // length_penalty: score / len^alpha
+    // 按长度惩罚后的分数选最佳：`log_prob / len^α`。
+    // log_prob 是负数、且序列越长越负，除以 `len^α`（α>0）相当于取"平均每 token 的对数概率"，
+    // 因此 α>0 会偏好长序列——这与参数文档一致（之前的实现累加原始 logit，符号是正的，
+    // 除以 len^α 反而偏好短序列，方向是反的）。
     let best = beams
         .iter()
         .max_by(|a, b| {

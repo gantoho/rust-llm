@@ -186,6 +186,10 @@ impl NormLayer {
 
     /// LayerNorm 分支的 `(γ, β, ε)`；RMSNorm 分支返回 None
     /// （GPU 常驻显存路径目前只实现了 LayerNorm）
+    ///
+    /// 唯一调用点都在 `model.rs` 的 `#[cfg(feature = "gpu")]` 函数里，
+    /// 所以不带 gpu feature 编译时它是"死代码"——这不是真死代码，别删。
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub fn ln_params(&self) -> Option<(&Tensor, &Tensor, f32)> {
         match self {
             NormLayer::LN(ln) => Some((&ln.gamma, &ln.beta, ln.eps)),
@@ -298,6 +302,9 @@ impl MLPEnum {
 
     /// GELU 分支的 `(W₁, b₁, W₂, b₂)`；SwiGLU 分支返回 None
     /// （GPU 常驻显存路径目前只实现了 GPT-2 风格的 GELU MLP）
+    ///
+    /// 同 [`NormLayer::ln_params`]：调用点只在 gpu feature 下，不带时是"死代码"，别删。
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub fn gelu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             MLPEnum::GELU { linear1, linear2 } => Some((

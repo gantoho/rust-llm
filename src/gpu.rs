@@ -84,7 +84,6 @@ static STATS_CPU: AtomicUsize = AtomicUsize::new(0);
 
 /// GPU dispatch 诊断记录（采集前 `DIAG_MAX` 次调用，在训练首步结束后统一打印）
 struct GpuDispatchDiag {
-    n: usize,
     x: u32, y: u32, z: u32,
     out_len: usize,
     total_ms: f64,
@@ -1086,8 +1085,10 @@ fn relu_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // 峰值探针：纯寄存器 FMA，测这台机器上 GPU 的浮点吞吐上限。
-// 用途：matmul 实测只有 ~36 GFLOP/s（MX150 峰值的 3%），需要先分清是「着色器写得差」
+// 用途（历史）：当时 matmul 只跑到 ~36 GFLOP/s（MX150 峰值的 3%），需要先分清是「着色器写得差」
 // 还是「这块 15W 入门卡的硬件上限本来就这么低」—— 这决定后面值不值得重写内核。
+// 结论：值得。探针实测 524 GFLOP/s（标称峰值的 44%），说明瓶颈在共享内存 LDS 往返而非硬件；
+// 按这个结论改成 8×8 分块后，各形状已到 200~230 GFLOP/s（见下方形状回放表）。
 // 8 条互不依赖的累加链（ILP=8）避免被 FMA 延迟绑死；循环外的条件写回让编译器无法删掉整个循环。
 @compute @workgroup_size(256, 1, 1)
 fn fma_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -2361,7 +2362,6 @@ impl GpuContext {
             // 这里的"同步"只覆盖 map+poll+拷回三段，不含随后的 unmap/归还 buffer
             let sync = diag_t_copy - diag_t_submit;
             GPU_DIAG_LOG.lock().unwrap().push(GpuDispatchDiag {
-                n: diag_n,
                 x, y, z,
                 out_len,
                 total_ms: total.as_secs_f64() * 1000.0,
@@ -4563,9 +4563,12 @@ fn gcd(a: usize, b: usize) -> usize {
 
 /// 峰值探针：纯寄存器 FMA 的实测吞吐上限。
 ///
-/// 目的：matmul 只跑到 ~36 GFLOP/s（MX150 理论峰值 ~1100 GFLOP/s），需要分清瓶颈性质：
+/// 目的（历史）：那时 matmul 只跑到 ~36 GFLOP/s（MX150 理论峰值 ~1100 GFLOP/s），需要分清瓶颈性质：
 /// - 若这里能跑到几百 GFLOP/s → 是 matmul 着色器的问题（共享内存 LDS 往返太平凡，值得重写内核）
 /// - 若这里也只有几十 GFLOP/s → 是这块 15W 入门卡本身的硬件/功耗上限，重写内核也没用
+///
+/// 实测结论：落到第一种，本机纯 FMA 能到 524 GFLOP/s。按这个结论重写分块后，
+/// matmul 各形状已到 200~230 GFLOP/s，所以下面打印的峰值是**基线**，不是 matmul 的现状。
 pub fn probe_fma() {
     let Some(Some(g)) = GPU.get() else {
         return;

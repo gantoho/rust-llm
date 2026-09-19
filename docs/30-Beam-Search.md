@@ -130,7 +130,10 @@ let mut beams: Vec<(Vec<usize>, f64)> = vec![(prompt_ids, 0.0)];
 
 ### 6.2 提前终止
 
-如果所有 beam 都生成了 EOS token，提前结束。
+某个 beam 生成结束标记后就不再扩展；所有 beam 都结束了就提前停止。
+
+> 本项目是字节级 BPE、没有专门的 EOS token，实现里用 `id = 0` 近似（见 `sample.rs` 的 `beam_search`），
+> 所以它只是个"提前停"的启发式，不等于真正的句子结束标志。
 
 ### 6.3 KV Cache 兼容
 

@@ -67,7 +67,8 @@ fn with_log(f: impl FnOnce(&mut RunLog)) {
 ///
 /// `op` 为操作名（`train` / `sft` / `finetune` / `eval` / `generate` / `chat`），用作文件名前缀。
 /// 文件名时间戳与头部「开始时间」都取命令开始执行的时刻（见 [`mark_start`]）。
-/// 重复调用只保留第一次创建的日志文件。
+/// 每次调用都会新建文件并**替换**全局日志句柄，所以重复调用以最后一次为准
+/// （正常流程里每个子命令只调一次）。
 pub fn start(op: &str) -> String {
     let (started, begin) = start_point();
     let path = format!("{LOG_DIR}/{op}_{}.log", fmt_timestamp(begin));
