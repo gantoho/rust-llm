@@ -630,12 +630,15 @@ B: 吃了
 cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt
 
 # ── 指定语料与步数 ──
+cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt --steps 300 --lr 4e-4
+
 cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt \
     --sft-file "data/corpus/zh_dialogue_*.txt,data/sft/" --steps 300 --lr 1e-4
 
 # ── 训练完对话（--prompt-format 默认就是 sft）──
 cargo run --release -- chat --ckpt checkpoints/zh-sft/best.ckpt --max-new 60
 cargo run --release -- chat --ckpt checkpoints/zh-sft/final.ckpt --max-new 60
+cargo run --release -- chat --ckpt checkpoints/zh-sft/final.ckpt --tokenizer checkpoints/zh-sft/tokenizer.json --max-new 60
 ```
 
 效果对照（`chat --temperature 0.3`，同一条输入「你好」）：
@@ -852,8 +855,8 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **35 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
-合计 44 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
+默认构建运行 **48 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
+合计 57 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -885,6 +888,11 @@ cargo test test_softmax -- --nocapture
 | `test_load_params_skips_optimizer_state` | 只加载参数时跳过优化器状态（`eval` / `generate` 路径） |
 | `test_non_finite_values_survive_roundtrip` | NaN / ±Inf 能原样保存并读回（二进制格式的收益） |
 | `test_rng_deterministic` / `test_rng_range` / `test_choice_range` | 随机数生成器 |
+| `parse_accepts_both_prefix_styles` / `parse_keeps_multiline_answer_and_drops_incomplete` / `parse_skips_text_without_role_markers` | SFT 对话解析：两种角色前缀、多行回答与残缺段、无标记文本跳过 |
+| `parse_accepts_named_speakers_in_dialogue_corpus` / `parse_rejects_named_speakers_in_prose` / `parse_resets_speakers_per_file` | 人名说话人：对话语料放行、小说正文拒绝、角色按文件重置 |
+| `build_stream_masks_question_and_marks_answer` | SFT 打包流：提问与角色标记被掩码、只有回答段是监督目标 |
+| `window_mask_is_shifted_by_one` | 窗口掩码右移一位对齐 `y[i] = tokens[start+1+i]` |
+| `sft_loader_batch_shapes_match` | SFT 加载器批次形状与"至少一个监督位置" |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
 
