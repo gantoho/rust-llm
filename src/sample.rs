@@ -208,12 +208,16 @@ pub fn generate(
     }
 
     if hit_window_limit {
-        // 不能静默变短：同一个 prompt 加不加 KV cache 会得到不同长度，用户必须知情
-        eprintln!(
+        // 不能静默变短：同一个 prompt 加不加 KV cache 会得到不同长度，用户必须知情。
+        // 打到 stderr 而不是 stdout —— stdout 是生成结果（`generate` 子命令可能被重定向到文件），
+        // 但同时也写进运行日志，否则事后复盘看不到"这次生成为什么变短了"。
+        let msg = format!(
             "[warn] KV cache 窗口已满（block_size={block_size}），生成在 {} 个 token 处提前结束；\
              需要更长输出请缩短 prompt，或加 --no-kv-cache 改用全量前向（滑动窗口可继续生成）",
             ids.len()
         );
+        eprintln!("{msg}");
+        crate::runlog::append(&msg);
     }
 
     tokenizer.decode(&ids)

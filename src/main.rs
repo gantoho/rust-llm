@@ -539,10 +539,14 @@ fn cmd_chat(
     }
     logln!("---");
 
-    // 上下文窗口要在「对话历史」和「本轮生成」之间分配：历史最多占
-    // `block_size - max_new` 个 token，剩下的留给本轮生成。
-    // 否则 prompt + 生成的 token 总数会超过 block_size，KV cache 写满后生成被提前截断
-    // （历史自己就超窗口时，甚至只剩 1 个 token 可生成）。
+    // 上下文窗口要在「system prompt」「对话历史」「本轮生成」三者之间分配。
+    //
+    // 分配顺序（前面的优先保）：
+    //   1. system prompt —— 永远保留。它是序列最开头的"注意力锚点"（attention sink），
+    //      丢掉它不只是失忆，还会让整条序列的注意力分布失稳
+    //   2. 本轮生成 —— 预留 max_new 个 token，否则 prompt + 生成超过 block_size 时
+    //      KV cache 写满，生成被提前截断（历史自己就超窗口时甚至只剩 1 个 token）
+    //   3. 对话历史 —— 剩下的额度都给它，不够就按 token 数从最老的开始丢
     let block_size = model.cfg.block_size;
     if max_new >= block_size {
         logln!(
@@ -550,10 +554,27 @@ fn cmd_chat(
         );
     }
     let prompt_budget = block_size.saturating_sub(max_new);
-    let mut warned_history_dropped = false;
+
+    let system = system.trim();
+    let n_system = tokenizer.encode(system).len();
+    let n_system_prefix = if system.is_empty() { 0 } else { n_system + 1 }; // +1 是它后面的 '\n'
+    if n_system_prefix >= prompt_budget {
+        logln!(
+            "[warn] system prompt 已有 {n_system} 个 token，占满了 {prompt_budget} 的输入预算，本轮没有空间留给对话历史"
+        );
+    }
+
+    // 裁剪不能静默：首次立即提示，之后每 HISTORY_REPORT_EVERY 次汇总一次，
+    // 否则跑几十轮下来用户不知道"已经无记忆多久了"
+    const HISTORY_REPORT_EVERY: usize = 10;
+    let mut first_trim_turn: Option<usize> = None;
+    let mut trim_count = 0usize;
+    let mut dropped_tokens_total = 0usize;
     let mut warned_prompt_overflow = false;
 
-    let mut context_history = system.to_string();
+    // 只存「对话历史」，不含 system：system 在拼接 prompt 时单独放在最前面，
+    // 这样它就不会被 `trim_history` 当成最老的内容丢掉。
+    let mut context_history = String::new();
     let mut turn = 0usize;
 
     loop {
@@ -571,24 +592,48 @@ fn cmd_chat(
         }
         turn += 1;
 
-        // 构造 prompt：历史 + 当前输入。
-        // 历史按 **token** 裁剪（不是字节/字符），并给本轮生成留够 max_new 个 token。
+        // 构造 prompt：system + 历史 + 当前输入。
+        // system 固定在序列最前面并独立于裁剪，历史按 **token** 裁剪（不是字节/字符），
+        // 并给本轮生成留够 max_new 个 token。
         let n_input = tokenizer.encode(input).len();
-        let history_budget = prompt_budget.saturating_sub(n_input + 1); // +1 是历史与输入之间的 '\n'
-        let trimmed = trim_history(&tokenizer, &context_history, history_budget);
-        if trimmed.len() < context_history.len() && !warned_history_dropped {
-            warned_history_dropped = true;
-            logln!(
-                "[info] 对话历史超出预算（{history_budget} token），最早的若干轮已被丢弃；\
-                 想保留更多历史请调小 --max-new"
-            );
+        // 历史预算 = 输入预算 - system（含其后 '\n'）- 本轮输入 - 历史与输入之间的 '\n'
+        let history_budget = prompt_budget.saturating_sub(n_system_prefix + n_input + 1);
+        let history = trim_history(&tokenizer, &context_history, history_budget);
+        if history.len() < context_history.len() {
+            let n_before = tokenizer.encode(&context_history).len();
+            let n_after = tokenizer.encode(&history).len();
+            let dropped = n_before.saturating_sub(n_after);
+            trim_count += 1;
+            dropped_tokens_total += dropped;
+            match first_trim_turn {
+                None => {
+                    first_trim_turn = Some(turn);
+                    logln!(
+                        "[info] 对话历史超出预算（{n_before} > {history_budget} token），\
+                         从本轮起丢弃最早的轮次（本次丢弃 {dropped} token，保留 {n_after} token）；\
+                         想保留更多历史请调小 --max-new"
+                    );
+                }
+                Some(t0) if trim_count % HISTORY_REPORT_EVERY == 0 => {
+                    logln!(
+                        "[info] 已丢弃历史 {trim_count} 次（起始于第 {t0} 轮），\
+                         累计丢弃 {dropped_tokens_total} token，当前保留 {n_after} token"
+                    );
+                }
+                Some(_) => {}
+            }
         }
-        context_history = trimmed;
-        let prompt = if context_history.is_empty() {
-            input.to_string()
-        } else {
-            format!("{}\n{}", context_history, input)
-        };
+
+        let mut prompt = String::new();
+        if !system.is_empty() {
+            prompt.push_str(system);
+            prompt.push('\n');
+        }
+        if !history.is_empty() {
+            prompt.push_str(&history);
+            prompt.push('\n');
+        }
+        prompt.push_str(input);
         runlog::append(&format!("\n[第 {turn} 轮] 输入：{input}"));
 
         let n_prompt = tokenizer.encode(&prompt).len();
@@ -621,14 +666,18 @@ fn cmd_chat(
         logln!("{response}");
         runlog::append(&format!("[第 {turn} 轮] 输出：{response}"));
 
-        // 更新历史：`prompt` 已含「历史 + 本轮输入」，只需再追加回复
-        // （不要重复拼 `input`，那会让每轮输入在窗口里占两份）。
+        // 更新历史：历史 = 旧历史 + 本轮输入 + 本轮回复（不含 system，它单独拼接）。
+        // 不要重复拼 `input`：prompt 里已含本轮输入，那会让每轮输入在窗口里占两份。
         // 长度控制交给下一轮开头的 `trim_history`（按真实 token 数裁剪）。
-        context_history = if response.is_empty() {
-            prompt
-        } else {
-            format!("{prompt}\n{response}")
-        };
+        context_history = history;
+        if !context_history.is_empty() {
+            context_history.push('\n');
+        }
+        context_history.push_str(input);
+        if !response.is_empty() {
+            context_history.push('\n');
+            context_history.push_str(response);
+        }
     }
     runlog::append(&format!("\n对话结束：共 {} 轮", turn));
     runlog::finish();

@@ -525,8 +525,9 @@ cargo run --release -- chat [参数]
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，对话时自动加载。
 
-**上下文预算**：`block_size` 是「历史 + 本轮生成」共用的窗口。chat 会把对话历史按真实 token 数裁剪到
-`block_size - max_new` 以内，保证本轮能生成满 `--max-new` 个 token；窗口紧张时可调小 `--max-new` 换取更长记忆。
+**上下文预算**：`block_size` 是「system prompt + 对话历史 + 本轮生成」三者共用的窗口。分配优先级依次是：
+system prompt 永远保留（它是序列开头的位置锚点），本轮生成预留 `--max-new` 个 token，剩下的额度给对话历史。
+历史按真实 token 数裁剪，超出即从最老的轮次开始丢弃；窗口紧张时可调小 `--max-new` 换取更长记忆。
 
 **示例**：
 
