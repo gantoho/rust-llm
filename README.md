@@ -632,6 +632,8 @@ cargo run --release -- sft --config config/config.json --pretrained checkpoints/
 # ── 指定语料与步数 ──
 cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt --steps 300 --lr 4e-4
 
+cargo run --release --features gpu -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt --steps 300 --lr 4e-4
+
 cargo run --release -- sft --config config/config.json --pretrained checkpoints/zh/best.ckpt \
     --sft-file "data/corpus/zh_dialogue_*.txt,data/sft/" --steps 300 --lr 1e-4
 
