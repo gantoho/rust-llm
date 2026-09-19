@@ -467,6 +467,25 @@ fn cmd_generate(
     runlog::finish();
 }
 
+/// 把对话历史裁剪到不超过 `budget` 个 token：从最老的一行开始丢，保留最近的内容。
+///
+/// 必须真的调 `encode` 来数 token —— 按"字节数 / 字符数"估算的偏差很大：
+/// 中英文、BPE 合并数都不同，同样长度的文本 token 数能差一倍以上。
+fn trim_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
+    if history.is_empty() || tokenizer.encode(history).len() <= budget {
+        return history.to_string();
+    }
+    // 行粒度足够细：每轮对话都会写入多行
+    let lines: Vec<&str> = history.split('\n').collect();
+    for start in 1..lines.len() {
+        let candidate = lines[start..].join("\n");
+        if tokenizer.encode(&candidate).len() <= budget {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 /// 交互式对话模式
 #[allow(clippy::too_many_arguments)]
 fn cmd_chat(
@@ -520,11 +539,21 @@ fn cmd_chat(
     }
     logln!("---");
 
-    let mut context_history = if !system.is_empty() {
-        system.to_string()
-    } else {
-        String::new()
-    };
+    // 上下文窗口要在「对话历史」和「本轮生成」之间分配：历史最多占
+    // `block_size - max_new` 个 token，剩下的留给本轮生成。
+    // 否则 prompt + 生成的 token 总数会超过 block_size，KV cache 写满后生成被提前截断
+    // （历史自己就超窗口时，甚至只剩 1 个 token 可生成）。
+    let block_size = model.cfg.block_size;
+    if max_new >= block_size {
+        logln!(
+            "[warn] --max-new={max_new} 不小于上下文窗口 {block_size}，本轮生成最多 {block_size} 个 token 就会停"
+        );
+    }
+    let prompt_budget = block_size.saturating_sub(max_new);
+    let mut warned_history_dropped = false;
+    let mut warned_prompt_overflow = false;
+
+    let mut context_history = system.to_string();
     let mut turn = 0usize;
 
     loop {
@@ -542,13 +571,33 @@ fn cmd_chat(
         }
         turn += 1;
 
-        // 构造 prompt：历史 + 当前输入
+        // 构造 prompt：历史 + 当前输入。
+        // 历史按 **token** 裁剪（不是字节/字符），并给本轮生成留够 max_new 个 token。
+        let n_input = tokenizer.encode(input).len();
+        let history_budget = prompt_budget.saturating_sub(n_input + 1); // +1 是历史与输入之间的 '\n'
+        let trimmed = trim_history(&tokenizer, &context_history, history_budget);
+        if trimmed.len() < context_history.len() && !warned_history_dropped {
+            warned_history_dropped = true;
+            logln!(
+                "[info] 对话历史超出预算（{history_budget} token），最早的若干轮已被丢弃；\
+                 想保留更多历史请调小 --max-new"
+            );
+        }
+        context_history = trimmed;
         let prompt = if context_history.is_empty() {
             input.to_string()
         } else {
             format!("{}\n{}", context_history, input)
         };
         runlog::append(&format!("\n[第 {turn} 轮] 输入：{input}"));
+
+        let n_prompt = tokenizer.encode(&prompt).len();
+        if n_prompt > block_size && !warned_prompt_overflow {
+            warned_prompt_overflow = true;
+            logln!(
+                "[warn] 本轮输入本身已有 {n_prompt} 个 token，超过上下文窗口 {block_size}，只有末尾内容参与生成"
+            );
+        }
 
         let out = generate(
             &model,
@@ -572,15 +621,14 @@ fn cmd_chat(
         logln!("{response}");
         runlog::append(&format!("[第 {turn} 轮] 输出：{response}"));
 
-        // 更新历史上下文（截断到 block_size 以内的字符数）
-        context_history = format!("{}\n{}\n{}", prompt, input, response);
-        let max_chars = model.cfg.block_size * 4; // 粗略估计：平均每个 token ~4 字符
-        if context_history.len() > max_chars {
-            let skip = context_history.len() - max_chars;
-            if let Some(pos) = context_history[skip..].find('\n') {
-                context_history = context_history[skip + pos + 1..].to_string();
-            }
-        }
+        // 更新历史：`prompt` 已含「历史 + 本轮输入」，只需再追加回复
+        // （不要重复拼 `input`，那会让每轮输入在窗口里占两份）。
+        // 长度控制交给下一轮开头的 `trim_history`（按真实 token 数裁剪）。
+        context_history = if response.is_empty() {
+            prompt
+        } else {
+            format!("{prompt}\n{response}")
+        };
     }
     runlog::append(&format!("\n对话结束：共 {} 轮", turn));
     runlog::finish();
