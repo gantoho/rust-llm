@@ -526,7 +526,7 @@ fn trim_sft_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> Stri
     String::new()
 }
 
-/// SFT 模板下的停止标记：模型答完会自己吐 `（结束）`；
+/// SFT 模板下的停止标记：模型答完会自己吐 `。。`；
 /// 万一没学会收尾，它就会顺着模板编下一轮提问，所以 `用户：` 也是停止标记。
 const SFT_STOP: &[&str] = &[SFT_END, SFT_USER];
 
