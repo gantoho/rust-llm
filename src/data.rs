@@ -211,7 +211,11 @@ impl DataLoader {
             hi - lo,
             self.block_size
         );
-        let max_start = hi - lo - self.block_size - 1;
+        // 可行的起点是 [lo, hi - block_size - 1]：窗口要取到 tokens[start + block_size]
+        // （`y` 比 `x` 右移一位），最后一个起点正好用满区间末尾，不能多减 1
+        // ——多减就成了"最少要 block_size + 2 个 token"，验证区恰好只有一个窗口时
+        // `choice(0)` 会直接 panic。
+        let max_start = hi - lo - self.block_size;
         let mut x = Vec::with_capacity(self.batch_size * self.block_size);
         let mut y = Vec::with_capacity(self.batch_size * self.block_size);
         for _ in 0..self.batch_size {
@@ -602,7 +606,8 @@ impl SftLoader {
             hi - lo,
             self.block_size
         );
-        let max_start = hi - lo - self.block_size - 1;
+        // 同 `DataLoader::sample_region`：起点上界是 `hi - block_size`
+        let max_start = hi - lo - self.block_size;
         let n = self.batch_size * self.block_size;
         let mut x = Vec::with_capacity(n);
         let mut y = Vec::with_capacity(n);
@@ -782,5 +787,29 @@ mod tests {
         }
         assert!(saw_sup, "掩码里至少要有一个监督位置");
         assert!(loader.supervised_ratio() > 0.0);
+    }
+
+    #[test]
+    fn region_of_exactly_one_window_can_be_sampled() {
+        // 分区只有 block_size + 1 个 token 时，唯一可行的起点就是 lo 本身。
+        // 起点上界早先多减了 1（写成 `hi - lo - block_size - 1`），这里会 `choice(0)` panic
+        // ——`--sft-file` 只给一个小文件时就是这个形状。
+        let block_size = 4;
+        let val_start = 5;
+        let loader = SftLoader {
+            tokens: (0..val_start + block_size + 1).map(|i| i % 7).collect(),
+            sup: vec![true; val_start + block_size + 1],
+            num_conversations: 1,
+            block_size,
+            batch_size: 3,
+            val_start,
+        };
+        let mut rng = Rng::new(1);
+        let (x, y, mask) = loader.eval_batch(&mut rng);
+        assert_eq!(x.len(), 3 * block_size);
+        assert_eq!(y.len(), 3 * block_size);
+        assert!(mask.is_some());
+        // 三个窗口都只能从 val_start 起，右端恰好用满验证区
+        assert_eq!(&x[..block_size], &loader.tokens[val_start..val_start + block_size]);
     }
 }
