@@ -1247,9 +1247,21 @@ fn drop_scale(i: u32) -> f32 {
     return 0.0;
 }
 
-/// LayerNorm 前向：eo[r,j] = (x[r,j]-μ_r)·√(σ²_r+ε)⁻¹·γ_j + β_j，
-/// 并把每行的 (μ, 1/σ) 写进 ep（反向直接复用，省一次重算）。
-/// p0=rows, p1=d, p2=ε(bitcast)；绑定：0=x, 1=γ, 2=β, 4=输出, 5=每行统计量
+/// 归一化前向（LayerNorm / RMSNorm 共用一套内核，靠模式位切换）：
+///
+/// ```text
+/// LayerNorm（p3=0）：eo[r,j] = (x[r,j]−μ_r)·√(σ²_r+ε)⁻¹·γ_j + β_j
+/// RMSNorm  （p3=1）：eo[r,j] = x[r,j]·√(E[x²]_r+ε)⁻¹·γ_j
+/// ```
+///
+/// RMSNorm 是 LayerNorm 的一个**特例**：不减均值（μ≡0）、方差取「平方的均值」
+/// 而不是「离差平方的均值」、没有平移项 β。所以同一套三趟归约结构只要改两处
+/// ——第一趟累加 x² 而非 x，第二趟的中心化量取 0——第二趟的离差平方和就自然退化成
+/// `Σx²/d`，用不着另写一条内核，也不会多一次显存往返。
+///
+/// 并把每行的 (μ, 1/σ) 写进 ep（反向直接复用，省一次重算；RMS 模式下 μ 写 0）。
+/// p0=rows, p1=d, p2=ε(bitcast), p3=模式(0=LayerNorm, 1=RMSNorm)；
+/// 绑定：0=x, 1=γ, 2=β, 4=输出, 5=每行统计量
 @compute @workgroup_size(256, 1, 1)
 fn ln_fwd_main(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -1258,24 +1270,33 @@ fn ln_fwd_main(
     let rows = params.p0;
     let d = params.p1;
     let eps = bitcast<f32>(params.p2);
+    let is_rms = params.p3 == 1u;
     let r = wid.x;
     // 整块一起退出（条件只取决于 workgroup_id），后面的 workgroupBarrier 才安全
     if (r >= rows) { return; }
     let base = r * d;
     let t = lid.x;
-    // 第一趟：均值
+    // 第一趟：LayerNorm 求和求均值；RMSNorm 直接求平方和（不做中心化）
     var s = 0.0;
-    for (var j = t; j < d; j = j + 256u) { s = s + ea[base + j]; }
+    if (is_rms) {
+        for (var j = t; j < d; j = j + 256u) {
+            let xv = ea[base + j];
+            s = s + xv * xv;
+        }
+    } else {
+        for (var j = t; j < d; j = j + 256u) { s = s + ea[base + j]; }
+    }
     elem_red[t] = s;
     workgroupBarrier();
     for (var k = 128u; k > 0u; k = k >> 1u) {
         if (t < k) { elem_red[t] = elem_red[t] + elem_red[t + k]; }
         workgroupBarrier();
     }
-    let mean = elem_red[0] / f32(d);
+    // RMSNorm 不减均值：中心化量恒为 0，第二趟的离差平方和就退化成 E[x²]
+    let mean = select(elem_red[0] / f32(d), 0.0, is_rms);
     // 每个线程读走均值之后才能复用同一块共享数组（少了这道 barrier 就是数据竞争）
     workgroupBarrier();
-    // 第二趟：方差
+    // 第二趟：方差（RMSNorm 下即平方的均值）
     var v = 0.0;
     for (var j = t; j < d; j = j + 256u) {
         let c = ea[base + j] - mean;
@@ -1292,16 +1313,21 @@ fn ln_fwd_main(
         ep[r * 2u] = mean;
         ep[r * 2u + 1u] = istd;
     }
-    // 第三趟：归一化 + 仿射
+    // 第三趟：归一化 + 仿射（RMSNorm 没有 β，该项取 0）
     for (var j = t; j < d; j = j + 256u) {
-        eo[base + j] = (ea[base + j] - mean) * istd * eb[j] + ec[j];
+        eo[base + j] = (ea[base + j] - mean) * istd * eb[j] + select(ec[j], 0.0, is_rms);
     }
 }
 
-/// LayerNorm 反向（对输入）：
+/// 归一化反向（对输入），同样 LayerNorm / RMSNorm 共用：
 ///   eo[r,j] = istd·(dy_j·γ_j − m1 − m2·x̂_j)
 ///   m1 = Σ_j dy_j·γ_j / d，m2 = Σ_j dy_j·γ_j·x̂_j / d，x̂ = (x−μ)·istd
-/// p0=rows, p1=d；绑定：0=上游梯度 dy, 1=x, 2=每行统计量, 4=输出 dx, 5=γ
+///
+/// RMSNorm 把 `m1` 置 0：它的梯度公式里没有「减去 dyγ 的均值」这一项
+/// （对应前向不减均值），而 `m2` 这一项在 μ=0 时正好退化成 RMSNorm 需要的
+/// `E[dyγ·x̂]·x̂`。于是同一条内核、只差一个 `select`。
+///
+/// p0=rows, p1=d, p2=模式(0=LayerNorm, 1=RMSNorm)；绑定：0=上游梯度 dy, 1=x, 2=每行统计量, 4=输出 dx, 5=γ
 @compute @workgroup_size(256, 1, 1)
 fn ln_bwd_x_main(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -1309,6 +1335,7 @@ fn ln_bwd_x_main(
 ) {
     let rows = params.p0;
     let d = params.p1;
+    let is_rms = params.p2 == 1u;
     let r = wid.x;
     if (r >= rows) { return; }
     let base = r * d;
@@ -1335,7 +1362,7 @@ fn ln_bwd_x_main(
         workgroupBarrier();
     }
     let inv_d = 1.0 / f32(d);
-    let m1 = elem_red[0] * inv_d;
+    let m1 = select(elem_red[0] * inv_d, 0.0, is_rms);
     let m2 = elem_red2[0] * inv_d;
     for (var j = t; j < d; j = j + 256u) {
         let xn = (eb[base + j] - mean) * istd;
@@ -1343,9 +1370,12 @@ fn ln_bwd_x_main(
     }
 }
 
-/// LayerNorm 反向（对 γ/β）：一个 workgroup 负责**一列**，跨行累加：
+/// 归一化反向（对 γ/β）：一个 workgroup 负责**一列**，跨行累加：
 ///   dγ_j = Σ_r dy[r,j]·x̂[r,j]，  dβ_j = Σ_r dy[r,j]
 /// p0=rows, p1=d；绑定：0=上游梯度 dy, 1=x, 2=每行统计量, 4=dγ, 5=dβ
+///
+/// RMSNorm 直接复用：它的 `dγ` 就是 `Σ_r dy·x̂`（μ=0 时 x̂ 即 x·istd，同上），
+/// 而 RMSNorm 没有 β，写出的 `dβ` 无人接收（调用方给一块临时缓冲即可）。
 ///
 /// 逐列而不是逐行：dγ/dβ 天然是「列方向」的归约，让一个 workgroup 独占一列即可
 /// 直接得到最终值，不必引入浮点原子加（WGSL 没有 atomicAdd<f32>）。
@@ -2029,7 +2059,7 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl GpuContext {
-    /// 批量矩阵乘（tiled：16×16 共享内存块，教学实现）。
+    /// 批量矩阵乘（tiled：16×16 共享内存块，块内用共享内存复用两个输入矩阵的行/列）。
     /// `a_t`/`b_t`：物理存储转置标志，见 [`matmul`]。
     fn matmul(
         &self,
@@ -2334,7 +2364,8 @@ impl GpuContext {
         self.queue.submit([encoder.finish()]);
         let diag_t_submit = diag_t.elapsed();
 
-        // 同步取回（教学简化：每次调用都等 GPU 完成，保证调用方拿到的数据可用）
+        // 同步取回：这一步的算子需要立刻拿到结果（反向/下一层要用），所以阻塞等 GPU 完成；
+        // 纯前向的整段链路走 `forward_*_resident` 那条常驻快路，不为每个算子付一次同步代价
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let diag_t_map = diag_t.elapsed();
@@ -2837,8 +2868,9 @@ impl GpuRecorder {
         GpuHandle { buf: self.ctx.make_buf(len.max(1), kind), len }
     }
 
-    /// 录制 LayerNorm 前向；同时把每行的 (mean, 1/σ) 写进 `stats`，
-    /// 反向直接复用（重算一遍要再读一次 x，不划算）
+    /// 录制归一化前向（LayerNorm / RMSNorm 由 `is_rms` 切换，见 `ln_fwd_main`）；
+    /// 同时把每行的 (mean, 1/σ) 写进 `stats`，反向直接复用（重算一遍要再读一次 x，不划算）。
+    /// RMSNorm 下 `beta` 槽位仍需一块合法显存，但内核不会用它的值（丢进 `select`）。
     #[allow(clippy::too_many_arguments)]
     fn ln_fwd(
         &mut self,
@@ -2850,6 +2882,7 @@ impl GpuRecorder {
         rows: usize,
         d: usize,
         eps: f32,
+        is_rms: bool,
     ) {
         self.ctx.batch_dispatch(
             &mut self.batch,
@@ -2862,14 +2895,14 @@ impl GpuRecorder {
                 (&out.buf, 4),
                 (&stats.buf, 5),
             ],
-            [rows as u32, d as u32, eps.to_bits(), 0, 0, 0],
+            [rows as u32, d as u32, eps.to_bits(), is_rms as u32, 0, 0],
             rows as u32, // 一个 workgroup 一行
             1,
             1,
         );
     }
 
-    /// 录制 LayerNorm 反向（对输入）：`dy` 是上游梯度，`gamma` 放 binding 5
+    /// 录制归一化反向（对输入）：`dy` 是上游梯度，`gamma` 放 binding 5
     fn ln_bwd_x(
         &mut self,
         dy: &GpuHandle,
@@ -2879,6 +2912,7 @@ impl GpuRecorder {
         gamma: &GpuHandle,
         rows: usize,
         d: usize,
+        is_rms: bool,
     ) {
         self.ctx.batch_dispatch(
             &mut self.batch,
@@ -2891,7 +2925,7 @@ impl GpuRecorder {
                 (&dx.buf, 4),
                 (&gamma.buf, 5),
             ],
-            [rows as u32, d as u32, 0, 0, 0, 0],
+            [rows as u32, d as u32, is_rms as u32, 0, 0, 0],
             rows as u32,
             1,
             1,
@@ -3339,7 +3373,7 @@ pub fn attn_forward(
 // ==================== 注意力子层整段常驻显存 ====================
 //
 // 覆盖 `TransformerBlock` 的注意力子层：
-//   x → LayerNorm → QKV 投影 → 按头重排 + RoPE → S/P/O → 合并头 → c_proj → dropout → 残差
+//   x → LayerNorm/RMSNorm → QKV 投影 → 按头重排 + RoPE → S/P/O → 合并头 → c_proj → dropout → 残差
 //
 // 这一段原本是「每个算子各自提交 + 各自回读」的重灾区：4 层每步要做约 48 次提交，
 // 每次固定开销数毫秒，中间量（Q/K/V、旋转后的 Q/K、注意力输出）全都要回读再传回。
@@ -3347,7 +3381,6 @@ pub fn attn_forward(
 // CPU 只付「上传 x / 回读子层输出」与 11 项边界梯度（合计约 2.3MB）。
 //
 // 限制（不满足时调用方回退逐算子路径，数值行为不变）：
-// - 只支持 LayerNorm（非 RMSNorm）与 n_kv_head == n_head（不需要 GQA 头复制）
 // - 只支持训练（`base = 0`、无 KV cache）：RoPE 的位置直接取序列内下标
 
 /// 逐元素内核里 `heads_split` 的模式：只加偏置
@@ -3365,9 +3398,9 @@ pub struct AttnLayerResident {
     x: GpuHandle,
     /// LayerNorm 输出 [rows, d]（dWq/dWk/dWv 用）
     xn: GpuHandle,
-    /// LayerNorm 每行的 (mean, 1/σ)，[rows*2]
+    /// 归一化每行的 (mean, 1/σ)，[rows*2]（RMSNorm 时 mean 槽位是 0）
     stats: GpuHandle,
-    /// LayerNorm 的 γ
+    /// 归一化的 γ
     gamma: GpuHandle,
     /// Q'（已旋转、已乘 1/√head_dim）：[b*n_head, t, head_dim]
     q: GpuHandle,
@@ -3390,6 +3423,8 @@ pub struct AttnLayerResident {
     seed: u32,
     dropout: f32,
     training: bool,
+    /// 归一化是否为 RMSNorm（反向走同一套内核、只切模式位）
+    is_rms: bool,
 }
 
 /// 注意力子层反向的边界梯度（已回读到 CPU，由调用方注回计算图）
@@ -3405,6 +3440,7 @@ pub struct AttnLayerGrads {
     pub dwproj: Vec<f32>,
     pub dbproj: Vec<f32>,
     pub dgamma: Vec<f32>,
+    /// RMSNorm 下没有 β，这一项是 `Σ_r dy` 的残值，**无意义，调用方忽略**
     pub dbeta: Vec<f32>,
 }
 
@@ -3460,9 +3496,9 @@ impl AttnLayerResident {
         rec.add(&dq_pre, &dk_pre, &sum2, rows * d);
         let dln = rec.empty(rows * d, KIND_OUT);
         rec.add(&sum2, &dv_pre, &dln, rows * d);
-        // 8) LayerNorm 反向
+        // 8) 归一化反向（LayerNorm / RMSNorm 同一套内核）
         let dxln = rec.empty(rows * d, KIND_OUT);
-        rec.ln_bwd_x(&dln, &self.x, &self.stats, &dxln, &self.gamma, rows, d);
+        rec.ln_bwd_x(&dln, &self.x, &self.stats, &dxln, &self.gamma, rows, d, self.is_rms);
         let dgamma = rec.empty(d, KIND_OUT);
         let dbeta = rec.empty(d, KIND_OUT);
         rec.ln_bwd_gb(&dln, &self.x, &self.stats, &dgamma, &dbeta, rows, d);
@@ -3498,6 +3534,11 @@ impl AttnLayerResident {
 ///
 /// 入参都是 CPU 上的张量数据：`x` `[b*t, d]`、`gamma`/`beta` `[d]`、
 /// `wq`/`wk`/`wv`/`wproj` `[d, d]`、`bq`/`bk`/`bv`/`bproj` `[d]`、`mask` `[t, t]`。
+///
+/// `is_rms` 切换归一化模式（RMSNorm 时 `beta` 的内容被内核丢弃，只需长度合法）。
+/// GQA 不需要在这里区分：K/V 投影的头复制由调用方**把权重按头展开**后喂进来
+/// （见 `model.rs` 的 `expand_kv`），展开后本函数的入口形态与标准 MHA 完全一致，
+/// 于是「按头重排」「注意力」「合并头」三段的布局都不用改。
 pub struct AttnLayerArgs<'a> {
     pub x: &'a [f32],
     pub gamma: &'a [f32],
@@ -3518,6 +3559,8 @@ pub struct AttnLayerArgs<'a> {
     pub d: usize,
     pub n_head: usize,
     pub eps: f32,
+    /// 归一化是否为 RMSNorm（true 时 `beta` 槽位被丢弃）
+    pub is_rms: bool,
     pub dropout: f32,
     pub training: bool,
 }
@@ -3578,7 +3621,7 @@ pub fn attn_layer_forward(a: &AttnLayerArgs) -> Option<AttnLayerResident> {
     // LayerNorm（顺带把每行统计量存进显存给反向复用）
     let xn = rec.empty(rows * d, KIND_OUT);
     let stats = rec.empty(rows * 2, KIND_OUT);
-    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, a.eps);
+    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, a.eps, a.is_rms);
     // QKV 三个投影
     let q_pre = rec.matmul(&xn, false, &hwq, false, rows, d, d, 1);
     let k_pre = rec.matmul(&xn, false, &hwk, false, rows, d, d, 1);
@@ -3620,6 +3663,7 @@ pub fn attn_layer_forward(a: &AttnLayerArgs) -> Option<AttnLayerResident> {
         seed,
         dropout: a.dropout,
         training: a.training,
+        is_rms: a.is_rms,
     })
 }
 
@@ -3715,7 +3759,7 @@ pub fn lm_head_ce(
 
 // ==================== MLP 子层常驻显存（前向 / 反向各一次提交） ====================
 //
-// 子层结构（GPT-2 风格）：x → LayerNorm → Linear₁ → GELU → Linear₂ → dropout → 残差 +
+// 子层结构（GPT-2 风格）：x → LayerNorm/RMSNorm → Linear₁ → GELU → Linear₂ → dropout → 残差 +
 //
 // 逐算子版这一段要付的代价：
 // - 前向：LN 在 CPU（逐元素 + rayon）、两次线性投影各自一次「提交 + 轮询」往返、
@@ -3737,13 +3781,13 @@ pub struct MlpResident {
     pub out: Vec<f32>,
     /// 子层输入 [rows, d]
     x: GpuHandle,
-    /// LayerNorm 输出 [rows, d]
+    /// 归一化输出 [rows, d]
     xn: GpuHandle,
     /// Linear₁ 输出 + b₁（GELU 的输入）[rows, hid]
     z: GpuHandle,
     /// GELU 输出 [rows, hid]
     act: GpuHandle,
-    /// LayerNorm 每行的 (mean, 1/σ)，[rows*2]
+    /// 归一化每行的 (mean, 1/σ)，[rows*2]（RMSNorm 时 mean 槽位是 0）
     stats: GpuHandle,
     w1: GpuHandle,
     w2: GpuHandle,
@@ -3756,6 +3800,8 @@ pub struct MlpResident {
     seed: u32,
     dropout: f32,
     training: bool,
+    /// 归一化是否为 RMSNorm（反向走同一套内核、只切模式位）
+    is_rms: bool,
 }
 
 /// MLP 子层反向的边界梯度（已回读到 CPU，由调用方乘上缩放后注回计算图）
@@ -3767,6 +3813,7 @@ pub struct MlpGrads {
     pub dw2: Vec<f32>,
     pub db2: Vec<f32>,
     pub dgamma: Vec<f32>,
+    /// RMSNorm 下没有 β，这一项是 `Σ_r dy` 的残值，**无意义，调用方忽略**
     pub dbeta: Vec<f32>,
 }
 
@@ -3798,9 +3845,9 @@ impl MlpResident {
         // 6) dxn = dz·W₁ᵀ，dW₁ = xnᵀ·dz
         let dxn = rec.matmul(&dz, false, &self.w1, true, rows, hid, d, 1);
         let dw1 = rec.matmul(&self.xn, true, &dz, false, d, rows, hid, 1);
-        // 7) LayerNorm 反向：对输入的 dx 与对 γ/β 的梯度
+        // 7) 归一化反向（LayerNorm / RMSNorm 同一套内核）：对输入的 dx 与对 γ/β 的梯度
         let dxln = rec.empty(rows * d, KIND_OUT);
-        rec.ln_bwd_x(&dxn, &self.x, &self.stats, &dxln, &self.gamma, rows, d);
+        rec.ln_bwd_x(&dxn, &self.x, &self.stats, &dxln, &self.gamma, rows, d, self.is_rms);
         let dgamma = rec.empty(d, KIND_OUT);
         let dbeta = rec.empty(d, KIND_OUT);
         rec.ln_bwd_gb(&dxn, &self.x, &self.stats, &dgamma, &dbeta, rows, d);
@@ -3824,8 +3871,9 @@ impl MlpResident {
 /// 入参都是 CPU 上的张量数据：`x` `[rows, d]`、`gamma`/`beta` `[d]`、
 /// `w1` `[d, hid]`、`b1` `[hid]`、`w2` `[hid, d]`、`b2` `[d]`。
 ///
-/// 只覆盖 GPT-2 风格（LayerNorm + GELU MLP）；形状/规模不合适或 GPU 不可用时返回 None，
-/// 调用方回退逐算子路径，数值行为不变。
+/// `is_rms` 切换归一化模式（RMSNorm 时 `beta` 的内容被内核丢弃，只需长度合法）。
+/// 只覆盖 GPT-2 风格的 GELU MLP（SwiGLU 由调用方让路）；
+/// 形状/规模不合适或 GPU 不可用时返回 None，调用方回退逐算子路径，数值行为不变。
 #[allow(clippy::too_many_arguments)]
 pub fn mlp_forward(
     x: &[f32],
@@ -3839,6 +3887,7 @@ pub fn mlp_forward(
     d: usize,
     hid: usize,
     eps: f32,
+    is_rms: bool,
     dropout: f32,
     training: bool,
 ) -> Option<MlpResident> {
@@ -3876,10 +3925,10 @@ pub fn mlp_forward(
     let hb1 = rec.upload(b1);
     let hw2 = rec.upload(w2);
     let hb2 = rec.upload(b2);
-    // LayerNorm（顺带把每行统计量存进显存给反向复用）
+    // 归一化（顺带把每行统计量存进显存给反向复用）
     let xn = rec.empty(rows * d, KIND_OUT);
     let stats = rec.empty(rows * 2, KIND_OUT);
-    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps);
+    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps, is_rms);
     // Linear₁ + GELU：偏置融进 GELU 内核，同时存下 GELU 前的 z 供反向用
     let y1 = rec.matmul(&xn, false, &hw1, false, rows, d, hid, 1);
     let act = rec.empty(rows * hid, KIND_OUT);
@@ -3907,6 +3956,7 @@ pub fn mlp_forward(
         seed,
         dropout,
         training,
+        is_rms,
     })
 }
 
@@ -3970,17 +4020,19 @@ pub struct StackArgs<'a> {
     pub d: usize,
     pub n_head: usize,
     pub eps: f32,
+    /// 归一化是否为 RMSNorm（各层共用同一份模型配置，故整叠一个开关）
+    pub is_rms: bool,
     pub dropout: f32,
     pub training: bool,
 }
 
 /// 一个注意力子层的常驻显存句柄（前向产出，反向复用）
 struct AttnSublayer {
-    /// 子层输入（LayerNorm 反向 + 残差直通用）
+    /// 子层输入（归一化反向 + 残差直通用）
     x: GpuHandle,
-    /// LayerNorm 输出（dWq/dWk/dWv 用）
+    /// 归一化输出（dWq/dWk/dWv 用）
     xn: GpuHandle,
-    /// LayerNorm 每行的 (mean, 1/σ)
+    /// 归一化每行的 (mean, 1/σ)（RMSNorm 时 mean 槽位是 0）
     stats: GpuHandle,
     gamma: GpuHandle,
     /// Q'（已旋转、已乘 1/√head_dim）/ K（已旋转）/ V：[b*n_head, t, head_dim]
@@ -3994,13 +4046,15 @@ struct AttnSublayer {
     wproj: GpuHandle,
     /// dropout 掩码种子：前向与反向必须一致，掩码由它重算
     seed: u32,
+    /// 归一化是否为 RMSNorm（反向切同一个模式位）
+    is_rms: bool,
 }
 
 /// 一个前馈子层的常驻显存句柄（前向产出，反向复用）
 struct MlpSublayer {
-    /// 子层输入（LayerNorm 反向 + 残差直通用）
+    /// 子层输入（归一化反向 + 残差直通用）
     x: GpuHandle,
-    /// LayerNorm 输出
+    /// 归一化输出
     xn: GpuHandle,
     /// Linear₁ 输出 + b₁（GELU 的输入）
     z: GpuHandle,
@@ -4011,6 +4065,8 @@ struct MlpSublayer {
     w2: GpuHandle,
     gamma: GpuHandle,
     seed: u32,
+    /// 归一化是否为 RMSNorm（反向切同一个模式位）
+    is_rms: bool,
 }
 
 /// 整叠 Block 一次提交跑完的结果：输出已回读，其余句柄留给反向复用。
@@ -4046,6 +4102,7 @@ fn record_attn_sublayer_fwd(
     mask: &GpuHandle,
     dims: (usize, usize, usize, usize),
     eps: f32,
+    is_rms: bool,
     dropout: f32,
     training: bool,
 ) -> (AttnSublayer, GpuHandle) {
@@ -4061,10 +4118,10 @@ fn record_attn_sublayer_fwd(
     let hbv = rec.upload(la.bv);
     let hwp = rec.upload(la.wproj);
     let hbp = rec.upload(la.bproj);
-    // LayerNorm（顺带把每行统计量存进显存给反向复用）
+    // 归一化（顺带把每行统计量存进显存给反向复用）
     let xn = rec.empty(rows * d, KIND_OUT);
     let stats = rec.empty(rows * 2, KIND_OUT);
-    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps);
+    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps, is_rms);
     // QKV 三个投影
     let q_pre = rec.matmul(&xn, false, &hwq, false, rows, d, d, 1);
     let k_pre = rec.matmul(&xn, false, &hwk, false, rows, d, d, 1);
@@ -4091,7 +4148,7 @@ fn record_attn_sublayer_fwd(
         rec.keep(h);
     }
     (
-        AttnSublayer { x: hx, xn, stats, gamma: hg, q, k, v, p, merged, wproj: hwp, seed },
+        AttnSublayer { x: hx, xn, stats, gamma: hg, q, k, v, p, merged, wproj: hwp, seed, is_rms },
         out,
     )
 }
@@ -4107,6 +4164,7 @@ fn record_mlp_sublayer_fwd(
     d: usize,
     hid: usize,
     eps: f32,
+    is_rms: bool,
     dropout: f32,
     training: bool,
 ) -> (MlpSublayer, GpuHandle) {
@@ -4119,7 +4177,7 @@ fn record_mlp_sublayer_fwd(
     let hb2 = rec.upload(la.b2);
     let xn = rec.empty(rows * d, KIND_OUT);
     let stats = rec.empty(rows * 2, KIND_OUT);
-    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps);
+    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps, is_rms);
     // Linear₁ + GELU：偏置融进 GELU 内核，同时存下 GELU 前的 z 供反向用
     let y1 = rec.matmul(&xn, false, &hw1, false, rows, d, hid, 1);
     let act = rec.empty(rows * hid, KIND_OUT);
@@ -4133,7 +4191,7 @@ fn record_mlp_sublayer_fwd(
     for h in [hb, hb1, hb2, y1, y2] {
         rec.keep(h);
     }
-    (MlpSublayer { x: hx, xn, z, act, stats, w1: hw1, w2: hw2, gamma: hg, seed }, out)
+    (MlpSublayer { x: hx, xn, z, act, stats, w1: hw1, w2: hw2, gamma: hg, seed, is_rms }, out)
 }
 
 /// 整叠 Block 常驻显存前向：所有子层录进**一次提交**，只有整叠输出回读。
@@ -4141,7 +4199,7 @@ fn record_mlp_sublayer_fwd(
 /// 不适用时返回 None，调用方回退逐 Block 路径（数值行为不变）：
 /// 形状/规模不满足、各层形状不一致、GPU 不可用。
 pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
-    let StackArgs { x, mask, layers, b, t, d, n_head, eps, dropout, training } = *a;
+    let StackArgs { x, mask, layers, b, t, d, n_head, eps, is_rms, dropout, training } = *a;
     if layers.is_empty() || b == 0 || t == 0 || d == 0 || n_head == 0 || d % n_head != 0 {
         return None;
     }
@@ -4206,11 +4264,11 @@ pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
     let mut mlp = Vec::with_capacity(layers.len());
     for la in layers {
         let (ah, a_out) = record_attn_sublayer_fwd(
-            &mut rec, hx, la, &hmask, (b, t, d, n_head), eps, dropout, training,
+            &mut rec, hx, la, &hmask, (b, t, d, n_head), eps, is_rms, dropout, training,
         );
         attn.push(ah);
         let (mh, m_out) =
-            record_mlp_sublayer_fwd(&mut rec, a_out, la, b, t, d, hid, eps, dropout, training);
+            record_mlp_sublayer_fwd(&mut rec, a_out, la, b, t, d, hid, eps, is_rms, dropout, training);
         mlp.push(mh);
         hx = m_out;
     }
@@ -4281,9 +4339,9 @@ fn record_attn_sublayer_bwd(
     rec.add(&dq_pre, &dk_pre, &sum2, rows * d);
     let dln = rec.empty(rows * d, KIND_OUT);
     rec.add(&sum2, &dv_pre, &dln, rows * d);
-    // 8) LayerNorm 反向
+    // 8) 归一化反向（LayerNorm / RMSNorm 同一套内核，模式位从前向的句柄里带过来）
     let dxln = rec.empty(rows * d, KIND_OUT);
-    rec.ln_bwd_x(&dln, &h.x, &h.stats, &dxln, &h.gamma, rows, d);
+    rec.ln_bwd_x(&dln, &h.x, &h.stats, &dxln, &h.gamma, rows, d, h.is_rms);
     let dgamma = rec.empty(d, KIND_OUT);
     let dbeta = rec.empty(d, KIND_OUT);
     rec.ln_bwd_gb(&dln, &h.x, &h.stats, &dgamma, &dbeta, rows, d);
@@ -4333,9 +4391,9 @@ fn record_mlp_sublayer_bwd(
     rec.col_sum(&dz, &db1, rows, hid);
     let dxn = rec.matmul(&dz, false, &h.w1, true, rows, hid, d, 1);
     let dw1 = rec.matmul(&h.xn, true, &dz, false, d, rows, hid, 1);
-    // 7) LayerNorm 反向
+    // 7) 归一化反向（LayerNorm / RMSNorm 同一套内核）
     let dxln = rec.empty(rows * d, KIND_OUT);
-    rec.ln_bwd_x(&dxn, &h.x, &h.stats, &dxln, &h.gamma, rows, d);
+    rec.ln_bwd_x(&dxn, &h.x, &h.stats, &dxln, &h.gamma, rows, d, h.is_rms);
     let dgamma = rec.empty(d, KIND_OUT);
     let dbeta = rec.empty(d, KIND_OUT);
     rec.ln_bwd_gb(&dxn, &h.x, &h.stats, &dgamma, &dbeta, rows, d);
@@ -4925,7 +4983,14 @@ mod tests {
             return;
         }
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
-        for &(rows, d, hid) in &[(48usize, 32usize, 64usize), (40, 300, 260)] {
+        // 每个形状跑两遍：LayerNorm 与 RMSNorm（同一套内核、只切模式位）。
+        // RMSNorm 下喂进去的 `beta` 仍是非零向量，内核应把它整个丢弃。
+        let cases: Vec<(usize, usize, usize, bool)> =
+            [(48usize, 32usize, 64usize), (40, 300, 260)]
+                .into_iter()
+                .flat_map(|(r, d, h)| [(r, d, h, false), (r, d, h, true)])
+                .collect();
+        for &(rows, d, hid, is_rms) in &cases {
             let (dropout, eps) = (0.1f32, 1e-5f32);
             let x: Vec<f32> = (0..rows * d).map(|i| ((i % 37) as f32 * 0.021).sin()).collect();
             let gamma: Vec<f32> = (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos()).collect();
@@ -4937,16 +5002,20 @@ mod tests {
             let dout: Vec<f32> = (0..rows * d).map(|i| ((i % 29) as f32 * 0.023).sin()).collect();
 
             let res = mlp_forward(
-                &x, &gamma, &beta, &w1, &b1, &w2, &b2, rows, d, hid, eps, dropout, true,
+                &x, &gamma, &beta, &w1, &b1, &w2, &b2, rows, d, hid, eps, is_rms, dropout, true,
             )
             .expect("该形状应走常驻显存路径");
             let seed = res.seed;
 
-            // ---- 前向参考：LayerNorm → linear₁ → GELU → linear₂ → dropout → 残差 ----
+            // ---- 前向参考：LayerNorm/RMSNorm → linear₁ → GELU → linear₂ → dropout → 残差 ----
             let mut xn = vec![0.0f32; rows * d];
             for r in 0..rows {
                 let base = r * d;
-                let mean = x[base..base + d].iter().sum::<f32>() / d as f32;
+                let mean = if is_rms {
+                    0.0
+                } else {
+                    x[base..base + d].iter().sum::<f32>() / d as f32
+                };
                 let var = x[base..base + d]
                     .iter()
                     .map(|&v| (v - mean) * (v - mean))
@@ -4954,7 +5023,8 @@ mod tests {
                     / d as f32;
                 let istd = 1.0 / (var + eps).sqrt();
                 for j in 0..d {
-                    xn[base + j] = (x[base + j] - mean) * istd * gamma[j] + beta[j];
+                    let aff = if is_rms { 0.0 } else { beta[j] };
+                    xn[base + j] = (x[base + j] - mean) * istd * gamma[j] + aff;
                 }
             }
             let y1 = cpu_matmul(&xn, &w1, rows, d, hid, 1, false, false);
@@ -4968,7 +5038,7 @@ mod tests {
             let out_ref: Vec<f32> = (0..rows * d)
                 .map(|i| x[i] + ref_drop_scale(i, dropout, seed, true) * (y2[i] + b2[i % d]))
                 .collect();
-            assert_close(&format!("out({rows},{d},{hid})"), &res.out, &out_ref);
+            assert_close(&format!("out({rows},{d},{hid},rms={is_rms})"), &res.out, &out_ref);
 
             // ---- 反向参考 ----
             let dypre: Vec<f32> = (0..rows * d)
@@ -4981,13 +5051,18 @@ mod tests {
             let db1_ref = ref_col_sum(&dz, rows, hid);
             let dxn = cpu_matmul(&dz, &w1, rows, hid, d, 1, false, true);
             let dw1_ref = cpu_matmul(&xn, &dz, d, rows, hid, 1, true, false);
-            // LayerNorm 反向：dx = istd·(dy·γ − m1 − m2·x̂)，m1/m2 是 dy·γ 与 dy·γ·x̂ 的行均值
+            // 归一化反向：dx = istd·(dy·γ − m1 − m2·x̂)，m1/m2 是 dy·γ 与 dy·γ·x̂ 的行均值
+            // （RMSNorm 时 m1 ≡ 0，且没有 dβ）
             let mut dxln = vec![0.0f32; rows * d];
             let mut dgamma_ref = vec![0.0f32; d];
             let mut dbeta_ref = vec![0.0f32; d];
             for r in 0..rows {
                 let base = r * d;
-                let mean = x[base..base + d].iter().sum::<f32>() / d as f32;
+                let mean = if is_rms {
+                    0.0
+                } else {
+                    x[base..base + d].iter().sum::<f32>() / d as f32
+                };
                 let var = x[base..base + d]
                     .iter()
                     .map(|&v| (v - mean) * (v - mean))
@@ -5001,9 +5076,11 @@ mod tests {
                     m1 += dyg;
                     m2 += dyg * xh;
                     dgamma_ref[j] += dxn[base + j] * xh;
-                    dbeta_ref[j] += dxn[base + j];
+                    if !is_rms {
+                        dbeta_ref[j] += dxn[base + j];
+                    }
                 }
-                m1 /= d as f32;
+                m1 = if is_rms { 0.0 } else { m1 / d as f32 };
                 m2 /= d as f32;
                 for j in 0..d {
                     let xh = (x[base + j] - mean) * istd;
@@ -5014,14 +5091,17 @@ mod tests {
             let dx_ref: Vec<f32> = dxln.iter().zip(&dout).map(|(a, b)| a + b).collect();
 
             let g = res.backward(&dout).expect("常驻反向应成功");
-            let tag = |n: &str| format!("{n}({rows},{d},{hid})");
+            let tag = |n: &str| format!("{n}({rows},{d},{hid},rms={is_rms})");
             assert_close(&tag("dx"), &g.dx, &dx_ref);
             assert_close(&tag("dw1"), &g.dw1, &dw1_ref);
             assert_close(&tag("db1"), &g.db1, &db1_ref);
             assert_close(&tag("dw2"), &g.dw2, &dw2_ref);
             assert_close(&tag("db2"), &g.db2, &db2_ref);
             assert_close(&tag("dgamma"), &g.dgamma, &dgamma_ref);
-            assert_close(&tag("dbeta"), &g.dbeta, &dbeta_ref);
+            // RMSNorm 没有 β：内核仍会写出一份「Σ dy」的残值，但**无人接收**（这里就不比）
+            if !is_rms {
+                assert_close(&tag("dbeta"), &g.dbeta, &dbeta_ref);
+            }
         }
     }
 
@@ -5057,6 +5137,7 @@ mod tests {
         d: usize,
         n_head: usize,
         eps: f32,
+        is_rms: bool,
         dropout: f32,
         seed: u32,
         training: bool,
@@ -5067,11 +5148,15 @@ mod tests {
         let scale = 1.0 / (hd as f32).sqrt();
         let half = hd / 2;
 
-        // LayerNorm
+        // 归一化：LayerNorm（p3=0）或 RMSNorm（p3=1，μ≡0、无 β）
         let mut xn = vec![0.0f32; rows * d];
         for r in 0..rows {
             let base = r * d;
-            let mean = x[base..base + d].iter().sum::<f32>() / d as f32;
+            let mean = if is_rms {
+                0.0
+            } else {
+                x[base..base + d].iter().sum::<f32>() / d as f32
+            };
             let var = x[base..base + d]
                 .iter()
                 .map(|&v| (v - mean) * (v - mean))
@@ -5079,7 +5164,8 @@ mod tests {
                 / d as f32;
             let istd = 1.0 / (var + eps).sqrt();
             for j in 0..d {
-                xn[base + j] = (x[base + j] - mean) * istd * gamma[j] + beta[j];
+                let aff = if is_rms { 0.0 } else { beta[j] };
+                xn[base + j] = (x[base + j] - mean) * istd * gamma[j] + aff;
             }
         }
         // QKV 投影（含偏置）
@@ -5173,7 +5259,7 @@ mod tests {
             .collect();
         (
             out,
-            RefAttnCache { xn, q, k, v, p, merged, wproj: wproj.to_vec() },
+            RefAttnCache { xn, q, k, v, p, merged },
         )
     }
 
@@ -5185,12 +5271,15 @@ mod tests {
         v: Vec<f32>,
         p: Vec<f32>,
         merged: Vec<f32>,
-        wproj: Vec<f32>,
     }
 
     /// 常驻「注意力子层」的单个形状用例：前向 + 11 项边界梯度 vs 纯循环参考。
-    fn attn_layer_case(b: usize, t: usize, d: usize, n_head: usize) {
-        let tag = |n: &str| format!("{n}[{b},{t},{d},{n_head}]");
+    ///
+    /// `is_rms = true` 时走 RMSNorm 模式：参考实现按「μ≡0、无 β」算，
+    /// 而喂给内核的 `beta` 仍是**非零**向量 —— 内核应把它整个丢弃，
+    /// 于是这一组用例同时也验证了 β 槽位确实被忽略。
+    fn attn_layer_case(b: usize, t: usize, d: usize, n_head: usize, is_rms: bool) {
+        let tag = |n: &str| format!("{n}[{b},{t},{d},{n_head},rms={is_rms}]");
         let hd = d / n_head;
         let (bn, rows, half) = (b * n_head, b * t, hd / 2);
         let (dropout, eps) = (0.1f32, 1e-5f32);
@@ -5237,6 +5326,7 @@ mod tests {
             d,
             n_head,
             eps,
+            is_rms,
             dropout,
             training: true,
         })
@@ -5245,7 +5335,7 @@ mod tests {
 
         let (out_ref, c) =
             ref_attn_layer_fwd(&x, &gamma, &beta, &wq, &bq, &wk, &bk, &wv, &bv, &wproj,
-                               &bproj, &mask, b, t, d, n_head, eps, dropout, seed, true);
+                               &bproj, &mask, b, t, d, n_head, eps, is_rms, dropout, seed, true);
         assert_close(&tag("attn.out"), &res.out, &out_ref);
 
         // ---- 反向参考 ----
@@ -5327,7 +5417,11 @@ mod tests {
         let mut dbeta_ref = vec![0.0f32; d];
         for r in 0..rows {
             let base = r * d;
-            let mean = x[base..base + d].iter().sum::<f32>() / d as f32;
+            let mean = if is_rms {
+                0.0
+            } else {
+                x[base..base + d].iter().sum::<f32>() / d as f32
+            };
             let var = x[base..base + d]
                 .iter()
                 .map(|&v| (v - mean) * (v - mean))
@@ -5341,9 +5435,11 @@ mod tests {
                 m1 += dyg;
                 m2 += dyg * xh;
                 dgamma_ref[j] += dln[base + j] * xh;
-                dbeta_ref[j] += dln[base + j];
+                if !is_rms {
+                    dbeta_ref[j] += dln[base + j];
+                }
             }
-            m1 /= d as f32;
+            m1 = if is_rms { 0.0 } else { m1 / d as f32 };
             m2 /= d as f32;
             for j in 0..d {
                 let xh = (x[base + j] - mean) * istd;
@@ -5363,7 +5459,10 @@ mod tests {
         assert_close(&tag("attn.dwproj"), &g.dwproj, &dwproj_ref);
         assert_close(&tag("attn.dbproj"), &g.dbproj, &dbproj_ref);
         assert_close(&tag("attn.dgamma"), &g.dgamma, &dgamma_ref);
-        assert_close(&tag("attn.dbeta"), &g.dbeta, &dbeta_ref);
+        // RMSNorm 没有 β：内核仍会写出一份「Σ dy」的残值，但**无人接收**（这里就不比）
+        if !is_rms {
+            assert_close(&tag("attn.dbeta"), &g.dbeta, &dbeta_ref);
+        }
     }
 
     /// 内核算力探针：单次提交内连续跑同一个 matmul，测出**纯内核**吞吐
@@ -5622,8 +5721,11 @@ mod tests {
             return;
         }
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
-        attn_layer_case(4, 128, 32, 4);
-        attn_layer_case(2, 300, 128, 4);
+        attn_layer_case(4, 128, 32, 4, false);
+        attn_layer_case(2, 300, 128, 4, false);
+        // RMSNorm 走同一套内核、只切模式位：形状换一组，避免与上面共用同一份随机数
+        attn_layer_case(4, 128, 32, 4, true);
+        attn_layer_case(2, 300, 128, 4, true);
     }
 
     /// 整叠 Block 常驻路径（打通子层边界）vs 逐子层常驻路径。
@@ -5635,8 +5737,11 @@ mod tests {
     ///
     /// dropout 一律关掉（`training = false`）：两条路径各自抽自己的种子，
     /// 掩码不可能逐位一致，开着就没法比对。
-    fn stack_case(n_layer: usize, b: usize, t: usize, d: usize, n_head: usize) {
-        let tag = |n: &str| format!("{n}[L{n_layer},{b},{t},{d},{n_head}]");
+    ///
+    /// `is_rms = true` 时归一化切到 RMSNorm 模式：两条路径共用同一套内核，
+    /// 因此 16 个槽位仍可逐一比对（含 RMSNorm 下无意义的 `dβ` 残值——两边算的一样）。
+    fn stack_case(n_layer: usize, b: usize, t: usize, d: usize, n_head: usize, is_rms: bool) {
+        let tag = |n: &str| format!("{n}[L{n_layer},{b},{t},{d},{n_head},rms={is_rms}]");
         let (rows, eps, hid) = (b * t, 1e-5f32, 4 * d);
         // 每层 16 个参数，顺序与 `StackLayerArgs` 一致
         let layers_w: Vec<Vec<Vec<f32>>> = (0..n_layer)
@@ -5699,13 +5804,15 @@ mod tests {
                 d,
                 n_head,
                 eps,
+                is_rms,
                 dropout: 0.0,
                 training: false,
             })
             .expect("参考路径：注意力子层应走常驻显存");
             let xa = a.out.clone();
             let m = mlp_forward(
-                &xa, &w[10], &w[11], &w[12], &w[13], &w[14], &w[15], rows, d, hid, eps, 0.0, false,
+                &xa, &w[10], &w[11], &w[12], &w[13], &w[14], &w[15], rows, d, hid, eps, is_rms, 0.0,
+                false,
             )
             .expect("参考路径：MLP 子层应走常驻显存");
             xr = m.out.clone();
@@ -5757,6 +5864,7 @@ mod tests {
             d,
             n_head,
             eps,
+            is_rms,
             dropout: 0.0,
             training: false,
         })
@@ -5784,7 +5892,10 @@ mod tests {
         }
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
         // 小配置；再来一个 d=128、t=300 的形状，跨过 workgroup_size(256) 的多轮归约边界
-        stack_case(2, 4, 128, 32, 4);
-        stack_case(2, 2, 300, 128, 4);
+        stack_case(2, 4, 128, 32, 4, false);
+        stack_case(2, 2, 300, 128, 4, false);
+        // RMSNorm 模式（整叠一个开关，各层共用）
+        stack_case(2, 4, 128, 32, 4, true);
+        stack_case(2, 2, 300, 128, 4, true);
     }
 }

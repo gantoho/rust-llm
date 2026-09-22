@@ -15,50 +15,63 @@
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
 - **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、39 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善。
-- **工程化完整**：CLI 子命令（train / eval / generate / chat / sft / finetune / preset / demo / bench）、
+- **工程化完整**：CLI 子命令（train / eval / generate / chat / sft / finetune / preset / demo / bench / scaling）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
-- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、梯度累积、Beam Search。
+- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、梯度累积、Beam Search、
+  KV Cache 滑动窗口（长上下文可持续生成）、混合精度训练（AMP 动态损失缩放，已接入训练循环）。
 - **真实可用**：加载预训练权重微调、交互式对话、分词器持久化、训练指标日志、运行日志（每次训练/推理自动存档）、预设模型配置。
-- **教学实现（尚未接入训练循环）**：LoRA 层与 `MixedPrecision` 动态损失缩放都有完整实现和文档，
-  但都还没接进 `train_gpt`——`finetune` 目前是常规全参微调，见 [§6](#6-finetune--加载预训练权重微调) 与第 26 / 29 课。
+- **LoRA 已接入**：`finetune` 子命令会冻结预训练主干、只训练低秩适配层（缺省挂 Q/K/V，`--lora-targets` 可扩到 O 与 MLP）
+  （本项目实测可训练参数 **24,576 / 1,866,496 = 1.32%**），支持**链式续训**（`--resume-lora`，接着训旧适配层）
+  与**推理合并**（`--merge-lora`，把增量就地并进主干），存档头部记录 LoRA 形态，加载后可直接对话，
+  见 [§6](#6-finetune--lora-微调) 与第 29 课。
+- **混合精度训练（AMP）已接入训练循环**：`train.amp` 打开后，loss 先乘上动态 `scale` 再反向，
+  参数更新前检查梯度是否溢出（含 Inf/NaN 就丢弃本步、不更新参数，`scale` 自动减半）、并把梯度
+  反缩放回真实尺度再做裁剪（保证裁剪阈值仍然作用在真实梯度上），见第 26 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
 ### 包含的功能（对应 39 课）
 
 | 模块 | 文件 | 内容 |
 |------|------|------|
-| 张量运算 | `src/tensor.rs` | Tensor 结构体、广播、逐元素/标量运算、matmul、softmax、permute、gather |
+| 张量运算 | `src/tensor.rs` | Tensor 结构体、广播、逐元素/标量运算、matmul、softmax、permute、gather；**`matmul_frozen`**（冻结权重：反向只求 `dx`） |
 | 自动微分 | `src/autograd.rs` | backward 反向传播、拓扑排序（计算图 → 梯度流） |
-| 模块接口 | `src/module.rs` | `Module` trait：参数收集的统一接口（`parameters()`） |
+| 模块接口 | `src/module.rs` | `Module` trait：参数收集的统一接口（`parameters()` / **`trainable_parameters()`**） |
 | RoPE 位置编码 | `src/rope.rs` | 旋转位置编码：把相对位置揉进 Q/K 向量 |
-| 神经网络层 | `src/layers.rs` | Linear、LayerNorm、**RMSNorm**、Embedding、ReLU/GELU/Tanh、**SwiGLU**、**LoRA** |
-| 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减） |
+| 神经网络层 | `src/layers.rs` | Linear、LayerNorm、**RMSNorm**、Embedding、ReLU/GELU/Tanh、**SwiGLU**、**LoRA 适配层（`LoraAdapter`，挂在 `Linear` 上）** |
+| 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减）；**`step()` 跳过冻结参数（含权重衰减）** |
 | 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），**save/load 持久化**，配置可切换；生成时做 UTF-8 约束，不会拼出乱码字符 |
-| 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、KV Cache、**GQA 分组查询注意力** |
-| GPT 模型 | `src/model.rs` | Transformer Block 堆叠、GPT 整体前向、checkpoint 参数名、**Dropout** |
+| 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、**KV Cache（含滑动窗口丢弃）**、**GQA 分组查询注意力**、**Q/K/V 注入 LoRA** |
+| GPT 模型 | `src/model.rs` | Transformer Block 堆叠、GPT 整体前向、checkpoint 参数名、**Dropout**、**`apply_lora`（冻结 + 注入）** |
 | 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样；**SFT 对话语料解析 + loss 掩码** |
-| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**；另外实现了但未接入的 `MixedPrecision` 动态损失缩放 |
+| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**、**按可训练子集统计梯度范数**、**`MixedPrecision` 动态损失缩放（AMP：溢出跳步 + 梯度反缩放）** |
 | 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search**，**停止标记** |
+| 缩放定律 | `src/scaling.rs` | 幂律拟合（固定 `b` 的闭式最小二乘 + 黄金分割搜 `b`）、`C ≈ 6ND` 与非嵌入参数口径、Chinchilla 20:1 与参数化闭式解两条最优配比、训练时长/电费估算、**真实跑多规模扫描并拟合实测指数** |
+| MoE 稀疏专家 | `src/moe.rs` | Top-K 路由（并列按下标、确定性）、两种门控口径（Top-K 重归一化 / Switch 原概率，**含 K = 1 的梯度陷阱**）、gather→expert→weighted→scatter 稀疏前向、负载均衡辅助损失、容量因子与 Token Dropping、参数/激活量口径 |
+| 量化 | `src/quant.rs` | INT8/INT4 的逐张量 / 逐通道 / 逐 token 量化与位打包、GPTQ（Hessian 逆 + 逐通道误差分摊）、AWQ（激活感知的缩放搜索）、校准集统计、逐层量化与 checkpoint 元信息、KIVI 式 KV cache 量化 |
+| 推测解码 | `src/speculative.rs` | 草稿→验证循环（拒绝采样 + 残差分布修正，输出**严格无损**）、`TargetStream` 缓存不变量与 `rollback_to`、`ModelDrafter`、多 Token 预测头（`MtpHeads` / `MtpDrafter`） |
+| 对齐 | `src/align.rs` | 奖励模型（标量头 + Bradley-Terry）、序列 logprob 与 loss 掩码、DPO（隐式奖励 + 参考模型）、GRPO 组内相对优势、PPO clip 目标 + KL(k3) 惩罚 |
+| RAG | `src/rag.rs` | 分块（字符域切分 + 句读对齐、可配重叠）、三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）、余弦检索与 MMR 多样化重排、按预算组装提示 |
+| 分布式 | `src/distributed.rs` | 环形 allreduce（reduce-scatter + all-gather）、数据并行、ZeRO-1/2（状态分片）、张量并行 MLP 与 QKV 列切分、GPipe / 1F1B 流水线、3D 并行规划（`DistConfig`） |
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
-| Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式 |
-| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **sft** / **finetune** / **preset** / demo / **bench** |
+| Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式，**头部记录 LoRA 形态（旧档兼容）** |
+| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
-### 前沿技术教程（第 31-38 课，纯文档）
+### 前沿技术（第 31-38 课）
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
-| Scaling Laws | `docs/31-Scaling-Laws.md` | 幂律关系、Chinchilla 最优配比、算力估算、涌现能力 |
-| MoE 混合专家模型 | `docs/32-MoE混合专家模型.md` | 稀疏激活、Router 门控网络、负载均衡、Switch/Mixtral/DeepSeek 架构 |
-| 量化技术 | `docs/33-量化技术.md` | INT8/INT4 量化、GPTQ、AWQ、GGUF、PTQ vs QAT、STE |
-| 推测解码 | `docs/34-推测解码.md` | 草稿模型 + 验证、拒绝采样、无损保证、Medusa/EAGLE |
-| 多 Token 预测 | `docs/35-多token预测.md` | MTP 训练目标、DeepSeek 实现、与推测解码结合 |
-| RLHF 与对齐 | `docs/36-RLHF与对齐.md` | SFT、奖励模型（Bradley-Terry）、PPO、DPO、GRPO、Constitutional AI |
-| RAG 检索增强生成 | `docs/37-RAG检索增强生成.md` | 文档分块、向量嵌入、相似度检索、重排序、HyDE、Self-RAG |
-| 分布式训练 | `docs/38-分布式训练.md` | 数据并行、ZeRO、张量并行、流水线并行、3D 并行、通信原语 |
+| Scaling Laws | `docs/31-Scaling-Laws.md` | 幂律关系、Chinchilla 最优配比、算力估算、涌现能力（**已落地代码**：`src/scaling.rs` + `scaling` 子命令） |
+| MoE 混合专家模型 | `docs/32-MoE混合专家模型.md` | 稀疏激活、Router 门控网络、负载均衡、Switch/Mixtral/DeepSeek 架构（**已落地代码**：`src/moe.rs` + `moe` 子命令） |
+| 量化技术 | `docs/33-量化技术.md` | INT8/INT4 量化、GPTQ、AWQ、GGUF、PTQ vs QAT、STE（**已落地代码**：`src/quant.rs` + `quant` 子命令） |
+| 推测解码 | `docs/34-推测解码.md` | 草稿模型 + 验证、拒绝采样、无损保证、Medusa/EAGLE（**已落地代码**：`src/speculative.rs` + `speculative` 子命令） |
+| 多 Token 预测 | `docs/35-多token预测.md` | MTP 训练目标、DeepSeek 实现、与推测解码结合（**已落地代码**：`src/speculative.rs` 的 `MtpHeads` / `MtpDrafter`） |
+| RLHF 与对齐 | `docs/36-RLHF与对齐.md` | SFT、奖励模型（Bradley-Terry）、PPO、DPO、GRPO、Constitutional AI（**已落地代码**：`src/align.rs` + `align` 子命令） |
+| RAG 检索增强生成 | `docs/37-RAG检索增强生成.md` | 文档分块、向量嵌入、相似度检索、重排序、HyDE、Self-RAG（**已落地代码**：`src/rag.rs` + `rag` 子命令） |
+| 分布式训练 | `docs/38-分布式训练.md` | 数据并行、ZeRO、张量并行、流水线并行、3D 并行、通信原语（**已落地代码**：`src/distributed.rs` + `distributed` 子命令） |
 
 ### 工程化完善教程（第 39 课，代码+文档）
 
@@ -100,12 +113,17 @@ cargo run --release -- sft --config config/config.json --pretrained checkpoints/
 cargo run --release -- chat --ckpt checkpoints/zh-sft/best.ckpt   # 之后用 SFT 权重对话
 
 # ═══════════════════════════════════════════
-#  微调（加载预训练模型，当前为全参微调；LoRA 尚未接入训练循环）
+#  LoRA 微调（冻结预训练主干，只训低秩适配层，只占 1.3% 参数）
 # ═══════════════════════════════════════════
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt
+cargo run --release -- finetune --pretrained checkpoints/zh/latest.ckpt --lora-rank 8 --lora-alpha 8
+cargo run --release -- chat --ckpt checkpoints/zh-lora/best.ckpt --temperature 0.3
+#  扩挂载（q/k/v/o/mlp/all）、链式续训、推理时合并增量
+cargo run --release -- finetune --pretrained checkpoints/zh/latest.ckpt --lora-targets all
+cargo run --release -- finetune --pretrained checkpoints/zh-lora/best.ckpt --resume-lora --steps 60
+cargo run --release -- chat --ckpt checkpoints/zh-lora/best.ckpt --merge-lora
 
 # ═══════════════════════════════════════════
-#  教学演示（验证所有算法正确性）
+#  端到端演示（验证所有算法正确性）
 # ═══════════════════════════════════════════
 cargo run --release -- demo
 
@@ -120,7 +138,8 @@ cargo run --release -- bench --steps 30
 
 ## 命令行完整参考
 
-程序提供 9 个子命令：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` / `preset` / `demo` / `bench`。
+程序提供 16 个子命令：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` / `preset` / `demo` / `bench` /
+`scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative`。
 
 ### 1. `train` —— 训练模型
 
@@ -166,7 +185,7 @@ JSON 头：step、best_val_loss、模型配置、优化器步数 opt_t、参数�
 
 **日志**：**每个评估点**（每 `eval_every` 步 + 最后一步）向 `logs/train.csv` 写一行（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；每次训练会覆盖该文件，要留档就一个实验配一个路径。
 
-**运行日志**：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` 六个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
+**运行日志**：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` / `scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative` 十三个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
 
 **分词器自动加载；`eval` 仍需要语料**：`eval` / `generate` / `chat` 都会从 checkpoint 目录自动加载 `tokenizer.json`（不必再指定分词器）。其中 **`generate` / `chat` 只依赖 checkpoint，不需要语料**；但 **`eval` 要算验证集 loss，仍会读配置里的 `train_file`**（或 `val_file`），所以它的 `--config` 必须指向语料还在的原配置：
 
@@ -208,7 +227,7 @@ cargo run --release --features gpu -- train --config config/config.json
 cargo run --release --features gpu -- train --config config/config.json --resume checkpoints/zh/latest.ckpt
 
 # ── 不同模型规模的训练（修改 config/config.json，或用 preset 生成）──
-# 小模型（教学用，秒级完成）：n_embd=64, n_layer=2, block_size=32（GPTConfig 的默认值）
+# 小模型（秒级完成，适合快速验证）：n_embd=64, n_layer=2, block_size=32（GPTConfig 的默认值）
 # 中模型（几分钟）：n_embd=256, n_layer=4, block_size=256
 # 大模型（需要耐心）：n_embd=512, n_layer=8, block_size=256
 # 不想手改就直接用预设：preset small(256维/4层/128上下文) / medium(512维/8层) / large(768维/12层)
@@ -251,6 +270,7 @@ cargo run --release -- eval [参数]
 | `--config <路径>` | string | `config/config.json` | 配置文件路径 |
 | `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
+| `--merge-lora` | flag | 关 | 推理前把 LoRA 增量就地并进主干权重（数值不变，省掉每层两次小矩阵乘）；基座无适配层时只打一行警告 |
 
 **评估指标**：
 - `val_loss` —— 验证集上的交叉熵损失
@@ -310,6 +330,7 @@ cargo run --release -- generate [参数]
 | `--no-kv-cache` | flag | 关闭 | 禁用 KV cache（每个新 token 都全量前向，慢但省内存） |
 | `--beam <束宽>` | int | 无（不用） | Beam Search 束宽（通常 4-10），指定后使用确定性搜索 |
 | `--length-penalty <α>` | float | `0.6` | Beam Search 长度惩罚（0=不惩罚，>0 偏好长序列） |
+| `--merge-lora` | flag | 关 | 推理前把 LoRA 增量就地并进主干权重（数值不变，省掉每层两次小矩阵乘） |
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，推理时自动加载。
 
@@ -459,7 +480,7 @@ cargo run --release -- generate --config config/config.json --prompt "The fox" -
 
 # 与 ChatGPT 等商用模型的区别：
 #   商用模型：每次请求随机生成种子 → 每次输出不同
-#   本项目：  固定种子 → 每次输出相同 → 便于精确对比不同参数/模型的效果（学习项目的核心优势）
+#   本项目：  固定种子 → 每次输出相同 → 可精确对比不同参数/模型的效果（实验可复现的前提）
 #
 
 # ═══════════════════════════════════════════
@@ -469,7 +490,7 @@ cargo run --release -- generate --config config/config.json --prompt "The fox" -
 # 默认开启 KV cache（推荐，推理速度快）
 cargo run --release -- generate --config config/config.json --prompt "Once" --max-new 100
 
-# 禁用 KV cache（每个 token 都全量前向，慢但结果一致，用于调试对比）
+# 禁用 KV cache（每个 token 都全量前向，慢但省显存；总长不超 block_size 时结果与开 cache 完全一致）
 cargo run --release -- generate --config config/config.json --prompt "Once" --max-new 100 --no-kv-cache
 
 # ═══════════════════════════════════════════
@@ -533,6 +554,7 @@ cargo run --release -- chat [参数]
 | `--max-new <数量>` | int | `200` | 每次生成的最大 token 数 |
 | `--seed <种子>` | int | `42` | 随机种子 |
 | `--prompt-format <模板>` | string | `sft` | `sft` = 用与 `sft` 子命令一致的对话模板拼 prompt（模型才会"回答"）；`raw` = 直接把历史拼给模型 |
+| `--merge-lora` | flag | 关 | 推理前把 LoRA 增量就地并进主干权重（数值不变，省掉每层两次小矩阵乘） |
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，对话时自动加载。
 
@@ -685,38 +707,108 @@ cargo run --release -- chat --ckpt checkpoints/zh-sft/final.ckpt --tokenizer che
 
 ---
 
-### 6. `finetune` —— 加载预训练权重微调
+### 6. `finetune` —— LoRA 微调
 
 ```bash
 cargo run --release -- finetune [参数]
 ```
 
-从预训练 checkpoint 接着训练：加载权重后按指定的步数与学习率做**全参微调**。
+加载预训练权重后**冻结全部主干**，只训练挂在各投影上的低秩适配层（LoRA，默认 Q/K/V，可用 `--lora-targets` 扩到 O 与 MLP）。
+语料与训练循环跟 `sft` 完全共用，只是参数集合不同——想对比"全参 SFT vs LoRA"，跑两条命令、看两份 CSV 即可。
 
-> ⚠️ **LoRA 尚未接入训练循环**：`src/layers.rs` 的 `LoRA` / `inject_lora` 以及 `--lora-rank` / `--lora-alpha`
-> 参数都已实现，但它们只会写进 `config.train.lora` 并打印一行提示，**不会冻结主参数、也不会注入适配层**。
-> 也就是说当前 `finetune` 训练的是全部参数，可训练参数量并没有「降到 1% 以下」。
-> LoRA 的原理与完整实现见第 29 课。
+**挂载位置**（`--lora-targets`）决定增量加在哪几个 `Linear` 上，写法与效果：
+
+| 取值 | 含义 | 每层对数 |
+|------|------|----------|
+| `q,k,v`（缺省） | 只动注意力输入侧 | 3 |
+| `q,k,v,o` | 加上输出投影 `c_proj` | 4 |
+| `all` | 再加 MLP 的两个（或三个）线性层 | 6（SwiGLU 时 8） |
+
+别名：`proj` / `c_proj` → `o`，`ffn` / `mlp` → `mlp`。大小写与空格随意，重复项会去重，未命中的词直接报错。
+**结构写进 checkpoint 头部**，所以训练与推理必须一致；加载时按存档头部的记录重建，不需要再传一遍。
+
+**冻结是三处一起做实的**（缺一处就会"以为冻结了、其实没冻"，详见第 29 课）：
+
+| 位置 | 做法 |
+|------|------|
+| 前向 | 冻结权重走 `Tensor::matmul_frozen`，反向只求 `dx`、不算 `dW` |
+| 优化器 | `AdamW` / `SGD` 的 `step()` 跳过 `!requires_grad()` 的参数，**连带不做权重衰减** |
+| GPU 常驻快路 | LoRA 形态下 `attn_resident` / `mlp_resident` / `blocks_resident` 整体让路（它们绕过 `Linear::forward`，会把增量静默丢掉） |
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--config <路径>` | string | `config/config.json` | 配置文件路径 |
-| `--pretrained <路径>` | string | 必填 | 预训练模型 checkpoint |
-| `--lora-rank <秩>` | int | `16` | LoRA 秩（低秩维度，通常 4-64） |
-| `--lora-alpha <系数>` | float | `16.0` | LoRA 缩放因子 α（通常 = rank） |
+| `--pretrained <路径>` | string | 必填 | 预训练模型 checkpoint（主干来源） |
+| `--lora-rank <秩>` | int | `16` | LoRA 秩 r（低秩维度，通常 4-64）；越小适配层越少 |
+| `--lora-alpha <系数>` | float | `= rank` | LoRA 缩放因子 α（缺省 = rank，即增量不额外缩放） |
+| `--lora-targets <位置>` | string | `q,k,v` | 适配层挂载位置，逗号分隔：`q` / `k` / `v` / `o` / `mlp` / `all`（见上表） |
+| `--resume-lora` | flag | 关 | **链式续训**：基座是 LoRA 存档时接着训**存档里那套**适配层（保留已学增量），此时不能再传 rank / alpha / targets |
+| `--sft-file <路径>` | string | config 的 `train.sft_file` | 对话语料，逗号分隔、可含 `*` 通配 |
 | `--steps <步数>` | int | `1000` | 微调步数 |
 | `--lr <学习率>` | float | `1e-4` | 微调学习率 |
+| `--out-dir <目录>` | string | `{out_dir}-lora` | 输出目录，缺省加 `-lora` 后缀，绝不覆盖预训练权重 |
 
 **示例**：
 
 ```bash
-# ── 基础微调 ──
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt
+# ── 基础用法（缺省 rank=16 / alpha=16 / 挂 q,k,v / 1000 步）──
+cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/latest.ckpt
 
-# ── 自定义步数与学习率 ──
-cargo run --release -- finetune --config config/config.json --pretrained checkpoints/zh/best.ckpt \
-    --steps 2000 --lr 5e-5
+# ── 本项目实测的配方：rank=8、alpha=8、60 步、lr=5e-5 ──
+cargo run --release -- finetune --pretrained checkpoints/zh/latest.ckpt \
+    --lora-rank 8 --lora-alpha 8 --steps 60 --lr 5e-5
+
+# ── 扩到 O 与 MLP（容量更大，参数仍只占几个百分点）──
+cargo run --release -- finetune --pretrained checkpoints/zh/latest.ckpt --lora-targets all
+
+# ── 用这个存档对话（目录是自包含的，不必再指回基座）──
+cargo run --release -- chat --ckpt checkpoints/zh-lora/best.ckpt
+
+# ── 链式续训：接着训存档里那套适配层，已学的增量不丢 ──
+cargo run --release -- finetune --pretrained checkpoints/zh-lora/best.ckpt --resume-lora --steps 60
+
+# ── 换语料 / 换输出目录 ──
+cargo run --release -- finetune --pretrained checkpoints/zh/latest.ckpt \
+    --sft-file data/sft/ --out-dir checkpoints/zh-lora2
 ```
+
+**链式续训 vs 重挂一套**：把 LoRA 存档当基座时，缺省语义是**重挂一套全新适配层**（原增量丢弃，只继承主干），这时会打一行 `[warn]` 提示；
+要接着训存档里那套就加 `--resume-lora`，它保留 A/B 的现有数值并重新解冻，rank / alpha / 挂载位置一律照存档，
+再传 `--lora-rank` 之类会直接报错。**这两种语义互斥**，选哪个取决于你是想在新任务上重来，还是想在旧任务上接着磨。
+
+**推理侧合并**：`eval` / `generate` / `chat` 都支持 `--merge-lora`，把 `ΔW = (α/r)·AᵀBᵀ` 就地并进主干权重
+（`W ← W + ΔW`），前向于是省掉每层两次小矩阵乘。**数值不受影响**——同 seed 下合并前后逐字相同（已实测）。
+注意合并会**丢弃**适配层本体，所以存档里的 A/B 不会被改写，`--merge-lora` 只作用于本次推理的内存副本；
+但它是**不可逆的运行时操作**，合并后的模型对象不能再拿来续训。
+
+**输出**（实测，[config/config.json](config/config.json) 的 1.84M 小模型 + 89 段对话语料）：
+
+```text
+LoRA 微调：rank=8 alpha=8 挂载=q,k,v steps=60 lr=0.00005｜冻结主干，只训适配层
+模型参数：1866496（含冻结主干）｜可训练：24576（1.317%）｜12 对低秩矩阵（挂载 q,k,v），共 24 个适配参数张量
+SFT 语料：89 段对话，打包 17898 token | 监督位置（回答段）占 56.1%
+LoRA：rank=8 alpha=8 挂载=q,k,v｜可训练参数 24576 / 1866496（1.32%）｜主干冻结：反向不算 dW、优化器不更新、不吃权重衰减
+...
+step    54 | lr 0.000006 | loss 6.2499 | val 6.5596 (ppl 706.0) *
+[done] checkpoint 已保存到 checkpoints/zh-lora/ | 总耗时 478s | 7.96s/步（共 60 步）
+```
+
+链式续训（`--resume-lora`，实测 5 步）的差别只在开头两行——结构照存档、命名换成"链式续训"：
+
+```text
+链式续训：沿用存档里的适配层（rank=8 alpha=8 挂载=q,k,v）steps=5 lr=0.0001｜已学的增量保留，只训 A/B
+模型参数：1866496（含冻结主干）｜可训练：24576（1.317%）｜12 对低秩矩阵（挂载 q,k,v），共 24 个适配参数张量
+```
+
+推理侧合并（`--merge-lora`）会多打一行 `LoRA 合并：12 个适配层的增量已并入主干权重（前向不再有额外矩阵乘）`。
+
+产物落在 `checkpoints/zh-lora/`：`{best,final,latest}.ckpt` + `tokenizer.json` + `lora.csv`
+（目录自包含——**冻结的主干也写在档案里**，所以加载时不必再指定 `--pretrained` 之外的任何东西）。
+实测档案只比基座大 296,186 字节，全部来自那 24,576 个适配参数的参数/动量块。
+
+> ⚠️ 别把这个 SFT val 当成效果指标：语料只有 89 段、验证集是切出来的 9 段，数字没有判别力。
+> 真正要看的是①预训练能力有没有退化（主干冻结 ⇒ 不会）②`chat` 聊两句有没有怪字。
+> 另外本基座对温度敏感，对话建议加 `--temperature 0.3`。
 
 ---
 
@@ -737,7 +829,7 @@ cargo run --release -- preset [参数]
 
 | 预设 | 参数量 | 架构 | 适合场景 |
 |------|--------|------|----------|
-| `small` | ~3.3M | GPT-2 风格（4层，256维，block=128，BPE 512） | 学习/演示，CPU 几分钟 |
+| `small` | ~3.3M | GPT-2 风格（4层，256维，block=128，BPE 512） | 快速验证，CPU 几分钟 |
 | `medium` | ~26M | LLaMA 风格（8层，512维，GQA，RMSNorm+SwiGLU） | 中等语料，推荐 GPU |
 | `large` | ~79M | LLaMA 风格（12层，768维，GQA，RMSNorm+SwiGLU） | 较大语料，需要 GPU |
 
@@ -766,20 +858,21 @@ cargo run --release -- train --config config/config_medium.json
 
 ---
 
-### 8. `demo` —— 教学演示
+### 8. `demo` —— 端到端演示
 
 ```bash
 cargo run --release -- demo
 ```
 
-无参数。依次运行 3 个教学演示（启用 `--features gpu` 时追加第 4 个 GPU 演示）：
+无参数。依次运行 3 个演示（启用 `--features gpu` 时追加第 4 个 GPU 演示）：
 
 1. **MLP 学习 XOR**（第 7 课）：验证神经网络 + 反向传播正确，训练后正确率 4/4（100%）
 2. **BPE 分词器**（第 8 课）：在示例语料上训练 BPE 词表（400 个 token），演示编码/解码往返
 3. **训练小 GPT 并生成文本**（第 12-20、25 课）：669 字符英文故事上训练 600 步，每 100 步记录一次
    （loss `1.63 → 0.15`），然后用 temperature=0.8 / top-k=10 / top-p=0.9 做三次生成：
-   生成 1 全量前向、生成 2 同 prompt + 同种子的 KV cache（输出应是生成 1 的前缀，用于验证
-   cache 不改生成分布）、生成 3 换个开头看小模型的泛化毛病
+   生成 1 全量前向、生成 2 同 prompt + 同种子的 KV cache（滑动窗口让它同样生成满 80 个 token），
+   再做一次**窗口内等价自检**（prompt + 生成不超 `block_size` 时两种模式必须逐 token 完全相等，
+   这是"cache 不改生成分布"的验证）、生成 3 换个开头看小模型的泛化毛病
 4. **GPU 加速对比**（第 27 课，仅 `--features gpu`）：验证 CPU vs GPU 数值一致性，实测加速比
 
 **示例**：
@@ -858,7 +951,149 @@ cargo run --release -- bench --steps 30
 
 ---
 
-### 10. `cargo test` —— 单元测试
+### 10. `scaling` —— Scaling Laws 实验（预算规划 + 实测幂律拟合）
+
+```bash
+cargo run --release -- scaling [参数]
+```
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config <路径>` | string | `config/config.json` | 配置文件路径（提供模型结构开关与语料路径） |
+| `--sizes <规模>` | string | `2x64,4x128,6x192` | 参数量扫描的规模网格，`层数x宽度` 逗号分隔 |
+| `--steps <步数>` | int | `600` | 每个规模训练多少步（固定 token 预算） |
+| `--data-multiples <倍数>` | string | `1,2,4,8` | 数据量扫描的倍数列表 |
+| `--batch-size <批>` | int | `8` | 扫描用批大小 |
+| `--block-size <长度>` | int | `64` | 扫描用上下文长度 |
+| `--lr <学习率>` | float | `3e-3` | 扫描用学习率 |
+| `--seed <种子>` | int | `42` | 随机种子（所有扫描点共用，保证可比） |
+| `--budget <FLOPs>` | float | `1e22` | 算力预算（用于最优配比与时长/电费估算） |
+| `--gpu-tflops <TFLOPS>` | float | `312.0` | 单卡峰值（A100 FP16 = 312） |
+| `--n-gpu <数量>` | int | `64` | 卡数 |
+| `--mfu <利用率>` | float | `0.4` | MFU（算力利用率，常见 0.3~0.6） |
+| `--out <路径>` | string | 无 | 把扫描点写成 CSV（可直接画图），不填则只打印 |
+
+**输出分两半**：
+
+1. **预算规划（纯解析，毫秒级）**：同一份算力下 20:1 法则与参数化损失闭式解两条路线的最优规模、
+   训练时长/电费、Chinchilla 论文配比表、过训练/欠训练曲线；
+2. **实测扫描（真训，分钟级）**：固定 token 预算放大模型（loss vs N）、固定模型放大数据
+   （loss vs D），再用幂律拟合出**实测指数**，并逐点打印实测 loss 与拟合值的偏差。
+
+> 实测出来的指数会明显大于论文值（$\alpha_N \approx 0.076$）——本项目规模比论文小 3~5 个数量级，
+> 不在论文的幂律区间内。这里验证的是**方法**（口径统一、预算固定、可复现），不是复刻论文数字。
+> 详见 [`docs/31-Scaling-Laws.md`](docs/31-Scaling-Laws.md)。
+
+**用法建议**：
+
+```bash
+# ── 快速看一眼（规模小、步数少）──
+cargo run --release -- scaling --steps 200 --sizes 2x64,4x128,6x192 --data-multiples 1,2,4
+
+# ── 完整默认实验（三个规模各 600 步 + 数据量 1/2/4/8 倍）──
+cargo run --release -- scaling
+
+# ── 只做预算规划（规模/倍数压到最小，几十秒出结果；两组都要 ≥3 个点才能拟合）──
+cargo run --release -- scaling --sizes 2x64,3x96,4x128 --steps 30 --data-multiples 1,2,4
+
+# ── 换硬件假设（H100 ×1024、MFU 45%）并导出 CSV ──
+cargo run --release -- scaling --budget 1e23 --gpu-tflops 989 --n-gpu 1024 --mfu 0.45 --out logs/scaling.csv
+```
+
+---
+
+### 11. `moe` —— MoE 稀疏专家实验（第 32 课）
+
+```bash
+cargo run --release -- moe [参数]
+```
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--experts <网格>` | string | `8` | 专家数网格（逗号分隔，逐个跑一遍对照实验） |
+| `--top-k <K>` | int | `2` | 每个 token 激活的专家数 |
+| `--steps <步数>` | int | `300` | 端到端对照的训练步数 |
+| `--batch-size <批>` | int | `8` | 每步批大小 |
+| `--block-size <长度>` | int | `64` | 上下文长度 |
+| `--lr <学习率>` | float | `3e-3` | 学习率 |
+| `--n-embd <维度>` | int | `64` | 隐藏维度（专家与路由器的宽度） |
+| `--n-layer <层数>` | int | `2` | Transformer 层数 |
+| `--aux-coef <α>` | float | `0.01` | 均衡辅助损失系数（对照组固定为 0） |
+| `--capacity-factors <列表>` | string | `0,1.0,1.25,2.0` | 容量因子扫描（0 = 不限容量） |
+| `--seed <种子>` | int | `42` | 随机种子（各组共用，保证初始权重一致、可比） |
+
+**输出分四节**：
+
+1. **参数 / 计算量口径**：`total = E·expert + router`（全驻显存）、`active = K·expert + router`（每 token 只算 K 个），
+   并用 `assert_eq!` 把公式与真实建层参数对账（公式漂移会当场 panic 而不是给出错数字）；
+2. **负载均衡辅助损失：隔离实验**：人为把路由器摆到塌缩点，然后**不跑主损失、只优化 `L_aux`**；
+3. **端到端对照**：同种子 / 同语料 / 同步数，α = 0 与 α = `aux_coef` 各训一遍，比对 loss 与路由不均衡度；
+4. **容量因子与 Token Dropping**：拿负载最不均的那份模型扫容量因子，看丢弃比例。
+
+实测输出（`cargo run --release -- moe --steps 60`）：
+
+```text
+=== 一、参数 / 计算量口径：MoE 省的是 FLOPs，不是显存 ===
+  E=8   K=2 | 单层 总 265224 / 激活 66696（3.98× / 省 74.9% FLOPs） | 模型 总 566608 / 激活 169552（3.34× / 省 70.1% FLOPs）
+
+=== 二、负载均衡辅助损失：隔离实验（不跑主损失，只优化 L_aux） ===
+  汇总：K=1：L_aux 5.932 → 1.039（p 摊平 ⇒ 1.0，不是下界），不均衡度 8.00 → 6.32，用到的专家 1/8 → 4/8
+       ｜K=2：L_aux 3.114 → 1.010（p 摊平 ⇒ 1.0，不是下界），不均衡度 4.00 → 3.92，用到的专家 2/8 → 6/8
+
+=== 三、端到端对照（同种子 / 同语料 / 同 60 步） ===
+  汇总：α=0: loss 1.9459 / 不均衡度 1.48｜α=0.01: loss 1.9771 / 不均衡度 1.26
+
+=== 四、容量因子与 Token Dropping ===
+  cf = 0     → 每专家容量 不限         丢弃 0/32768 = 0.00% ｜读到 token 的专家 8/8
+  cf = 1     → 每专家容量 128        丢弃 8171/32768 = 24.94% ｜读到 token 的专家 8/8
+  cf = 1.25  → 每专家容量 160        丢弃 5317/32768 = 16.23% ｜读到 token 的专家 8/8
+  cf = 2     → 每专家容量 256        丢弃 862/32768 = 2.63% ｜读到 token 的专家 8/8
+```
+
+**两个容易踩的坑**（详见 [`docs/32-MoE混合专家模型.md`](docs/32-MoE混合专家模型.md)）：
+
+- **K = 1 配错门控口径 ⇒ 路由器拿不到主损失梯度**。Top-K 内部**重归一化**（Mixtral / DeepSeek 式）在
+  K = 1 时权重恒等于 1，对 logits 的雅可比整体是 0。K = 1 必须配 `switch_gate`（Switch Transformer 式
+  原概率）。`moe` 子命令与单测 `test_k1_renorm_gate_has_no_router_gradient` 都验证了这一点。
+- **「`L_aux` 掉到 1」不是负载均衡的证书**。`L_aux = E·Σ f_i·p_i` 里 `f` 由 argmax 给出（不可导），
+  `p` 才是可导的；`p` 均匀时无论 `f` 长什么样都有 `L_aux = 1`。所以第二节的隔离实验里
+  `L_aux` 被压到 1.0 附近，**硬路由几乎没动**（K = 2 组 4.00 → 3.92）。1 也不是下界：
+  `f` 与 `p` 支撑集不交时 `L_aux` 可以是 0。
+
+> **端到端对照的诚实读法**：这个规模（2 层 × 64 维、几十步）下 α = 0 那一份**不会**塌缩——
+> 随机初始化的路由器在几百步内大体保持对称，路由塌缩是「富者愈富」的**长期**动力学，
+> 所以第二节才改用隔离实验。但塌缩的**代价**在任何规模下都一样：主损失不关心是谁在算，
+> 未被选中的专家拿不到任何梯度（等于白占显存），而 loss 曲线看不出异常。
+
+---
+
+### 12. `quant` / `distributed` / `align` / `rag` / `speculative` —— 第 33~38 课实验
+
+第 33~38 课各带一个子命令，把该课的算法跑成**带断言自检**的实验：输出的是实测数字与结论，
+参数配得不合法（如 `--gamma` 相对 `--block-size` 过大）会当场 panic，而不是给出一份看起来正常的结果。
+
+```bash
+cargo run --release -- quant [参数]        # 第 33 课：权重量化（RTN / GPTQ / AWQ）
+cargo run --release -- distributed [参数]  # 第 38 课：集合通信 + DP / ZeRO / TP / PP / 3D
+cargo run --release -- align [参数]        # 第 36 课：奖励模型 / DPO / GRPO / PPO
+cargo run --release -- rag [参数]          # 第 37 课：分块 / 向量化 / 检索 / 提示组装
+cargo run --release -- speculative [参数]  # 第 34/35 课：推测解码 + 多 Token 预测
+```
+
+| 子命令 | 关键参数 | 输出分节 |
+|--------|---------|---------|
+| `quant` | `--bits int8\|int4`、`--method rtn\|gptq\|awq`、`--calib-file` / `--calib-samples` / `--calib-tokens`、`--act-order`、`--damp`、`--alpha`、`--eval`、`--out` | 逐层量化误差报告（各算法对照）→（`--eval`）量化前后验证集 loss / 困惑度 → 量化权重落盘 |
+| `distributed` | `--dp` `--tp` `--pp`（三轴相乘 = 卡数）、`--micro-batches`、`--steps`、`--batch-size`、`--lr`、`--weight-decay` | 集合通信量对照 → DP / ZeRO-1/2 训练轨迹与状态分片 → TP 数值一致 → PP（GPipe / 1F1B）→ 3D 切分报告 |
+| `align` | `--rm-steps`、`--steps`、`--beta`、`--clip-eps`、`--kl-coef`、`--group-size`、`--rm-lr` / `--lr` | 奖励模型排序准确率 → DPO 偏好边界 → GRPO 组内优势 → PPO 裁剪分支 + KL(k3) 惩罚 |
+| `rag` | `--chunk-size` / `--overlap`、`--top-k`、`--mmr-lambda` / `--mmr-pool`、`--hash-dim`、`--context-chars`、`--query` | 分块不变量 → 三种向量化对照 → top-k 与 MMR 检索 → 提示组装（含预算截断） |
+| `speculative` | `--gamma`、`--mtp-heads` / `--mtp-steps`、`--trials`、`--temperature`、`--block-size` | 无损性核对（与逐 token 解码逐位对照）→ 接受率与 γ 取舍 → 缓存不变量 → 首 token 分布等价 → MTP 头当草稿 |
+
+> `quant` 需要一个已训练好的 checkpoint（缺省读 `out_dir/latest.ckpt`，可 `--ckpt` 指定）；
+> 其余四个自带小模型与内置语料，直接跑即可。
+
+---
+
+### 13. `cargo test` —— 单元测试
 
 ```bash
 # ── 运行全部测试 ──
@@ -887,8 +1122,11 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **48 个单元测试**（零外部依赖，秒级完成）；加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试，
-合计 57 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）：
+默认构建运行 **200 个单元测试**（零外部依赖；全量约 14 分钟，开发中按名字过滤跑单模块通常只要几秒）；
+加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
+合计 210 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
+曾观察到随机失败。
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -912,7 +1150,11 @@ cargo test test_softmax -- --nocapture
 | `test_rotary` / `test_rotary_grad_exact` | RoPE 正交性 + 梯度精确验证 |
 | `test_kv_cache_matches_full_forward` | KV cache 推理 vs 全量前向一致性 |
 | `test_kv_cache_generate_matches_full` | 同 prompt + 同种子下，KV cache 生成 vs 全量生成逐 token 一致（窗口内） |
-| `test_kv_cache_output_is_prefix_of_full_beyond_window` | 超出缓存窗口时 KV cache 提前结束，输出仍是全量输出的前缀 |
+| `test_kv_cache_sliding_window_drops_oldest_rows` | 滑动窗口只丢最旧的行：`seq_len` 封顶在 `window`，绝对位置计数继续累加（RoPE 基准靠它） |
+| `test_kv_cache_sliding_window_matches_full_window_forward` | 超窗后 KV cache 增量推理与全量窗口前向的 logits 数值吻合（单层模型下两者严格等价） |
+| `test_kv_cache_generate_beyond_window_is_not_truncated` | 缓存写满后不再提前结束：加/不加 `--no-kv-cache` 生成同样多的 token |
+| `test_amp_loss_scaling_is_numerically_transparent` | 开/关 AMP 的最终 loss 完全相同（scale 是 2 的幂，f32 下缩放精确） |
+| `test_mixed_precision_grows_shrinks_and_unscales` | AMP：无溢出按间隔翻倍、溢出减半并要求跳过本步、梯度反缩放回真实尺度 |
 | `test_char_tokenizer_roundtrip` / `test_bpe_roundtrip` | 分词器编码/解码往返 |
 | `test_utf8_pending_accepts_only_legal_prefix` / `test_decode_drops_incomplete_tail` | 字节级 BPE 的 UTF-8 约束：只接受合法的字节前缀、解码时丢掉不完整尾部 |
 | `test_linear_regression_converges` | 线性回归收敛 |
@@ -921,12 +1163,46 @@ cargo test test_softmax -- --nocapture
 | `test_save_load_roundtrip_is_bit_exact` | checkpoint 保存/恢复后参数逐位一致 |
 | `test_load_params_skips_optimizer_state` | 只加载参数时跳过优化器状态（`eval` / `generate` 路径） |
 | `test_non_finite_values_survive_roundtrip` | NaN / ±Inf 能原样保存并读回（二进制格式的收益） |
+| `test_lora_checkpoint_roundtrip` | LoRA 存档：头部记下 rank/alpha/targets、按名对齐逐位还原；**不注入适配层就加载必须报错** |
+| `test_header_without_lora_field_is_accepted` | LoRA 之前存的旧档（无 `lora` 字段）仍能读入 |
+| `test_lora_targets_parse` / `test_lora_config_serde_compatibility` | `--lora-targets` 解析（别名 / 大小写 / 去重 / 报错）；旧档无 `targets` 回落 `q,k,v` |
+| `test_matmul_frozen` | 冻结权重的矩阵乘：前向与 `matmul` 一致、反向只回传 `dx`、`w.grad()` 全 0 |
+| `test_lora_forward_matches_formula` / `test_lora_forward_3d` | 适配层前向 = 主干 + (α/r)·(x@Aᵀ)@Bᵀ；α 只以 α/r 进入；2D / 3D 输入都对 |
+| `test_lora_zero_init_keeps_forward_identical` | B 初始为 0 ⇒ 挂上适配器前后前向**逐位相同** |
+| `test_frozen_weight_gets_no_grad_while_lora_does` | 单独冻结主干时 `weight.grad()` 全 0；主干+适配器时只有 A/B 拿到梯度；优化器带权重衰减也拉不动冻结主干 |
+| `test_apply_lora_freezes_backbone_and_trains_adapters_only` | 走完整训练步（前向→backward→AdamW）：可训练集合恰好是 12 个 `lora_a`/`lora_b`、主干逐位不变、适配层确实在动 |
+| `test_lora_targets_control_where_adapters_land` | `--lora-targets` 真生效：只开 `v,mlp` 时 Q/K/O 上没有适配参数，张量数 = `(1+MLP线性层数) × 2 × n_layer` |
+| `test_merge_lora_into_weight_is_in_place` | 合并改的是**原 `weight` 张量的数据**（旧句柄能读到新值），合并后适配器被摘除，前向不变 |
+| `test_merge_lora_matches_two_branch_forward` | 灌非零 A/B 后，合并前（双分支）与合并后（单分支）前向偏差 < 1e-4 |
+| `test_resume_lora_keeps_adapter_values_and_unfreezes` | 链式续训：A/B 数值原样保留（不重随机）、只有适配层被解冻、主干仍冻结 |
 | `test_rng_deterministic` / `test_rng_range` / `test_choice_range` | 随机数生成器 |
 | `parse_accepts_both_prefix_styles` / `parse_keeps_multiline_answer_and_drops_incomplete` / `parse_skips_text_without_role_markers` | SFT 对话解析：两种角色前缀、多行回答与残缺段、无标记文本跳过 |
 | `parse_accepts_named_speakers_in_dialogue_corpus` / `parse_rejects_named_speakers_in_prose` / `parse_resets_speakers_per_file` | 人名说话人：对话语料放行、小说正文拒绝、角色按文件重置 |
 | `build_stream_masks_question_and_marks_answer` | SFT 打包流：提问与角色标记被掩码、只有回答段是监督目标 |
 | `window_mask_is_shifted_by_one` | 窗口掩码右移一位对齐 `y[i] = tokens[start+1+i]` |
 | `sft_loader_batch_shapes_match` | SFT 加载器批次形状与"至少一个监督位置" |
+| `test_fit_power_law_recovers_known_exponent` | 幂律拟合能把已知的 `(a, α, b)` 还原回来（固定 `b` 闭式最小二乘 + 黄金分割搜 `b`） |
+| `test_fit_power_law_with_zero_irreducible_loss` | `b = 0` 的退化工况：不可约损失不参与时 `α` 不被带偏 |
+| `test_param_accounting_matches_real_model` | 参数量公式 vs 真实建层（RMSNorm / SwiGLU / GQA 各组合逐项核对） |
+| `test_ratio20_allocation_invariants` | 20:1 最优解满足 `C = 6ND`、`D/N = 20`、`N ∝ C^0.5` |
+| `test_chinchilla_table_rows_are_consistent` | 文档那张 Chinchilla 配比表逐行满足 `C = 6ND` 与 `D/N = 20` |
+| `test_parametric_optimal_matches_grid_search` | 参数化损失的闭式最优解与网格搜索的最小值点一致 |
+| `test_wall_clock_matches_doc_example` | 时长/电费估算复现文档例子（7B × 1T token → 约 61 天 / 约 \$3700） |
+| `test_overtrain_curve_has_interior_minimum` | 固定算力沿 IsoFLOP 曲线移动时，预测 loss 有内点最小值（不在 `k = 1`） |
+| `test_params_scan_larger_models_reach_lower_loss` | 真训参数量扫描：更大的模型在同 token 预算下 loss 更低 |
+| `test_tokens_scan_is_monotone` | 真训数据量扫描：token 数翻倍 loss 单调下降（过训练曲线形状正确） |
+| `test_top_k_gate_picks_highest_logits` | Top-K 路由取到 logits 最大的 K 个；并列按下标升序（确定性）；`penalty`/`mask` 两个掩码互为 0/1 对偶 |
+| `test_gate_weights_are_softmax_over_topk_only` | 只在 Top-K 上做 softmax ⇒ 恰好 K 个非零、和为 1；未选中位置概率与**梯度**都恰好为 0（"只在 Top-K 取权重"天然可导） |
+| `test_moe_forward_matches_dense_reference` | 稀疏前向（gather→专家→加权→scatter）与逐 token 逐专家的稠密参考实现逐元素吻合 |
+| `test_moe_routing_is_per_token` | 路由与门控都逐 token 进行：同一行在整批与单条前向里结果一致（容量不限时无跨 token 泄漏） |
+| `test_capacity_factor_drops_overflow` | 容量因子：超出容量的分配按 token 顺序先到先得地丢弃，被丢弃的 token 该层输出为 0 |
+| `test_aux_loss_minimum_at_uniform` | `L_aux = E·Σf_i p_i` 的取值规律：`p = f` 时 `≥ 1`（均匀取 1）；支撑集不交时可为 0；**p 均匀时恒为 1（与 f 无关，不是均衡证书）** |
+| `test_layer_aux_loss_is_above_one_when_skewed` | 真实 MoE 层上的辅助损失：路由偏斜时明显大于 1，门控压平后回到 1 附近，α = 0 时不返回该节点 |
+| `test_k1_renorm_gate_has_no_router_gradient` | K = 1 的门控陷阱：重归一化口径下 `w ≡ 1`、路由器**拿不到**主损失梯度；Switch 原概率口径下拿得到 |
+| `test_only_selected_experts_receive_gradients` | 稀疏的梯度也是稀疏的：只有被选中的专家拿到梯度，路由器一定拿到 |
+| `test_sparse_stats_matches_real_layer` | 参数/激活量公式与真实建层逐位一致（GELU 与 SwiGLU 两种专家）；4 专家取 2 ⇒ 激活约一半、省约一半 FLOPs |
+| `test_aux_loss_gradient_balances_routing` | 只优化 `L_aux` 能把偏斜的负载推平（不均衡度下降）——这是"加不加辅助损失"对照实验的机理 |
+| `test_moe_layer_trains` | 端到端：MoE 层 + 输出头在簇状合成任务上真的能学起来（专家可分工） |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
 
@@ -951,7 +1227,7 @@ cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
 
 ---
 
-### 11. GPU 加速（可选 feature）
+### 14. GPU 加速（可选 feature）
 
 默认构建**不启用 GPU**，保持依赖轻量。通过 `--features gpu` 开启 wgpu 计算着色器加速：
 
@@ -1007,10 +1283,16 @@ cargo run --features gpu -- demo
 融合后只回读每行一个 f32 的 row_loss（约 16KB）。
 
 常驻路径的**适用条件**（任一不满足就自动回退逐算子 → CPU）：训练模式（无 KV cache、`base = 0`）、
-LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head == n_head`（不支持 GQA 头复制）、
-形状与规模够大。整叠路径默认**关闭**，用 `LLM_GPU_STACK` 打开——它与逐子层路径数值逐位一致，
-实测还**更快**（同配置 ABBA 两轮：0.59/0.60 s/步 vs 0.67/0.70 s/步，约快 12%）；默认关闭只是因为它的
-准入条件更严（要求所有层都是 LayerNorm + GELU MLP，任一层不满足就整条路径放弃）。
+GPT-2 风格的 GELU MLP（SwiGLU 由调用方让路）、形状与规模够大。
+
+归一化用 LayerNorm 还是 RMSNorm、K/V 是不是 GQA 的头数，都**不需要让路**——两者在参数层面
+就被抹平了：RMSNorm 与 LayerNorm 共用同一套归约内核，只靠一个模式位切换（RMSNorm 是
+"μ≡0、无 β"的特例）；GQA 则把 K/V 的**参数**按 `repeat_kv` 的同一套头顺序展开成 `n_head` 份
+（`expand_kv_head`）、反向再把梯度按组折回（`fold_kv_head_grad`），展开后与标准 MHA 同形，
+常驻路径一行内核都不用改。整叠路径默认**关闭**，用 `LLM_GPU_STACK` 打开——它与逐子层路径数值
+逐位一致，实测还**更快**（同配置 ABBA 两轮：0.59/0.60 s/步 vs 0.67/0.70 s/步，约快 12%）；
+默认关闭只是因为它的准入条件更严（要求所有层都是 GELU MLP——各层共用同一份配置，所以一个
+SwiGLU 就足以让整条路径放弃）。
 详见 [docs/27-GPU加速.md](docs/27-GPU加速.md) 的 §4 与 §8。
 
 **环境变量**：
@@ -1063,7 +1345,13 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "n_kv_head": 0,        // KV 头数。0 = 标准 MHA；< n_head 时启用 GQA
     "use_rmsnorm": false,  // true = RMSNorm（LLaMA 风格），false = LayerNorm（GPT-2 风格）
     "use_swiglu": false,   // true = SwiGLU MLP（LLaMA 风格），false = GELU MLP（GPT-2 风格）
-    "dropout": 0.0         // Dropout 概率。0 = 不丢弃，>0 时训练中随机丢弃
+    "dropout": 0.0,        // Dropout 概率。0 = 不丢弃，>0 时训练中随机丢弃
+    // ---- MoE 稀疏专家（第 32 课；n_expert = 1 就是稠密 FFN，行为与以前逐位相同）----
+    "n_expert": 1,             // 每个 MoE 层的专家数（≥ 2 时该前馈子层换成 MoE）
+    "moe_top_k": 1,            // 每个 token 激活几个专家
+    "moe_capacity_factor": 0.0,// 专家容量因子。0 = 不限（推理必须 0）
+    "moe_aux_coef": 0.0,       // 负载均衡辅助损失系数 α。0 = 不加
+    "moe_switch_gate": false   // 门控口径：false = Top-K 重归一化（Σw = 1）；true = Switch 原概率
   }
 }
 ```
@@ -1079,6 +1367,11 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 | `use_rmsnorm` | bool | `false` | 是否使用 RMSNorm 替代 LayerNorm |
 | `use_swiglu` | bool | `false` | 是否使用 SwiGLU MLP 替代 GELU MLP |
 | `dropout` | float | `0.0` | Dropout 概率（0~1）。用于注意力权重和残差连接 |
+| `n_expert` | int | `1` | 每个 MoE 层的专家数。**`1` = 稠密 FFN**（与加 MoE 之前逐位相同）；`≥ 2` 时该前馈子层换成 MoE |
+| `moe_top_k` | int | `1` | 每个 token 激活几个专家（`1 ≤ K ≤ n_expert`） |
+| `moe_capacity_factor` | float | `0.0` | 专家容量因子（`capacity = cf × n·K/E`，超出按 token 顺序先到先得丢弃）。`0` = 不限容量，**推理时必须 0** |
+| `moe_aux_coef` | float | `0.0` | 负载均衡辅助损失系数 α（`L_aux = α·E·Σ f_i·p_i`）。`0` = 不加 |
+| `moe_switch_gate` | bool | `false` | 门控口径：`false` = Top-K 内部重归一化（Mixtral / DeepSeek 式，`Σw = 1`）；`true` = 全部专家上的 softmax 原概率（Switch Transformer 式，`Σw < 1`）。**`moe_top_k = 1` 时必须置 `true`**，否则权重恒为 1、路由器拿不到主损失梯度 |
 
 ### train 段 —— 训练参数
 
@@ -1093,6 +1386,9 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "warmup_steps": 20,       // 线性预热步数（从 0 线性升到 max_lr）
     "weight_decay": 0.01,     // AdamW 权重衰减系数
     "grad_clip": 1000000.0,   // 梯度裁剪阈值（梯度总范数超过此值时等比缩放；默认极大值 = 实际上不裁剪）
+    "amp": true,              // 动态损失缩放（AMP）：loss 先乘 scale 再反向，更新前查溢出并反缩放
+    "amp_init_scale_log2": 16, // 初始 scale = 2^16 = 65536
+    "amp_growth_interval": 2000, // 连续这么多步无溢出就把 scale 翻倍（上限 2^24）
     "eval_every": 100,        // 每 N 步评估一次验证集（同时保存 latest checkpoint）
     "eval_iters": 20,         // 评估时采样的批数（取平均减少方差）
     "tokenizer": "bpe",       // 分词器类型："char"（字符级）或 "bpe"（字节对编码）
@@ -1102,10 +1398,10 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "out_dir": "checkpoints", // checkpoint 输出目录（权重 + tokenizer.json）
     "accum_steps": 1,         // 梯度累积步数。有效 batch = batch_size × accum_steps
     "tokenizer_file": null,   // 分词器文件路径。null = 从语料训练并保存；Some = 从文件加载
-    "lora": null,             // LoRA 配置（目前未接入训练循环，见第 29 课）
+    "lora": null,             // LoRA 配置；finetune 子命令读它（CLI 的 --lora-rank/--lora-alpha/--lora-targets 会覆盖）
     "log_file": "logs/train.csv", // 训练指标日志。null = 不记录；默认 logs/train.csv（自动建目录）
     "early_stop_patience": 0,  // 早停耐心值。0 = 不启用；N = 连续 N 次评估不改善则停止
-    "sft_file": null          // SFT 语料（逗号分隔，可为文件/目录/含 * 的路径）。只被 `sft` 子命令读取
+    "sft_file": null          // SFT / LoRA 微调语料（逗号分隔，可为文件/目录/含 * 的路径）
   }
 }
 ```
@@ -1120,6 +1416,9 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 | `warmup_steps` | int | `20` | 线性预热步数。前 N 步学习率从 0 线性升到 `max_lr`（≤ `steps`） |
 | `weight_decay` | float | `0.01` | AdamW 权重衰减。正则化防过拟合 |
 | `grad_clip` | float | `1000000.0` | 梯度裁剪。所有参数梯度的 L2 范数超过此值时等比缩放（默认值极大 ≈ 实际不裁剪，各预设配置会显式指定） |
+| `amp` | bool | `true` | 动态损失缩放（AMP，见第 26 课）。开启后 loss 先乘 `scale` 再反向；参数更新前检查梯度是否含 Inf/NaN（含则丢弃本步、不更新参数，并把 `scale` 减半）与梯度反缩放，再执行裁剪与更新。`scale` 恒为 2 的幂，f32 下乘除都是精确的指数移位，所以数值上与关闭 AMP 完全一致——它换来的是**溢出保护**与裁剪阈值的正确性 |
+| `amp_init_scale_log2` | int | `16` | AMP 初始缩放因子以 2 的幂给出（`scale = 2^16 = 65536`）。取值须 ≤ `24`（`scale` 上限就是 2^24） |
+| `amp_growth_interval` | int | `2000` | AMP 缩放因子增长间隔：连续这么多步没有溢出就把 `scale` 翻倍 |
 | `eval_every` | int | `100` | 每 N 步在验证集上评估 loss / 困惑度，并保存 `latest.ckpt` |
 | `eval_iters` | int | `20` | 评估时采样多少批取平均（减少随机波动） |
 | `tokenizer` | string | `"bpe"` | `"char"` = 字符级分词；`"bpe"` = 字节对编码 |
@@ -1129,10 +1428,10 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 | `out_dir` | string | `"checkpoints"` | 权重输出目录：checkpoint（latest / best / final）与 `tokenizer.json` 都写在这里。目录不存在时自动创建 |
 | `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
 | `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
-| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0 }`。**目前只做参数校验与预估并打印一行提示，既不冻结主参数、也不注入适配层**——`finetune` 实际训练的是全部参数（详见 [§6](#6-finetune--加载预训练权重微调) 与第 29 课） |
+| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0, "targets": { "q": true, "k": true, "v": true, "o": false, "mlp": false } }`。**只被 `finetune` 子命令读取**（`sft` 忽略它），`--lora-rank` / `--lora-alpha` / `--lora-targets` 优先于它（CLI 没传才看这里）；`train` 子命令不注入适配层，读到它只会打印一行提示。`targets` 字段可省（回落 `q,k,v`，兼容旧档）。详见 [§6](#6-finetune--lora-微调) 与第 29 课 |
 | `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = **每个评估点**（每 `eval_every` 步 + 最后一步）写一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`。无验证集时 `val_loss` / `ppl` 两列留空。**每次训练覆盖该文件**，不是追加 |
 | `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
-| `sft_file` | string/null | `null` | SFT（监督微调）语料路径，逗号分隔，每项可以是文件、目录或含 `*` 的路径。**只被 `sft` 子命令读取**；`sft --sft-file` 优先于它。命令行未指定且这里也是 `null` 时 `sft` 直接报错 |
+| `sft_file` | string/null | `null` | 对话语料路径，逗号分隔，每项可以是文件、目录或含 `*` 的路径。**被 `sft` 与 `finetune` 两个子命令读取**（LoRA 微调与全参 SFT 共用同一份语料，效果才可对比）；`--sft-file` 优先于它。两处命令行都未指定且这里也是 `null` 时直接报错 |
 
 ### 完整配置示例（仓库当前 `config/config.json`）
 
@@ -1158,6 +1457,9 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
     "warmup_steps": 300,
     "weight_decay": 0.1,
     "grad_clip": 1.0,
+    "amp": true,
+    "amp_init_scale_log2": 16,
+    "amp_growth_interval": 2000,
     "eval_every": 200,
     "eval_iters": 20,
     "tokenizer": "bpe",
@@ -1241,7 +1543,7 @@ llm_from_scratch/
 │                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）
 │                       #      corpus_perf/（性能测试用节选）、sft/（SFT 问答语料 zh_qa.txt）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / chat / sft / finetune / preset / demo / bench
+│   ├── main.rs         # CLI 入口：train / eval / generate / chat / sft / finetune / preset / demo / bench / scaling / moe
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）
 │   ├── runlog.rs       # 运行日志：每次训练 / 推理自动写 logs/{操作}_{时间戳}.log（命令行 + 完整配置 + 过程输出）
@@ -1260,7 +1562,9 @@ llm_from_scratch/
 │   ├── model.rs        # GPT 模型：Transformer Block + 前向（第 9-12、19 课）
 │   ├── data.rs         # 数据集 + SFT 对话解析与 loss 掩码（第 14 课）
 │   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）
-│   └── sample.rs       # 推理与采样（第 15、30 课）
+│   ├── sample.rs       # 推理与采样（第 15、30 课）
+│   ├── scaling.rs      # Scaling Laws：幂律拟合、算力/参数口径、Chinchilla 最优配比、实测扫描（第 31 课）
+│   └── moe.rs          # MoE 稀疏专家：Top-K 路由、两种门控口径、稀疏前向、辅助损失、容量因子（第 32 课）
 └── docs/               # 39 课教程文档（00-学习计划 + 01~39 各课）
 ```
 
@@ -1286,7 +1590,7 @@ llm_from_scratch/
 1. 先读每课教程文档（`docs/XX-xxx.md`）理解原理；
 2. 再看对应源码，对照实现；
 3. 自己动手改代码、跑实验，验证理解；
-4. 完成每课末尾的"动手练习"。
+4. 读完每课末尾的"拓展方向"（核心内容已全部实现，那里是进阶拓展）。
 
 > 推荐从 [docs/00-学习计划.md](docs/00-学习计划.md) 开始，按阶段顺序阅读：
 >
@@ -1300,24 +1604,63 @@ llm_from_scratch/
 > | 六、训练进阶与正则化 | 17-19 | AdamW、学习率调度、Dropout | ✅ |
 > | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA、Flash Attention | ✅ |
 > | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
-> | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 📖 |
+> | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 31-38 ✅ |
 > | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、微调工作流、SFT 监督微调、交互式对话 | ✅ |
 
 ## 代码验证状态
 
-- **48 个单元测试全部通过**（`cargo test`）；加 `--features gpu` 再跑 9 个 GPU 测试，合计 57 个（详见 [§10 `cargo test`](#10-cargo-test--单元测试)）
-- **`cargo build` 与 `cargo build --features gpu` 均零警告**：为教学对照保留、当前训练/推理路径没有调用点的算子
-  （`Tensor::mul` / `neg` / `sum_last_dim` / `div`、`Tensor::external`、`NormLayer::ln_params`、`Gelu::gelu_weights`）
-  都按调用条件标了 `#[allow(dead_code)]` / `#[cfg_attr(not(feature = "gpu"), allow(dead_code))]`，并在注释里写明保留理由，
-  所以不带 gpu feature 编译时也不会冒出一堆 `never used` 噪声
+- **200 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `200 passed; 0 failed`，耗时约 14 分钟；
+  GPU 用例需 `--features gpu`，另计）（详见 [§13 `cargo test`](#13-cargo-test--单元测试)）
+- **`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：剩余提示是 `dead_code` 警告，
+  分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的 `cholesky_inverse` /
+  `Calibration` / `awq_best_alpha`、`distributed.rs` 的 `World::barrier` / `broadcast` / `qkv_head_columns`、
+  `rag.rs` 的 `Retriever::from_text`、`speculative.rs` 的 `MtpDrafter::heads_mut`、`rope.rs` 的 `with_window`）——
+  它们都有单测覆盖，只是非测试构建里没有直接调用点。另一类是少数只在测试基准或 `gpu` feature 常驻路径上
+  被调用的算子：`Tensor::mul` / `div` / `sum_last_dim` / `add_scalar` 是融合算子的
+  **分步参考实现**（测试用它们串出定义式，再与融合算子比对数值），`Tensor::external` / `NormLayer::ln_params` /
+  `Gelu::gelu_weights` 的调用点全在 GPU 常驻路径，`Tensor::neg` 则是逐元素算子集里的一员。
+  后一类已按调用条件标了 `#[allow(dead_code)]` / `#[cfg_attr(not(feature = "gpu"), allow(dead_code))]` 并在注释里写明，
+  不带 gpu feature 编译时不会混进 `never used` 噪声
 - 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
   RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛、
-  重复惩罚、checkpoint 二进制往返（含 NaN/±Inf）、**SFT 对话解析 / loss 掩码对齐 / 批次形状**
+  重复惩罚、checkpoint 二进制往返（含 NaN/±Inf）、**SFT 对话解析 / loss 掩码对齐 / 批次形状**、
+  **LoRA（零初始化前向不变、冻结主干无梯度、可训练集合、挂载位置生效、合并前后前向等价、续训保留旧数值、存档往返）**、
+  **KV cache 滑动窗口（超窗丢弃最旧行、绝对位置继续累计、单层模型下与全量窗口前向数值等价）**、
+  **AMP 动态损失缩放（开/关结果逐位一致、scale 翻倍与减半、梯度反缩放）**、
+  **Scaling Laws（幂律拟合还原已知指数、参数口径与真实建层逐位一致、Chinchilla 表自洽、20:1 与参数化闭式解两条路线、时长/电费复现文档例子、真训多规模扫描与数据量扫描）**、
+  **MoE（Top-K 路由确定性与掩码对偶、稀疏前向与稠密参考逐元素吻合、路由逐 token 无跨 token 泄漏、容量丢弃语义、辅助损失取值规律与梯度、K = 1 门控梯度陷阱、稀疏梯度、参数口径、端到端可训）**、
+  **量化（逐元素 / 逐通道 / 逐 token 量化与反量化、位打包往返、GPTQ 分块不改结果、AWQ α 搜索、校准集合并、Hessian 逆的数值校验）**、
+  **推测解码（贪心路径逐位一致、拒绝采样的分布等价、缓存回滚不变量、MTP 头形状与梯度、多步训练 loss 下降）**、
+  **对齐（DPO = `ln 2`、PPO 裁剪梯度为 0、GRPO 优势均值 0 / 方差 1、奖励模型排序准确率高于随机）**、
+  **RAG（分块不变量、余弦相似度自比 1 / 正交 0、MMR 多样化、提示预算截断）**、
+  **分布式（环形 allreduce = 数据和、DP / ZeRO 与单进程全 batch 一致、TP 前向反向与单卡一致、PP 两种调度等价、3D 切分互不重叠且覆盖完整）**
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、GPT 训练 loss 1.63→0.15、文本生成正常
 - **工程化功能已全部集成**：监督微调（`sft`，带 loss 掩码，默认输出到 `{out_dir}-sft`，不覆盖预训练权重）、
-  微调（`finetune`，当前为**全参微调**，LoRA 只做参数校验与预估并如实打印提示）、
+  LoRA 微调（`finetune`，冻结主干只训适配层，实测可训练参数 1.32%，可选挂载位置 / 链式续训 / 推理合并，默认输出到 `{out_dir}-lora`）、
   Beam Search（`generate --beam`）、交互式对话（`chat`，含 `--prompt-format sft/raw`）、分词器持久化（`tokenizer.json`）、
   预设配置（`preset`）、训练指标日志（CSV）、运行日志（`logs/{操作}_{时间戳}.log`）、早停（`early_stop_patience`）
+- **Scaling Laws 已落地**（第 31 课）：`scaling` 子命令上半场算预算（20:1 法则 vs 参数化损失闭式解、
+  Chinchilla 配比表、训练时长/电费、过训练曲线），下半场**真训**多个规模做幂律拟合（loss vs N / vs D）
+  并导出 CSV；参数口径与真实建层共用公式 + 扫描时逐位断言，公式漂移会当场 panic 而不是给出错数字
+- **MoE 稀疏专家已落地**（第 32 课）：`moe` 子命令四节实验（参数口径 / 负载均衡隔离实验 / 端到端对照 /
+  容量因子与 Token Dropping）；`GPTConfig.n_expert = 1` 时行为与加 MoE 之前**逐位相同**；
+  `moe_top_k = 1` 时必须配 `moe_switch_gate`，否则路由器拿不到主损失梯度（子命令与单测都会指出这一点）
+- **量化已落地**（第 33 课）：`quant` 子命令支持 RTN / GPTQ / AWQ 三种 weight-only 量化（int8 / int4），
+  校准集走 Hessian `XᵀX`（含 act-order、阻尼、分块），AWQ 的缩放指数 α 可在 0~1 网格上按代理误差逐层搜索，
+  可选 `--eval` 对比量化前后验证集 loss / 困惑度，并把量化权重与元信息落盘到 checkpoint
+- **推测解码与多 Token 预测已落地**（第 34/35 课）：`speculative` 子命令五节实验——贪心路径与逐 token
+  解码**逐位对照**、γ 扫描下的目标前向次数对照、缓存不变量逐轮核对（`cache_fed` 恒等于序列长度 − 1）、
+  首 token 经验分布对目标分布（4σ 统计判据）、MTP 头训练后当草稿且仍然无损；
+  `gamma + 1 <= block_size`、被拒位置 `rollback_to` 对齐等约束在代码里直接断言
+- **RLHF 与对齐已落地**（第 36 课）：`align` 子命令依次验证奖励模型排序准确率、DPO 偏好边界
+  （策略与参考相同时 loss = `ln 2`，一步训练后 chosen / rejected 的 logprob 差严格变大）、
+  GRPO 组内优势（均值 0、方差 1）、PPO 裁剪分支梯度为 0 与 KL(k3) 惩罚
+- **RAG 已落地**（第 37 课）：`rag` 子命令验证分块不变量（除重叠外每字符恰好出现一次、中文多字节不被切开）、
+  三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）对照、top-k 与 MMR 检索、按预算组装提示
+- **分布式训练已落地**（第 38 课）：`distributed` 子命令给出集合通信量对照（环形 allreduce =
+  reduce-scatter + all-gather，每 rank 只与左右邻居通信）、DP / ZeRO-1/2 的训练轨迹与状态分片、
+  TP / PP / 3D 的切分与激活驻留报告；单测保证 DP / ZeRO 与单进程全 batch **数值一致**、
+  TP 前向反向与单卡一致
 
 ## 性能优化与基准测试
 
@@ -1373,8 +1716,8 @@ cargo run --release -- bench --steps 30
 | 推理（KV cache） | ~591 tok/s | ~1129 tok/s | **约 1.9×** |
 | 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
 
-**正确性**：48 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
-（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§9 `bench`](#9-bench--性能基准) 与 [§11 GPU 章节](#11-gpu-加速可选-feature)。）
+**正确性**：当时 69 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
+（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§9 `bench`](#9-bench--性能基准) 与 [§14 GPU 章节](#14-gpu-加速可选-feature)。）
 
 ### 还能压的地方
 
@@ -1497,15 +1840,21 @@ loss 直接变 NaN，整轮实验作废。
 
 ## 后续方向
 
-以下方向已在第 31-38 课教程文档中详细讲解，代码实现可作为进阶练习：
+第 31~38 课（Scaling Laws、MoE、量化、推测解码、多 Token 预测、RLHF、RAG、分布式训练）
+**均已落地为可运行代码 + 单测 + CLI 子命令**：
 
-- **Scaling Laws**（第 31 课）：指导训练资源分配的幂律公式，Chinchilla 最优配比
-- **MoE 混合专家模型**（第 32 课）：Router 门控 + 多专家稀疏激活，Mixtral / DeepSeek 架构
-- **量化部署**（第 33 课）：INT4/INT8 量化、GPTQ/AWQ，让大模型跑在消费级显卡上
-- **推测解码**（第 34 课）：小模型猜 + 大模型验，无损加速推理 2-4×
-- **多 Token 预测**（第 35 课）：同时预测未来 K 个 token，提升表征质量
-- **人类对齐**（第 36 课）：RLHF (PPO) / DPO / GRPO，让模型"有用、无害、诚实"
-- **RAG 检索增强生成**（第 37 课）：向量检索 + LLM 生成，解决知识截止和幻觉问题
-- **分布式训练**（第 38 课）：数据并行、ZeRO、张量/流水线并行，训练百亿级模型
-- 长度外推：RoPE 配合 NTK-aware scaling、YaRN 等技巧（见第 20 课文档）
+- **Scaling Laws**（第 31 课）→ `src/scaling.rs` + `scaling` 子命令
+- **MoE 混合专家模型**（第 32 课）→ `src/moe.rs` + `moe` 子命令
+- **量化部署**（第 33 课）→ `src/quant.rs`（INT8/INT4、GPTQ、AWQ、校准、逐层量化）+ `quant` 子命令
+- **推测解码**（第 34 课）→ `src/speculative.rs`（拒绝采样 + 残差修正 + KV cache 回滚）+ `speculative` 子命令
+- **多 Token 预测**（第 35 课）→ `src/speculative.rs` 的 `MtpHeads` / `MtpDrafter`
+- **人类对齐**（第 36 课）→ `src/align.rs`（奖励模型、DPO、GRPO、PPO）+ `align` 子命令
+- **RAG 检索增强生成**（第 37 课）→ `src/rag.rs`（分块、向量化、检索、提示组装）+ `rag` 子命令
+- **分布式训练**（第 38 课）→ `src/distributed.rs`（DP、ZeRO、TP、PP、3D）+ `distributed` 子命令
+- **长度外推**（第 20 课）→ `src/rope.rs`（Linear PI / NTK-aware / YaRN）
+
+仍可继续推进的方向：
+
 - 更大的语料与模型规模（`config/config.json` 可直接调大，CPU 训练需耐心）
+- 真实多机多卡通信后端：`distributed.rs` 目前是单进程模拟 world，语义与数值对齐真实集合通信，
+  换成 NCCL / MPI 时算法本身无需改动，但需要另写通信层

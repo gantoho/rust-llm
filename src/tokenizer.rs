@@ -7,9 +7,24 @@
 //! - `BPETokenizer`：字节对编码（现代 GPT 的实际方案，能压缩常见词/子词）
 //!
 //! 两种分词器都支持序列化/反序列化（save/load），训练后可持久化，推理时直接加载。
+//!
+//! 统一入口 [`Tokenizer`] 在内容词表之上再挂一组**特殊 token**
+//! （[`SpecialTokens`]：BOS / EOS / PAD，见该结构体的文档）。它们让"序列在哪里结束"
+//! 成为一个可以学习的符号，而不是靠语料里凑巧高频的字符组合来暗示。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+
+/// 把 JSON 美化成文本写到文件（父目录不存在时自动创建）。
+/// 分词器的三种保存路径（char / bpe / 带特殊 token 的统一入口）共用同一份写法，
+/// 避免三处各写一遍 `File::create` + `to_string_pretty`。
+fn write_json(path: &str, json: &serde_json::Value) {
+    crate::config::ensure_parent_dir(path);
+    let text = serde_json::to_string_pretty(json).expect("序列化分词器 JSON 失败");
+    std::fs::File::create(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
+}
 
 // ==================== 字符级分词器 ====================
 
@@ -63,16 +78,17 @@ impl CharTokenizer {
             .collect()
     }
 
-    /// 保存到文件（JSON 格式）
-    pub fn save(&self, path: &str) {
-        let json = serde_json::json!({
+    /// 序列化成 JSON（[`Tokenizer::save`] 会往这份 JSON 上再补特殊 token 字段）
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "char",
             "chars": self.chars.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-        });
-        let mut f = std::fs::File::create(path)
-            .unwrap_or_else(|e| panic!("无法创建分词器文件 {path}: {e}"));
-        f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes())
-            .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
+        })
+    }
+
+    /// 保存到文件（JSON 格式）
+    pub fn save(&self, path: &str) {
+        write_json(path, &self.to_json());
     }
 
     /// 从文件加载（独立使用，Tokenizer::load 会自动调用 from_json 避免重复读文件）
@@ -256,17 +272,18 @@ impl BPETokenizer {
         }
     }
 
-    /// 保存到文件（JSON 格式）
-    pub fn save(&self, path: &str) {
-        let json = serde_json::json!({
+    /// 序列化成 JSON（[`Tokenizer::save`] 会往这份 JSON 上再补特殊 token 字段）
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "bpe",
             "merges": self.merges.iter().map(|(a, b)| vec![*a, *b]).collect::<Vec<_>>(),
             "vocab": self.vocab.iter().map(|v| v.clone()).collect::<Vec<_>>(),
-        });
-        let mut f = std::fs::File::create(path)
-            .unwrap_or_else(|e| panic!("无法创建分词器文件 {path}: {e}"));
-        f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes())
-            .unwrap_or_else(|e| panic!("写入分词器文件 {path} 失败: {e}"));
+        })
+    }
+
+    /// 保存到文件（JSON 格式）
+    pub fn save(&self, path: &str) {
+        write_json(path, &self.to_json());
     }
 
     /// 从文件加载（独立使用，Tokenizer::load 会自动调用 from_json 避免重复读文件）
@@ -309,26 +326,134 @@ impl BPETokenizer {
     }
 }
 
+// ==================== 特殊 token ====================
+
+/// 三个特殊 token 的字面写法。语料与 prompt 里可以直接写这三个字符串，
+/// [`Tokenizer::encode`] 会把它们识别成对应的特殊 id（不会被 BPE 拆成字节）。
+pub const BOS_LITERAL: &str = "<|bos|>";
+pub const EOS_LITERAL: &str = "<|eos|>";
+pub const PAD_LITERAL: &str = "<|pad|>";
+
+/// 特殊 token 的 id 分配（BOS / EOS / PAD）
+///
+/// 三个 id 紧跟在**内容词表之后**（`base` = `CharTokenizer` / `BPETokenizer` 的词表大小），
+/// 这样分配有两个好处：
+/// 1. 内容 token 的 id 一个都没动，旧的 `tokenizer.json` 读进来还是同一套编码；
+/// 2. 词表大小 = `base + COUNT`，模型只需在 embedding 表尾追加三行即可容纳——
+///    旧 checkpoint 靠 [`crate::checkpoint`] 的"前缀行恢复 + 优化器状态补零"继续用，
+///    不必因为加了一个 EOS 就重训。
+///
+/// 有了真正的 EOS，生成（[`crate::sample`]）与 SFT（[`crate::data`]）不再需要用
+/// "语料里高频出现的字符组合"来冒充结束标记：那个做法要求标记的每个字符都被充分训练过，
+/// 一旦低频就会把模型带进乱码模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpecialTokens {
+    pub bos: usize,
+    pub eos: usize,
+    pub pad: usize,
+}
+
+impl SpecialTokens {
+    /// 特殊 token 的个数：词表大小 = 内容词表 + `COUNT`
+    pub const COUNT: usize = 3;
+
+    /// 紧跟在内容词表 `base` 之后分配三个 id
+    pub fn new(base: usize) -> Self {
+        SpecialTokens {
+            bos: base,
+            eos: base + 1,
+            pad: base + 2,
+        }
+    }
+
+    /// 是否属于这三个特殊 token
+    pub fn contains(&self, id: usize) -> bool {
+        id >= self.bos && id <= self.pad
+    }
+
+    /// id -> 字面写法；不是特殊 token 时返回 `None`
+    pub fn name(&self, id: usize) -> Option<&'static str> {
+        if id == self.bos {
+            Some(BOS_LITERAL)
+        } else if id == self.eos {
+            Some(EOS_LITERAL)
+        } else if id == self.pad {
+            Some(PAD_LITERAL)
+        } else {
+            None
+        }
+    }
+
+    /// 三个字面量与 id 的对应表（`encode` 切分时用）
+    fn literals(&self) -> [(&'static str, usize); Self::COUNT] {
+        [
+            (BOS_LITERAL, self.bos),
+            (EOS_LITERAL, self.eos),
+            (PAD_LITERAL, self.pad),
+        ]
+    }
+}
+
 // ==================== 统一分词器接口（配置可切换） ====================
+
+/// 内容分词器的两种实现（只负责"文本 <-> 内容 token"，不认识特殊 token）
+enum Inner {
+    Char(CharTokenizer),
+    Bpe(BPETokenizer),
+}
+
+impl Inner {
+    fn vocab_size(&self) -> usize {
+        match self {
+            Inner::Char(t) => t.vocab_size(),
+            Inner::Bpe(t) => t.vocab_size(),
+        }
+    }
+
+    fn encode(&self, text: &str) -> Vec<usize> {
+        match self {
+            Inner::Char(t) => t.encode(text),
+            Inner::Bpe(t) => t.encode(text),
+        }
+    }
+
+    fn decode(&self, ids: &[usize]) -> String {
+        match self {
+            Inner::Char(t) => t.decode(ids),
+            Inner::Bpe(t) => t.decode(ids),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Inner::Char(t) => t.to_json(),
+            Inner::Bpe(t) => t.to_json(),
+        }
+    }
+}
 
 /// 统一的分词器：`"char"` 用 [`CharTokenizer`]，`"bpe"` 用 [`BPETokenizer`]。
 ///
 /// 上层（数据加载 / 训练 / 采样）只依赖这一个接口，不关心具体实现。
 /// 注意：`encode` 出来的 id 空间由具体实现决定，两者互不通用。
-pub enum Tokenizer {
-    Char(CharTokenizer),
-    Bpe(BPETokenizer),
+///
+/// 在内容词表之上再挂一组特殊 token（[`SpecialTokens`]）：新建的分词器一律带，
+/// 从旧文件读入的（JSON 里没有 `specials` 字段）则保持原样、`vocab_size` 不变，
+/// 于是旧 checkpoint 不受影响。
+pub struct Tokenizer {
+    inner: Inner,
+    specials: Option<SpecialTokens>,
 }
 
 impl Tokenizer {
-    /// 字符级分词器：词表来自语料中出现的所有字符
+    /// 字符级分词器：词表 = 语料中出现的所有字符 + 3 个特殊 token
     pub fn char(text: &str) -> Self {
-        Tokenizer::Char(CharTokenizer::new(text))
+        Self::wrap(Inner::Char(CharTokenizer::new(text)))
     }
 
-    /// BPE 分词器：在语料上训练，目标词表大小 = 256 + 合并次数
+    /// BPE 分词器：在语料上训练，内容词表大小 = 256 + 合并次数（再加 3 个特殊 token）
     pub fn bpe(text: &str, target_vocab: usize) -> Self {
-        Tokenizer::Bpe(BPETokenizer::train(text, target_vocab))
+        Self::wrap(Inner::Bpe(BPETokenizer::train(text, target_vocab)))
     }
 
     /// 按名称构造：`"char"` / `"bpe"`，其余报错
@@ -340,52 +465,187 @@ impl Tokenizer {
         }
     }
 
+    /// 新建分词器都要挂上特殊 token：id 从内容词表的末尾接着排
+    fn wrap(inner: Inner) -> Self {
+        let specials = Some(SpecialTokens::new(inner.vocab_size()));
+        Tokenizer { inner, specials }
+    }
+
+    /// 内容词表大小（不含特殊 token）
+    pub fn content_vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    /// 完整词表大小 = 内容词表 + 特殊 token 个数
     pub fn vocab_size(&self) -> usize {
-        match self {
-            Tokenizer::Char(t) => t.vocab_size(),
-            Tokenizer::Bpe(t) => t.vocab_size(),
-        }
+        self.content_vocab_size()
+            + self.specials.map_or(0, |_| SpecialTokens::COUNT)
     }
 
+    pub fn specials(&self) -> Option<SpecialTokens> {
+        self.specials
+    }
+
+    /// 是否带特殊 token（旧文件读入的分词器没有）
+    pub fn has_specials(&self) -> bool {
+        self.specials.is_some()
+    }
+
+    /// 去掉特殊 token，退回"纯内容词表"。
+    ///
+    /// 只在一个场景用得上：分词器文件丢了、从语料重建时（[`Self::from_name`] 一律带
+    /// 特殊 token），而要加载的 checkpoint 是老格式（嵌入表只有内容词表那么多行）。
+    /// 模型词表是硬约束——多出来的 3 行没有对应的嵌入行，只能按老格式对齐。
+    pub fn without_specials(mut self) -> Self {
+        self.specials = None;
+        self
+    }
+
+    /// 结束标记 id；旧分词器返回 `None`（此时调用方需回退到字符串停止标记）
+    pub fn eos_id(&self) -> Option<usize> {
+        self.specials.map(|s| s.eos)
+    }
+
+    /// 序列起始标记 id；旧分词器返回 `None`
+    pub fn bos_id(&self) -> Option<usize> {
+        self.specials.map(|s| s.bos)
+    }
+
+    /// 填充标记 id（对齐 / 变长 batch 用）；旧分词器返回 `None`
+    pub fn pad_id(&self) -> Option<usize> {
+        self.specials.map(|s| s.pad)
+    }
+
+    fn is_special(&self, id: usize) -> bool {
+        self.specials.map_or(false, |s| s.contains(id))
+    }
+
+    /// 文本 -> id 序列。
+    ///
+    /// 带特殊 token 时，文本里的 `<|bos|>` / `<|eos|>` / `<|pad|>` 会被识别成对应的
+    /// 特殊 id，其余部分照常交给内容分词器（**不跨字面量做 BPE 合并**——否则字面量
+    /// 可能被并进相邻 token，边界就错位了）。
     pub fn encode(&self, text: &str) -> Vec<usize> {
-        match self {
-            Tokenizer::Char(t) => t.encode(text),
-            Tokenizer::Bpe(t) => t.encode(text),
+        match self.specials {
+            None => self.inner.encode(text),
+            Some(sp) => self.encode_with_specials(text, &sp),
         }
     }
 
+    fn encode_with_specials(&self, text: &str, sp: &SpecialTokens) -> Vec<usize> {
+        let mut ids: Vec<usize> = Vec::new();
+        let mut rest = text;
+        loop {
+            // 找"最靠前"的那个字面量；同一位置不可能同时命中两个（字面量互不为前缀）
+            let mut hit: Option<(usize, usize, usize)> = None; // (位置, id, 字面量字节数)
+            for (lit, id) in sp.literals() {
+                if let Some(p) = rest.find(lit) {
+                    if hit.map_or(true, |(best, _, _)| p < best) {
+                        hit = Some((p, id, lit.len()));
+                    }
+                }
+            }
+            match hit {
+                Some((p, id, len)) => {
+                    if p > 0 {
+                        ids.extend(self.inner.encode(&rest[..p]));
+                    }
+                    ids.push(id);
+                    rest = &rest[p + len..];
+                }
+                None => {
+                    ids.extend(self.inner.encode(rest));
+                    return ids;
+                }
+            }
+        }
+    }
+
+    /// id 序列 -> 文本（**丢掉特殊 token**，用于给用户看生成结果）
     pub fn decode(&self, ids: &[usize]) -> String {
-        match self {
-            Tokenizer::Char(t) => t.decode(ids),
-            Tokenizer::Bpe(t) => t.decode(ids),
+        if self.specials.is_none() {
+            return self.inner.decode(ids);
         }
+        let mut out = String::new();
+        let mut run: Vec<usize> = Vec::new();
+        for &id in ids {
+            if self.is_special(id) {
+                if !run.is_empty() {
+                    out.push_str(&self.inner.decode(&run));
+                    run.clear();
+                }
+            } else {
+                run.push(id);
+            }
+        }
+        if !run.is_empty() {
+            out.push_str(&self.inner.decode(&run));
+        }
+        out
     }
 
-    /// 词表中每个 token 的字节序列，供生成时做 UTF-8 约束（见 [`utf8_pending`]）。
+    /// id 序列 -> 文本，特殊 token 保留成 `<|eos|>` 这样的字面写法。
+    ///
+    /// 调试 / 日志用（等价于 HuggingFace 的 `skip_special_tokens=False`）：
+    /// [`Tokenizer::decode`] 会把 EOS 抹掉，想看"模型到底在哪一步收的尾"就得用这个。
+    pub fn decode_verbose(&self, ids: &[usize]) -> String {
+        let Some(sp) = self.specials else {
+            return self.inner.decode(ids);
+        };
+        let mut out = String::new();
+        let mut run: Vec<usize> = Vec::new();
+        for &id in ids {
+            match sp.name(id) {
+                Some(name) => {
+                    if !run.is_empty() {
+                        out.push_str(&self.inner.decode(&run));
+                        run.clear();
+                    }
+                    out.push_str(name);
+                }
+                None => run.push(id),
+            }
+        }
+        if !run.is_empty() {
+            out.push_str(&self.inner.decode(&run));
+        }
+        out
+    }
+
+    /// 内容词表中每个 token 的字节序列，供生成时做 UTF-8 约束（见 [`utf8_pending`]）。
     ///
     /// `char` 分词器每个 token 都是完整字符，不可能拼出非法 UTF-8，因此返回 `None`。
+    /// 返回的切片**不含**特殊 token（长度为 [`Tokenizer::content_vocab_size`]）：
+    /// UTF-8 约束的循环用 `get(id)` 取值，特殊 token 自然落到 `None` 分支——它们没有
+    /// 字节语义，任何时候都允许被采样到（正是 EOS 需要的）。
     pub fn vocab_bytes(&self) -> Option<&[Vec<u8>]> {
-        match self {
-            Tokenizer::Char(_) => None,
-            Tokenizer::Bpe(t) => Some(&t.vocab),
+        match &self.inner {
+            Inner::Char(_) => None,
+            Inner::Bpe(t) => Some(&t.vocab),
         }
     }
 
     /// 类型名（打印用）："char" / "bpe"
     pub fn kind(&self) -> &'static str {
-        match self {
-            Tokenizer::Char(_) => "char",
-            Tokenizer::Bpe(_) => "bpe",
+        match self.inner {
+            Inner::Char(_) => "char",
+            Inner::Bpe(_) => "bpe",
         }
     }
 
-    /// 保存分词器到文件（父目录不存在时自动创建）
+    /// 保存分词器到文件（父目录不存在时自动创建）。
+    ///
+    /// 内容部分与旧格式**逐字段一致**，只在末尾追加一个 `specials` 字段——
+    /// 因此新版分词器文件可以被旧版代码读出内容词表（旧版忽略未知字段），
+    /// 而新版代码读旧文件时 `specials` 缺席，就按"没有特殊 token"处理。
     pub fn save(&self, path: &str) {
-        crate::config::ensure_parent_dir(path);
-        match self {
-            Tokenizer::Char(t) => t.save(path),
-            Tokenizer::Bpe(t) => t.save(path),
+        let mut json = self.inner.to_json();
+        if let Some(sp) = self.specials {
+            json["specials"] = serde_json::json!({
+                "bos": sp.bos, "eos": sp.eos, "pad": sp.pad,
+            });
         }
+        write_json(path, &json);
     }
 
     /// 从文件加载分词器（自动识别 char/bpe 类型，只读一次文件）
@@ -397,14 +657,43 @@ impl Tokenizer {
             .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
         let json: serde_json::Value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
+        Self::from_json(&json)
+    }
+
+    /// 从已解析的 JSON 构造（`load` 与测试共用）
+    pub fn from_json(json: &serde_json::Value) -> Self {
         let typ = json["type"]
             .as_str()
             .expect("分词器文件格式错误：缺少 type 字段");
-        match typ {
-            "char" => Tokenizer::Char(CharTokenizer::from_json(&json)),
-            "bpe" => Tokenizer::Bpe(BPETokenizer::from_json(&json)),
+        let inner = match typ {
+            "char" => Inner::Char(CharTokenizer::from_json(json)),
+            "bpe" => Inner::Bpe(BPETokenizer::from_json(json)),
             other => panic!("未知分词器类型 '{}'（可选：char / bpe）", other),
-        }
+        };
+        let specials = if json["specials"].is_object() {
+            let s = &json["specials"];
+            let read = |k: &str| {
+                s[k].as_u64()
+                    .unwrap_or_else(|| panic!("分词器 specials.{k} 缺失或不是整数")) as usize
+            };
+            let sp = SpecialTokens {
+                bos: read("bos"),
+                eos: read("eos"),
+                pad: read("pad"),
+            };
+            // 特殊 token 必须紧跟在内容词表之后，否则 id 空间有洞
+            assert_eq!(
+                sp.bos,
+                inner.vocab_size(),
+                "分词器文件损坏：specials.bos（{}）不等于内容词表大小（{}）",
+                sp.bos,
+                inner.vocab_size()
+            );
+            Some(sp)
+        } else {
+            None
+        };
+        Tokenizer { inner, specials }
     }
 }
 
@@ -563,5 +852,89 @@ mod tests {
         let mut ids = tok.encode("测试");
         ids.extend_from_slice(&[0xE4, 0xB8]);
         assert_eq!(tok.decode(&ids), "测试");
+    }
+
+    /// 特殊 token 紧跟在内容词表之后：内容 token 的 id 一个都没变。
+    #[test]
+    fn test_special_tokens_are_appended_after_content_vocab() {
+        let corpus = "hello world hello";
+        let tok = Tokenizer::char(corpus);
+        let sp = tok.specials().expect("新建分词器应带特殊 token");
+
+        assert_eq!(tok.content_vocab_size(), 8); // h,e,l,o,' ',w,r,d
+        assert_eq!(sp.bos, 8);
+        assert_eq!(sp.eos, 9);
+        assert_eq!(sp.pad, 10);
+        assert_eq!(tok.vocab_size(), 11);
+        assert_eq!(tok.eos_id(), Some(9));
+
+        // 内容字符的编码与不带特殊 token 的字符级分词器完全一致
+        let plain = CharTokenizer::new(corpus);
+        assert_eq!(tok.encode("hello"), plain.encode("hello"));
+    }
+
+    /// 字面量 `<|eos|>` 要被识别成特殊 id，而不是被 BPE 拆成一串字节 token；
+    /// 它旁边的正文照常编码，且**不会**跨字面量做合并。
+    #[test]
+    fn test_encode_recognizes_special_literals() {
+        let tok = Tokenizer::bpe("你好世界你好世界", 300);
+        let eos = tok.eos_id().unwrap();
+        let bos = tok.bos_id().unwrap();
+
+        let ids = tok.encode(&format!("{BOS_LITERAL}你好{EOS_LITERAL}"));
+        assert_eq!(ids[0], bos);
+        assert_eq!(*ids.last().unwrap(), eos);
+        // 中间部分与单独编码"你好"一致（没有跨字面量合并）
+        assert_eq!(&ids[1..ids.len() - 1], &tok.encode("你好")[..]);
+
+        // 空文本、纯字面量、开头就是字面量都不出错
+        assert!(tok.encode("").is_empty());
+        assert_eq!(tok.encode(EOS_LITERAL), vec![eos]);
+        assert_eq!(tok.encode(&format!("{EOS_LITERAL}abc"))[0], eos);
+    }
+
+    /// `decode` 丢掉特殊 token（给用户看的文本），`decode_verbose` 保留字面写法（调试用）。
+    #[test]
+    fn test_decode_skips_specials_and_verbose_keeps_them() {
+        let tok = Tokenizer::bpe("你好世界你好世界", 300);
+        let ids = tok.encode(&format!("{BOS_LITERAL}你好{EOS_LITERAL}{PAD_LITERAL}"));
+        assert_eq!(tok.decode(&ids), "你好");
+        assert_eq!(
+            tok.decode_verbose(&ids),
+            format!("{BOS_LITERAL}你好{EOS_LITERAL}{PAD_LITERAL}")
+        );
+    }
+
+    /// 特殊 token 必须能存活 save/load 往返；内容词表部分与不带特殊 token 的写法一致。
+    #[test]
+    fn test_specials_survive_save_load() {
+        let tok = Tokenizer::bpe("你好世界你好世界", 300);
+        let mut path = std::env::temp_dir();
+        path.push(format!("llm_tok_test_{}.json", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        tok.save(&path);
+        let back = Tokenizer::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back.vocab_size(), tok.vocab_size());
+        assert_eq!(back.eos_id(), tok.eos_id());
+        assert_eq!(back.kind(), "bpe");
+        assert_eq!(back.encode("你好世界"), tok.encode("你好世界"));
+    }
+
+    /// 旧格式分词器文件（没有 `specials` 字段）照常读入，词表大小不变——
+    /// 这样旧 checkpoint 不会因为本次改动而失效。
+    #[test]
+    fn test_legacy_tokenizer_file_loads_without_specials() {
+        let legacy = serde_json::json!({
+            "type": "char",
+            "chars": ["h", "i"],
+        });
+        let tok = Tokenizer::from_json(&legacy);
+        assert!(!tok.has_specials());
+        assert_eq!(tok.vocab_size(), 2);
+        assert_eq!(tok.eos_id(), None);
+        assert_eq!(tok.encode("hi"), vec![0, 1]);
+        assert_eq!(tok.decode(&[1, 0]), "ih");
     }
 }

@@ -9,8 +9,20 @@ use crate::tensor::Tensor;
 
 /// 模块接口：任何可训练结构都实现它
 pub trait Module {
-    /// 返回模块的所有参数（含嵌套子模块）
+    /// 返回模块的所有参数（含嵌套子模块，含被冻结的）
     fn parameters(&self) -> Vec<Tensor>;
+
+    /// 返回**可训练**参数子集（默认 = 全部参数）。
+    ///
+    /// 判定依据是 [`Tensor::requires_grad`]：LoRA 微调会把主干参数置为 false，
+    /// 于是这里只剩适配层的 `lora_a` / `lora_b`。用于统计「本次训练到底动了多少参数」，
+    /// 以及让调用方看清冻结是否真的生效。
+    fn trainable_parameters(&self) -> Vec<Tensor> {
+        self.parameters()
+            .into_iter()
+            .filter(|p| p.requires_grad())
+            .collect()
+    }
 }
 
 /// 便捷方法：清零所有参数的梯度

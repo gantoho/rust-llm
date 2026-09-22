@@ -65,6 +65,25 @@ fn read_all(files: &[String]) -> String {
         .join("\n")
 }
 
+/// 给一段**完整文档**的 token 序列加上起止标记：`[BOS] …正文… [EOS]`。
+///
+/// 特殊 token 的意义就在于把"序列从哪开始、到哪结束"变成模型能学的符号。
+/// 老分词器（JSON 里没有特殊 token 字段）原样返回，行为与以前完全一致。
+///
+/// 训练文本与验证文本各自包一层：两份文本是两个独立文档，中间不该让模型
+/// 把"训练集结尾"和"验证集开头"当成连续上下文（那正是验证 loss 虚低的一种来源）。
+fn encode_document(tokenizer: &Tokenizer, text: &str) -> Vec<usize> {
+    let mut ids = Vec::new();
+    if let Some(bos) = tokenizer.bos_id() {
+        ids.push(bos);
+    }
+    ids.extend(tokenizer.encode(text));
+    if let Some(eos) = tokenizer.eos_id() {
+        ids.push(eos);
+    }
+    ids
+}
+
 /// 把一个路径项展开成若干**文件路径**：文件 → 它自己；目录 → 目录下所有 `.txt`；
 /// 含 `*` → 通配匹配结果。目录与通配符的结果都排序，保证不同机器上顺序一致（采样可复现）。
 fn resolve_files(path: &str) -> Vec<String> {
@@ -133,7 +152,7 @@ impl DataLoader {
     /// 整个文本都作为训练数据（demo 用，无验证集）。
     /// 需要 `tokens.len() > block_size`，否则无法切出完整序列。
     pub fn new(text: &str, tokenizer: &Tokenizer, block_size: usize, batch_size: usize) -> Self {
-        let tokens = tokenizer.encode(text);
+        let tokens = encode_document(tokenizer, text);
         assert!(
             tokens.len() > block_size,
             "语料太短，无法切出完整序列（{} <= {}，必须严格大于 block_size）",
@@ -159,7 +178,7 @@ impl DataLoader {
         block_size: usize,
         batch_size: usize,
     ) -> Self {
-        let mut tokens = tokenizer.encode(train_text);
+        let mut tokens = encode_document(tokenizer, train_text);
         assert!(
             tokens.len() > block_size,
             "训练语料太短，无法切出完整序列（{} <= {}，必须严格大于 block_size）",
@@ -169,7 +188,7 @@ impl DataLoader {
         let val_start = match val_text {
             Some(v) => {
                 let split = tokens.len();
-                tokens.extend(tokenizer.encode(v));
+                tokens.extend(encode_document(tokenizer, v));
                 assert!(
                     tokens.len() - split > block_size,
                     "验证文本太短，无法切出完整序列（{} token，需要 > {}）",
@@ -486,24 +505,47 @@ pub fn parse_dialogue_files(texts: &[String]) -> Vec<SftTurns> {
 /// 回答正文、回答后的换行、以及结尾的 [`SFT_END`]；提问与角色标记全部屏蔽——
 /// 它们只是给模型的上下文，不是它该学会生成的东西。
 ///
+/// 每段对话用 `[BOS] … [EOS]` 包起来：EOS 是**可训练的结束符号**（`sup = true`），
+/// 模型因此能学会"答到哪算答完"，而不是靠语料里高频的字符组合去暗示。
+/// 老分词器没有特殊 token 时才退回文本标记 [`SFT_END`]。
+///
 /// 逐段编码再拼接，而不是先拼成一个大字符串整体编码：BPE 的合并会跨边界进行，
 /// 整串编码有可能把"标记末尾"和"正文开头"并成一个 token，那样监督区的起点
 /// 就不落在 token 边界上了，掩码会错位一个 token。
 fn build_sft_stream(tokenizer: &Tokenizer, convs: &[SftTurns]) -> (Vec<usize>, Vec<bool>) {
     let mut tokens: Vec<usize> = Vec::new();
     let mut sup: Vec<bool> = Vec::new();
-    let mut push = |text: &str, supervised: bool| {
+    // 写成嵌套函数而不是闭包：闭包会把 `tokens` / `sup` 可变借走，后面就没法再直接
+    // `push` 特殊 token 了（BOS / EOS 不是"一段文本"，掩码要单独补）。
+    fn push(
+        tokenizer: &Tokenizer,
+        tokens: &mut Vec<usize>,
+        sup: &mut Vec<bool>,
+        text: &str,
+        supervised: bool,
+    ) {
         let ids = tokenizer.encode(text);
         sup.extend(std::iter::repeat(supervised).take(ids.len()));
         tokens.extend(ids);
-    };
+    }
+    let eos = tokenizer.eos_id();
     for conv in convs {
-        for (user, assistant) in conv {
-            push(&format!("{SFT_USER}\n{user}\n"), false);
-            push(&format!("{SFT_ASSISTANT}\n"), false);
-            push(&format!("{assistant}\n"), true);
+        if let Some(bos) = tokenizer.bos_id() {
+            tokens.push(bos);
+            sup.push(false);
         }
-        push(&format!("{SFT_END}\n"), true);
+        for (user, assistant) in conv {
+            push(tokenizer, &mut tokens, &mut sup, &format!("{SFT_USER}\n{user}\n"), false);
+            push(tokenizer, &mut tokens, &mut sup, &format!("{SFT_ASSISTANT}\n"), false);
+            push(tokenizer, &mut tokens, &mut sup, &format!("{assistant}\n"), true);
+        }
+        match eos {
+            Some(id) => {
+                tokens.push(id);
+                sup.push(true);
+            }
+            None => push(tokenizer, &mut tokens, &mut sup, &format!("{SFT_END}\n"), true),
+        }
     }
     (tokens, sup)
 }
@@ -662,6 +704,7 @@ impl BatchSource for SftLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::{BOS_LITERAL, EOS_LITERAL};
 
     #[test]
     fn parse_accepts_both_prefix_styles() {
@@ -731,20 +774,36 @@ mod tests {
         assert_eq!(tokens.len(), sup.len());
         assert!(sup.iter().any(|b| !*b), "提问与角色标记必须被屏蔽");
 
+        // BOS 是"序列从这里开始"的符号，不是模型要学会生成的内容 —— 必须屏蔽
+        assert_eq!(tokens[0], tok.bos_id().unwrap(), "每段对话以 BOS 开头");
+        assert!(!sup[0], "BOS 不参与 loss");
+
         // 监督区必须紧接着「助手：」标记开始（按 token 下标切，不能按字节切：
         // 一个汉字占多个字节，用 token 下标当字节下标会切在字符中间）
         let first = sup.iter().position(|b| *b).unwrap();
-        let prefix = tok.decode(&tokens[..first]);
+        let prefix = tok.decode_verbose(&tokens[..first]);
         assert_eq!(
             prefix,
-            format!("{SFT_USER}\n你好\n{SFT_ASSISTANT}\n"),
-            "监督区之前只应是提问与角色标记"
+            format!("{BOS_LITERAL}{SFT_USER}\n你好\n{SFT_ASSISTANT}\n"),
+            "监督区之前只应是 BOS、提问与角色标记"
         );
 
-        // 监督区内容 = 回答正文 + 换行 + 结束标记
+        // 监督区内容 = 回答正文 + 换行 + **可训练的 EOS**：模型要学会"答完就该停"，
+        // 而不是靠语料里高频的字符组合去暗示（老分词器没有特殊 token 时才退回 SFT_END）
         let last = sup.iter().rposition(|b| *b).unwrap();
-        let supervised = tok.decode(&tokens[first..=last]);
-        assert_eq!(supervised, format!("你也好\n{SFT_END}\n"));
+        assert_eq!(tokens[last], tok.eos_id().unwrap(), "监督区以 EOS 收尾");
+        assert_eq!(tok.decode_verbose(&tokens[first..=last]), format!("你也好\n{EOS_LITERAL}"));
+    }
+
+    /// 老分词器（没有特殊 token）必须退回文本结束标记，不能凭空造出 BOS/EOS。
+    #[test]
+    fn build_stream_falls_back_to_text_end_marker_without_specials() {
+        let tok = Tokenizer::char("用户：你好\n助手：你也好\n。。\n").without_specials();
+        let convs = vec![vec![("你好".to_string(), "你也好".to_string())]];
+        let (tokens, sup) = build_sft_stream(&tok, &convs);
+        assert_eq!(tokens.len(), sup.len());
+        let supervised: String = tok.decode(&tokens[sup.iter().position(|b| *b).unwrap()..]);
+        assert_eq!(supervised.trim_end(), format!("你也好\n{SFT_END}"));
     }
 
     #[test]

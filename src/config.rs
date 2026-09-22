@@ -46,6 +46,14 @@ pub struct TrainConfig {
     pub warmup_steps: usize,      // 线性预热步数
     pub weight_decay: f32,        // AdamW 权重衰减
     pub grad_clip: f32,           // 梯度裁剪阈值
+    /// 动态损失缩放（AMP）开关：开启后训练循环把 loss 乘 `scale` 再反向，
+    /// 更新参数前先做溢出检查（梯度含 Inf/NaN 就跳过本步更新）再反缩放回真实尺度。
+    /// 详见 [`crate::train::MixedPrecision`]。
+    pub amp: bool,
+    /// AMP 初始缩放因子（以 2 的幂给出）：`scale = 2^amp_init_scale_log2`，默认 16（65536）。
+    pub amp_init_scale_log2: u32,
+    /// AMP 缩放因子增长间隔：连续这么多步无溢出就把 scale 翻倍（上限 2^24）。
+    pub amp_growth_interval: usize,
     pub eval_every: usize,        // 每 N 步评估一次验证集并保存 latest checkpoint
     pub eval_iters: usize,        // 评估时采样的批数
     pub tokenizer: String,        // "char" 字符级 / "bpe" BPE
@@ -59,11 +67,12 @@ pub struct TrainConfig {
     /// 分词器文件路径：Some 时从文件加载（跳过训练），None 时从语料训练并保存。
     /// 训练完成后自动保存到 `{out_dir}/tokenizer.json`。
     pub tokenizer_file: Option<String>,
-    /// LoRA 微调配置：Some(rank, alpha) 时**只做参数校验与影响日志里的预估**。
+    /// LoRA 微调配置（训练循环读它的是 `finetune` 子命令；`train` 子命令不注入适配层）。
     ///
-    /// ⚠️ LoRA 尚未接入 `train_gpt`：主模型不会被冻结、适配层也不会被注入，
-    /// 训练的实际是全部参数。rank 通常 4-64，alpha 通常 = rank。
-    /// 原理与完整实现见 `docs/29-LoRA低秩适配.md`。
+    /// `Some(rank, alpha)` 表示"按 LoRA 形态训练"：冻结全部主干，只更新每层 Q/K/V 的
+    /// 低秩适配层。rank 通常 4-64，alpha 通常 = rank。
+    /// ⚠️ `train` 子命令只做参数校验并提示（它没有可挂载的基座）；要真跑 LoRA 请用
+    /// `finetune --pretrained <ckpt>`。原理见 `docs/29-LoRA低秩适配.md`。
     pub lora: Option<LoRAConfig>,
     /// 训练指标日志文件路径：**每个评估点**（每 eval_every 步 + 最后一步）记录一行 step/lr/loss/ppl 到 CSV。
     /// 默认 `logs/train.csv`（日志目录自动创建）；显式设为 `null` 时不记录。
@@ -80,10 +89,120 @@ pub struct TrainConfig {
 }
 
 /// LoRA 微调配置
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct LoRAConfig {
     pub rank: usize,
     pub alpha: f32,
+    /// 适配层挂在哪几个投影上（见 [`LoRATargets`]）
+    pub targets: LoRATargets,
+}
+
+impl Default for LoRAConfig {
+    fn default() -> Self {
+        LoRAConfig {
+            rank: 16,
+            alpha: 16.0,
+            targets: LoRATargets::default(),
+        }
+    }
+}
+
+/// 适配层挂在哪几个投影上。
+///
+/// 缺省只挂 Q/K/V：这是 LoRA 论文与社区实践里性价比最高的一组——注意力里
+/// "该去看哪里"（Q/K）和"看到了取什么"（V）最需要随下游任务调整。
+/// `c_proj` 只做一次线性汇总、MLP 又离输出更远，收益递减而参数量同步翻倍，
+/// 所以默认关闭，要用才显式打开（`--lora-targets q,k,v,o,mlp`）。
+///
+/// 结构会写进 checkpoint 头部：加载端据此重放注入，所以训练与推理必须一致。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LoRATargets {
+    pub q: bool,
+    pub k: bool,
+    pub v: bool,
+    /// 注意力输出投影（`c_proj`）
+    pub o: bool,
+    /// MLP 的各投影（GELU 两个 / SwiGLU 三个）
+    pub mlp: bool,
+}
+
+impl Default for LoRATargets {
+    fn default() -> Self {
+        LoRATargets {
+            q: true,
+            k: true,
+            v: true,
+            o: false,
+            mlp: false,
+        }
+    }
+}
+
+impl LoRATargets {
+    /// 解析 `q,k,v,o,mlp` 形式的挂载位置串。
+    ///
+    /// 大小写不敏感、允许空格与重复项；`proj`/`c_proj` 等价于 `o`，`ffn`/`mlp` 等价。
+    /// 给一个空串（或一个都没命中）会报错而不是静默返回"全不挂"——
+    /// 后者会训出一个可训练参数为 0 的模型，白跑一轮才发现。
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut t = LoRATargets {
+            q: false,
+            k: false,
+            v: false,
+            o: false,
+            mlp: false,
+        };
+        for part in spec
+            .split(',')
+            .map(|p| p.trim().to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+        {
+            match part.as_str() {
+                "q" => t.q = true,
+                "k" => t.k = true,
+                "v" => t.v = true,
+                "o" | "proj" | "c_proj" => t.o = true,
+                "mlp" | "ffn" => t.mlp = true,
+                "all" => {
+                    t.q = true;
+                    t.k = true;
+                    t.v = true;
+                    t.o = true;
+                    t.mlp = true;
+                }
+                other => {
+                    return Err(format!(
+                        "未知的 LoRA 挂载位置 `{other}`（可选：q / k / v / o / mlp / all）"
+                    ))
+                }
+            }
+        }
+        if !(t.q || t.k || t.v || t.o || t.mlp) {
+            return Err("LoRA 挂载位置不能为空（可选：q / k / v / o / mlp / all）".to_string());
+        }
+        Ok(t)
+    }
+}
+
+impl std::fmt::Display for LoRATargets {
+    /// 日志用：按固定顺序输出命中的位置名（`q,k,v`）
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = Vec::new();
+        for (on, name) in [
+            (self.q, "q"),
+            (self.k, "k"),
+            (self.v, "v"),
+            (self.o, "o"),
+            (self.mlp, "mlp"),
+        ] {
+            if on {
+                names.push(name);
+            }
+        }
+        write!(f, "{}", names.join(","))
+    }
 }
 
 impl Default for TrainConfig {
@@ -97,6 +216,9 @@ impl Default for TrainConfig {
             warmup_steps: 20,
             weight_decay: 0.01,
             grad_clip: 1000000.0,
+            amp: true,
+            amp_init_scale_log2: 16,
+            amp_growth_interval: 2000,
             eval_every: 100,
             eval_iters: 20,
             tokenizer: "bpe".to_string(),
@@ -163,6 +285,16 @@ impl Config {
         assert!(t.weight_decay >= 0.0, "train.weight_decay 不能为负");
         assert!(t.grad_clip > 0.0, "train.grad_clip 必须 > 0");
         assert!(t.accum_steps >= 1, "train.accum_steps 必须 >= 1（否则除零）");
+        assert!(
+            t.amp_init_scale_log2 <= 24,
+            "train.amp_init_scale_log2（{}）不能大于 24：scale 上限就是 2^24，\
+             初始值超过它会让 scale 永远只能收缩",
+            t.amp_init_scale_log2
+        );
+        assert!(
+            t.amp_growth_interval >= 1,
+            "train.amp_growth_interval 必须 >= 1（用于累计无溢出步数）"
+        );
         assert!(t.bpe_vocab >= 256, "train.bpe_vocab 必须 >= 256（字节级基础词表）");
         // 模型参数
         assert!(m.n_embd >= 1, "model.n_embd 必须 >= 1");
@@ -233,6 +365,7 @@ impl Config {
                 use_rmsnorm: true,
                 use_swiglu: true,
                 dropout: 0.1,
+                ..GPTConfig::default()
             },
             train: TrainConfig {
                 steps: 10000,
@@ -269,6 +402,7 @@ impl Config {
                 use_rmsnorm: true,
                 use_swiglu: true,
                 dropout: 0.1,
+                ..GPTConfig::default()
             },
             train: TrainConfig {
                 steps: 50000,
@@ -308,5 +442,54 @@ impl Config {
         ensure_parent_dir(path);
         std::fs::write(path, json)
             .unwrap_or_else(|e| panic!("无法写入配置文件 {path}: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--lora-targets` 的解析：别名、大小写、重复项都容忍，认不出的名字与空串必须报错
+    /// （空串静默变成"哪都不挂"会训出一个可训练参数为 0 的模型，白跑一轮才发现）。
+    #[test]
+    fn test_lora_targets_parse() {
+        let t = LoRATargets::parse(" Q , k ,V ").unwrap();
+        assert_eq!(
+            t,
+            LoRATargets { q: true, k: true, v: true, o: false, mlp: false }
+        );
+        assert_eq!(
+            LoRATargets::parse("all").unwrap(),
+            LoRATargets { q: true, k: true, v: true, o: true, mlp: true }
+        );
+        let t = LoRATargets::parse("proj,ffn").unwrap();
+        assert!(t.o && t.mlp && !t.q && !t.k && !t.v);
+        assert!(LoRATargets::parse("q,q").is_ok(), "重复项不该报错");
+        assert!(LoRATargets::parse("").is_err());
+        assert!(LoRATargets::parse(" , ").is_err());
+        assert!(LoRATargets::parse("q,bogus").is_err());
+    }
+
+    /// LoRA 段的向后兼容：接入 `targets` 之前存的档只有 rank/alpha，必须照样读得进来
+    /// （缺的字段走缺省 q/k/v），否则旧存档会直接打不开。
+    #[test]
+    fn test_lora_config_serde_compatibility() {
+        let old: LoRAConfig = serde_json::from_str(r#"{"rank":8,"alpha":8.0}"#).unwrap();
+        assert_eq!(old.rank, 8);
+        assert_eq!(old.alpha, 8.0);
+        assert_eq!(old.targets, LoRATargets::default(), "旧档应回落到缺省 q/k/v");
+
+        // 新档带 targets：逐个字段读回，未提到的字段同理走缺省
+        let new: LoRAConfig =
+            serde_json::from_str(r#"{"rank":8,"alpha":8.0,"targets":{"k":false,"o":true}}"#)
+                .unwrap();
+        assert_eq!(
+            new.targets,
+            LoRATargets { q: true, k: false, v: true, o: true, mlp: false }
+        );
+
+        // 日志里的挂载位置：固定按 q,k,v,o,mlp 顺序输出
+        assert_eq!(new.targets.to_string(), "q,v,o");
+        assert_eq!(LoRATargets::default().to_string(), "q,k,v");
     }
 }

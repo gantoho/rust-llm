@@ -10,9 +10,52 @@
 //!
 //! 结合使用：重复惩罚 -> temperature 调整锐度 -> top-k/top-p 截断 -> 按概率随机抽样。
 
+use crate::attention::KVCache;
 use crate::model::GPT;
+use crate::quant::QBits;
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
+
+/// 推理侧 KV cache 的开关与压缩设置（第 25 / 33 课）。
+///
+/// 打包成结构体而不是给 `generate` 再加三个标量参数：`generate` 的入参本来就多，
+/// 而这三项是**同进退**的一组（不用缓存时后两项无意义）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KvOpts {
+    /// 是否使用 KV cache。关掉 = 每生成一个 token 都全量重算一次上下文
+    /// （慢，但没有缓存内存；用来做数值对照）。
+    pub enable: bool,
+    /// Attention Sink：超窗丢弃时**永久保留最前面的 `sink` 个位置**（StreamingLLM）。
+    /// 流式长文本生成必须开，否则丢掉序列开头后质量断崖下跌，见 [`crate::attention::KvCacheOpts::sink`]。
+    pub sink: usize,
+    /// 缓存量化位宽：`None` = f32，`Some(Int8/Int4)` = KIVI 式压缩（K 逐通道、V 逐 token）
+    pub bits: Option<QBits>,
+}
+
+impl KvOpts {
+    /// 不开缓存（等价于全量前向）
+    pub fn off() -> Self {
+        KvOpts {
+            enable: false,
+            ..KvOpts::default()
+        }
+    }
+
+    /// 开缓存 + 指定 Attention Sink 与量化位宽
+    pub fn on(sink: usize, bits: Option<QBits>) -> Self {
+        KvOpts {
+            enable: true,
+            sink,
+            bits,
+        }
+    }
+
+    /// 按模型结构造出这一轮推理要用的缓存集合
+    fn build(&self, model: &GPT) -> Option<Vec<KVCache>> {
+        self.enable
+            .then(|| model.new_kv_cache_with(self.sink, self.bits))
+    }
+}
 
 /// 采样超参数（temperature / top-k / top-p / 重复惩罚）
 ///
@@ -61,6 +104,32 @@ pub fn sample_token(
     recent: &[usize],
     rng: &mut Rng,
 ) -> usize {
+    let (ids, probs) = probs_from_logits(logits, opts, recent);
+    let mut u = rng.next_f32();
+    for (i, p) in probs.iter().enumerate() {
+        if u < *p {
+            return ids[i];
+        }
+        u -= p;
+    }
+    ids.last().copied().unwrap_or(0)
+}
+
+/// 把一行 logits 变成「候选 token + 归一化概率」，即采样流程的全部预处理：
+/// 重复惩罚 → temperature → top-k → top-p → softmax 归一化。
+///
+/// 抽成公开函数是为了让**任何**需要"这个分布长什么样"的地方都用同一份实现：
+/// 推测解码要在草稿分布 q 与目标分布 p 之间做接受/拒绝校正（见
+/// [`crate::speculative`]），校正的正确性完全建立在"p、q 是同一套预处理算出来的"
+/// 之上。两边各写一遍预处理，一旦有一项（比如 top-p 的边界取法）不一致，
+/// 拒绝采样就不再收敛到目标分布，而这种偏差在输出里表现为"偶尔串味"，极难定位。
+///
+/// 返回值按概率从高到低排列；`ids` 与 `probs` 等长，`probs` 之和为 1。
+pub fn probs_from_logits(
+    logits: &[f32],
+    opts: &SampleOpts,
+    recent: &[usize],
+) -> (Vec<usize>, Vec<f32>) {
     // 1. 重复惩罚：压低最近出现过的 token。
     //    正值除以系数、负值乘以系数 —— 两种情况下数值都变小，因此更难被抽中。
     //    作用在**原始 logit** 上、再统一做 temperature 缩放，与 HuggingFace 的处理顺序一致。
@@ -122,15 +191,24 @@ pub fn sample_token(
         }
     }
 
-    // 7. 按概率随机抽样
+    (items.into_iter().map(|(i, _)| i).collect(), probs)
+}
+
+/// 在**给定的离散分布**上采样（`probs` 不必有序，内部不重排）。
+///
+/// 与 [`sample_token`] 的区别：那个从 logits 出发、含整套预处理；这个只做"掷一次骰子"。
+/// 推测解码的拒绝采样要把"残差分布 `max(0, p − q)`"归一化后再抽一次，
+/// 那一步没有 logits 可言，只能直接给概率。
+pub fn sample_from_probs(ids: &[usize], probs: &[f32], rng: &mut Rng) -> usize {
+    debug_assert_eq!(ids.len(), probs.len());
     let mut u = rng.next_f32();
     for (i, p) in probs.iter().enumerate() {
         if u < *p {
-            return items[i].0;
+            return ids[i];
         }
         u -= p;
     }
-    items.last().map(|(i, _)| *i).unwrap_or(0)
+    ids.last().copied().unwrap_or(0)
 }
 
 /// 生成文本
@@ -138,45 +216,48 @@ pub fn sample_token(
 /// - prompt: 起始文本
 /// - max_new: 最多生成多少个新 token
 /// - opts: 采样超参数（含重复惩罚与停止标记 `opts.stop`）
-/// - use_kv_cache: 是否使用 KV cache 加速（第 18 课）
+/// - kv: KV cache 开关与压缩设置（第 25 / 33 课）
+///
+/// 结束条件有三个，任何一个命中就收：
+/// 1. 采到 EOS token（分词器带特殊 token 时；这是模型真正学过的结束符号）
+/// 2. `opts.stop` 里的字符串出现（模板停止标记，给没学 EOS 的老权重兜底）
+/// 3. 生成到 `max_new` 个 token
 pub fn generate(
     model: &GPT,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_new: usize,
     opts: &SampleOpts,
-    use_kv_cache: bool,
+    kv: KvOpts,
     rng: &mut Rng,
 ) -> String {
     let block_size = model.cfg.block_size;
-    let mut ids = tokenizer.encode(prompt);
+    // prompt 前面补 BOS：训练时每篇文档都以 BOS 开头（见 `data::encode_document`），
+    // 推理从 BOS 起头才与训练分布一致。老分词器没有 BOS，行为不变。
+    let mut ids = match tokenizer.bos_id() {
+        Some(bos) => vec![bos],
+        None => Vec::new(),
+    };
+    ids.extend(tokenizer.encode(prompt));
     if ids.is_empty() {
-        ids.push(0); // 空 prompt：先喂一个 token，避免 0 长度上下文导致下标下溢
+        ids.push(0); // 空 prompt 且无 BOS：先喂一个 token，避免 0 长度上下文导致下标下溢
     }
-    // 仅在使用 KV cache 时才分配缓存，全量模式不浪费内存
-    let mut cache = use_kv_cache.then(|| model.new_kv_cache());
-    // 缓存窗口写满时是否提前结束（全量模式会滑动窗口继续，KV cache 做不到）
-    let mut hit_window_limit = false;
+    let mut cache = kv.build(model);
+    let eos = tokenizer.eos_id();
     // 字节级 BPE 的 UTF-8 约束：词表里有"半个汉字"，采样前要把它们排除（char 分词器返回 None）
     let vocab_bytes = tokenizer.vocab_bytes();
     let mut masked: Vec<f32> = Vec::new();
 
     for _ in 0..max_new {
-        // KV cache 模式：上下文总长达到 block_size 就停（缓存无法像全量模式那样截断历史）
-        if cache.as_ref().is_some_and(|c| c[0].seq_len() >= block_size) {
-            hit_window_limit = true;
-            break;
-        }
-        // 只保留最近的 block_size 个 token（全量模式需要）
+        // 只保留最近的 block_size 个 token（两种模式都必须遵守的上下文上限）
         let start = ids.len().saturating_sub(block_size);
         let ctx = &ids[start..];
 
         // 推理不需要反向：no_grad 下不挂计算图、不分配梯度缓冲
         let logits = crate::tensor::no_grad(|| {
-            if use_kv_cache {
+            if let Some(c) = cache.as_mut() {
                 // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
                 // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-                let c = cache.as_mut().unwrap();
                 if c[0].seq_len() == 0 {
                     model.forward(ctx, 1, ctx.len(), Some(c), false)
                 } else {
@@ -213,8 +294,15 @@ pub fn generate(
         let next = sample_token(row, opts, recent, rng);
         ids.push(next);
 
+        // 采到 EOS 就收：这是模型自己学出来的结束符号（训练时每段序列末尾都带它），
+        // 比"等某个字符组合出现"可靠得多。EOS 本身不进结果。
+        if eos == Some(next) {
+            return tokenizer.decode(&ids[..ids.len() - 1]);
+        }
+
         // 命中停止标记就收：SFT 模板下模型答完会自己吐「。。」，
         // 不截断的话它会顺着模板继续编下一轮提问（"回答后面跟提问"在训练语料里到处都是）。
+        // 这一条是给**没学过 EOS 的老权重**兜底的路径。
         //
         // 只在**新生成的部分**里查找：prompt 自己就含「用户：」（模板的一部分），
         // 对整个字符串搜索会立刻在 prompt 里命中，结果返回空白。
@@ -229,25 +317,7 @@ pub fn generate(
         }
     }
 
-    if hit_window_limit {
-        warn_window_full(block_size, ids.len());
-    }
-
     tokenizer.decode(&ids)
-}
-
-/// 生成被窗口截断时的告警。
-///
-/// 不能静默变短：同一个 prompt 加不加 KV cache 会得到不同长度，用户必须知情。
-/// 打到 stderr 而不是 stdout —— stdout 是生成结果（`generate` 子命令可能被重定向到文件），
-/// 但同时也写进运行日志，否则事后复盘看不到"这次生成为什么变短了"。
-fn warn_window_full(block_size: usize, n_ids: usize) {
-    let msg = format!(
-        "[warn] KV cache 窗口已满（block_size={block_size}），生成在 {n_ids} 个 token 处提前结束；\
-         需要更长输出请缩短 prompt，或加 --no-kv-cache 改用全量前向（滑动窗口可继续生成）"
-    );
-    eprintln!("{msg}");
-    crate::runlog::append(&msg);
 }
 
 /// Beam Search 生成：维护 `beam_size` 个候选序列，每步扩展后保留 top-k。
@@ -262,6 +332,10 @@ fn warn_window_full(block_size: usize, n_ids: usize) {
 /// - beam_size: 束宽（通常 4-10），越大搜索越充分，但越慢
 /// - length_penalty: 长度惩罚指数 α（0 = 不惩罚，>0 偏好长序列，<0 偏好短序列）
 ///   最终分数 = log_prob / len^α（Google NMT 的公式）
+/// - kv: KV cache 设置。开启后**每条 beam 持有自己的缓存**：束内所有路径共享同一段
+///   前缀，扩展时克隆父路径的缓存（[`KVCache::fork`]），于是每步每条路径只前向 1 个
+///   token，而不再是"每条路径重算整段上下文"。缓存窗口就是 `block_size`，所以它与
+///   全量重算的可见范围完全一致（RoPE 只看相对距离，位置整体平移不影响打分）。
 ///
 /// 累加的必须是 **log 概率**而不是原始 logit：log_softmax 会把 logit 归一化成一个
 /// 合法分布的对数（各项 ≤ 0，序列越长和越小），除以 `len^α` 才有"平均每 token 的对数概率"
@@ -274,52 +348,87 @@ pub fn beam_search(
     max_new: usize,
     beam_size: usize,
     length_penalty: f32,
+    kv: KvOpts,
     _rng: &mut Rng,
 ) -> String {
     assert!(beam_size >= 1, "beam_size 必须 >= 1");
-    let block_size = model.cfg.block_size;
     let vocab_size = model.cfg.vocab_size;
-    let prompt_ids = tokenizer.encode(prompt);
-    let prompt_len = prompt_ids.len();
-    let prompt_ids = if prompt_ids.is_empty() {
-        vec![0]
-    } else {
-        prompt_ids
-    };
+    // 与 generate 一致：prompt 前补 BOS（训练时文档以 BOS 开头）
+    let mut prompt_ids: Vec<usize> = tokenizer.bos_id().into_iter().collect();
+    prompt_ids.extend(tokenizer.encode(prompt));
+    if prompt_ids.is_empty() {
+        prompt_ids.push(0);
+    }
 
-    // 每个 beam: (token_ids, cumulative_log_prob)
-    let mut beams: Vec<(Vec<usize>, f64)> = vec![(prompt_ids, 0.0)];
+    // 每个候选路径：token 序列 + 累计对数概率 + 它自己的缓存 + 是否已收尾（吐过 EOS）
+    struct Beam {
+        ids: Vec<usize>,
+        score: f64,
+        cache: Option<Vec<KVCache>>,
+        finished: bool,
+    }
+
+    let mut base_cache = kv.build(model);
+    // 每条路径的缓存都要从"同一个 prompt 前缀"出发，所以先做一次 prefill 再克隆。
+    // prefill 只喂到**倒数第二个** token 为止：剩下那一个交给主循环统一处理
+    // （循环里"把最后一个 token 喂进缓存换出下一个 token 的分布"是同一套动作，
+    // 少一个特例就少一处出错的地方）。prompt 只有一个 token 时不用 prefill。
+    if let Some(cache) = base_cache.as_mut() {
+        if prompt_ids.len() >= 2 {
+            let start = prompt_ids.len().saturating_sub(model.cfg.block_size);
+            let prefill = &prompt_ids[start..prompt_ids.len() - 1];
+            crate::tensor::no_grad(|| model.forward(prefill, 1, prefill.len(), Some(cache), false));
+        }
+    }
+    let only_cache = || base_cache.as_ref().map(|c| c.iter().map(|x| x.fork()).collect());
+
+    let mut beams: Vec<Beam> = vec![Beam {
+        ids: prompt_ids,
+        score: 0.0,
+        cache: only_cache(),
+        finished: false,
+    }];
+    let eos = tokenizer.eos_id();
     // 字节级 BPE 的 UTF-8 约束（同 generate：排除"半个汉字"的 token）
     let vocab_bytes = tokenizer.vocab_bytes();
     let mut masked: Vec<f32> = Vec::new();
 
     for _step in 0..max_new {
-        let mut candidates: Vec<(Vec<usize>, f64)> = Vec::new();
+        let mut candidates: Vec<Beam> = Vec::new();
 
-        for (ids, score) in &beams {
-            // 已经生成 EOS（这里用 id=0 简化）就不扩展
-            if ids.last() == Some(&0) && ids.len() > prompt_len {
-                candidates.push((ids.clone(), *score));
+        for mut beam in beams {
+            // 已收尾的路径不再扩展，但保留下来参与最终比较
+            if beam.finished {
+                candidates.push(beam);
                 continue;
             }
-            // 上下文截断
-            let start = ids.len().saturating_sub(block_size);
-            let ctx = &ids[start..];
 
-            // 全量前向（beam search 通常是离线的，不用 KV cache）
-            // 推理无需反向，包在 no_grad 里避免建图开销
-            let logits = crate::tensor::no_grad(|| model.forward(ctx, 1, ctx.len(), None, false));
-            let n = logits.numel();
-            let last_row = &logits.data()[n - vocab_size..];
-            // 只允许"接上后仍是合法 UTF-8 前缀"的 token
-            let row: &[f32] = match vocab_bytes {
-                Some(vocab) => {
-                    masked.clear();
-                    masked.extend_from_slice(last_row);
-                    mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, ids));
-                    &masked
+            // 拿到"下一个 token"的分布：把这条路径的最后一个 token 喂进缓存。
+            // 缓存覆盖 `ids[..len-1]`，喂完正好补成 `ids[..len]`，分布就是"接在 ids 之后"。
+            let row: Vec<f32> = {
+                let last = *beam.ids.last().expect("beam 至少含 prompt 一个 token");
+                let logits = match beam.cache.as_mut() {
+                    Some(cache) => crate::tensor::no_grad(|| {
+                        model.forward(&[last], 1, 1, Some(cache), false)
+                    }),
+                    // 不用缓存：整段上下文重算（慢，但没有缓存内存）
+                    None => {
+                        let start = beam.ids.len().saturating_sub(model.cfg.block_size);
+                        let ctx = &beam.ids[start..];
+                        crate::tensor::no_grad(|| model.forward(ctx, 1, ctx.len(), None, false))
+                    }
+                };
+                let n = logits.numel();
+                let last_row = logits.data()[n - vocab_size..].to_vec();
+                match vocab_bytes {
+                    Some(vocab) => {
+                        masked.clear();
+                        masked.extend_from_slice(&last_row);
+                        mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, &beam.ids));
+                        masked.clone()
+                    }
+                    None => last_row,
                 }
-                None => last_row,
             };
 
             // 先 log_softmax 成对数概率再累加（用 max 减去最大值做数值稳定化）。
@@ -343,27 +452,32 @@ pub fn beam_search(
                 .iter()
                 .enumerate()
                 .filter(|(_, l)| l.is_finite()) // 被屏蔽的 -inf 直接跳过
-                .map(|(i, &l)| (i, *score + (l as f64 - log_z)))
+                .map(|(i, &l)| (i, beam.score + (l as f64 - log_z)))
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(beam_size);
 
             for (tok, new_score) in scored {
-                let mut new_ids = ids.clone();
-                new_ids.push(tok);
-                candidates.push((new_ids, new_score));
+                let mut ids = beam.ids.clone();
+                ids.push(tok);
+                // 克隆父路径的缓存：兄弟路径的前缀完全相同，缓存自然也一样
+                let cache = beam.cache.as_ref().map(|c| c.iter().map(|x| x.fork()).collect());
+                candidates.push(Beam {
+                    ids,
+                    score: new_score,
+                    cache,
+                    finished: eos == Some(tok),
+                });
             }
         }
 
         // 按分数排序，保留 top-beam_size
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(beam_size);
         beams = candidates;
 
-        // 所有 beam 都结束了就提前停
-        if beams.iter().all(|(ids, _)| {
-            ids.len() > prompt_len && ids.last() == Some(&0)
-        }) {
+        // 所有 beam 都收尾了就提前停
+        if beams.iter().all(|b| b.finished) {
             break;
         }
     }
@@ -375,13 +489,18 @@ pub fn beam_search(
     let best = beams
         .iter()
         .max_by(|a, b| {
-            let sa = a.1 / (a.0.len() as f64).powf(length_penalty as f64);
-            let sb = b.1 / (b.0.len() as f64).powf(length_penalty as f64);
+            let sa = a.score / (a.ids.len() as f64).powf(length_penalty as f64);
+            let sb = b.score / (b.ids.len() as f64).powf(length_penalty as f64);
             sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
         })
-        .unwrap();
+        .expect("beams 至少有一条（prompt 本身）");
 
-    tokenizer.decode(&best.0)
+    // EOS 不进结果：它在 id 序列里是"结束符"，不是内容
+    let ids: &[usize] = match best.ids.last() {
+        Some(&last) if eos == Some(last) => &best.ids[..best.ids.len() - 1],
+        _ => &best.ids,
+    };
+    tokenizer.decode(ids)
 }
 
 // ==================== 生成时的 UTF-8 约束 ====================
@@ -393,7 +512,11 @@ pub fn beam_search(
 /// 这里在采样前剪掉这些 token：数学上等价于把这些 token 的概率设为 0 后重新归一化。
 ///
 /// `pending` 是当前字节流末尾未拼完的字节（见 [`pending_tail`]）。
-fn mask_illegal_utf8(logits: &mut [f32], vocab: &[Vec<u8>], pending: &[u8]) {
+///
+/// 公开到 crate 内是给推测解码用的（见 [`crate::speculative`]）：它逐位验证草稿时
+/// 必须用**同一套**掩码，否则目标分布 p 与草稿分布 q 的定义域不一致，
+/// 拒绝采样就不再收敛到目标分布。
+pub(crate) fn mask_illegal_utf8(logits: &mut [f32], vocab: &[Vec<u8>], pending: &[u8]) {
     let mut buf: Vec<u8> = Vec::with_capacity(pending.len() + 4);
     for (id, logit) in logits.iter_mut().enumerate() {
         let Some(tok) = vocab.get(id) else { continue };
@@ -409,7 +532,9 @@ fn mask_illegal_utf8(logits: &mut [f32], vocab: &[Vec<u8>], pending: &[u8]) {
 /// 算出已生成 token 序列末尾"未拼完的字节"（最多 3 字节，UTF-8 单字符最长 4 字节）。
 ///
 /// 只需回看末尾几个 token：取满 8 个（每个至少 1 字节）必然覆盖最近的字符边界。
-fn pending_tail(vocab: &[Vec<u8>], ids: &[usize]) -> Vec<u8> {
+///
+/// 同样公开到 crate 内给推测解码复用（见 [`mask_illegal_utf8`] 的说明）。
+pub(crate) fn pending_tail(vocab: &[Vec<u8>], ids: &[usize]) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     for &id in ids.iter().rev().take(8) {
         let Some(tok) = vocab.get(id) else { continue };
@@ -458,31 +583,32 @@ mod tests {
         let (model, tokenizer) = tiny_setup();
         // tiny 的 block_size = 32：prompt 3 + 生成 20 = 23 ≤ 32，全程在缓存窗口内
         let mut rng_full = Rng::new(1234);
-        let full = generate(&model, &tokenizer, "the", 20, &opts(), false, &mut rng_full);
+        let full = generate(&model, &tokenizer, "the", 20, &opts(), KvOpts::off(), &mut rng_full);
         let mut rng_cache = Rng::new(1234);
-        let cached = generate(&model, &tokenizer, "the", 20, &opts(), true, &mut rng_cache);
+        let cached = generate(&model, &tokenizer, "the", 20, &opts(), KvOpts::on(0, None), &mut rng_cache);
 
         assert_eq!(full, cached, "窗口内的 KV cache 生成应与全量前向逐 token 一致");
     }
 
-    /// 缓存窗口写满后 KV cache 模式会提前结束，全量模式靠滑动窗口继续生成。
-    /// 两者长度不同是有意为之（见 `generate` 里的 `hit_window_limit` 警告），
-    /// 但 cache 的输出应是全量输出的**前缀**：只变短，内容不变。
+    /// 超出缓存窗口后，KV cache 模式靠滑动窗口继续生成，不再提前结束：
+    /// 同一个 prompt 加不加 `--no-kv-cache` 都应产出同样多的 token。
+    ///
+    /// 这里只断言长度，不断言内容：超过上下文窗口后，"增量 + 滑动窗口"（标准推理语义）
+    /// 与"截断后重算"本就不是同一个函数——重算会把窗口内各位置在浅层可见的上下文一并砍掉，
+    /// 深层 K/V 随之不同。机制层面的严格等价由
+    /// `model::tests::test_kv_cache_sliding_window_matches_full_window_forward` 验证。
     #[test]
-    fn test_kv_cache_output_is_prefix_of_full_beyond_window() {
+    fn test_kv_cache_generate_beyond_window_is_not_truncated() {
         let (model, tokenizer) = tiny_setup();
         let mut rng_full = Rng::new(1234);
-        let full = generate(&model, &tokenizer, "the", 60, &opts(), false, &mut rng_full);
+        let full = generate(&model, &tokenizer, "the", 60, &opts(), KvOpts::off(), &mut rng_full);
         let mut rng_cache = Rng::new(1234);
-        let cached = generate(&model, &tokenizer, "the", 60, &opts(), true, &mut rng_cache);
+        let cached = generate(&model, &tokenizer, "the", 60, &opts(), KvOpts::on(0, None), &mut rng_cache);
 
-        assert!(
-            cached.chars().count() < full.chars().count(),
-            "超出窗口时 cache 模式应提前结束，输出比全量短"
-        );
-        assert!(
-            full.starts_with(&cached),
-            "超出窗口时 cache 输出应仍是全量输出的前缀：\nfull   = {full}\ncached = {cached}"
+        assert_eq!(
+            full.chars().count(),
+            cached.chars().count(),
+            "滑动窗口下 cache 模式不应再提前结束：\nfull   = {full}\ncached = {cached}"
         );
     }
 

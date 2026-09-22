@@ -236,7 +236,9 @@ opt.zero_grad();
 
 ---
 
-## 8. 动手练习
+## 8. 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
 
 1. **对比 SGD vs AdamW**：临时把 `train_gpt` 里的 `AdamW::new(...)` 换成 `SGD::new(0.01, params.clone())`（去掉 `opt.lr = scheduler.lr()` 那行，因为 `SGD::lr` 是私有字段），跑 600 步看 loss——体会 AdamW 在小语料上的收敛速度优势。
 2. **手推第一步**：假设某参数 `θ=1.0`、`g=0.5`、`lr=0.001`、`wd=0.01`，手算 `t=1` 时 `m_hat`、`v_hat`、`step`、`decay`，再在 `AdamW::step` 里加一行 `println!` 验证。

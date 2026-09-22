@@ -12,7 +12,7 @@
 
 - **跨平台**：Windows 走 DX12 / Vulkan，NVIDIA 独显和 Intel 核显都能用；
 - **纯 Rust**：不依赖 CUDA，也不引入深度学习框架（`wgpu`/`pollster` 是**可选**依赖，默认不编译）；
-- **计算着色器**：WGSL 手写算子，和写 CPU 的 for 循环思路一致，适合教学。
+- **计算着色器**：WGSL 手写算子，和写 CPU 的 for 循环思路一致——每一行都能对着数学公式核对，改完还能拿 CPU 参考实现逐值比对。
 
 本机标定用的是一块 **NVIDIA GeForce MX150**（3 个 SM、2GB 显存，Dx12 后端）。
 它很小，所以本课所有实测数字都能一眼看出「什么值得上 GPU、什么不值得」。
@@ -136,8 +136,19 @@ matmul / scale / add / relu / 掩码 softmax 都走它，`tensor.rs` 里按 FLOP
 （注意力子层的结果要作为前馈子层的输入）。这一点曾经写错过，代价很大，见 [§9](#9-踩坑记录)。
 
 **适用条件**（任一不满足就自动回退逐算子 → CPU）：训练模式（无 KV cache、`base = 0`）、
-LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head == n_head`（不支持 GQA 头复制）、
-形状与规模够大。
+GPT-2 风格的 GELU MLP（SwiGLU 由调用方让路）、形状与规模够大。
+
+归一化用 LayerNorm 还是 RMSNorm、K/V 是不是 GQA 的头数，都**不需要让路**——两者在参数层面
+就被抹平了：
+
+- **RMSNorm**：和 LayerNorm 共用同一套归约内核，靠一个模式位切换。RMSNorm 是 LayerNorm
+  在"μ≡0、无 β"下的特例，所以前向只需把第一趟归约从"求和"换成"求平方和"、第三趟的仿射项取 0，
+  反向只需把 `m1` 置 0（`dγ` 的公式本来就一致，写出的 `dβ` 无人接收）。
+- **GQA**：不动内核，而是在**权重**上做一次等价变换——把 K/V 的参数按
+  [`repeat_kv`](../src/attention.rs) 的同一套头顺序展开成 `n_head` 份
+  （[`expand_kv_head`](../src/attention.rs)），反向再把梯度按组折回
+  （[`fold_kv_head_grad`](../src/attention.rs)）。展开后与标准 MHA 同形，整条常驻路径一行不用改；
+  代价只是每步每层多上传 `(n_rep-1)` 份 K/V 权重（默认配置下 64KB 量级）。
 
 整叠路径默认**关闭**，用 `LLM_GPU_STACK=1` 打开。它在数值上与逐子层路径完全一致
 （同 seed 下 loss / val 逐位相同），实测也**更快**：同一配置 ABBA 两轮，
@@ -147,7 +158,8 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 （本机实测：逐子层约 `20.7ms/次 × 多次/步`，整叠一次提交 66~96ms 覆盖所有层）。
 
 默认仍关闭，因为它的**准入条件更严**：整叠要求所有 Block 都满足常驻条件
-（LayerNorm + GELU MLP，任一层不满足就整条路径放弃），而逐子层是"哪个子层不满足就只回退那一个"。
+（GELU MLP——各层共用同一份配置，所以一个 SwiGLU 就足以让整条路径放弃），
+而逐子层是"哪个子层不满足就只回退那一个"。
 想复现对照实验或追求吞吐时设 `LLM_GPU_STACK=1`。
 
 ---
@@ -197,11 +209,14 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 
 | 配置 | step 1 loss（GPU） | step 1 loss（CPU） |
 |------|------------------|------------------|
-| GQA（注意力常驻**不可用**，其余 GPU 路径生效） | 4.5354 | 4.5354（**逐位一致**） |
-| MHA（注意力常驻生效） | 4.5075 | 4.5169（差 0.2%） |
+| GQA 配置（测得时注意力常驻尚不支持 GQA，故该链路未生效） | 4.5354 | 4.5354（**逐位一致**） |
+| MHA 配置（注意力常驻生效） | 4.5075 | 4.5169（差 0.2%） |
 
-也就是说：**想让 GPU 结果和 CPU 完全对上，就把 `n_kv_head` 设成小于 `n_head`**（GQA）——
-代价是失去注意力常驻链路。测试里的 `assert_close` 正是按 `1e-3` 相对误差设的门槛。
+也就是说：**想让 GPU 结果与 CPU 逐位对上，就把常驻链路整体让路**——把
+`LLM_GPU_MATMUL_MIN_FLOPS` 设得比实际形状的 FLOPs 都大即可（见 [§7](#7-环境变量)）。
+只要注意力常驻链路生效，差值就在 `1e-3` 相对误差量级，测试里的 `assert_close` 正是按这个门槛设的；
+`test_gpu_resident_path_matches_loop_path` 把 LayerNorm / RMSNorm / GQA / RMSNorm+GQA
+四种形态都纳入了同一条门槛的守护（同一份参数、同一批数据跑常驻与逐算子两遍，比 loss 与全部参数梯度）。
 
 ---
 
@@ -251,7 +266,8 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 2. MX150 每次 dispatch 的固定开销约 10ms。手写 CPU 矩阵乘（朴素三重循环、无 SIMD/BLAS）
    实际吞吐只有约 3.5 GFLOPS，所以即使是 `n_embd=256` 的小模型，GPU 依然比 CPU 快
    （`bench` 子命令里 GPU 1900 tok/s vs CPU 1540 tok/s）。
-   教学实现以「清晰、可回退」优先，不追求极致吞吐。
+   这一档的提升空间不在"把单个着色器写得更玄"，而在**减少 dispatch 次数**：把相邻算子的形状凑齐、
+   用常驻显存路径一次提交算完一整段（见 §4.2 的路径设计与 §8 的实测数字）。
 
 `bench` 子命令是稳定的对照点（固定模型/语料/种子，step 30 的 loss 恒为 `2.6326`）：
 
@@ -301,12 +317,13 @@ LayerNorm（不支持 RMSNorm）、GELU MLP（不支持 SwiGLU）、`n_kv_head =
 
 ---
 
-## 10. 动手练习
+## 10. 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
 
 1. 把 `matmul_small_main` 的 tile 从 64×64 改成 32×32 或 128×64，用 `mm_tile_ab_probe` 同进程交替标定，
    看趋势是否还成立（小 tile 赢在**占用率**，再小就可能输在访存**复用率**上）；
-2. 给 `MLPEnum`/`NormLayer` 再加一条常驻链路（例如把 SwiGLU 或 RMSNorm 也做成融合内核），
-   并补一个 `assert_close` 数值测试；
+2. 给 `MLPEnum` 再加一条常驻链路（把 SwiGLU 的三次投影也做成融合内核），并补一个 `assert_close` 数值测试；
 3. 把注意力常驻链路的归约结构改成与 CPU 同序，验证能否把它从「1e-3 近似」拉回**逐位一致**；
 4. 用 `LLM_GPU_STACK=1` 与默认配置各跑一次同 seed 训练，
    验证两条路径的 loss 逐位相同，并用 `s/步` 解释"整叠为什么反而略快"（提示：数一数每步各提交了几次）；

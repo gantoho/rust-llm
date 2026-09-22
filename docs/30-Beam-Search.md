@@ -132,13 +132,16 @@ let mut beams: Vec<(Vec<usize>, f64)> = vec![(prompt_ids, 0.0)];
 
 某个 beam 生成结束标记后就不再扩展；所有 beam 都结束了就提前停止。
 
-> 本项目是字节级 BPE、没有专门的 EOS token，实现里用 `id = 0` 近似（见 `sample.rs` 的 `beam_search`），
-> 所以它只是个"提前停"的启发式，不等于真正的句子结束标志。
+> 本项目现在用的是**真实的 EOS 特殊 token**（`tokenizer.eos_id()`，见第 1 课的特殊 token 设计）：
+> 分词器带特殊 token 时它是真实 id，旧 checkpoint 或无特殊 token 的词表下为 `None`，
+> 此时不做提前终止。选中的序列末尾若带 EOS，解码前会被摘掉（EOS 是结束符，不是内容）。
 
 ### 6.3 KV Cache 兼容
 
 Beam Search 中每个 beam 的 KV Cache 独立，需要为每个 beam 维护一份。
-本项目实现中使用全量前向（不用 KV Cache），简化了实现。
+本项目实现里每条 beam 持有一份**独立的 KV Cache**（`Beam.cache`）：新候选的缓存从父路径 `fork` 出来，
+兄弟路径前缀相同、缓存自然一致，之后每条 beam 只喂自己最后一个 token 做增量前向。
+是否启用由 `KvOpts` 决定，关闭时退化为全量前向。
 
 ---
 
@@ -174,7 +177,7 @@ cargo run --release -- generate --config config/config.json --prompt "The fox" -
 ## 8. 关键要点
 
 - Beam Search 维护 k 个候选，每步扩展后保留 top-k
-- 得分用累积 log 概率，避免数值下溢；但当前实现累加的是**原始 logit**（未取 log_softmax），属已知简化/待改进点
+- 得分必须是累积 **log 概率**：`sample.rs` 的 `beam_search` 先对 logits 做 `log_softmax`（减最大值做数值稳定化，`log_z = max + ln Σ exp(l − max)`，被屏蔽的 `-inf` 自然为 0），再逐 token 累加；直接用原始 logit 累加会带上尺度偏置
 - 长度惩罚 α 解决短序列天然得分高的偏置
 - 适合翻译、摘要等"精确"任务；不适合创意写作
 - 速度是采样的 k 倍（k = beam_size）

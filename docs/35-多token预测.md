@@ -1,8 +1,9 @@
 # 第 35 课：多 Token 预测（Multi-Token Prediction）
 
-> **本课为前沿技术教程（纯文档，无配套代码实现）。**
-> 与本项目已有代码的关联：MTP 预测头可复用 `src/layers.rs` 的 `Linear` 层；
-> 训练循环可扩展 `src/train.rs` 的 `train_gpt` 函数支持多头损失。
+> **本课已落地为可运行代码**：`src/speculative.rs` 的 `MtpHeads`（K 个 `Linear` 头 + 各头交叉熵损失）
+> 与 `MtpDrafter`（把 MTP 头当推测解码的草稿）+ `speculative` 子命令的第五节实验。
+> 与已有代码的衔接：预测头复用 `src/layers.rs` 的 `Linear` 层，主干隐状态由 `GPT::forward_hidden_cached`
+> 提供；训练时只更新各头参数（主干可冻结），推理时一次前向即可给出往后 γ 个位置的分布。
 
 ---
 
@@ -159,7 +160,38 @@ MTP 的 K 个损失会累加，总梯度比 NTP 大 K 倍。需要：
 - 调低学习率，或
 - 对每个头的损失做 $1/K$ 的缩放
 
-## 动手练习
+## 本项目的实际实现
+
+上面的原理已全部落地为可运行代码。MTP 相关组件与第 34 课共用 [`src/speculative.rs`](../src/speculative.rs)（8 个单测），
+CLI 入口是 [`speculative`](../README.md#12-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令（通过 `--mtp-heads` / `--mtp-steps` 控制）。
+
+### 代码结构
+
+| 组件 | 位置 | 说明 |
+|------|------|------|
+| `MtpHeads` | `speculative.rs` | K 个 `Linear` 预测头：第 k 个头把位置 i 的隐状态映射到位置 i+k+1 的 token logits。提供 `new(k, n_embd, vocab)`、`logits(hidden)`（返回 K+1 个 logits 张量）、`loss(hidden, targets)`（各头交叉熵之和的均值） |
+| `MtpDrafter` | `speculative.rs` | 拿 MTP 头当推测解码的草稿来源：实现 `Drafter` trait，一次前向即可给出往后 γ 个位置的候选分布（不必自回归），但各分布彼此条件独立，接受率通常低于小模型草稿 |
+| `Drafter` trait | `speculative.rs` | 草稿来源统一接口：`propose()`/`commit()`/`reset()`，`MtpDrafter` 和 `ModelDrafter` 均实现此 trait |
+| `SpecDecoder` | `speculative.rs` | 推测解码执行体，可接受任意 `Drafter` 实现（包括 `MtpDrafter`） |
+
+### CLI 用法
+
+```bash
+# 训练 MTP 头并用于推测解码（K=4 头，80 步训练）
+cargo run --release -- speculative --mtp-heads 4 --mtp-steps 80
+
+# 调整 MTP 头数（K=2 头，更轻量）
+cargo run --release -- speculative --mtp-heads 2 --mtp-steps 80
+
+# 对比：用小模型草稿 vs MTP 头草稿（不传 --mtp-heads 即用 ModelDrafter）
+cargo run --release -- speculative --gamma 4 --max-new 48
+```
+
+---
+
+## 拓展方向
+
+> 核心内容已全部实现（`src/speculative.rs` 的 `MtpHeads` / `MtpDrafter`），这里是进阶拓展。
 
 1. **实现 MTP 训练**：在现有 GPT 模型上添加 3 个额外预测头，实现 K=4 的多 token 预测。
 2. **对比实验**：在相同数据和步数下，分别用 NTP 和 MTP 训练小模型，对比 loss 曲线和生成质量。

@@ -323,7 +323,9 @@ pub fn tiny(vocab_size: usize) -> Self {
 
 ---
 
-## 6. 动手练习
+## 6. 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
 
 1. **手推数据流**：设 `vocab=50, b=2, t=3`，用 tiny 配置，写出 `GPT::forward` 里每一步张量的形状（从 `idx` 到 `logits`），对照第 4.3 节的表检查。
 2. **改配置**：自己加一个 `GPTConfig::small`，比如 `n_embd=128, n_head=8, n_layer=4, block_size=64`。注意 `head_dim = 128/8 = 16` 仍成立；再按 5.2 节的表估一下参数量。

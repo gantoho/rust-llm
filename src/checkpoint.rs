@@ -22,8 +22,11 @@
 use std::fs::File;
 use std::io::{Read, Write};
 
+use crate::config::LoRAConfig;
 use crate::model::{GPT, GPTConfig};
-use crate::optim::AdamW;
+use crate::optim::{AdamW, Optimizer};
+use crate::quant::{QuantMeta, QuantMethod, QuantOpts};
+use crate::tensor::Tensor;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 7] = b"LLMCP2\n";
@@ -39,6 +42,21 @@ struct CkptHeader {
     model: GPTConfig,
     opt_t: usize,
     params: Vec<ParamMeta>,
+    /// 存档时的 LoRA 形态（`None` = 普通全参模型）。
+    ///
+    /// 加载端必须据此**先注入同样的适配器再恢复参数**：参数是按名字逐个对齐的，
+    /// 少了 `*.lora_a` / `*.lora_b` 这些名字，参数数量与形状就对不上，直接报错。
+    /// `serde(default)` 让 LoRA 之前存的旧档（没有这个字段）照常读入。
+    #[serde(default)]
+    lora: Option<LoRAConfig>,
+    /// 存档时的量化记录（`None` = 没量化过）。
+    ///
+    /// 只记**参数**（位宽 / 算法 / 字节口径），不记整数码：数据块里写的始终是 f32 权重，
+    /// 于是任何现有加载路径（训练续跑、推理、合并）都不用知道量化这件事。
+    /// 真要在部署时把显存压下来，加载端按这份记录原地重放一次 RTN 量化即可
+    /// （见 [`requantize_after_load`]）。`serde(default)` 让量化之前的旧档照常读入。
+    #[serde(default)]
+    quant: Option<QuantMeta>,
 }
 
 /// 单个参数的元信息
@@ -54,10 +72,29 @@ pub struct Checkpoint {
     pub step: usize,
     pub best_val_loss: f32,
     pub model: GPTConfig,
+    /// 存档时的 LoRA 形态；加载端据此在恢复参数**之前**重放注入（见 [`CkptHeader::lora`]）
+    pub lora: Option<LoRAConfig>,
+    /// 存档时的量化记录；`Some` 表示这份权重当初被量化过（权重本身仍是 f32，
+    /// 见 [`requantize_after_load`]）
+    pub quant: Option<QuantMeta>,
 }
 
 /// 保存 checkpoint：模型参数 + 优化器状态 + 元信息
+///
+/// 参数块按 [`GPT::named_parameters`] 的顺序写（LoRA 形态下会把 `*.lora_a` / `*.lora_b`
+/// 一并带上，三段数据块仍然等长）——优化器状态必须覆盖同一组参数，格式才成立。
+/// 冻结的主干参数照样写进去：它们的数值自始至终没变，存档因此是**自包含**的，
+/// 单独一个文件就能加载推理，不必再去找基座 checkpoint。
+///
+/// 写出去的权重永远是 f32：量化过的层必须先 [`GPT::dequantize_weights`] 烘焙回来
+/// （否则这里写的是量化**之前**的原始 f32，而头部却记着"已量化"——两份数据对不上，
+/// 加载端重放量化得到的模型与内存里那个不是同一个）。真写错了会在下面直接断言拦下。
 pub fn save(path: &str, model: &GPT, opt: &AdamW, step: usize, best_val_loss: f32) {
+    assert!(
+        !model.has_quant(),
+        "保存前必须先 GPT::dequantize_weights()：存档里写的是 f32 权重，\
+         而量化层的 weight 字段仍是最初的未量化数值（量化结果只在 quant 里）"
+    );
     // 权重目录（默认 checkpoints/）不存在时自动创建，保证产物不会落到根目录
     crate::config::ensure_parent_dir(path);
     let named = model.named_parameters();
@@ -75,6 +112,8 @@ pub fn save(path: &str, model: &GPT, opt: &AdamW, step: usize, best_val_loss: f3
         model: model.cfg.clone(),
         opt_t,
         params,
+        lora: model.lora.clone(),
+        quant: model.quant_meta(),
     };
     let json = serde_json::to_vec(&header).expect("序列化 checkpoint 头失败");
 
@@ -116,6 +155,8 @@ pub fn load_header(path: &str) -> Checkpoint {
         step: h.step,
         best_val_loss: h.best_val_loss.unwrap_or(f32::INFINITY),
         model: h.model,
+        lora: h.lora,
+        quant: h.quant,
     }
 }
 
@@ -133,10 +174,42 @@ pub fn load_with_opt(path: &str, model: &GPT, opt: &mut AdamW) -> Checkpoint {
     let (ckpt, metas, data, opt_t) = read_file(path);
     let block = numel_total(&metas) * 4;
     restore_params(model, &metas, &data[..block]);
-    let m = decode_f32s(&metas, &data[block..block * 2]);
-    let v = decode_f32s(&metas, &data[block * 2..]);
+    let mut m = decode_f32s(&metas, &data[block..block * 2]);
+    let mut v = decode_f32s(&metas, &data[block * 2..]);
+    // 词表被扩大时（[`GPT::resize_vocab`]），存档里的动量只覆盖旧词表的那些行。
+    // 多出来的行按"从未更新过"补零：AdamW 的 m=v=0 加上偏置校正，第一步就等价于
+    // 用该行自己的梯度从头开始累积，不会污染旧行的历史。
+    for (i, p) in opt.params().iter().enumerate() {
+        if m[i].len() < p.numel() {
+            m[i].resize(p.numel(), 0.0);
+            v[i].resize(p.numel(), 0.0);
+        }
+    }
     opt.restore_state(opt_t, m, v);
     ckpt
+}
+
+/// 加载后按存档头里的记录**原地重建权重量化**。
+///
+/// 为什么只做 RTN：GPTQ 要 `H = XᵀX`、AWQ 要 `mean|x|`，两者都依赖**当次校准集**的激活
+/// 统计，而 checkpoint 里没有（也不该有）——把统计量塞进存档会让文件带上"当时那个
+/// 校准集"的痕迹，换个领域就等于用错的统计去补偿。所以这里只做"不需要任何额外信息"的
+/// RTN：误差比 GPTQ 略大，但完全确定、与校准集无关。要拿到 GPTQ 的精度，正确做法是
+/// 加载后在**目标领域**的数据上重跑一次 [`GPT::calibrate`] + [`GPT::quantize_weights`]。
+///
+/// `meta` 只用其中最"硬"的一项——位宽 `bits`。重建之后的模型自己的量化记录以本次
+/// 实测结果为准（`method` 记为 [`QuantMethod::Rtn`]，因为确实是用 RTN 建的），
+/// 存档里那份原始记录属于**那份存档**，不属于这个模型。
+///
+/// 调用前模型必须是 f32（刚 [`load_params`] 完就是），否则量化会作用在已经量化过的
+/// 权重上，误差叠加一层。
+pub fn requantize_after_load(model: &mut GPT, meta: &QuantMeta) {
+    assert!(
+        !model.has_quant(),
+        "模型已经带量化权重了，请先 GPT::dequantize_weights() 再重建"
+    );
+    // 算法参数走默认（RTN 本就不看它们；换个 method 也不会改变这份默认的行为）
+    model.quantize_weights(meta.bits, QuantMethod::Rtn, None, QuantOpts::default());
 }
 
 /// 参数总元素数：三段数据块的长度基准（每段 `total * 4` 字节）
@@ -199,6 +272,8 @@ fn read_file(path: &str) -> (Checkpoint, Vec<ParamMeta>, Vec<u8>, usize) {
         step: header.step,
         best_val_loss: header.best_val_loss.unwrap_or(f32::INFINITY),
         model: header.model,
+        lora: header.lora,
+        quant: header.quant,
     };
 
     // 读取并校验数据段总长度：参数 + m + v 三段等长
@@ -215,6 +290,22 @@ fn read_file(path: &str) -> (Checkpoint, Vec<ParamMeta>, Vec<u8>, usize) {
         data.len()
     );
     (ckpt, header.params, data, header.opt_t)
+}
+
+/// 词嵌入的名称。只有它允许"模型行数 > 存档行数"——
+/// 词表扩展只能是"表尾追加行"，其它参数扩大都意味着配置不一致，必须报错。
+const EMBEDDING_PARAM: &str = "tok_emb.table";
+
+/// 存档里的 `tok_emb.table` 是否按**前缀行**恢复到模型上（模型词表更大）。
+///
+/// 判据：非首维形状完全一致，且模型首维不小于存档首维。这样"给已训模型加
+/// BOS/EOS/PAD 三个特殊 token"不必重训——旧行的数值逐位保留，只有新增的三行
+/// 取 [`GPT::resize_vocab`] 的初始化值，继续训练即可收敛。
+fn is_vocab_extension(name: &str, meta: &ParamMeta, t: &Tensor) -> bool {
+    name == EMBEDDING_PARAM
+        && t.shape().len() == meta.shape.len()
+        && t.shape()[1..] == meta.shape[1..]
+        && t.shape()[0] >= meta.shape[0]
 }
 
 /// 按名字、形状把参数数据写回模型
@@ -234,6 +325,9 @@ fn restore_params(model: &GPT, metas: &[ParamMeta], bytes: &[u8]) {
             "参数名不匹配：checkpoint='{}' vs 模型='{}'",
             meta.name, name
         );
+        if is_vocab_extension(name, meta, t) {
+            continue; // 词表扩展：行数允许更多，下面只写前缀行
+        }
         assert_eq!(
             t.shape(),
             &meta.shape[..],
@@ -243,8 +337,21 @@ fn restore_params(model: &GPT, metas: &[ParamMeta], bytes: &[u8]) {
             t.shape()
         );
     }
-    for ((_, t), data) in named.iter().zip(decode_f32s(metas, bytes)) {
-        t.set_data(data);
+    for ((name, t), data) in named.iter().zip(decode_f32s(metas, bytes)) {
+        if t.numel() == data.len() {
+            t.set_data(data);
+        } else {
+            // 词表扩展：前缀行照写，新增行保持模型里的初始化值
+            let mut full = t.data_ref().clone();
+            assert!(
+                name == EMBEDDING_PARAM,
+                "参数 {name} 的数据长度（{}）与模型（{}）不符",
+                data.len(),
+                full.len()
+            );
+            full[..data.len()].copy_from_slice(&data);
+            t.set_data(full);
+        }
     }
 }
 
@@ -254,6 +361,7 @@ mod tests {
     use crate::model::GPTConfig;
     use crate::module::Module;
     use crate::optim::Optimizer;
+    use crate::quant::QBits;
     use crate::rng::Rng;
     use crate::tensor::Tensor;
 
@@ -369,5 +477,206 @@ mod tests {
         let want = restored[0].data_ref();
         assert!(want[0].is_nan(), "NaN 未存活");
         assert_eq!(got[1..3], want[1..3], "Inf 未存活");
+    }
+
+    /// LoRA 存档：头部记下 rank/alpha，加载端据此重建适配层后参数才能按名字对齐。
+    /// 冻结的主干照样写入，所以单个文件就是自包含的——不需要再额外指定基座 checkpoint。
+    #[test]
+    fn test_lora_checkpoint_roundtrip() {
+        let mut rng = Rng::new(13);
+        let mut model = GPT::new(GPTConfig::tiny(64), &mut rng);
+        let lora = LoRAConfig {
+            rank: 4,
+            alpha: 8.0,
+            ..Default::default()
+        };
+        model.apply_lora(&lora, &mut rng);
+        // 让适配层带上非零数值：B 初始为 0，只灌零梯度的话"存没存"看不出来
+        let mut opt = AdamW::new(1e-2, model.parameters(), 0.1);
+        for p in opt.params() {
+            if p.requires_grad() {
+                p.grad
+                    .borrow_mut()
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, g)| *g = (i as f32 * 0.05).sin());
+            }
+        }
+        opt.step();
+
+        let path = tmp_path("lora");
+        save(&path, &model, &opt, 5, 2.5);
+
+        // 头部必须带上 LoRA 形态，否则加载端不知道要重建适配层
+        let head = load_header(&path);
+        assert_eq!(head.lora.as_ref().map(|l| l.rank), Some(4));
+        assert_eq!(head.lora.as_ref().map(|l| l.alpha), Some(8.0));
+
+        // 按头部记录重建适配层后再加载：参数（含 lora_a / lora_b）逐位还原
+        let mut rng2 = Rng::new(77);
+        let mut model2 = GPT::new(GPTConfig::tiny(64), &mut rng2);
+        model2.apply_lora(&lora, &mut rng2);
+        let ckpt = load_params(&path, &model2);
+
+        assert_eq!(ckpt.lora.as_ref().map(|l| l.rank), Some(4));
+        let np = model.named_parameters();
+        let np2 = model2.named_parameters();
+        assert_eq!(np.len(), np2.len());
+        assert!(np.iter().any(|(n, _)| n.ends_with(".lora_b")));
+        for ((name, a), (_, b)) in np.iter().zip(np2.iter()) {
+            assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
+        }
+
+        // 反过来：不重建适配层、拿普通模型直接加载，参数名对不上必须报错，
+        // 而不是悄悄装进去一半。这就是头部要记 LoRA 形态的原因。
+        let plain = GPT::new(GPTConfig::tiny(64), &mut Rng::new(78));
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 这条断言是**故意**触发 panic 的，别让它刷屏
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_params(&path, &plain);
+        }));
+        std::panic::set_hook(hook);
+        let _ = std::fs::remove_file(&path);
+        assert!(err.is_err(), "没注入适配层就加载 LoRA 存档，应该直接报错");
+    }
+
+    /// LoRA 之前存的旧档没有 `lora` 字段，必须照常读入为 None（serde default）
+    #[test]
+    fn test_header_without_lora_field_is_accepted() {
+        let json = r#"{"step":3,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":3,"params":[]}"#;
+        let h: CkptHeader = serde_json::from_str(json).expect("旧档应能读入");
+        assert!(h.lora.is_none());
+        assert_eq!(h.step, 3);
+    }
+
+    /// 量化之前存的旧档没有 `quant` 字段，同样必须照常读入（serde default）。
+    /// 这是"加字段不能把已有存档读废"的同一条约束，两个字段各测一次。
+    #[test]
+    fn test_header_without_quant_field_is_accepted() {
+        let json = r#"{"step":4,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":4,"params":[]}"#;
+        let h: CkptHeader = serde_json::from_str(json).expect("旧档应能读入");
+        assert!(h.quant.is_none());
+        assert_eq!(h.step, 4);
+    }
+
+    /// 量化元信息必须穿过存档往返：存档里写的是 f32 权重（逐位还原），
+    /// 头部单独记下"当初怎么量化的"，加载端据此原地重放量化。
+    #[test]
+    fn checkpoint_roundtrip_preserves_quant_meta() {
+        let mut rng = Rng::new(53);
+        let mut model = GPT::new(GPTConfig::tiny(64), &mut rng);
+        let reports =
+            model.quantize_weights(QBits::Int8, QuantMethod::Rtn, None, QuantOpts::default());
+        assert!(model.has_quant());
+        // 逐层报告必须覆盖全部投影：RTN 不需要校准集，没有任何层该被跳过
+        let summary = model.quant_summary(reports);
+        assert!(!summary.layers.is_empty(), "tiny 模型也该有可量化的投影");
+        assert_eq!(summary.skipped, 0, "RTN 不需要校准集，不该有层被跳过");
+        let (orig, quantized) = model.weight_bytes();
+        assert_eq!((summary.f32_bytes, summary.quant_bytes), (orig, quantized));
+        assert!(quantized < orig, "int8 量化后字节数应少于 f32");
+
+        // 存档前烘焙回 f32：存档里永远是 f32，量化只在内存里活过一段
+        model.dequantize_weights();
+        assert!(!model.has_quant(), "烘焙后不应再留着量化表示");
+
+        let opt = AdamW::new(1e-3, model.parameters(), 0.1);
+        let path = tmp_path("quant_meta");
+        save(&path, &model, &opt, 12, 0.8);
+
+        // 只读头就能看到量化记录（eval / 部署据此决定要不要重建量化）
+        let head = load_header(&path);
+        let meta = head.quant.expect("头部应记下量化元信息");
+        assert_eq!(meta.bits, QBits::Int8);
+        assert_eq!(meta.method, QuantMethod::Rtn);
+        assert_eq!(meta.orig_bytes, orig);
+        assert_eq!(meta.quant_bytes, quantized);
+
+        // 参数逐位还原（量化结果已经烘焙进 f32，所以这里比的是量化后的数值）
+        let mut rng2 = Rng::new(54);
+        let mut model2 = GPT::new(GPTConfig::tiny(64), &mut rng2);
+        let ckpt = load_params(&path, &model2);
+        assert_eq!(ckpt.quant.map(|m| m.bits), Some(QBits::Int8));
+        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+            assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
+        }
+
+        // 按头部记录原地重建：模型重新带上量化表示，省下的字节与最初一致
+        requantize_after_load(&mut model2, &meta);
+        assert!(model2.has_quant(), "重建后应重新带上量化表示");
+        let (o2, q2) = model2.weight_bytes();
+        assert_eq!((o2, q2), (orig, quantized), "同一位宽重建，字节口径应一致");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 词表扩展：存档词表 64、模型词表 67（多了 BOS/EOS/PAD）时——
+    /// 旧行逐位恢复、新行保持初始化值，并且可以接着续训（动量对新增行补零）。
+    #[test]
+    fn test_vocab_extension_restores_prefix_rows_and_pads_optimizer() {
+        let (model, opt) = trained_tiny(41);
+        let path = tmp_path("vocab_ext");
+        save(&path, &model, &opt, 9, 0.7);
+        let (opt_t, _, _) = opt.state();
+
+        // 模型按更大的词表构造，再把 embedding 扩到 67 行
+        let mut rng = Rng::new(123);
+        let mut model2 = GPT::new(GPTConfig::tiny(64), &mut rng);
+        model2.resize_vocab(67, &mut rng);
+        assert_eq!(model2.cfg.vocab_size, 67);
+
+        let mut opt2 = AdamW::new(1e-3, model2.parameters(), 0.1);
+        let ckpt = load_with_opt(&path, &model2, &mut opt2);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ckpt.step, 9);
+
+        // 旧行逐位一致；新增的三行是 resize_vocab 的初始化值（非零、有限）
+        let d = model2.cfg.n_embd;
+        let old = model.named_parameters();
+        let new = model2.named_parameters();
+        for ((name, a), (_, b)) in old.iter().zip(&new) {
+            let (ad, bd) = (a.data_ref(), b.data_ref());
+            if name == EMBEDDING_PARAM {
+                continue; // 行数变了（64 -> 67），前缀行在下面单独比对
+            }
+            assert_bits_eq(&ad[..], &bd[..], &format!("参数 {name}"));
+        }
+        let emb_old = &old.iter().find(|(n, _)| n == EMBEDDING_PARAM).unwrap().1;
+        let emb_new = &new.iter().find(|(n, _)| n == EMBEDDING_PARAM).unwrap().1;
+        assert_bits_eq(&emb_old.data_ref()[..], &emb_new.data_ref()[..64 * d], "词嵌入旧行");
+        let emb_d = emb_new.data_ref();
+        assert_eq!(emb_d.len(), 67 * d);
+        assert!(
+            emb_d[64 * d..].iter().all(|v| v.is_finite() && *v != 0.0),
+            "新增行应保留初始化值"
+        );
+
+        // 续训：优化器步数还原，新增行的动量是从零补齐的（长度已对齐）
+        let (t2, m2, v2) = opt2.state();
+        assert_eq!(t2, opt_t);
+        let emb_idx = new.iter().position(|(n, _)| n == EMBEDDING_PARAM).unwrap();
+        assert_eq!(m2[emb_idx].len(), 67 * d);
+        assert!(v2[emb_idx][64 * d..].iter().all(|x| *x == 0.0));
+    }
+
+    /// 非词表参数形状不符时必须照旧报错——扩展只开放给 `tok_emb.table`。
+    #[test]
+    fn test_shape_mismatch_outside_embedding_still_panics() {
+        let (model, opt) = trained_tiny(43);
+        let path = tmp_path("shape_guard");
+        save(&path, &model, &opt, 3, 1.0);
+
+        // 改 n_embd 会让 c_q.weight 等一堆参数形状不符
+        let mut cfg = GPTConfig::tiny(64);
+        cfg.n_embd = 32; // n_head=4，head_dim 仍整除
+        let mut rng = Rng::new(9);
+        let bad = GPT::new(cfg, &mut rng);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_params(&path, &bad);
+        }));
+        std::panic::set_hook(hook);
+        let _ = std::fs::remove_file(&path);
+        assert!(err.is_err(), "配置不一致时必须报错，而不是悄悄装进去一半");
     }
 }

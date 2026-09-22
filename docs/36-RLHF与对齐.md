@@ -1,8 +1,9 @@
 # 第 36 课：RLHF 与人类对齐（Alignment）
 
-> **本课为前沿技术教程（纯文档，无配套代码实现）。**
-> 与本项目已有代码的关联：SFT 阶段可复用 `src/train.rs` 的训练循环和 `src/loss.rs` 的交叉熵损失；
-> DPO 损失可基于 `src/tensor.rs` 的现有算子 `log_softmax_last_dim` 实现；注意该文件没有独立的 `sigmoid` 算子，它只在 `swiglu` 里以 `1/(1+exp(-x))` 内联（`src/tensor.rs:1103`），需要时可按同样方式手写。
+> **本课已落地为可运行代码**：`src/align.rs`（17 个单测）+ `align` 子命令——奖励模型（Bradley-Terry
+> 成对损失）、DPO（隐式奖励 + 参考模型 logprob）、GRPO（组内相对优势）、PPO（clip 目标 + KL(k3) 惩罚）。
+> 与已有代码的衔接：SFT 复用 `src/train.rs` 的训练循环与 `src/loss.rs` 的交叉熵；
+> DPO / PPO 都建在 `src/tensor.rs` 现有算子上，`sigmoid` / `softplus` / KL 估计等标量函数写在 `src/align.rs` 里。
 
 ---
 
@@ -211,7 +212,53 @@ $$
 
 让 AI 自己根据一组"宪法"原则来修订和改进回答，减少人工参与。
 
-## 动手练习
+## 本项目的实际实现
+
+上面的原理已全部落地为可运行代码。核心文件是 [`src/align.rs`](../src/align.rs)（20 个单测），
+CLI 入口是 [`align`](../README.md#12-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令。
+
+### 代码结构
+
+| 组件 | 位置 | 说明 |
+|------|------|------|
+| `RewardModel` | `align.rs` | 奖励模型：GPT 主干 + 标量头（`Linear`），给一条回答打分（无界实数，仅相对大小有意义）。实现 `Module` trait 聚合 backbone 和 head 的参数 |
+| `MaskedSequence` | `align.rs` | 带掩码的 token 序列：`ids` + `mask[i]`（是否计入对数概率）。提供 `full()`（整条参与）和 `answer_only()`（仅回答部分参与）两种构造方式 |
+| `PreferencePair` | `align.rs` | 一对偏好样本：同一 prompt 下的 `chosen`（优选）和 `rejected`（劣选）两个 `MaskedSequence` |
+| `bradley_terry_loss` | `align.rs` | Bradley-Terry 成对损失：`-log σ(r_chosen - r_rejected)`，形式等价于 `softplus(-delta)`，手写梯度注入 |
+| `ranking_accuracy` | `align.rs` | 排序准确率：chosen 分数严格高于 rejected 的比例（随机猜测基准 0.5） |
+| `sequence_logprob` / `sequence_logprob_value` | `align.rs` | 序列对数概率之和（因果位移 + 掩码求和），`_value` 版本不建计算图，用于预计算参考模型 logprob |
+| `precompute_reference_logprobs` | `align.rs` | 批量预计算参考模型的对数概率（参考模型冻结，提前算好避免每步重复计算） |
+| `implicit_reward` | `align.rs` | DPO 隐式奖励：`β * (log π_θ(y) - log π_ref(y))`，策略与参考模型的对数概率比 |
+| `dpo_loss` / `dpo_batch_loss` | `align.rs` | DPO 成对损失 + 批量版本：`-log σ(β * [(log π_c - log π_ref_c) - (log π_r - log π_ref_r)])` |
+| `group_advantages` | `align.rs` | GRPO 组内相对优势归一化：`(r_i - mean(r)) / std(r)`，std=0 时短路返回全零 |
+| `kl_k3` | `align.rs` | k3 估计的 KL 散度：`exp(-δ) - (-δ) - 1`（无偏、低方差、恒非负） |
+| `grpo_loss` | `align.rs` | GRPO 损失：组内相对优势 + 裁剪代理目标，与 PPO 形式相同但优势来源不同 |
+| `ppo_loss` | `align.rs` | PPO 损失：裁剪代理目标 + 参考模型 KL 惩罚（`kl_coef` 控制约束松紧） |
+
+### CLI 用法
+
+```bash
+# 默认配置（奖励模型 150 步 + DPO 60 步 + GRPO + PPO）
+cargo run --release -- align
+
+# 调整训练步数
+cargo run --release -- align --rm-steps 200 --steps 100
+
+# 调整超参数
+cargo run --release -- align --beta 0.2 --clip-eps 0.3 --kl-coef 0.1
+
+# GRPO 组大小和学习率
+cargo run --release -- align --group-size 8 --rm-lr 5e-3 --lr 2e-3
+
+# 调整模型规模
+cargo run --release -- align --n-embd 32 --n-layer 4 --block-size 64
+```
+
+---
+
+## 拓展方向
+
+> 核心内容已全部实现（`src/align.rs` + `align` 子命令），这里是进阶拓展。
 
 1. **理解 SFT Loss**：在已有的 CrossEntropy 基础上，实现一个简单的 SFT 训练循环（用 (指令, 回答) 数据）。
 2. **实现 Bradley-Terry Loss**：给定 (好回答分数, 差回答分数)，实现奖励模型的损失函数。

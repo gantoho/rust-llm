@@ -14,7 +14,7 @@
 //! 旋转位置编码（rotary）见 `src/rope.rs`。
 
 use rayon::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -80,7 +80,13 @@ pub struct Tensor {
     pub(crate) data: Rc<RefCell<Vec<f32>>>,
     pub(crate) shape: Vec<usize>,
     pub(crate) grad: Rc<RefCell<Vec<f32>>>,
-    pub(crate) requires_grad: bool,
+    /// 是否参与训练（`false` = 冻结）。与 `data` / `grad` 一样是**共享**的
+    /// （`Rc<Cell<bool>>`）：同一参数被克隆出多个句柄（优化器的参数表、`named_parameters`
+    /// 的返回、各层的持有）后，冻结其中任何一个都等于冻结这一个参数本身。
+    ///
+    /// 若用普通 `bool`，`#[derive(Clone)]` 会把它逐句柄复制一份——在模型上冻结、
+    /// 优化器手里那份却仍是 true，就会出现"以为冻结了、其实照旧更新"的隐性错误。
+    pub(crate) requires_grad: Rc<Cell<bool>>,
     /// 父节点列表。
     /// 注意：用 `Rc<Vec<_>>` 而不是 `Vec<Tensor>`——
     /// 若直接存 Vec，`derive(Clone)` 会递归深拷贝整棵祖先计算图，
@@ -444,7 +450,7 @@ impl Tensor {
             // **不需要梯度**的父节点（如 masked_softmax 的 mask：它不参与求导，
             // 但闭包仍会往它的 grad 里累加），缓冲长度不足会直接越界 panic。
             grad: Rc::new(RefCell::new(vec![0.0; len])),
-            requires_grad,
+            requires_grad: Rc::new(Cell::new(requires_grad)),
             parents: Rc::new(Vec::new()),
             backward: None,
         }
@@ -457,7 +463,21 @@ impl Tensor {
     /// 仍会拿着参数张量的 `requires_grad = true` 一路建出整张计算图。
     #[inline]
     pub(crate) fn req(&self) -> bool {
-        self.requires_grad && grad_enabled()
+        self.requires_grad.get() && grad_enabled()
+    }
+
+    /// 冻结 / 解冻本参数（`requires_grad`）。
+    ///
+    /// 标志是共享的（见字段注释），所以对任意一个克隆句柄调用都作用于同一个参数——
+    /// LoRA 里"冻结主干"就是靠它：优化器手里的句柄与模型里的句柄指向同一个开关。
+    pub fn set_requires_grad(&self, v: bool) {
+        self.requires_grad.set(v);
+    }
+
+    /// 本参数是否参与训练（no_grad 模式不影响这个"参数属性"，与 [`Tensor::req`] 区分）
+    #[inline]
+    pub fn requires_grad(&self) -> bool {
+        self.requires_grad.get()
     }
 
     /// 用数据 + 形状构造叶子张量（不追踪梯度，例如输入数据）
@@ -542,18 +562,34 @@ impl Tensor {
     /// 用于「反向公式解析已知、不必建图」的融合算子：例如输出头的交叉熵，
     /// 其 dlogits 就是 softmax - onehot，直接在显存里算完即可，
     /// 没必要为了回传梯度而把 33.6M 元素的 logits 拉回 CPU 建一张计算图。
+    ///
+    /// `backward` 收到的是**本张量自己攒到的上游梯度**（autograd 按逆拓扑序执行，
+    /// 轮到它时槽里已经攒齐）。这一步必须由构造函数代劳，不能像 [`Tensor::external`]
+    /// 那样把句柄交给调用方：融合算子的反向是「按上游梯度为 1 算好、再整体乘回去」，
+    /// 若把上游梯度当成恒等于 1，一旦真的有别的算子改了它（例如 AMP 的
+    /// [`Tensor::mul_scalar`] 把 loss 乘上 2^16），整条链路的梯度比例就会被悄悄丢掉。
     pub fn external_scalar_loss(
         value: f32,
         parents: Vec<Tensor>,
-        backward: impl Fn() + 'static,
+        backward: impl Fn(f32) + 'static,
     ) -> Tensor {
+        let grad = Rc::new(RefCell::new(vec![0.0f32]));
+        let slot = grad.clone();
+        let f: Box<dyn Fn()> = Box::new(move || {
+            // 上游为 0 说明这条支路没人需要（如被丢弃的那一次梯度累积），
+            // 连常驻显存反向都不必白跑一趟
+            let upstream = slot.borrow()[0];
+            if upstream != 0.0 {
+                backward(upstream);
+            }
+        });
         Tensor {
             data: Rc::new(RefCell::new(vec![value])),
             shape: vec![],
-            grad: Rc::new(RefCell::new(vec![0.0])),
-            requires_grad: true,
+            grad,
+            requires_grad: Rc::new(Cell::new(true)),
             parents: Rc::new(parents),
-            backward: Some(Rc::new(backward)),
+            backward: Some(Rc::from(f)),
         }
     }
 
@@ -567,7 +603,8 @@ impl Tensor {
     /// 返回的闭包在 autograd 反向时被调用 —— 那一刻槽里已经攒好了上游梯度。
     /// 之所以绕这一道，是因为闭包需要读自己的 grad，而梯度槽要等张量构造出来才存在。
     ///
-    /// 调用点只在 `model.rs` 的 gpu 常驻路径里，不带 gpu feature 时是"死代码"，别删。
+    /// 调用点有两处：`model.rs` 的 gpu 常驻路径，以及 [`Tensor::matmul_frozen`]
+    /// （LoRA 冻结主干时的部分反向）。不带 gpu feature 时前者是"死代码"，别删。
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub fn external(
         data: Vec<f32>,
@@ -581,7 +618,7 @@ impl Tensor {
             data: Rc::new(RefCell::new(data)),
             shape,
             grad,
-            requires_grad: true,
+            requires_grad: Rc::new(Cell::new(true)),
             parents: Rc::new(parents),
             backward: Some(Rc::from(f)),
         }
@@ -624,7 +661,7 @@ impl Tensor {
             data: self.data.clone(), // Rc 共享，不克隆 Vec
             shape: new_shape,
             grad: Rc::new(RefCell::new(vec![0.0; numel])),
-            requires_grad,
+            requires_grad: Rc::new(Cell::new(requires_grad)),
             parents: Rc::new(Vec::new()),
             backward: None,
         };
@@ -717,7 +754,7 @@ impl Tensor {
             });
         drop(sd);
 
-        let mut result = Tensor::new(out_data, new_shape, self.requires_grad);
+        let mut result = Tensor::new(out_data, new_shape, self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -794,19 +831,23 @@ impl Tensor {
         self.binary(other, |a, b| a - b, |_, _| (1.0, -1.0))
     }
 
-    /// 逐元素乘法。与 [`Tensor::div`] 一样属于"算子集完整性"的保留项：
-    /// 训练路径走的是 `*` 运算符重载，这里的方法版没有调用点。
+    /// 逐元素乘法。
+    ///
+    /// 主训练路径上的乘法都走融合算子（`matmul` / `swiglu` / `layer_norm` 等内部一次算完），
+    /// 所以这个方法版在非测试构建里没有调用点。它是**分步参考实现**：测试用
+    /// `mul` / `div` / `sum_last_dim` 串出"手写版"公式，再与融合算子的输出比对，
+    /// 融合实现一旦写错（比如反向系数符号反了）就会被这些测试抓住。
     #[allow(dead_code)]
     pub fn mul(&self, other: &Tensor) -> Tensor {
         // ∂c/∂a = b，∂c/∂b = a
         self.binary(other, |a, b| a * b, |a, b| (b, a))
     }
 
-    /// 逐元素除法。保留项，理由同 [`Tensor::mul`]。
+    /// 逐元素除法。调用点与保留理由同 [`Tensor::mul`]。
     #[allow(dead_code)]
     pub fn div(&self, other: &Tensor) -> Tensor {
         // 反向必须与前向 `a / b` 严格对应（∂/∂a = 1/b，∂/∂b = -a/b²）。
-        // 给 b 加 `1e-8` 会让梯度与自己的前向不一致——教学代码里宁可得到 ±inf，
+        // 给 b 加 `1e-8` 会让梯度与自己的前向不一致——宁可得到 ±inf，
         // 也不要一个"看起来没事但数学上是错的"梯度。
         self.binary(other, |a, b| a / b, |a, b| (1.0 / b, -a / (b * b)))
     }
@@ -912,10 +953,14 @@ impl Tensor {
 
     // ---------- 标量运算 ----------
 
+    /// 逐元素加标量：c = x + s，∂x = g（标量是常量，不参与梯度）
+    ///
+    /// 与 [`Tensor::mul_scalar`] 对称。主路径上需要加常量的地方（如 eps）都并入融合算子，
+    /// 非测试构建里没有调用点；测试在分步参考实现里用它补齐公式。
     #[allow(dead_code)]
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
         let data = self.data.borrow().iter().map(|a| a + scalar).collect();
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -933,7 +978,7 @@ impl Tensor {
 
     pub fn mul_scalar(&self, scalar: f32) -> Tensor {
         let data = self.data.borrow().iter().map(|a| a * scalar).collect();
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -953,11 +998,13 @@ impl Tensor {
 
     /// 取负：c = -x，∂x = -g
     ///
-    /// 保留项：属于"算子集完整性"（教学对照用），当前训练/推理路径没有调用点。
+    /// 逐元素算子集的一员（与 [`Tensor::sub`] 一起构成"求负"语义）。当前训练/推理路径
+    /// 没有调用点，因为需要取负的地方都是与别的运算合并成一步算的；保留它是为了让算子集
+    /// 在语义上闭合（有 `sub` 就该有 `neg`），代价只是一个 `allow(dead_code)`。
     #[allow(dead_code)]
     pub fn neg(&self) -> Tensor {
         let data = self.data.borrow().iter().map(|a| -a).collect();
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -983,7 +1030,7 @@ impl Tensor {
             .map(|&a| if a > 0.0 { 1.0 } else { 0.0 })
             .collect();
         drop(sd);
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1005,7 +1052,7 @@ impl Tensor {
         let sd = self.data.borrow();
         let data: Vec<f32> = sd.iter().map(|&a| a.tanh()).collect();
         drop(sd);
-        let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1047,7 +1094,7 @@ impl Tensor {
                 }
             });
         drop(sd);
-        let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1181,7 +1228,7 @@ impl Tensor {
         let sd = self.data.borrow();
         let data: Vec<f32> = sd.iter().map(|&a| a.ln()).collect();
         drop(sd);
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1204,7 +1251,7 @@ impl Tensor {
         let sd = self.data.borrow();
         let data: Vec<f32> = sd.iter().map(|&a| a.powf(p)).collect();
         drop(sd);
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1288,12 +1335,55 @@ impl Tensor {
         result
     }
 
+    /// `y = x @ W`，其中 `W` 是**冻结**权重：反向只求 `dx = g @ Wᵀ`，**不求 `dW`**。
+    ///
+    /// 与 [`Tensor::matmul`] 的区别只在反向。通用 `matmul` 会把 `dW = xᵀ @ g` 一起算出来
+    /// 并写进 `W.grad`；对冻结权重（LoRA 要冻结的预训练主干）这笔计算纯属浪费——
+    /// 它和 `dx` 的那次矩阵乘同量级，占了反向矩阵乘计算量的一半。挡着不算，
+    /// "冻结"才不只体现在"优化器不更新它"上，而是真的省下计算。
+    ///
+    /// 只支持 2D × 2D：调用方（[`crate::layers::Linear`]）会先把 3D 输入展平成 2D。
+    /// `W` 不参与求导这件事由调用方保证，这里不看 `W.requires_grad`。
+    pub fn matmul_frozen(&self, w: &Tensor) -> Tensor {
+        assert_eq!(self.rank(), 2, "matmul_frozen 的左操作数必须为 2D");
+        assert_eq!(w.rank(), 2, "matmul_frozen 的右操作数必须为 2D");
+        let (m, k1) = (self.shape[0], self.shape[1]);
+        let (k2, n) = (w.shape[0], w.shape[1]);
+        assert_eq!(
+            k1, k2,
+            "矩阵乘法维度不匹配：{:?} x {:?}",
+            self.shape, w.shape
+        );
+
+        let sd = self.data.borrow();
+        let wd = w.data.borrow();
+        let out_data = matmul_data(&sd, &wd, m, k1, n, 1, false, false);
+        drop(sd);
+        drop(wd);
+
+        // 左操作数不需要梯度（推理，或输入本身是常量）→ 反向整段省掉
+        if !self.req() {
+            return Tensor::from_vec(out_data, vec![m, n]);
+        }
+        let x_bwd = self.clone();
+        let w_bwd = w.clone();
+        Tensor::external(out_data, vec![m, n], vec![self.clone()], move |grad| {
+            Box::new(move || {
+                let g = grad.borrow();
+                let wd = w_bwd.data.borrow();
+                // dx = g @ Wᵀ：g 是 [m, n]，W 是 [k, n]（按 n 转置读）→ [m, k]
+                let dx = matmul_data(&g, &wd, m, n, k1, 1, false, true);
+                x_bwd.accumulate_grad(&dx, 1.0);
+            })
+        })
+    }
+
     // ---------- 归约运算 ----------
 
     /// 求和成标量，梯度均匀传给每个元素
     pub fn sum(&self) -> Tensor {
         let total = self.data.borrow().iter().sum();
-        let mut result = Tensor::new(vec![total], vec![], self.requires_grad);
+        let mut result = Tensor::new(vec![total], vec![], self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1312,8 +1402,9 @@ impl Tensor {
     /// 沿最后一维求和，**保持维度**：[..., D] -> [..., 1]
     /// 反向：梯度广播回最后一维
     ///
-    /// 保留项：属于"算子集完整性"（教学对照用），当前没有调用点
-    /// （需要求和的路径各自用了更专门的融合算子）。
+    /// 主路径上需要求和的地方都用了更专门的融合算子，所以这个方法在非测试构建里没有调用点。
+    /// 它是**分步参考实现**：测试用它把归一化、注意力打分等公式按定义一步步写出来，
+    /// 再与融合算子比对数值（见 [`Tensor::mul`] 的说明）。
     #[allow(dead_code)]
     pub fn sum_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "sum_last_dim 需要至少 1 维");
@@ -1334,7 +1425,7 @@ impl Tensor {
         let mut new_shape = self.shape.clone();
         *new_shape.last_mut().unwrap() = 1;
 
-        let mut result = Tensor::new(out_data, new_shape, self.requires_grad);
+        let mut result = Tensor::new(out_data, new_shape, self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1382,7 +1473,7 @@ impl Tensor {
         }
         drop(sd);
 
-        let mut result = Tensor::new(out_data.clone(), self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(out_data.clone(), self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1929,7 +2020,7 @@ impl Tensor {
             });
         drop(sd);
 
-        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -1972,10 +2063,10 @@ impl Tensor {
         assert!((0.0..=1.0).contains(&p), "dropout 概率 p 必须在 [0, 1] 之间");
         if !training || p == 0.0 {
             // 推理或不丢弃：恒等（需要梯度时设 requires_grad）
-            return Tensor::new(self.data.borrow().clone(), self.shape.clone(), self.requires_grad);
+            return Tensor::new(self.data.borrow().clone(), self.shape.clone(), self.requires_grad.get());
         }
         if p >= 1.0 {
-            return Tensor::new(vec![0.0; self.numel()], self.shape.clone(), self.requires_grad);
+            return Tensor::new(vec![0.0; self.numel()], self.shape.clone(), self.requires_grad.get());
         }
         let keep = 1.0 - p;
         let scale = 1.0 / keep;
@@ -2007,7 +2098,7 @@ impl Tensor {
         let out_data: Vec<f32> = sd.iter().zip(&mask).map(|(x, m)| x * m).collect();
         drop(sd);
 
-        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad);
+        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -2042,7 +2133,7 @@ impl Tensor {
         drop(sd);
         let idx_vec = indices.to_vec();
 
-        let mut result = Tensor::new(out_data, vec![n, d], self.requires_grad);
+        let mut result = Tensor::new(out_data, vec![n, d], self.requires_grad.get());
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
@@ -2055,6 +2146,53 @@ impl Tensor {
                     let row = idx_vec[i];
                     for j in 0..d2 {
                         sgm[row * d2 + j] += g[i * d2 + j];
+                    }
+                }
+            }));
+        }
+        result
+    }
+
+    /// 按行散射相加（`gather_rows` 的转置）：rows [N, D] + indices [N] -> out [M, D]。
+    ///
+    /// `out[indices[i]] += rows[i]`，其余行保持 0；同一行被多次命中时数值（与梯度）累加。
+    /// 反向恰好是 [`Tensor::gather_rows`] 的前向：`d_rows[i] = g[indices[i]]`。
+    ///
+    /// 用途是 MoE（第 32 课）：专家只处理"分到自己这里"的若干 token（先 `gather_rows`
+    /// 把这些行取出来），算完再散射回原来的位置。真实的稀疏 MoE 就是
+    /// gather → expert → scatter 三步，而不是把每个专家都跑满全部 token 再用掩码筛掉——
+    /// 后者算出来的数值一样，却把稀疏激活省下的计算量全还回去了。
+    pub fn scatter_add_rows(&self, indices: &[usize], n_out: usize) -> Tensor {
+        assert_eq!(self.rank(), 2, "scatter_add_rows 的 rows 必须为 2 维");
+        assert_eq!(
+            indices.len(),
+            self.shape[0],
+            "indices 数量必须等于 rows 的行数"
+        );
+        let d = self.shape[1];
+        let sd = self.data.borrow();
+        let mut out_data = vec![0.0f32; n_out * d];
+        for (i, &idx) in indices.iter().enumerate() {
+            assert!(idx < n_out, "scatter 索引越界：{} >= {}", idx, n_out);
+            for j in 0..d {
+                out_data[idx * d + j] += sd[i * d + j];
+            }
+        }
+        drop(sd);
+        let idx_vec = indices.to_vec();
+
+        let mut result = Tensor::new(out_data, vec![n_out, d], self.requires_grad.get());
+        if self.req() {
+            let rg = result.grad.clone();
+            let sg = self.grad.clone();
+            let d2 = d;
+            result.parents = Rc::new(vec![self.clone()]);
+            result.backward = Some(Rc::new(move || {
+                let g = rg.borrow();
+                let mut sgm = sg.borrow_mut();
+                for (i, &row) in idx_vec.iter().enumerate() {
+                    for j in 0..d2 {
+                        sgm[i * d2 + j] += g[row * d2 + j];
                     }
                 }
             }));
@@ -2122,6 +2260,30 @@ mod tests {
         let c = a.matmul(&b);
         assert_eq!(c.shape(), &[2, 1, 1]);
         assert_eq!(c.data(), vec![17.0, 53.0]); // [1*5+2*6=17, 3*7+4*8=53]
+    }
+
+    #[test]
+    fn test_matmul_frozen() {
+        // x: [2,3]，W: [3,2]
+        let x_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let w_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+        // ① 前向与通用 matmul 完全一致
+        let x = Tensor::param(x_data.clone(), vec![2, 3]);
+        let w = Tensor::param(w_data.clone(), vec![3, 2]);
+        let y = x.matmul_frozen(&w);
+        let y_ref = Tensor::from_vec(x_data, vec![2, 3])
+            .matmul(&Tensor::from_vec(w_data, vec![3, 2]));
+        assert_eq!(y.shape(), &[2, 2]);
+        assert_eq!(y.data(), y_ref.data());
+
+        // ② 反向：loss = sum(y) ⇒ 上游梯度全 1，dx = 1 @ Wᵀ 的每一行都是 W 的列和
+        y.sum().backward();
+        assert_eq!(x.grad(), vec![3.0, 7.0, 11.0, 3.0, 7.0, 11.0]);
+
+        // ③ W 是 param（requires_grad = true）却一点梯度都没攒到：
+        //    "冻结"不只体现在优化器不更新它，而是反向压根没算 dW
+        assert_eq!(w.grad(), vec![0.0; 6]);
     }
 
     #[test]
@@ -2242,6 +2404,35 @@ mod tests {
         assert!((x.grad()[0] - 3.0).abs() < 1e-6);
         assert!((y.grad()[0] - 2.0).abs() < 1e-6);
         assert!((w.grad()[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// 融合 loss 节点（[`Tensor::external_scalar_loss`]）必须消费自己的上游梯度。
+    ///
+    /// 这类节点的反向是「按上游梯度 = 1 算好、再整体乘回去」，而 autograd 按逆拓扑序
+    /// 执行、轮到它时才把上游梯度攒进它的 grad 槽。若把上游当成恒等于 1，
+    /// AMP 的 `scale_loss`（`mul_scalar(2^16)`）就会被静默丢掉：梯度被 scale 除回去后
+    /// 整体偏小 2^16 倍，梯度裁剪随之失效、训练轨迹偏离。这里用 2 的幂做标量，
+    /// 断言结果**逐位**相等（乘以 2^k 在 f32 下是精确的指数移位）。
+    #[test]
+    fn test_external_scalar_loss_consumes_upstream_gradient() {
+        let make = || {
+            let x = Tensor::param(vec![1.0f32, 2.0, 3.0], vec![3]);
+            let x_bwd = x.clone();
+            // 模拟融合核：dx 按「上游梯度 = 1」算好，比例留给节点自己补
+            let loss = Tensor::external_scalar_loss(3.0, vec![x.clone()], move |upstream| {
+                x_bwd.accumulate_grad(&[1.0, 1.0, 1.0], upstream);
+            });
+            (x, loss)
+        };
+
+        let (x, loss) = make();
+        loss.backward();
+        assert_eq!(x.grad(), vec![1.0, 1.0, 1.0], "上游为 1 时应原样传下去");
+
+        let (x, loss) = make();
+        loss.mul_scalar(2.0f32.powi(16)).backward();
+        let want = 2.0f32.powi(16);
+        assert_eq!(x.grad(), vec![want, want, want], "上游被缩放后必须完整传递");
     }
 
     #[test]

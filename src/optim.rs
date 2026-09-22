@@ -43,8 +43,14 @@ impl Optimizer for SGD {
     }
 
     /// 更新一步：θ = θ - lr * g（原位更新，避免每次克隆整份数据）
+    ///
+    /// 冻结参数（`requires_grad = false`，LoRA 的主干）直接跳过：它们的梯度槽可能被
+    /// GPU 常驻显存路径注入了非零值，不跳过就会被"顺手更新"，冻结就名存实亡了。
     fn step(&mut self) {
         for p in &self.params {
+            if !p.requires_grad() {
+                continue;
+            }
             let g = p.grad.borrow();
             let mut d = p.data.borrow_mut();
             for j in 0..d.len() {
@@ -61,6 +67,12 @@ impl Optimizer for SGD {
 /// 2. 二阶动量 v：梯度平方的指数移动平均（感知"坡度陡缓"，陡的地方步子小）
 /// 3. 偏差修正：训练初期 m、v 从 0 起步，除以 (1-β^t) 修正
 /// 4. 权重衰减：每步额外把参数往 0 拉一点（正则化，防止过拟合）
+///
+/// 冻结参数（`requires_grad = false`）不参与更新：既不做梯度步，也不吃权重衰减。
+/// 后者尤其重要——AdamW 的衰减项是 `lr·wd·θ`，与梯度无关，若不跳过，
+/// 被冻结的主干权重会每步朝 0 缩一点，LoRA 的"冻结"就只是名义上的。
+/// 冻结参数的动量槽仍然分配（保持 `params` / `state()` 与模型参数一一对应，
+/// checkpoint 的三段数据块才能等长），只是始终为 0。
 pub struct AdamW {
     pub lr: f32,
     beta1: f32,
@@ -138,6 +150,9 @@ impl Optimizer for AdamW {
         let wd = self.weight_decay;
 
         for i in 0..self.params.len() {
+            if !self.params[i].requires_grad() {
+                continue; // 冻结参数：不更新、也不做权重衰减（见结构体注释）
+            }
             let g = self.params[i].grad.borrow();
             let mut d = self.params[i].data.borrow_mut();
             let mi = &mut self.m[i];

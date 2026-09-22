@@ -3,10 +3,14 @@
 //! 训练 GPT 的完整骨架：
 //! 1. 采样一个 batch
 //! 2. 前向算损失
-//! 3. 反向算梯度
+//! 3. 反向算梯度（开启 AMP 时先把 loss 乘上 scale）
 //! 4. 梯度裁剪（防止梯度爆炸）
 //! 5. 优化器更新参数
 //! 6. 清零梯度
+//!
+//! 开启 `train.amp` 后，第 3 步与第 4 步之间会插入动态损失缩放的两步：**溢出检查**
+//! （梯度含 Inf/NaN 就丢弃本步、不更新参数）与**梯度反缩放**（把梯度除回真实尺度，
+//! 保证裁剪阈值仍然作用在真实梯度上），见 [`MixedPrecision`]。
 //!
 //! 学习率调度（第 18 课）：
 //! - warmup：前若干步学习率从 0 线性升到最大值（让训练稳定起步）
@@ -29,29 +33,35 @@ use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
 use crate::{checkpoint, checkpoint::Checkpoint};
 
-/// 混合精度训练（Automatic Mixed Precision，AMP）
+/// 混合精度训练（Automatic Mixed Precision，AMP）的损失缩放机制
 ///
 /// 核心思想：
 /// 1. **前向/反向用低精度**（FP16/BF16）：矩阵乘法在 FP16 下快 2-8×，显存减半
 /// 2. **主权重用 FP32**：优化器更新需要高精度（小学习率 × 梯度在 FP16 下会下溢为 0）
 /// 3. **损失缩放（Loss Scaling）**：FP16 最小正规数 ~6e-8，小梯度会下溢为 0。
-///    解法：loss 乘一个大数（scale），让梯度数值范围移到 FP16 可表示区间，
+///    解法：loss 乘一个大数（scale），让梯度数值范围移到可表示区间，
 ///    优化器更新前再除回来。
 ///
 /// **动态损失缩放**（本实现）：
-/// - 初始 scale = 2^16 = 65536
-/// - 每 N 步无溢出 → scale 翻倍（尝试更大）
+/// - 初始 scale = 2^init_scale_log2（默认 2^16 = 65536）
+/// - 每 `growth_interval` 步无溢出 → scale 翻倍（试探更大的可表示区间）
 /// - 出现溢出（NaN/Inf） → scale 减半，跳过本步更新
 ///
-/// **本项目的简化**：当前 Tensor 全程 f32，没有真正的 FP16 类型。
-/// MixedPrecision 只实现"动态损失缩放"机制，为将来引入 FP16 做好架构准备。
-/// 缩放本身不影响 f32 训练（f32 的动态范围足够大），但代码逻辑与真实 AMP 完全一致。
-#[allow(dead_code)] // 教学实现：AMP 动态损失缩放机制完整可用，为将来引入 FP16 做好架构准备
+/// **在 Tensor 全程 f32 的本项目里，它起什么作用**：
+/// - scale 恒为 2 的幂，f32 下乘以/除以 2^k 是精确的指数移位，整条反向链路逐位
+///   等于未缩放的结果——所以损失缩放本身不改变数值，不会污染可复现性。
+/// - 真正被改变的是**溢出保护**：某一步梯度爆成 Inf/NaN 时跳过本步更新
+///   （否则 AdamW 的一阶/二阶矩被 Inf 污染，之后整个训练永久变成 NaN），
+///   并让 scale 自动收缩去适配当前的数值范围。
+/// - **反缩放是正确性的刚需**：梯度裁剪必须作用在真实尺度的梯度上。若带着 scale
+///   去裁剪，阈值会被放大 2^16 倍而形同虚设，裁剪日志也会读出无意义的范数。
+///
+/// FP16/BF16 的存储与算力收益要求 `Tensor` 引入 dtype 维度（每个算子都要有半精度
+/// 实现），那是独立工程（见 docs/26-混合精度训练.md）；而损失缩放、溢出跳步、
+/// 梯度反缩放这三件事并不依赖半精度类型，本模块把它们完整落在训练循环里。
 pub struct MixedPrecision {
     /// 当前损失缩放因子
     pub scale: f32,
-    /// 初始缩放因子（2^init_scale_log2）
-    init_scale: f32,
     /// 缩放因子增长步数（连续 N 步无溢出后翻倍）
     growth_interval: usize,
     /// 连续无溢出步数计数
@@ -61,13 +71,10 @@ pub struct MixedPrecision {
     max_scale: f32,
 }
 
-#[allow(dead_code)] // 教学实现：AMP 动态损失缩放机制完整可用
 impl MixedPrecision {
     pub fn new(init_scale_log2: u32, growth_interval: usize) -> Self {
-        let init_scale = (2.0f32).powi(init_scale_log2 as i32);
         MixedPrecision {
-            scale: init_scale,
-            init_scale,
+            scale: (2.0f32).powi(init_scale_log2 as i32),
             growth_interval,
             growth_steps: 0,
             min_scale: 1.0,
@@ -106,13 +113,14 @@ impl MixedPrecision {
         true
     }
 
-    /// 优化器更新后，需要把梯度除回 scale（因为 loss 被放大了 scale 倍）
+    /// 把梯度除回真实尺度：溢出检查通过后、梯度裁剪**之前**调用
     ///
-    /// 注意：在实际 AMP 中，梯度在反向时已经自动按 scale 缩放了，
-    /// 所以这里是在 optimizer.step() 之前把梯度归一化。
-    /// 但在我们的实现中，optimizer.step() 不关心梯度的绝对值（AdamW 有自适应学习率），
-    /// 所以这个除法实际上是隐式地通过学习率来补偿的。
-    /// 这里提供一个显式的 unscale 方法，供需要时手动调用。
+    /// 前向时 loss 被乘了 `scale`，反向出来的所有梯度都带着同一个因子，必须在更新参数前
+    /// 除掉。少这一步不会让 AdamW 的更新方向出错（它按梯度自身的尺度自适应调步长），
+    /// 但会有两处实打实的错误：
+    /// - 梯度裁剪的阈值被整体放大 `scale` 倍，裁剪等于失效（本项目默认 grad_clip 很大，
+    ///   看着"没坏"，换个正常阈值立刻暴露）；
+    /// - 进度日志里的梯度范数是假的，看不出真实量级，梯度异常时无法察觉。
     pub fn unscale_gradients(&self, params: &[Tensor]) {
         let inv_scale = 1.0 / self.scale;
         for p in params {
@@ -206,7 +214,18 @@ pub fn eval_loss(model: &GPT, loader: &dyn BatchSource, eval_iters: usize, rng: 
     total / eval_iters as f32
 }
 
-/// 前向 + 交叉熵，返回「打印用未缩放、反向按 `1/accum` 缩放」的 loss 张量。
+/// 前向 + 交叉熵 + MoE 均衡辅助损失，返回「打印用未缩放、反向按 `1/accum` 缩放」的
+/// 总损失张量。
+///
+/// 总损失 = 交叉熵 + Σ_layers α·L_aux（最后一项只在 MoE 配置下存在，见第 32 课）。
+/// 辅助损失必须**跟着主损失一起反向**，否则各层路由器的梯度只能是 0——它唯一的职责
+/// 就是把负载推平，主损失本身对路由偏斜是无感的（谁被选中都行，只要选中的专家算得准）。
+///
+/// 两条路径返回的 loss 在数值上都是**未缩放**的原始值，缩放只作用在梯度上：
+/// 逐算子路径靠 [`Tensor::external_scalar_loss`] 注入上游梯度，常驻显存路径
+/// 在同一个节点里把 `1/accum` 与上游梯度相乘，因此梯度累积与 AMP 的 `scale`
+/// 可以任意叠加，不会丢比例。辅助损失同样只缩放梯度、不改数值，
+/// 否则打印出来的 loss 会随 `accum` 变小。
 ///
 /// GPU 可用且尺寸合适时走「输出头常驻显存」路径：`hidden @ Wᵀ` 与 softmax+交叉熵
 /// 录进一次提交，logits 与 dlogits（本配置下各 33.6M 元素）全程留在显存、只回读每行 CE，
@@ -229,8 +248,56 @@ fn forward_loss(
     accum: usize,
 ) -> Tensor {
     let hidden = model.forward_hidden(x, batch_size, block_size, true);
+    // 必须在 forward 之后**立刻**取走：每个 Block 只保留"最近一次前向"的那份辅助损失，
+    // 下一次前向会覆盖它（见 [`crate::model::GPT::aux_loss`]）。
+    let aux = model.aux_loss();
+    let base = cross_entropy_with_head(
+        model,
+        &hidden,
+        y,
+        mask,
+        batch_size,
+        block_size,
+        accum,
+    );
+    match aux {
+        None => base,
+        Some(a) => base.add(&scale_grad_only(a, 1.0 / accum as f32)),
+    }
+}
+
+/// 把标量张量的**梯度**乘以 `factor`（值保持不变，打印用）。
+///
+/// 梯度累积要求 `(1/accum)·Σ_m (L_ce,m + α·L_aux,m)`，两项都得除 `accum`；
+/// 而返回值又要保持未缩放供打印。于是与 [`forward_loss`] 里处理交叉熵的手法一致：
+/// 新节点只改上游梯度的注入比例，不动数值。
+fn scale_grad_only(t: Tensor, factor: f32) -> Tensor {
+    if factor == 1.0 {
+        return t;
+    }
+    let v = t.item();
+    let inner = t.clone();
+    Tensor::external_scalar_loss(v, vec![t], move |upstream| {
+        inner.accumulate_grad(&[factor * upstream], 1.0);
+    })
+}
+
+/// 交叉熵部分（`hidden @ Wᵀ` + 掩码交叉熵），MoE 辅助损失由 [`forward_loss`] 另加。
+///
+/// `batch_size` / `block_size` 只被「输出头常驻显存」路径用来算行数，不带 GPU 时用不上。
+#[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
+fn cross_entropy_with_head(
+    model: &GPT,
+    hidden: &Tensor,
+    y: &[usize],
+    mask: Option<&[bool]>,
+    batch_size: usize,
+    block_size: usize,
+    accum: usize,
+) -> Tensor {
     let head = model.head_weight();
     let inv_accum = 1.0 / accum as f32;
+    let hidden = hidden.clone();
 
     #[cfg(feature = "gpu")]
     if mask.is_none() && crate::tensor::grad_enabled() {
@@ -242,11 +309,17 @@ fn forward_loss(
         {
             let hidden_bwd = hidden.clone();
             let head_bwd = head.clone();
-            return Tensor::external_scalar_loss(resident.loss, vec![hidden.clone()], move || {
-                let (dx, dw) = resident.backward().expect("常驻输出头反向失败");
-                hidden_bwd.accumulate_grad(&dx, inv_accum);
-                head_bwd.accumulate_grad(&dw, inv_accum);
-            });
+            return Tensor::external_scalar_loss(
+                resident.loss,
+                vec![hidden.clone()],
+                move |upstream| {
+                    let (dx, dw) = resident.backward().expect("常驻输出头反向失败");
+                    // 融合核的反向按「上游梯度 = 1」算好，比例在这里补上：
+                    // AMP 的 scale_loss 就是靠这一项才没被丢掉
+                    hidden_bwd.accumulate_grad(&dx, upstream * inv_accum);
+                    head_bwd.accumulate_grad(&dw, upstream * inv_accum);
+                },
+            );
         }
     }
 
@@ -259,8 +332,8 @@ fn forward_loss(
     // 梯度累积：不缩放 loss 本身（打印要用原始值），只把 1/accum 作为上游梯度注入
     let raw_val = loss.item();
     let loss_bwd = loss.clone();
-    Tensor::external_scalar_loss(raw_val, vec![loss], move || {
-        loss_bwd.accumulate_grad(&[inv_accum], 1.0);
+    Tensor::external_scalar_loss(raw_val, vec![loss], move |upstream| {
+        loss_bwd.accumulate_grad(&[inv_accum * upstream], 1.0);
     })
 }
 
@@ -316,6 +389,10 @@ pub fn train_gpt(
     rng: &mut Rng,
 ) -> f32 {
     let params = model.parameters();
+    // 真正参与训练的参数（LoRA 形态下 = 各层的适配层；普通训练 = 全部）。
+    // 梯度裁剪与范数统计只该看这一组：冻结参数不产生梯度（前向走 matmul_frozen），
+    // 但 GPU 常驻输出头快路仍会往共享词嵌入上注回梯度，那些值不该影响裁剪系数。
+    let trainable = model.trainable_parameters();
     let mut opt = AdamW::new(cfg.max_lr, params.clone(), cfg.weight_decay);
     let mut scheduler = LRScheduler::new(cfg.warmup_steps, cfg.steps, cfg.max_lr, cfg.min_lr);
 
@@ -335,6 +412,7 @@ pub fn train_gpt(
     let block_size = loader.block_size();
     let batch_size = loader.batch_size();
     let param_count: usize = params.iter().map(|p| p.numel()).sum();
+    let trainable_count: usize = trainable.iter().map(|p| p.numel()).sum();
     logln!(
         "开始训练：{}（vocab={}）模型参数 {} | 语料 {} tokens（训练 {} / 验证 {}）| batch={} block={}",
         tokenizer.kind(),
@@ -346,12 +424,25 @@ pub fn train_gpt(
         batch_size,
         block_size,
     );
-    // 配置里带了 LoRA 段只说明"想用 LoRA"，训练循环并没有据此冻结或注入任何东西。
-    // 这里如实说清楚，别让人以为可训练参数量真的降下来了（见 docs/29-LoRA低秩适配.md）。
-    if let Some(lora) = cfg.lora.as_ref() {
+    // LoRA 形态：主干已冻结，只有适配层在学。这里报出真实占比，别让人靠猜。
+    if let Some(lora) = model.lora.as_ref() {
         logln!(
-            "[warn] 配置里有 LoRA（rank={} alpha={}），但训练循环尚未接入 LoRA：\
-             主参数不会冻结、适配层不会注入，下面训练的是**全部参数**",
+            "LoRA：rank={} alpha={} 挂载={}｜可训练参数 {} / {}（{:.2}%）｜主干冻结：反向不算 dW、\
+             优化器不更新、不吃权重衰减",
+            lora.rank,
+            lora.alpha,
+            lora.targets,
+            trainable_count,
+            param_count,
+            100.0 * trainable_count as f32 / param_count.max(1) as f32,
+        );
+    } else if let Some(lora) = cfg.lora.as_ref() {
+        // 配置里带了 LoRA 段只说明"想用 LoRA"。`train` 子命令不注入适配层（没有基座可挂），
+        // 真正干活的是 `finetune`。这里如实说清楚，别让人以为可训练参数量降下来了。
+        logln!(
+            "[warn] 配置里声明了 LoRA（rank={} alpha={}），但本次模型未注入适配层：\
+             `train` 子命令不做注入，LoRA 微调请用 `finetune`（见 docs/29-LoRA低秩适配.md）。\
+             下面训练的是**全部参数**",
             lora.rank,
             lora.alpha,
         );
@@ -389,6 +480,21 @@ pub fn train_gpt(
     let mut last_progress_t = train_t0; // 上次打印进度的时间
     let progress_interval = 5.0; // 每 5 秒打印一次进度
     let accum = cfg.accum_steps.max(1);
+    // AMP：动态损失缩放。None = 关闭（不缩放、不检查溢出）。
+    let mut amp = if cfg.amp {
+        let mp = MixedPrecision::new(cfg.amp_init_scale_log2, cfg.amp_growth_interval);
+        logln!(
+            "[info] AMP 已启用：初始 scale = 2^{} = {:.0}，每 {} 次无溢出翻倍，\
+             溢出则跳过本步并把 scale 减半（梯度裁剪前会反缩放回真实尺度）",
+            cfg.amp_init_scale_log2,
+            mp.scale,
+            cfg.amp_growth_interval
+        );
+        Some(mp)
+    } else {
+        None
+    };
+    let mut amp_skipped = 0usize; // 因梯度溢出被跳过的参数更新次数
     // 实际完成到的步数：早停会提前退出，结尾统计与 final.ckpt 都不能用 cfg.steps
     let mut last_step_done = start_step;
     for step in start_step..cfg.steps {
@@ -402,7 +508,11 @@ pub fn train_gpt(
 
         // 3. 反向（梯度自动累加到现有梯度上）
         let t_seg = std::time::Instant::now();
-        loss.backward();
+        match amp.as_ref() {
+            // AMP：把 loss 乘上 scale 再反向，让整条反向链路的梯度落在更安全的数值区间
+            Some(mp) => mp.scale_loss(&loss).backward(),
+            None => loss.backward(),
+        }
         let bwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
 
         // 判定实验：第一步的反向跑完就收网，按形状回放测出「每步每个形状各花多少 ms」
@@ -414,6 +524,27 @@ pub fn train_gpt(
 
         // 每 accum 步才做一次梯度裁剪 + 优化器更新 + 清零
         if (step + 1) % accum == 0 || step + 1 == cfg.steps {
+            // 4. AMP 溢出检查（此时梯度还带着 scale）
+            // 梯度里出现 Inf/NaN 就跳过本次参数更新：不跳的话 AdamW 的一阶/二阶矩会被
+            // Inf 污染，之后每一步都是 NaN，训练再也回不来。scale 同时自动收缩。
+            let overflow = match amp.as_mut() {
+                Some(mp) => !mp.check_and_update(&trainable),
+                None => false,
+            };
+            if overflow {
+                amp_skipped += 1;
+                let scale = amp.as_ref().map(|m| m.scale).unwrap_or(0.0);
+                logln!(
+                    "[amp] step {} 梯度溢出（Inf/NaN）：跳过本次参数更新，scale 收缩到 {:.0}（累计跳过 {} 次）",
+                    step + 1,
+                    scale,
+                    amp_skipped
+                );
+            } else if let Some(mp) = amp.as_ref() {
+                // 5. AMP 反缩放：把梯度除回真实尺度，必须在裁剪之前
+                mp.unscale_gradients(&trainable);
+            }
+
             // 周期性打印进度（在 zero_grad 之前，此时梯度有效）
             {
                 let now = std::time::Instant::now();
@@ -427,7 +558,7 @@ pub fn train_gpt(
                     // 裁剪**前**的原始梯度范数，末尾 `*` 表示本步会触发裁剪。
                     // 不能打印 min(raw, grad_clip)：那样范数恒被压在阈值上限，
                     // 梯度是否爆炸、裁剪是否频繁完全看不出来（曾经因此漏判梯度异常）。
-                    let raw_norm: f32 = params.iter().map(|p| {
+                    let raw_norm: f32 = trainable.iter().map(|p| {
                         p.grad.borrow().iter().map(|g| g * g).sum::<f32>()
                     }).sum::<f32>().sqrt();
                     let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
@@ -446,19 +577,24 @@ pub fn train_gpt(
                 }
             }
 
-            // 4. 梯度裁剪
-            clip_grad_norm(&params, cfg.grad_clip);
+            if overflow {
+                // 坏梯度整批丢弃：不更新参数，也不推进学习率（本步没有真正发生）
+                opt.zero_grad();
+            } else {
+                // 6. 梯度裁剪
+                clip_grad_norm(&trainable, cfg.grad_clip);
 
-            // 5. 更新参数（设置当前学习率）
-            let cur_lr = scheduler.lr();
-            opt.lr = cur_lr;
-            opt.step();
+                // 7. 更新参数（设置当前学习率）
+                let cur_lr = scheduler.lr();
+                opt.lr = cur_lr;
+                opt.step();
 
-            // 6. 清零梯度
-            opt.zero_grad();
+                // 8. 清零梯度
+                opt.zero_grad();
 
-            // 学习率调度：只在 optimizer 实际更新后递增
-            scheduler.step();
+                // 学习率调度：只在 optimizer 实际更新后递增
+                scheduler.step();
+            }
         }
 
         // 周期性评估 + 存 checkpoint
@@ -569,8 +705,91 @@ pub fn train_gpt(
         logln!("[done] matmul 分流：GPU {} / CPU {}", gpu_calls, cpu_calls);
     }
     if best_val_loss.is_finite() {
+        if let Some(mp) = amp.as_ref() {
+            logln!(
+                "[done] AMP：最终 scale = {:.0}，累计因梯度溢出跳过 {} 次参数更新",
+                mp.scale,
+                amp_skipped
+            );
+        }
         best_val_loss
     } else {
         final_loss
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::DataLoader;
+    use crate::model::{GPT, GPTConfig};
+    use crate::tokenizer::Tokenizer;
+
+    /// 跑一次极小的端到端训练（无验证集、不存 checkpoint），返回最终训练 loss。
+    fn run_tiny_training(amp: bool) -> f32 {
+        let corpus = "the quick brown fox jumps over the lazy dog, and then the dog jumps \
+                      back over the quick brown fox again and again and again.";
+        let tokenizer = Tokenizer::char(corpus);
+        let mut rng = Rng::new(11);
+        let model = GPT::new(GPTConfig::tiny(tokenizer.vocab_size()), &mut rng);
+        let loader = DataLoader::new(corpus, &tokenizer, 16, 4);
+        let tcfg = TrainConfig {
+            seed: 11,
+            steps: 12,
+            batch_size: 4,
+            warmup_steps: 2,
+            max_lr: 1e-3,
+            min_lr: 1e-3,
+            // 正常量级的裁剪阈值：一旦漏掉反缩放，阈值会被整体放大 2^16 倍，裁剪失效，
+            // 结果会立刻偏离——这条断言因此同时覆盖了「反缩放」这一步。
+            grad_clip: 1.0,
+            eval_every: 12, // 只在最后一步评估
+            eval_iters: 1,
+            log_file: None,
+            amp,
+            ..TrainConfig::default()
+        };
+        let mut train_rng = Rng::new(11);
+        train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut train_rng)
+    }
+
+    /// AMP 的损失缩放对 f32 训练是数值透明的：`scale` 恒为 2 的幂，乘/除 2^k 在 f32 下
+    /// 只是指数移位（精确），整条反向链路逐位等于未缩放时的结果。所以开与不开启 AMP
+    /// 必须得到完全相同的最终 loss。
+    #[test]
+    fn test_amp_loss_scaling_is_numerically_transparent() {
+        let plain = run_tiny_training(false);
+        let with_amp = run_tiny_training(true);
+        assert_eq!(
+            plain, with_amp,
+            "开/关 AMP 的最终 loss 应完全相同（无 AMP {plain}，有 AMP {with_amp}）"
+        );
+    }
+
+    /// 动态损失缩放的两个方向 + 反缩放：无溢出时按间隔翻倍，检测到 Inf/NaN 时减半并要求
+    /// 跳过本步；反缩放把梯度除回真实尺度。
+    #[test]
+    fn test_mixed_precision_grows_shrinks_and_unscales() {
+        let mut mp = MixedPrecision::new(16, 3);
+        assert_eq!(mp.scale, 65536.0, "初始 scale 应为 2^16");
+
+        let clean = Tensor::from_vec(vec![1.0, 2.0], vec![2]);
+        assert!(mp.check_and_update(&[clean.clone()]));
+        assert!(mp.check_and_update(&[clean.clone()]));
+        assert_eq!(mp.scale, 65536.0, "未到增长间隔（3 次）不应翻倍");
+        assert!(mp.check_and_update(&[clean]));
+        assert_eq!(mp.scale, 131072.0, "满 3 次无溢出应翻倍");
+
+        let broken = Tensor::from_vec(vec![0.0, 0.0], vec![2]);
+        *broken.grad.borrow_mut() = vec![1.0, f32::NAN];
+        assert!(!mp.check_and_update(&[broken]), "含 NaN 的梯度应判为溢出");
+        assert_eq!(mp.scale, 65536.0, "溢出后 scale 应减半");
+
+        // 反缩放：梯度此刻带着 scale 倍，除回来才是真实梯度
+        let g = Tensor::from_vec(vec![0.0, 0.0], vec![2]);
+        *g.grad.borrow_mut() = vec![65536.0, -32768.0];
+        mp.scale = 65536.0;
+        mp.unscale_gradients(&[g.clone()]);
+        assert_eq!(*g.grad.borrow(), vec![1.0, -0.5]);
     }
 }

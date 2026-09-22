@@ -1,8 +1,9 @@
 # 第 37 课：RAG 检索增强生成（Retrieval-Augmented Generation）
 
-> **本课为前沿技术教程（纯文档，无配套代码实现）。**
-> 与本项目已有代码的关联：RAG 的生成阶段可复用 `src/sample.rs` 的 `generate` 函数；
-> 文档向量化可用 `src/tensor.rs` 的 matmul 实现余弦相似度计算。
+> **本课已落地为可运行代码**：`src/rag.rs`（9 个单测）+ `rag` 子命令——分块（字符域切分 + 句读对齐 +
+> 可配重叠）、三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）、余弦检索与 MMR 多样化重排、提示组装。
+> 与已有代码的衔接：生成阶段复用 `src/sample.rs` 的 `generate`；稠密向量由 `GPT::forward_hidden`
+> 做均值池化得到，余弦相似度在 L2 归一化后用点积计算。
 
 ---
 
@@ -209,7 +210,55 @@ LLM 判断: "这个问题我不确定" → 触发检索
 
 > **最佳实践**：三者常组合使用——RAG 提供外部知识，微调适应领域风格，长上下文处理单篇长文档。
 
-## 动手练习
+## 本项目的实际实现
+
+上面的原理已全部落地为可运行代码。核心文件是 [`src/rag.rs`](../src/rag.rs)（19 个单测），
+CLI 入口是 [`rag`](../README.md#12-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令。
+
+### 代码结构
+
+| 组件 | 位置 | 说明 |
+|------|------|------|
+| `ChunkOpts` / `Chunk` | `rag.rs` | 分块参数（`size`/`overlap`/`align`）与文本块（`text`/`start`/`end`/`source`） |
+| `chunk_text` | `rag.rs` | 将长文本按字符窗口切成带重叠的块，支持可选的句子/段落边界对齐 |
+| `Embedder` trait | `rag.rs` | 向量化器接口：`dim()` + `embed(text) → Vec<f32>` |
+| `TfIdf` | `rag.rs` | TF-IDF 向量化器：`fit` 统计文档频率，`embed` 生成稀疏向量 |
+| `HashingEmbedder` | `rag.rs` | 特征哈希向量化器：FNV-1a 哈希映射到固定维度，无词表、无未登录词问题，符号哈希缓解冲突偏置 |
+| `ModelEmbedder` | `rag.rs` | 模型稠密向量化器：GPT 隐状态均值池化 + 归一化，三者中唯一"懂语义"的检索器 |
+| `ScoredChunk` | `rag.rs` | 一条检索结果：`index` + `chunk` + 余弦相似度 `score` |
+| `Retriever` | `rag.rs` | 向量检索器：持有嵌入器 + 块向量，提供 `build`/`from_text`/`from_corpus_dir`/`search`（暴力 top-k）/`search_mmr`（MMR 去冗余重排） |
+| `PromptOpts` / `RagPrompt` | `rag.rs` | 提示组装参数与结果：字符预算 `max_context_chars` + 系统约束指令 + 来源标注 |
+| `build_rag_prompt` | `rag.rs` | 将检索命中组装为最终提示文本，带来源标注和字符预算裁剪，强制"只依据资料回答" |
+| `l2_norm` / `l2_normalize` / `cosine_similarity` | `rag.rs` | 底层向量工具：L2 范数、归一化、余弦相似度（零向量安全） |
+| `truncate_chars` / `terms` | `rag.rs` | 文本工具：按字符截断（中文安全）、unigram+bigram 词项切分（无分词器的中文检索） |
+
+### CLI 用法
+
+```bash
+# 默认配置（chunk_size=120, overlap=30, top_k=4, 特征哈希 512 维）
+cargo run --release -- rag
+
+# 调整分块参数
+cargo run --release -- rag --chunk-size 200 --overlap 50
+
+# 调整检索参数
+cargo run --release -- rag --top-k 6 --mmr-lambda 0.3 --mmr-pool 20
+
+# 自定义查询
+cargo run --release -- rag --query "attention mechanism transformer"
+
+# 使用模型稠密向量（需要先训练小模型）
+cargo run --release -- rag --n-embd 64 --n-layer 4
+
+# 调整提示预算
+cargo run --release -- rag --context-chars 500
+```
+
+---
+
+## 拓展方向
+
+> 核心内容已全部实现（`src/rag.rs` + `rag` 子命令），这里是进阶拓展。
 
 1. **实现简单向量检索**：给定一组文本的向量表示和一个查询向量，实现余弦相似度 Top-K 检索。
 2. **文本分块**：实现滑动窗口分块算法，支持配置 chunk_size 和 overlap。
