@@ -1816,10 +1816,18 @@ fn create() -> Option<GpuContext> {
         _ => "Other",
     };
     println!("[gpu] 已选择适配器: {} ({})", info.name, device_type);
+    let mut limits = wgpu::Limits::default();
+    let target_buf_size: u64 = 512 * 1024 * 1024;
+    if limits.max_storage_buffer_binding_size < target_buf_size {
+        limits.max_storage_buffer_binding_size = target_buf_size;
+    }
+    if limits.max_uniform_buffer_binding_size < 64 * 1024 {
+        limits.max_uniform_buffer_binding_size = 64 * 1024;
+    }
     let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("llm_from_scratch"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
+        required_limits: limits,
         experimental_features: wgpu::ExperimentalFeatures::default(),
         memory_hints: wgpu::MemoryHints::default(),
         trace: wgpu::Trace::Off,
