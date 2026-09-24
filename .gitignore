@@ -12,3 +12,6 @@
 *.log
 # 重定向出来的 stderr 文件（如 probe.err）
 *.err
+
+# 临时目录
+/.temp/
