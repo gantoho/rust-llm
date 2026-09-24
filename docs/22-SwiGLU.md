@@ -4,7 +4,7 @@
 > 代码位置：[src/layers.rs](../src/layers.rs)（`SwiGLUMLP` 层、`MLPEnum` 枚举）
 > 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` 使用 `MLPEnum`）
 >
-> 配置开关：`config/config.json` → `model.use_swiglu: true`（示例值；仓库当前 `config/config.json` 里是 `false`，需手动改为 `true` 才能启用 SwiGLU）
+> 配置开关：`config/config.json` → `model.use_swiglu: true`（**默认已启用**，改回 `false` 则退回 GELU MLP）
 
 ---
 
@@ -16,7 +16,7 @@
 
 ---
 
-## 2. GPT-2 风格 MLP（回顾）
+## 2. 经典风格 MLP（回顾）
 
 第 11 课的 MLP 结构：
 
@@ -89,7 +89,7 @@ SwiGLU MLP：`SiLU(x @ W_gate) ⊙ (x @ W_up) @ W_down` —— 有两个"视角"
 
 | 模型 | MLP 激活 |
 |------|---------|
-| GPT-2/3 | GELU |
+| 经典解码器 | GELU |
 | LLaMA / LLaMA 2 / LLaMA 3 | **SwiGLU** |
 | Mistral / Mixtral | **SwiGLU** |
 | Qwen / Qwen2 | **SwiGLU** |
@@ -102,7 +102,7 @@ SwiGLU MLP：`SiLU(x @ W_gate) ⊙ (x @ W_up) @ W_down` —— 有两个"视角"
 SwiGLU 有三个矩阵（vs GELU 的两个），但通过调整隐藏层维度保持总参数量相近：
 
 ```
-GPT-2:   W1[D, 4D] + W2[4D, D] = 8D² 参数
+经典:   W1[D, 4D] + W2[4D, D] = 8D² 参数
 SwiGLU:  W_gate[D, h] + W_up[D, h] + W_down[h, D] = 3Dh 参数
 ```
 

@@ -14,19 +14,257 @@
 //! 旋转位置编码（rotary）见 `src/rope.rs`。
 
 use rayon::prelude::*;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::autograd::record;
 
 /// 防除零小常数（div / log 反向用）
 const EPS: f32 = 1e-8;
 
+/// 线程安全的共享可变句柄：`Arc<Mutex<T>>` 的薄封装。
+///
+/// 保留了 `RefCell` 时代 `borrow()` / `borrow_mut()` 的调用习惯，
+/// 全库调用点几乎零改动；内部是 `Arc<Mutex<T>>`，因此张量可以安全地
+/// 被 rayon 并行闭包与多线程（数据并行、多卡训练）共享 —— 这正是旧实现
+/// `Rc<RefCell<_>>` 做不到的（`Rc` 非 `Send`/`Sync`，把整张计算图锁死在单线程）。
+///
+/// **加锁纪律**：`Mutex` 不可重入，同一线程对同一个 `Shared` 嵌套加锁会死锁。
+/// 因此所有「一个算子的两个输入可能是同一张量」的位点（`x + x`、`x @ x`、
+/// `swiglu(x, x)`）必须先用 [`Shared::ptr_eq`] 判同一、只借一把锁
+/// （见 binary / matmul / swiglu 的前向与反向）。
+/// 另外，锁持有期间 panic 不会毒化后续访问：这里统一用
+/// `PoisonError::into_inner` 忽略毒化，避免一次断言失败引发连锁误报。
+pub struct Shared<T>(Arc<Mutex<T>>);
+
+impl<T> Shared<T> {
+    /// 用一个值新建共享句柄（对应原 `Rc::new(RefCell::new(v))`）
+    pub fn new(v: T) -> Self {
+        Shared(Arc::new(Mutex::new(v)))
+    }
+
+    /// 只读借用（对应 `RefCell::borrow`）。guard 存活期内持有锁。
+    pub fn borrow(&self) -> MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 可变借用（对应 `RefCell::borrow_mut`）。guard 存活期内持有锁。
+    pub fn borrow_mut(&self) -> MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 两个句柄是否指向同一份底层数据（对应 `Rc::ptr_eq` / `Arc::ptr_eq`）。
+    /// 反向闭包用它区分「同一张量参与两次 → 单锁叠加」与「两张量 → 双锁」。
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+
+    /// 底层缓冲的裸指针标识（autograd 拓扑去重用，对应 `Rc::as_ptr`）。
+    /// 只取地址做键，不加锁、不解引用。
+    pub fn as_ptr(s: &Self) -> usize {
+        Arc::as_ptr(&s.0) as usize
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(Arc::clone(&self.0))
+    }
+}
+
+// ==================== bf16 混合精度（批次 10b） ====================
+
+/// 张量数据的物理存储类型。
+///
+/// - [`DType::F32`]：32 位浮点，算子直接锁借位读写，零转换开销；
+/// - [`DType::Bf16`]：bf16 位模式（真 `u16` 存储），内存真实减半。
+///
+/// **decode-at-boundary 约定**：bf16 只存在于存储层。算子入口通过
+/// [`Tensor::decode`] 拿到 f32 视图、算子内全程 f32 计算，
+/// 出口经 [`Tensor::new_like`] 统一 encode 回 bf16 落盘。
+/// 梯度缓冲（`grad`）恒为 f32，不参与该约定。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DType {
+    F32,
+    Bf16,
+}
+
+/// f32 → bf16 位模式（round-to-nearest-even，IEEE 754 bfloat16）。
+///
+/// 取高 16 位，按第 17 位（舍入位）+ 低位是否有残留做「就近取偶」进位：
+/// `+ 0x7FFF` 补足舍入阈值，`+ ((bits >> 16) & 1)` 在恰好半数时向偶数靠拢。
+/// NaN 单独处理：直接截取高 16 位并强制尾数最高位为 1，保证转换后仍是
+/// NaN（纯 RNE 进位可能把某些 NaN 尾数进成全 0 → 变成无穷大）。
+fn f32_to_bf16(x: f32) -> u16 {
+    if x.is_nan() {
+        // 保留符号位与全 1 指数，尾数置非零
+        return ((x.to_bits() >> 16) | 0x0040) as u16;
+    }
+    let bits = x.to_bits();
+    let rounding_bias = ((bits >> 16) & 1) + 0x7FFF;
+    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+}
+
+/// bf16 → f32：位模式左移 16 位补满尾数，指数/符号位原样保留。
+/// ±0、±∞、NaN 都按位无损映射。
+fn bf16_to_f32(x: u16) -> f32 {
+    f32::from_bits((x as u32) << 16)
+}
+
+/// 张量数据缓冲的**变体内容**（住在 [`Shared`] 单层锁槽里）。
+///
+/// 用枚举而不是「统一 u16 + tag」：f32 路径的锁借位语义完全不变；
+/// bf16 路径只在算子边界付 decode（入口解码）/ encode（出口编码）成本。
+///
+/// **变体本身是共享状态**：槽是 `Shared<Buffer>`（`Arc<Mutex<Buffer>>`），
+/// 所有克隆句柄看到同一个变体——[`Tensor::to_bf16`] 原地换变体后，
+/// 模型里其余句柄同步生效（若变体直接放在每个 Tensor 克隆体上会脱节）。
+#[derive(Clone)]
+pub enum Buffer {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+}
+
+impl Buffer {
+    /// 缓冲的存储类型（只看变体，本体已在锁槽内、无需再加锁）。
+    pub(crate) fn dtype(&self) -> DType {
+        match self {
+            Buffer::F32(_) => DType::F32,
+            Buffer::Bf16(_) => DType::Bf16,
+        }
+    }
+
+    /// 缓冲元素个数（bf16 下也是逻辑元素数：每元素恰一个 `u16`）。
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Buffer::F32(v) => v.len(),
+            Buffer::Bf16(v) => v.len(),
+        }
+    }
+}
+
+impl Shared<Buffer> {
+    /// 只读解码视图（与 [`Tensor::decode`] 相同；反向闭包持 `data` 句柄时用）。
+    pub fn decode(&self) -> DataGuard<'_> {
+        let slot = self.borrow();
+        match &*slot {
+            Buffer::F32(_) => DataGuard::F32(slot),
+            Buffer::Bf16(u) => {
+                let v = u.par_iter().map(|&x| bf16_to_f32(x)).collect();
+                drop(slot); // 解码完立即释放槽锁
+                DataGuard::Bf16(v)
+            }
+        }
+    }
+
+    /// 可变解码视图（与 [`Tensor::decode_mut`] 相同；闭包持 `data` 句柄的写入点用）。
+    pub fn decode_mut(&self) -> DataGuardMut<'_> {
+        let slot = self.borrow_mut();
+        // 先判变体再构造（借出 guard 后不能再摸 slot）
+        if matches!(&*slot, Buffer::Bf16(_)) {
+            let cache = match &*slot {
+                Buffer::Bf16(u) => u.par_iter().map(|&x| bf16_to_f32(x)).collect(),
+                Buffer::F32(_) => unreachable!("持锁期内变体不会改变"),
+            };
+            DataGuardMut::Bf16 { guard: slot, cache }
+        } else {
+            DataGuardMut::F32(slot)
+        }
+    }
+}
+
+/// 数据的**只读解码视图**（算子入口用，对应旧的 `data.borrow()`）。
+///
+/// - `F32`：直接持 `MutexGuard<Buffer>`（槽内就是 `Vec<f32>`），
+///   零拷贝零转换，语义与旧 `borrow()` 一致；
+/// - `Bf16`：锁内并行解码为 `Vec<f32>` 后立即释放锁，持有解码副本。
+///
+/// 实现 `Deref<Target = [f32]>`：索引、切片、`par_iter`、
+/// `let sd_ref: &[f32] = &guard;`（解引用 coercion）等既有用法原样成立。
+pub enum DataGuard<'a> {
+    F32(MutexGuard<'a, Buffer>),
+    Bf16(Vec<f32>),
+}
+
+impl Deref for DataGuard<'_> {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match self {
+            DataGuard::F32(g) => match &**g {
+                Buffer::F32(v) => v.as_slice(),
+                Buffer::Bf16(_) => unreachable!("DataGuard::F32 持锁期内变体不会改变"),
+            },
+            DataGuard::Bf16(v) => v.as_slice(),
+        }
+    }
+}
+
+/// 数据的**可变解码视图**（优化器就地更新等写入点用，对应旧 `data.borrow_mut()`）。
+///
+/// - `F32`：直接可变锁借位，零转换；
+/// - `Bf16`：借位时解码进 `cache`，全程按 f32 就地改，**`Drop` 时
+///   统一并行 encode 回槽内 u16 存储**——写路径无需逐点手工编码
+///   （master weights 语义：参数真存 bf16，更新在 f32 算完后截断回写）。
+pub enum DataGuardMut<'a> {
+    F32(MutexGuard<'a, Buffer>),
+    Bf16 {
+        guard: MutexGuard<'a, Buffer>,
+        cache: Vec<f32>,
+    },
+}
+
+impl Deref for DataGuardMut<'_> {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match self {
+            DataGuardMut::F32(g) => match &**g {
+                Buffer::F32(v) => v.as_slice(),
+                Buffer::Bf16(_) => unreachable!("DataGuardMut::F32 持锁期内变体不会改变"),
+            },
+            DataGuardMut::Bf16 { cache, .. } => cache.as_slice(),
+        }
+    }
+}
+
+impl DerefMut for DataGuardMut<'_> {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        match self {
+            DataGuardMut::F32(g) => match &mut **g {
+                Buffer::F32(v) => v.as_mut_slice(),
+                Buffer::Bf16(_) => unreachable!("DataGuardMut::F32 持锁期内变体不会改变"),
+            },
+            DataGuardMut::Bf16 { cache, .. } => cache.as_mut_slice(),
+        }
+    }
+}
+
+impl Drop for DataGuardMut<'_> {
+    fn drop(&mut self) {
+        if let DataGuardMut::Bf16 { guard, cache } = self {
+            use rayon::prelude::*;
+            match &mut **guard {
+                Buffer::Bf16(raw) => {
+                    // 并行 encode：bf16 舍入逐元素独立，块间无写冲突
+                    raw.par_iter_mut()
+                        .zip(cache.par_iter())
+                        .for_each(|(slot, &v)| *slot = f32_to_bf16(v));
+                }
+                Buffer::F32(_) => unreachable!("DataGuardMut::Bf16 持锁期内变体不会改变"),
+            }
+        }
+    }
+}
+
 // permute 的映射表缓存。
 // 训练中同一形状每步反复出现（Q/K/V 拆头 [0,2,1,3]、Kᵀ [0,2,1]、合头 [0,2,1,3]），
-// map 只依赖 (源形状, dims)，建一次后用 Rc 共享给前向/反向，避免每步重建几十万元素的下标表。
-// 用 thread_local 而非 static：Rc 不是 Send/Sync，而本项目训练/推理是单线程的。
+// map 只依赖 (源形状, dims)，建一次后用 Arc 共享给前向/反向，避免每步重建几十万元素的下标表。
+// 用 thread_local 而非 static：缓存按线程隔离，各训练/推理线程互不竞争。
 thread_local! {
-    static PERMUTE_MAP_CACHE: RefCell<HashMap<(Vec<usize>, Vec<usize>), Rc<Vec<usize>>>> =
+    static PERMUTE_MAP_CACHE: RefCell<HashMap<(Vec<usize>, Vec<usize>), Arc<Vec<usize>>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -40,8 +278,8 @@ thread_local! {
 }
 
 // 推理模式开关（no_grad）：置 false 时所有算子的"是否建图"判断一律为假，
-// 既不挂 parents / backward 闭包，也不分配梯度缓冲。
-// 推理不需要反向，建图是纯开销 —— 单 token 前向时，分配 Rc + 闭包的代价
+// 既不向线性 tape 登记反向条目，也不分配梯度缓冲。
+// 推理不需要反向，建图是纯开销 —— 单 token 前向时，分配 Arc + 闭包的代价
 // 甚至超过矩阵乘本身。
 thread_local! {
     static GRAD_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
@@ -67,32 +305,59 @@ pub fn no_grad<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// 反向函数类型：无参数、无返回值，通过闭包捕获的 Rc 句柄直接读写各节点的梯度
-type BackwardFn = Rc<dyn Fn()>;
-
 /// 张量结构体
 ///
-/// 内部使用 `Rc<RefCell<_>>` 共享可变数据：
-/// - `Rc`    让多个张量可以"引用同一个底层数据"
-/// - `RefCell` 允许在运行时借用可变
+/// 内部使用 `Shared<_>`（即 `Arc<Mutex<_>>`）共享可变数据：
+/// - `Arc`  让多个张量可以"引用同一个底层数据"，且跨线程安全（`Send + Sync`）
+/// - `Mutex` 允许在运行时互斥借用（对应原 `RefCell` 的运行时借用检查）
 #[derive(Clone)]
 pub struct Tensor {
-    pub(crate) data: Rc<RefCell<Vec<f32>>>,
+    /// 数据缓冲（`Shared<Buffer>` = `Arc<Mutex<Buffer>>` 单层锁槽）。
+    /// [`Buffer::F32`] 为默认（算子直接锁借位零转换）；
+    /// [`Buffer::Bf16`] 为真 u16 bf16 存储（内存减半）——bf16 只存在于
+    /// 存储层，算子入口经 [`Tensor::decode`] 解码成 f32 视图计算，
+    /// 出口经 [`Tensor::new_like`] encode 落盘（decode-at-boundary 约定）。
+    /// 变体住在共享槽里：原地换变体（[`Tensor::to_bf16`]）对所有克隆句柄可见。
+    pub(crate) data: Shared<Buffer>,
     pub(crate) shape: Vec<usize>,
-    pub(crate) grad: Rc<RefCell<Vec<f32>>>,
+    /// 各维度在**物理缓冲** `data` 中的步长（以元素计）。
+    ///
+    /// 绝大多数张量是「行主序连续」的：strides 可由 shape 推出（见
+    /// [`row_major_strides`]），此时逻辑序 == 物理序，与没有该字段时完全一致。
+    ///
+    /// 唯一的非连续来源是 [`Tensor::permute`]：视图与父张量共享同一块物理
+    /// 缓冲（零拷贝），只换 shape/strides。因此：
+    /// - 按逻辑索引读数据要用 [`Tensor::data`]（按 strides gather）或先
+    ///   [`Tensor::contiguous`] 物化；
+    /// - 直接 `data.borrow()` 线性读物理缓冲的算子，只接收连续输入——
+    ///   permute 的消费点都在 reshape / matmul / sum_last_dim / flash_attention
+    ///   入口处物化（连续时物化是零开销的自身克隆）。
+    /// - 读数据一律用 [`Tensor::decode`]（f32/bf16 统一解码视图），
+    ///   不要直接 match `data` 变体。
+    ///
+    /// `grad` 不带 strides：梯度缓冲永远按**逻辑行主序**全长分配，
+    /// 反向闭包之间传递的都是逻辑序，视图的反向只需在入口处做一次映射。
+    pub(crate) strides: Vec<usize>,
+    pub(crate) grad: Shared<Vec<f32>>,
     /// 是否参与训练（`false` = 冻结）。与 `data` / `grad` 一样是**共享**的
-    /// （`Rc<Cell<bool>>`）：同一参数被克隆出多个句柄（优化器的参数表、`named_parameters`
+    /// （`Arc<AtomicBool>`）：同一参数被克隆出多个句柄（优化器的参数表、`named_parameters`
     /// 的返回、各层的持有）后，冻结其中任何一个都等于冻结这一个参数本身。
     ///
     /// 若用普通 `bool`，`#[derive(Clone)]` 会把它逐句柄复制一份——在模型上冻结、
     /// 优化器手里那份却仍是 true，就会出现"以为冻结了、其实照旧更新"的隐性错误。
-    pub(crate) requires_grad: Rc<Cell<bool>>,
-    /// 父节点列表。
-    /// 注意：用 `Rc<Vec<_>>` 而不是 `Vec<Tensor>`——
-    /// 若直接存 Vec，`derive(Clone)` 会递归深拷贝整棵祖先计算图，
-    /// 深层图上每次建节点都是 O(图深) 的灾难。用 Rc 共享后克隆是 O(1)。
-    pub(crate) parents: Rc<Vec<Tensor>>,
-    pub(crate) backward: Option<BackwardFn>,
+    /// 用原子 bool 而非加锁：读取在每步、每个算子的建图判断里都会发生，Relaxed 原子最便宜。
+    pub(crate) requires_grad: Arc<AtomicBool>,
+    // 计算图结构不在张量上：反向闭包统一登记到 autograd 的**线性 tape**
+    // （见 `crate::autograd::record`），`Tensor` 只保留数据/形状/梯度本体。
+}
+
+/// 由形状推导行主序（C 风格）步长：最后一维步长 1，向左逐维乘该维长度。
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * shape[d + 1];
+    }
+    strides
 }
 
 // ==================== 广播工具（第 3 课） ====================
@@ -160,24 +425,15 @@ fn broadcast_map(target: &[usize], src: &[usize]) -> Vec<usize> {
 /// - `Ident`：两形状相同，直接 1:1
 /// - `Mod(n)`：src 是 target 的右后缀且无大小为 1 的维度，源下标 = t % n
 ///   （覆盖偏置 [d]→[rows,d]、mask [t,tt]→[bh,t,tt] 等训练热路径，免建 4-16MB map）
-/// - `Map(m)`：通用情况，查预建表（Rc 共享给反向闭包，不克隆）
+/// - `Map(m)`：通用情况，查预建表（Arc 共享给反向闭包，不克隆）
 enum SrcIdx {
     Ident,
     Mod(usize),
-    Map(Rc<Vec<usize>>),
-}
-
-/// 查源下标
-fn src_idx(t: usize, s: &SrcIdx) -> usize {
-    match s {
-        SrcIdx::Ident => t,
-        SrcIdx::Mod(n) => t % n,
-        SrcIdx::Map(m) => m[t],
-    }
+    Map(Arc<Vec<usize>>),
 }
 
 /// SrcIdx 的跨线程轻量视图（rayon 并行闭包用）。
-/// `Rc<Vec<usize>>` 不是 Sync，不能直接进并行闭包；这里借用它的切片共享只读访问。
+/// 借用内部切片共享只读访问（`Copy` 视图），免去在并行闭包里逐元素克隆下标表。
 #[derive(Clone, Copy)]
 enum SrcIdxView<'a> {
     Ident,
@@ -347,10 +603,182 @@ fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize
     out
 }
 
-/// flash attention 前向的中间状态：决定反向走「常驻显存」路径还是逐算子路径。
+/// 构造后缀因果掩码 `[t, t_total]`：query i 只能看到 key `j <= i + (t_total - t)`，
+/// 其余位置为 -inf。
+///
+/// 分块前向（`flash_forward_cpu`）已在核内按同一规则屏蔽，CPU 路径不再需要这块
+/// O(T×T_total) 的分配；只有 GPU 常驻路径与 `LLM_GPU_PROBE` 录制（内核按真实
+/// buffer 消费掩码）才在这里真的物化一次。
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub fn causal_mask_data(t: usize, t_total: usize) -> Vec<f32> {
+    let visible_before = t_total - t;
+    let mut mask = vec![0.0f32; t * t_total];
+    for i in 0..t {
+        for j in 0..t_total {
+            if j > i + visible_before {
+                mask[i * t_total + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    mask
+}
+
+/// Flash Attention 的 CPU 分块前向：按输出行（`B*H × T`）并行，行内按键块扫描 +
+/// 在线 softmax，中间 P 从不落地。
+///
+/// 可见范围不物化掩码：query i 只算 `j < k_end`（`k_end = i + visible_before + 1`），
+/// 与 `causal_mask_data` 生成的掩码逐位一致，被屏蔽的键根本不进打分与累加。
+///
+/// 行内维护运行最大值 m 与指数和 l：新块并入时先 `m ← max(m, m_blk)`，
+/// 旧累计乘 `exp(m_old - m_new)` 重标定，再加新块的 `exp·V`，最后除以 l。
+/// **漏掉重标定**会让前序块按 `exp(m_final - m_old)` 整体放大——该因子随注意力
+/// 变尖锐指数增长，反向随之爆炸（历史 bug，回归测试见
+/// `test_flash_attention_backward_matches_standard`）。
+#[allow(clippy::too_many_arguments)]
+fn flash_forward_cpu(
+    q_scaled: &[f32],
+    k: &[f32],
+    v: &[f32],
+    bh: usize,
+    n_rep: usize, // GQA：Q 头 → 共享 KV 头的除数（MHA 时为 1）
+    t: usize,
+    t_total: usize,
+    head_dim: usize,
+    visible_before: usize,
+    block_size: usize,
+) -> Vec<f32> {
+    let bs = block_size.max(1);
+    let mut out = vec![0.0f32; bh * t * head_dim];
+    out.par_chunks_mut(head_dim).enumerate().for_each(|(r, ochunk)| {
+        let i = r % t;
+        let k_end = (i + visible_before + 1).min(t_total);
+        // K/V 是 [kv_bh, T_total, HD] 展平：本行 Q 头 hh = r/t 映射到共享 KV 头
+        // hh/n_rep（与旧 repeat_kv 的「第 b 个 KV 头复制成 n_rep 份、头序 b*n_rep+r」
+        // 互逆；n_rep=1 时退化为按行所属批组起算）
+        let kv_base = ((r / t) / n_rep) * t_total * head_dim;
+        let qrow = &q_scaled[r * head_dim..(r + 1) * head_dim];
+        let mut m = f32::NEG_INFINITY;        // 行内运行最大值
+        let mut l = 0.0f32;                   // 行内指数和（最终归一化分母）
+        let mut acc = vec![0.0f32; head_dim]; // 未归一化的输出累加
+        let mut sbuf = vec![0.0f32; bs];      // 块内打分暂存（每行的工作集 = O(block_size)）
+        let mut ks = 0;
+        while ks < k_end {
+            let ke = (ks + bs).min(k_end);
+            let n = ke - ks;
+            // 1) 块内打分 S = Q'·Kᵀ（缩放已在 Q' 里）
+            for jj in 0..n {
+                let krow = &k[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
+                let mut s = 0.0f32;
+                for d in 0..head_dim {
+                    s += qrow[d] * krow[d];
+                }
+                sbuf[jj] = s;
+            }
+            // 2) 在线 softmax：运行最大值更新后，旧累计整体乘 exp(m_old - m_new) 重标定
+            let blk_max = sbuf[..n].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let m_new = m.max(blk_max);
+            let f = (m - m_new).exp(); // m = -inf（首块）时为 0，等价于从零开始累加
+            l *= f;
+            for a in acc.iter_mut() {
+                *a *= f;
+            }
+            // 3) 累加新块的 exp·V
+            for jj in 0..n {
+                let e = (sbuf[jj] - m_new).exp();
+                l += e;
+                let vrow = &v[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
+                for d in 0..head_dim {
+                    acc[d] += e * vrow[d];
+                }
+            }
+            m = m_new;
+            ks = ke;
+        }
+        if l > 0.0 {
+            for d in 0..head_dim {
+                ochunk[d] = acc[d] / l;
+            }
+        }
+    });
+    out
+}
+
+/// GQA 物化的数据版：把 K/V 的 `kv_bh` 个头按 `n_rep` 连续复制成 `kv_bh * n_rep` 个头，
+/// 头序与旧 `repeat_kv` 张量算子一致（输出头 i ← 源头 i / n_rep）。
+///
+/// CPU 分块核在 `flash_forward_cpu` 里用核内索引直接省掉这次物化；
+/// 它只为两条路径保留语义基准：GPU 内核的核外展开，以及反向 matmul 链的输入展开。
+pub(crate) fn repeat_flat(src: &[f32], kv_bh: usize, n_rep: usize) -> Vec<f32> {
+    if n_rep == 1 {
+        return src.to_vec();
+    }
+    let per = src.len() / kv_bh;
+    let mut out = Vec::with_capacity(kv_bh * n_rep * per);
+    for h in 0..kv_bh {
+        let chunk = &src[h * per..(h + 1) * per];
+        for _ in 0..n_rep {
+            out.extend_from_slice(chunk);
+        }
+    }
+    out
+}
+
+/// [`repeat_flat`] 的伴随：把展开后（`kv_bh * n_rep` 组）的梯度按 n_rep 个相邻副本
+/// 求和折回 `kv_bh` 组（⟨repeat_flat(x), g⟩ == ⟨x, fold(g)⟩），即旧 `repeat_kv`
+/// 反向的求和语义。dK/dV 在 GQA 下算在展开布局上，写父梯度前必须先折回。
+fn fold_repeat_grad(src: &[f32], kv_bh: usize, n_rep: usize) -> Vec<f32> {
+    let per = src.len() / (kv_bh * n_rep);
+    let mut out = vec![0.0f32; kv_bh * per];
+    for b in 0..kv_bh {
+        for r in 0..n_rep {
+            let seg = &src[(b * n_rep + r) * per..(b * n_rep + r + 1) * per];
+            for (i, v) in seg.iter().enumerate() {
+                out[b * per + i] += v;
+            }
+        }
+    }
+    out
+}
+
+/// 反向重算注意力概率 P：`softmax(Q'·Kᵀ)`，行内按后缀因果屏蔽（超出 k_end 的位置为 0）。
+///
+/// 分块前向不在前后向之间保留 P（O(T²) 不驻留）；反向先用矩阵乘算 scores，
+/// 再在这里归一化——O(T²) 只作为反向的临时工作集存在（dP/dS 本来也是 O(T²)）。
+#[allow(clippy::too_many_arguments)]
+fn causal_softmax_cpu(
+    x: &[f32],
+    rows: usize,
+    t: usize,
+    t_total: usize,
+    visible_before: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * t_total];
+    out.par_chunks_mut(t_total).enumerate().for_each(|(r, row)| {
+        let i = r % t;
+        let k_end = (i + visible_before + 1).min(t_total);
+        let base = r * t_total;
+        let mut mx = f32::NEG_INFINITY;
+        for j in 0..k_end {
+            mx = mx.max(x[base + j]);
+        }
+        let mut sum = 0.0f32;
+        for j in 0..k_end {
+            let e = (x[base + j] - mx).exp();
+            row[j] = e;
+            sum += e;
+        }
+        for j in 0..k_end {
+            row[j] /= sum;
+        }
+        // k_end..t_total 保持 0：被屏蔽的位置不参与任何反向累加
+    });
+    out
+}
+
+/// flash attention 前向的中间状态：决定反向走「常驻显存」路径还是本地重算。
 enum AttnCache {
-    /// 逐算子/纯 CPU 路径产出的注意力概率 P（留在 CPU）
-    Cpu(Rc<Vec<f32>>),
+    /// 分块前向路径：P 不落地，反向时按同一因果规则就地重算
+    Cpu,
     /// 常驻显存路径：S 与 P 从未离开显存，反向也只回读 dQ/dK/dV
     #[cfg(feature = "gpu")]
     Gpu(Box<crate::gpu::AttnResident>),
@@ -358,7 +786,11 @@ enum AttnCache {
 
 /// 注意力前向的逐算子路径：S = Q'·Kᵀ → P = softmax(S + mask) → O = P·V。
 /// 每个算子各自做 GPU/CPU 分流（`matmul_data` / `gpu::softmax_mask`），返回 (O, P)。
-/// 常驻显存路径不可用时由 `flash_attention` 调用（也是 `LLM_GPU_PROBE` 录制形状时走的路径）。
+///
+/// 现在只服务 `LLM_GPU_PROBE` 形状录制（普通回退已换成 `flash_forward_cpu` 分块核，
+/// 见 `Tensor::flash_attention`）：录制模式下常驻路径整体关闭，这里把前向拆回
+/// 逐算子，让 `matmul` 把真实训练形状记进探针。
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn attn_forward_ops(
     q_scaled: &[f32],
@@ -369,7 +801,7 @@ fn attn_forward_ops(
     t: usize,
     t_total: usize,
     head_dim: usize,
-) -> (Vec<f32>, Rc<Vec<f32>>) {
+) -> (Vec<f32>, Arc<Vec<f32>>) {
     let scores = matmul_data(q_scaled, k, t, head_dim, t_total, bh, false, true);
     let rows = bh * t;
     let m_n = mask.len();
@@ -379,7 +811,7 @@ fn attn_forward_ops(
     #[cfg(not(feature = "gpu"))]
     let attn = masked_softmax_cpu(&scores, mask, rows, t_total, m_n);
     let out = matmul_data(&attn, v, t, t_total, head_dim, bh, false, false);
-    (out, Rc::new(attn))
+    (out, Arc::new(attn))
 }
 
 /// 构造 matmul 的反向闭包（2D 与 3D 批量共用，batch=1 时 bi 循环退化）。
@@ -402,11 +834,13 @@ fn matmul_backward(
     let og = b.grad.clone();
     let sd = a.data.clone();
     let od = b.data.clone();
-    result.parents = Rc::new(vec![a.clone(), b.clone()]);
-    result.backward = Some(Rc::new(move || {
-        let g = rg.borrow();
-        let sd_b = sd.borrow();
-        let od_b = od.borrow();
+    record(
+        &result,
+        vec![a.clone(), b.clone()],
+        Arc::new(move || {
+            let g = rg.borrow();
+        let sd_b = sd.decode();
+        let od_b = od.decode();
         // ∂a = g @ bᵀ、∂b = aᵀ @ g：GPU 内核支持按转置读物理矩阵，
         // 无需在 CPU 构造 52 万~210 万元素的转置矩阵（仅 CPU 回退时才物化）
         let da = matmul_data(&g, &od_b, m, n, k, batch, false, true);
@@ -414,7 +848,9 @@ fn matmul_backward(
         drop(g);
         drop(sd_b);
         drop(od_b);
-        if Rc::ptr_eq(&sg, &og) {
+        // a、b 是同一张量（x@x）时梯度缓冲也是同一把锁——Mutex 不可重入，
+        // 必须走单锁分支把 da/db 依次叠加进同一块缓冲
+        if Shared::ptr_eq(&sg, &og) {
             let mut sgm = sg.borrow_mut();
             for i in 0..batch * m * k {
                 sgm[i] += da[i];
@@ -432,7 +868,8 @@ fn matmul_backward(
                 ogm[j] += db[j];
             }
         }
-    }));
+        }),
+    );
 }
 
 // ==================== Tensor ====================
@@ -440,20 +877,53 @@ fn matmul_backward(
 impl Tensor {
     // ---------- 构造 ----------
     pub(crate) fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
+        Self::new_with_dtype(data, shape, requires_grad, DType::F32)
+    }
+
+    /// 按指定 dtype 落盘的输出构造门：bf16 时在末尾把 f32 计算结果
+    /// 统一 encode 成 u16 位模式存储（算子内的计算始终是 f32）。
+    pub(crate) fn new_with_dtype(
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        requires_grad: bool,
+        dtype: DType,
+    ) -> Self {
         let len = data.len();
         // no_grad 模式下强制关闭求导
         let requires_grad = requires_grad && grad_enabled();
+        let strides = row_major_strides(&shape);
+        let buf = match dtype {
+            DType::F32 => Buffer::F32(data),
+            DType::Bf16 => {
+                use rayon::prelude::*;
+                Buffer::Bf16(data.into_par_iter().map(f32_to_bf16).collect())
+            }
+        };
         Tensor {
-            data: Rc::new(RefCell::new(data)),
+            data: Shared::new(buf),
             shape,
+            strides,
             // 注意：grad 缓冲必须始终按 data 全长分配。反向闭包可能写入
             // **不需要梯度**的父节点（如 masked_softmax 的 mask：它不参与求导，
             // 但闭包仍会往它的 grad 里累加），缓冲长度不足会直接越界 panic。
-            grad: Rc::new(RefCell::new(vec![0.0; len])),
-            requires_grad: Rc::new(Cell::new(requires_grad)),
-            parents: Rc::new(Vec::new()),
-            backward: None,
+            // grad 恒为 f32，不随数据 dtype 变化（见字段注释）。
+            grad: Shared::new(vec![0.0; len]),
+            requires_grad: Arc::new(AtomicBool::new(requires_grad)),
         }
+    }
+
+    /// 以「源张量」的 dtype 继承构造输出——算子出口统一 encode 的接线点。
+    ///
+    /// 算子内全程 f32 计算，构造输出时若源是 bf16 则末尾一次性
+    /// encode 落盘，保持整条计算流的存储 dtype 与源一致。
+    /// `requires_grad` 仍由调用方显式传入（与 dtype 无关）。
+    pub(crate) fn new_like(
+        &self,
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Self {
+        Self::new_with_dtype(data, shape, requires_grad, self.dtype())
     }
 
     /// 该张量在当前模式下是否需要自动微分。
@@ -463,7 +933,7 @@ impl Tensor {
     /// 仍会拿着参数张量的 `requires_grad = true` 一路建出整张计算图。
     #[inline]
     pub(crate) fn req(&self) -> bool {
-        self.requires_grad.get() && grad_enabled()
+        self.requires_grad.load(Ordering::Relaxed) && grad_enabled()
     }
 
     /// 冻结 / 解冻本参数（`requires_grad`）。
@@ -471,13 +941,13 @@ impl Tensor {
     /// 标志是共享的（见字段注释），所以对任意一个克隆句柄调用都作用于同一个参数——
     /// LoRA 里"冻结主干"就是靠它：优化器手里的句柄与模型里的句柄指向同一个开关。
     pub fn set_requires_grad(&self, v: bool) {
-        self.requires_grad.set(v);
+        self.requires_grad.store(v, Ordering::Relaxed);
     }
 
     /// 本参数是否参与训练（no_grad 模式不影响这个"参数属性"，与 [`Tensor::req`] 区分）
     #[inline]
     pub fn requires_grad(&self) -> bool {
-        self.requires_grad.get()
+        self.requires_grad.load(Ordering::Relaxed)
     }
 
     /// 用数据 + 形状构造叶子张量（不追踪梯度，例如输入数据）
@@ -492,6 +962,27 @@ impl Tensor {
             numel
         );
         Tensor::new(data, shape, false)
+    }
+
+    /// 共享一份已有数据缓冲构造张量（**不拷贝数据**）。
+    ///
+    /// 用于「只读消费、由持有方负责变更」的场景：KV cache 的 f32 路径用它把
+    /// 整段历史以 O(1) 交给注意力前向，省掉解码每步 O(T·D) 的克隆（见
+    /// [`crate::attention::KVCache::k`]）。叶子张量：requires_grad = false、
+    /// 不挂 backward；grad 缓冲仍按 data 全长分配——注意力的反向闭包可能往
+    /// 输入张量的 grad 里累加，长度不足会越界（见 [`Tensor::new`] 的注释）。
+    pub(crate) fn shared(data: Shared<Buffer>, shape: Vec<usize>) -> Self {
+        let numel: usize = shape.iter().product();
+        let len = data.borrow().len();
+        assert_eq!(len, numel, "共享数据长度 {len} 与形状 {shape:?} 要求的元素数 {numel} 不一致");
+        let strides = row_major_strides(&shape);
+        Tensor {
+            data, // 零拷贝：直接共享调用方的缓冲句柄
+            shape,
+            strides,
+            grad: Shared::new(vec![0.0; len]),
+            requires_grad: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// 构造参数张量（requires_grad = true）
@@ -509,31 +1000,109 @@ impl Tensor {
 
     // ---------- 访问器 ----------
 
-    /// 返回数据副本（兼容旧调用点，热路径建议用 `data_ref`）
+    /// 数据的物理存储类型（`F32` / `Bf16`，读一次锁槽看变体）。
+    pub fn dtype(&self) -> DType {
+        self.data.borrow().dtype()
+    }
+
+    /// 只读解码视图（算子入口统一读数接口，对应旧 `data.borrow()`）。
+    ///
+    /// - `F32`：直接锁借位，零拷贝零转换；
+    /// - `Bf16`：锁内并行解码成 `Vec<f32>` 后即释放锁，持有解码副本。
+    ///
+    /// 实现 `Deref<Target = [f32]>`，索引 / 切片 / `par_iter` /
+    /// `let r: &[f32] = &guard;` 等既有用法原样成立。
+    /// F32 变体存活期内持有数据锁——期间不要对同一张量再发起读写。
+    pub fn decode(&self) -> DataGuard<'_> {
+        self.data.decode()
+    }
+
+    /// 可变解码视图（优化器等写入点用，对应旧 `data.borrow_mut()`）。
+    ///
+    /// - `F32`：直接可变锁借位；
+    /// - `Bf16`：借位时解码进 f32 缓存，调用方按 f32 就地改，
+    ///   **`Drop` 时统一并行 encode 回 u16 存储**（master weights 语义：
+    ///   参数真存 bf16，更新在 f32 精度下完成后截断回写）。
+    pub fn decode_mut(&self) -> DataGuardMut<'_> {
+        self.data.decode_mut()
+    }
+
+    /// 把数据缓冲**原地**转为 bf16 存储（内存减半），形状/步长/梯度不变。
+    ///
+    /// 变体住在共享槽（`Shared<Buffer>`）里，所以转换后**所有克隆句柄**
+    /// （模型各层的参数句柄、优化器参数表）同步看到 bf16 存储。
+    /// 供训练入口在建模完成后统一调用（`config.bf16` 开启时）；
+    /// 测试里默认不调用，保持既有数值断言在 f32 精度下成立。
+    pub fn to_bf16(&self) {
+        let mut slot = self.data.borrow_mut();
+        if matches!(&*slot, Buffer::Bf16(_)) {
+            return; // 已是 bf16
+        }
+        let encoded = match &*slot {
+            Buffer::F32(v) => {
+                use rayon::prelude::*;
+                Buffer::Bf16(v.par_iter().map(|&x| f32_to_bf16(x)).collect())
+            }
+            Buffer::Bf16(_) => unreachable!(),
+        };
+        *slot = encoded;
+    }
+
+    /// 返回**逻辑序**数据副本（兼容旧调用点，热路径建议用 `decode`）。
+    /// 连续张量直接克隆缓冲；permute 视图按 strides gather，保证返回的
+    /// 永远是行主序逻辑序，与形状对齐。
     pub fn data(&self) -> Vec<f32> {
-        self.data.borrow().clone()
+        if self.is_contiguous() {
+            return self.decode().to_vec();
+        }
+        // 非连续视图：按逻辑下标 → strides 偏移 gather（元素数不大，串行即可）
+        let sd = self.decode();
+        let rank = self.rank();
+        let mut out = vec![0.0f32; self.numel()];
+        let mut idx = vec![0usize; rank];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let _ = i; // 逻辑下标由 idx 里程表维护
+            let mut off = 0usize;
+            for d in 0..rank {
+                off += idx[d] * self.strides[d];
+            }
+            *slot = sd[off];
+            for d in (0..rank).rev() {
+                idx[d] += 1;
+                if idx[d] < self.shape[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        out
     }
 
     /// 只读借用底层数据，避免 O(N) 克隆。
     /// 适用于只读遍历（checkpoint 写入、采样取最后一行等）。
-    pub fn data_ref(&self) -> std::cell::Ref<'_, Vec<f32>> {
-        self.data.borrow()
+    /// 返回 `MutexGuard`：存活期内持有该张量数据锁——持有期间**不要**再对
+    /// 同一张量发起读写（`Mutex` 不可重入，会死锁）。
+    ///
+    /// 注意：返回的是**物理缓冲**，permute 视图下物理序 ≠ 逻辑序；
+    /// 需要逻辑序的调用点（如 checkpoint 存盘）必须先 [`Tensor::contiguous`]。
+    pub fn data_ref(&self) -> DataGuard<'_> {
+        self.decode()
     }
 
     /// 读取标量值（0 维张量专用，避免克隆整个 Vec）
     pub fn item(&self) -> f32 {
         assert_eq!(self.numel(), 1, "item() 只适用于单元素张量");
-        self.data.borrow()[0]
+        // 单元素张量的唯一元素偏移恒为 0（无论 strides）
+        self.decode()[0]
     }
 
     pub fn set_data(&self, new_data: Vec<f32>) {
-        let mut d = self.data.borrow_mut();
+        let mut d = self.decode_mut();
         assert_eq!(d.len(), new_data.len(), "set_data 长度不一致");
-        *d = new_data;
+        d.copy_from_slice(&new_data); // bf16 时 Drop 会把整段 encode 回 u16
     }
 
     /// 读取梯度副本（测试/调试用；训练代码用 `p.grad.borrow()` 原位访问避免拷贝）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn grad(&self) -> Vec<f32> {
         self.grad.borrow().clone()
     }
@@ -571,11 +1140,11 @@ impl Tensor {
     pub fn external_scalar_loss(
         value: f32,
         parents: Vec<Tensor>,
-        backward: impl Fn(f32) + 'static,
+        backward: impl Fn(f32) + Send + Sync + 'static,
     ) -> Tensor {
-        let grad = Rc::new(RefCell::new(vec![0.0f32]));
+        let grad = Shared::new(vec![0.0f32]);
         let slot = grad.clone();
-        let f: Box<dyn Fn()> = Box::new(move || {
+        let f: Box<dyn Fn() + Send + Sync> = Box::new(move || {
             // 上游为 0 说明这条支路没人需要（如被丢弃的那一次梯度累积），
             // 连常驻显存反向都不必白跑一趟
             let upstream = slot.borrow()[0];
@@ -583,14 +1152,15 @@ impl Tensor {
                 backward(upstream);
             }
         });
-        Tensor {
-            data: Rc::new(RefCell::new(vec![value])),
+        let result = Tensor {
+            data: Shared::new(Buffer::F32(vec![value])),
             shape: vec![],
+            strides: Vec::new(), // 0 维张量无步长
             grad,
-            requires_grad: Rc::new(Cell::new(true)),
-            parents: Rc::new(parents),
-            backward: Some(Rc::from(f)),
-        }
+            requires_grad: Arc::new(AtomicBool::new(true)),
+        };
+        record(&result, parents, Arc::from(f));
+        result
     }
 
     /// 构造一个「前向数据已由外部算好、反向也由外部提供」的张量。
@@ -610,18 +1180,20 @@ impl Tensor {
         data: Vec<f32>,
         shape: Vec<usize>,
         parents: Vec<Tensor>,
-        backward: impl FnOnce(Rc<RefCell<Vec<f32>>>) -> Box<dyn Fn()>,
+        backward: impl FnOnce(Shared<Vec<f32>>) -> Box<dyn Fn() + Send + Sync>,
     ) -> Tensor {
-        let grad = Rc::new(RefCell::new(vec![0.0f32; data.len()]));
+        let grad = Shared::new(vec![0.0f32; data.len()]);
         let f = backward(grad.clone());
-        Tensor {
-            data: Rc::new(RefCell::new(data)),
+        let strides = row_major_strides(&shape);
+        let result = Tensor {
+            data: Shared::new(Buffer::F32(data)),
             shape,
+            strides,
             grad,
-            requires_grad: Rc::new(Cell::new(true)),
-            parents: Rc::new(parents),
-            backward: Some(Rc::from(f)),
-        }
+            requires_grad: Arc::new(AtomicBool::new(true)),
+        };
+        record(&result, parents, Arc::from(f));
+        result
     }
 
     pub fn zero_grad(&self) {
@@ -645,8 +1217,80 @@ impl Tensor {
 
     // ---------- 形状工具 ----------
 
+    /// 张量在物理缓冲中是否行主序连续（可按 numel 线性读取）。
+    /// 0 维张量恒为连续；唯一非连续来源是 [`Tensor::permute`] 视图。
+    pub fn is_contiguous(&self) -> bool {
+        self.strides == row_major_strides(&self.shape)
+    }
+
+    /// 物化为连续张量：已连续时返回自身克隆（零开销），
+    /// 非连续（permute 视图）时按 strides gather 到新缓冲。
+    /// 梯度按逻辑序 1:1 回传（视图与父张量的 grad 都是行主序全长）。
+    pub fn contiguous(&self) -> Tensor {
+        if self.is_contiguous() {
+            return self.clone();
+        }
+        let total = self.numel();
+        let rank = self.rank();
+        assert!(rank <= 8, "contiguous 维度过多：{}", rank);
+        let shape = self.shape.clone();
+        let strides = self.strides.clone();
+        let out_data = {
+            let sd = self.decode();
+            let sd_ref: &[f32] = &sd;
+            let mut out_data = vec![0.0f32; total];
+            // 并行按 4096 分块：每个块只分解一次起点下标，
+            // 块内用「里程表进位」递增多维下标，避免逐元素做除法。
+            out_data.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
+                let mut r = ci * 4096;
+                let mut idx = [0usize; 8];
+                for d in (0..rank).rev() {
+                    idx[d] = r % shape[d];
+                    r /= shape[d];
+                }
+                for slot in chunk.iter_mut() {
+                    let mut off = 0usize;
+                    for d in 0..rank {
+                        off += idx[d] * strides[d];
+                    }
+                    *slot = sd_ref[off];
+                    // 里程表 +1（逻辑行主序）
+                    for d in (0..rank).rev() {
+                        idx[d] += 1;
+                        if idx[d] < shape[d] {
+                            break;
+                        }
+                        idx[d] = 0;
+                    }
+                }
+            });
+            drop(sd);
+            out_data
+        };
+        let result = self.new_like(out_data, shape, self.requires_grad.load(Ordering::Relaxed));
+        if self.req() {
+            let rg = result.grad.clone();
+            let sg = self.grad.clone();
+            record(&result, vec![self.clone()], Arc::new(move || {
+                let g = rg.borrow();
+                let g_ref: &[f32] = &g;
+                let mut sgm = sg.borrow_mut();
+                // 物化只改内存布局、不改逻辑元素顺序，梯度 1:1 逐元素累加。
+                sgm.par_chunks_mut(4096)
+                    .zip(g_ref.par_chunks(4096))
+                    .for_each(|(s, gg)| {
+                        for (a, &b) in s.iter_mut().zip(gg) {
+                            *a += b;
+                        }
+                    });
+            }));
+        }
+        result
+    }
+
     /// reshape：不改变元素顺序，梯度按 1:1 传回。
-    /// 共享底层数据 Rc（不克隆 Vec），只分配新的梯度缓冲。
+    /// 连续输入共享底层数据 Arc（不克隆 Vec），只分配新的梯度缓冲；
+    /// 非连续输入（permute 视图）先物化再共享。
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
         let numel: usize = new_shape.iter().product();
         assert_eq!(
@@ -656,20 +1300,22 @@ impl Tensor {
             self.shape,
             new_shape
         );
-        let requires_grad = self.req();
-        let mut result = Tensor {
-            data: self.data.clone(), // Rc 共享，不克隆 Vec
+        // 非连续视图先物化：reshape 后共享的必须是行主序缓冲，
+        // 否则新形状下的线性读取会拿到错位的数据。
+        let src = self.contiguous();
+        let requires_grad = src.req();
+        let strides = row_major_strides(&new_shape);
+        let result = Tensor {
+            data: src.data.clone(), // Arc 共享，不克隆 Vec
             shape: new_shape,
-            grad: Rc::new(RefCell::new(vec![0.0; numel])),
-            requires_grad: Rc::new(Cell::new(requires_grad)),
-            parents: Rc::new(Vec::new()),
-            backward: None,
+            strides,
+            grad: Shared::new(vec![0.0; numel]),
+            requires_grad: Arc::new(AtomicBool::new(requires_grad)),
         };
         if requires_grad {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = src.grad.clone();
+            record(&result, vec![src], Arc::new(move || {
                 let g = rg.borrow();
                 let g_ref: &[f32] = &g;
                 let mut sgm = sg.borrow_mut();
@@ -689,6 +1335,11 @@ impl Tensor {
     }
 
     /// 任意维度重排（如 [0,2,1] 把 2、3 维交换）。
+    ///
+    /// **零拷贝视图**：与源张量共享物理缓冲，只重算 strides
+    /// （`new_strides[i] = self.strides[dims[i]]`）并新建梯度缓冲。
+    /// 线性读算子（matmul/sum_last_dim/flash_attention/reshape 等）在入口
+    /// 检测非连续并自动 [`Tensor::contiguous`] 物化。
     /// 反向：梯度按逆重排传回。
     pub fn permute(&self, dims: &[usize]) -> Tensor {
         assert_eq!(dims.len(), self.rank(), "permute 必须提供所有维度");
@@ -702,70 +1353,75 @@ impl Tensor {
         }
         let new_shape: Vec<usize> = dims.iter().map(|&d| self.shape[d]).collect();
         let total = self.numel();
+        let requires_grad = self.requires_grad.load(Ordering::Relaxed);
 
-        // 反解 permute 的逆映射：inv[perm[i]] = i
-        let mut inv = vec![0usize; self.rank()];
-        for (i, &d) in dims.iter().enumerate() {
-            inv[d] = i;
-        }
-        // 前向：out_flat -> src_flat
-        // 热路径：训练中每步都要对 Q/K/V 拆头、合头做多次 permute，
-        // 原实现每次重建几十万元素的下标表；训练形状固定，缓存一次、Rc 共享即可。
-        // （张量最多 4 维，固定栈数组即可，超过 8 维防御性断言）
-        assert!(self.rank() <= 8, "permute 维度过多：{}", self.rank());
-        let map: Rc<Vec<usize>> = PERMUTE_MAP_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            cache
-                .entry((self.shape.clone(), dims.to_vec()))
-                .or_insert_with(|| {
-                    let mut map = vec![0usize; total];
-                    let mut out_idx = [0usize; 8];
-                    for out_flat in 0..total {
-                        let mut r = out_flat;
-                        for d in (0..self.rank()).rev() {
-                            out_idx[d] = r % new_shape[d];
-                            r /= new_shape[d];
-                        }
-                        let mut src_flat = 0usize;
-                        for d in 0..self.rank() {
-                            let sd = out_idx[inv[d]]; // 源的第 d 维来自输出的第 inv[d] 维
-                            src_flat = src_flat * self.shape[d] + sd;
-                        }
-                        map[out_flat] = src_flat;
-                    }
-                    Rc::new(map)
-                })
-                .clone()
-        });
-
-        let sd = self.data.borrow();
-        let sd_ref: &[f32] = &sd;
-        let map_ref: &[usize] = &map;
-        let mut out_data = vec![0.0f32; total];
-        // 并行：每块 4096 元素，permute 只是查表搬移，适合多核
-        out_data
-            .par_chunks_mut(4096)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let base = ci * 4096;
-                for (j, slot) in chunk.iter_mut().enumerate() {
-                    *slot = sd_ref[map_ref[base + j]];
-                }
-            });
-        drop(sd);
-
-        let mut result = Tensor::new(out_data, new_shape, self.requires_grad.get());
+        // 零拷贝：共享物理缓冲，按排列取源 strides 得到新视图布局
+        let new_strides: Vec<usize> = dims.iter().map(|&d| self.strides[d]).collect();
+        let result = Tensor {
+            data: self.data.clone(), // Arc 共享，不克隆 Vec
+            shape: new_shape.clone(),
+            strides: new_strides,
+            grad: Shared::new(vec![0.0; total]),
+            requires_grad: Arc::new(AtomicBool::new(requires_grad)),
+        };
         if self.req() {
+            // 反解 permute 的逆映射：inv[perm[i]] = i
+            let mut inv = vec![0usize; self.rank()];
+            for (i, &d) in dims.iter().enumerate() {
+                inv[d] = i;
+            }
+            // 反向闭包持有的 map 是 out_flat -> src_flat（**逻辑行主序**下的
+            // 置换，与物理 strides 无关）：视图的 grad 与父张量的 grad 都是
+            // 逻辑行主序全长缓冲，所以原地查表回填依然成立。
+            // 热路径：训练中每步都要对 Q/K/V 拆头、合头做多次 permute，
+            // 缓存置换表一次、Arc 共享即可。
+            // （张量最多 4 维，固定栈数组即可，超过 8 维防御性断言）
+            assert!(self.rank() <= 8, "permute 维度过多：{}", self.rank());
+            let map: Arc<Vec<usize>> = PERMUTE_MAP_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                cache
+                    .entry((self.shape.clone(), dims.to_vec()))
+                    .or_insert_with(|| {
+                        let mut map = vec![0usize; total];
+                        let mut out_idx = [0usize; 8];
+                        for out_flat in 0..total {
+                            let mut r = out_flat;
+                            for d in (0..self.rank()).rev() {
+                                out_idx[d] = r % new_shape[d];
+                                r /= new_shape[d];
+                            }
+                            let mut src_flat = 0usize;
+                            for d in 0..self.rank() {
+                                let sd = out_idx[inv[d]]; // 源的第 d 维来自输出的第 inv[d] 维
+                                src_flat = src_flat * self.shape[d] + sd;
+                            }
+                            map[out_flat] = src_flat;
+                        }
+                        Arc::new(map)
+                    })
+                    .clone()
+            });
             let rg = result.grad.clone();
             let sg = self.grad.clone();
-            let map_bw = map.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![self.clone()], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for (of, &sf) in map_bw.iter().enumerate() {
-                    sgm[sf] += g[of];
+                let g_ref: &[f32] = &g;
+                let mb: &[usize] = &map;
+                // map 是 out→src 的置换（双射）：先串行建逆映射 src→out（纯整数
+                // 赋值，远比浮点循环便宜），再按梯度槽位分块并行回填——双射保证
+                // 每个槽位只被一个输出索引命中，块间无写冲突。
+                let mut inv = vec![0usize; mb.len()];
+                for (of, &sf) in mb.iter().enumerate() {
+                    inv[sf] = of;
                 }
+                let inv_ref: &[usize] = &inv;
+                sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
+                    let base = ci * 4096;
+                    for (j, s) in ch.iter_mut().enumerate() {
+                        *s += g_ref[inv_ref[base + j]];
+                    }
+                });
             }));
         }
         result
@@ -808,7 +1464,7 @@ impl Tensor {
             } else {
                 match self.suffix_mod(&target) {
                     Some(n) => SrcIdx::Mod(n),
-                    None => SrcIdx::Map(Rc::new(broadcast_map(&target, &self.shape))),
+                    None => SrcIdx::Map(Arc::new(broadcast_map(&target, &self.shape))),
                 }
             };
             let b_src = if other.shape == target {
@@ -816,7 +1472,7 @@ impl Tensor {
             } else {
                 match other.suffix_mod(&target) {
                     Some(n) => SrcIdx::Mod(n),
-                    None => SrcIdx::Map(Rc::new(broadcast_map(&target, &other.shape))),
+                    None => SrcIdx::Map(Arc::new(broadcast_map(&target, &other.shape))),
                 }
             };
             (target, a_src, b_src)
@@ -833,17 +1489,17 @@ impl Tensor {
 
     /// 逐元素乘法。
     ///
-    /// 主训练路径上的乘法都走融合算子（`matmul` / `swiglu` / `layer_norm` 等内部一次算完），
-    /// 所以这个方法版在非测试构建里没有调用点。它是**分步参考实现**：测试用
-    /// `mul` / `div` / `sum_last_dim` 串出"手写版"公式，再与融合算子的输出比对，
+    /// 主训练路径上的乘法多走融合算子（`matmul` / `swiglu` / `layer_norm` 等内部一次算完），
+    /// 但 MoE 辅助损失、分布式对齐等路径仍在用这个方法版。它同时是**分步参考实现**：
+    /// 测试用 `mul` / `div` / `sum_last_dim` 串出"手写版"公式，再与融合算子的输出比对，
     /// 融合实现一旦写错（比如反向系数符号反了）就会被这些测试抓住。
-    #[allow(dead_code)]
     pub fn mul(&self, other: &Tensor) -> Tensor {
         // ∂c/∂a = b，∂c/∂b = a
         self.binary(other, |a, b| a * b, |a, b| (b, a))
     }
 
-    /// 逐元素除法。调用点与保留理由同 [`Tensor::mul`]。
+    /// 逐元素除法。生产路径无调用点，作为分步参考实现保留给测试
+    /// （理由同 [`Tensor::mul`]：用定义式公式与融合算子比对数值）。
     #[allow(dead_code)]
     pub fn div(&self, other: &Tensor) -> Tensor {
         // 反向必须与前向 `a / b` 严格对应（∂/∂a = 1/b，∂/∂b = -a/b²）。
@@ -861,13 +1517,20 @@ impl Tensor {
         &self,
         other: &Tensor,
         fwd: impl Fn(f32, f32) -> f32 + Sync + 'static,
-        back: impl Fn(f32, f32) -> (f32, f32) + Sync + 'static,
+        // back 会被 move 进反向闭包（类型是 Arc<dyn Fn() + Send + Sync>），故需 Send
+        back: impl Fn(f32, f32) -> (f32, f32) + Sync + Send + 'static,
     ) -> Tensor {
-        let (target_shape, a_src, b_src) = self.broadcast_plan(other);
-        let sa = self.data.borrow();
-        let sb = other.data.borrow();
+        // 非连续（permute 视图）先物化，下文按行主序线性读（含反向闭包按缓冲读）
+        let lhs = self.contiguous();
+        let rhs = other.contiguous();
+        let (target_shape, a_src, b_src) = lhs.broadcast_plan(&rhs);
+        // 同一张量参与两次（如 x + x）时两把锁是同一个 Mutex——不可重入会死锁，
+        // 判同一后只借一把锁、两个视图都指向它（shared borrow 可安全别名）
+        let same_data = Shared::ptr_eq(&lhs.data, &rhs.data);
+        let sa = lhs.decode();
+        let sb = if same_data { None } else { Some(rhs.decode()) };
         let sa_ref: &[f32] = &sa;
-        let sb_ref: &[f32] = &sb;
+        let sb_ref: &[f32] = sb.as_deref().unwrap_or(&sa);
         let total: usize = target_shape.iter().product();
         let a_view: SrcIdxView<'_> = (&a_src).into();
         let b_view: SrcIdxView<'_> = (&b_src).into();
@@ -885,30 +1548,33 @@ impl Tensor {
         drop(sa);
         drop(sb);
 
-        let requires = self.req() || other.req();
-        let mut result = Tensor::new(out_data, target_shape, requires);
+        let requires = lhs.req() || rhs.req();
+        // 输出继承左操作数的 dtype（bf16 流下逐元素算子保持存储精度一致）
+        let result = lhs.new_like(out_data, target_shape, requires);
         if requires {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            let og = other.grad.clone();
-            let sd = self.data.clone();
-            let od = other.data.clone();
-            // 广播索引方式随闭包带走（Mod 不占内存，Map 是 Rc 共享，无需克隆 4-16MB map）
+            let sg = lhs.grad.clone();
+            let og = rhs.grad.clone();
+            let sd = lhs.data.clone();
+            let od = rhs.data.clone();
+            // 广播索引方式随闭包带走（Mod 不占内存，Map 是 Arc 共享，无需克隆 4-16MB map）
             let a_src_c = a_src;
             let b_src_c = b_src;
-            let same_shape = self.shape == other.shape;
-            result.parents = Rc::new(vec![self.clone(), other.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let same_shape = lhs.shape == rhs.shape;
+            record(&result, vec![lhs, rhs], Arc::new(move || {
                 let g = rg.borrow();
-                let sd_b = sd.borrow();
-                let od_b = od.borrow();
+                // 同一张量参与两次（如 x*x）时 sd/od 是同一把 Mutex——判同一后只借一把锁，
+                // 两个只读视图都指向它（shared borrow 可安全别名）
+                let same_data = Shared::ptr_eq(&sd, &od);
+                let sd_b = sd.decode();
+                let od_b = if same_data { None } else { Some(od.decode()) };
                 let g_ref: &[f32] = &g;
                 let sd_ref: &[f32] = &sd_b;
-                let od_ref: &[f32] = &od_b;
+                let od_ref: &[f32] = od_b.as_deref().unwrap_or(&sd_b);
                 if same_shape {
                     // 形状相同 ⇒ 两侧索引都是恒等（见 broadcast_plan），可以按块并行。
                     // 残差相加、x*x 这类占反向的大头，串行时单步 ~0.5s。
-                    if Rc::ptr_eq(&sg, &og) {
+                    if Shared::ptr_eq(&sg, &og) {
                         // 同一张量参与运算（如 x*x、x/x），两条路径梯度叠加
                         let mut sgm = sg.borrow_mut();
                         sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
@@ -936,14 +1602,99 @@ impl Tensor {
                             });
                     }
                 } else {
+                    // 广播分支：Mod/Map 的目标是多对一（如 t % numel），不能按
+                    // 槽位分块直写。形状==目标的一侧槽位与 t 对齐，可直接分块并行；
+                    // 另一侧先在块内收集 (槽位, 值)，再按块序串行合并——合并顺序
+                    // 等于 t 递增顺序，与原串行累加逐位一致。
+                    let av = SrcIdxView::from(&a_src_c);
+                    let bv = SrcIdxView::from(&b_src_c);
+                    let a_aligned = matches!(a_src_c, SrcIdx::Ident);
+                    let b_aligned = matches!(b_src_c, SrcIdx::Ident);
                     let mut sgm = sg.borrow_mut();
                     let mut ogm = og.borrow_mut();
-                    for t in 0..g.len() {
-                        let ia = src_idx(t, &a_src_c);
-                        let ib = src_idx(t, &b_src_c);
-                        let (da, db) = back(sd_ref[ia], od_ref[ib]);
-                        sgm[ia] += g[t] * da;
-                        ogm[ib] += g[t] * db;
+                    match (a_aligned, b_aligned) {
+                        (true, false) => {
+                            // a 恒等直写；b 多对一，块内收集后合并进 ogm
+                            let partials: Vec<Vec<(usize, f32)>> = sgm
+                                .par_chunks_mut(4096)
+                                .enumerate()
+                                .map(|(ci, ch)| {
+                                    let base = ci * 4096;
+                                    let mut local = Vec::with_capacity(ch.len());
+                                    for (j, s) in ch.iter_mut().enumerate() {
+                                        let t = base + j;
+                                        let ib = bv.idx(t);
+                                        let (da, db) = back(sd_ref[t], od_ref[ib]);
+                                        *s += g_ref[t] * da;
+                                        local.push((ib, g_ref[t] * db));
+                                    }
+                                    local
+                                })
+                                .collect();
+                            for part in partials {
+                                for (i, v) in part {
+                                    ogm[i] += v;
+                                }
+                            }
+                        }
+                        (false, true) => {
+                            // b 恒等直写；a 多对一，块内收集后合并进 sgm
+                            let partials: Vec<Vec<(usize, f32)>> = ogm
+                                .par_chunks_mut(4096)
+                                .enumerate()
+                                .map(|(ci, ch)| {
+                                    let base = ci * 4096;
+                                    let mut local = Vec::with_capacity(ch.len());
+                                    for (j, s) in ch.iter_mut().enumerate() {
+                                        let t = base + j;
+                                        let ia = av.idx(t);
+                                        let (da, db) = back(sd_ref[ia], od_ref[t]);
+                                        *s += g_ref[t] * db;
+                                        local.push((ia, g_ref[t] * da));
+                                    }
+                                    local
+                                })
+                                .collect();
+                            for part in partials {
+                                for (i, v) in part {
+                                    sgm[i] += v;
+                                }
+                            }
+                        }
+                        _ => {
+                            // 两侧都多对一：并行收集两侧 (槽位, 值) 后按块序合并
+                            let (pa, pb): (
+                                Vec<Vec<(usize, f32)>>,
+                                Vec<Vec<(usize, f32)>>,
+                            ) = g_ref
+                                .par_chunks(4096)
+                                .enumerate()
+                                .map(|(ci, gc)| {
+                                    let base = ci * 4096;
+                                    let mut la = Vec::with_capacity(gc.len());
+                                    let mut lb = Vec::with_capacity(gc.len());
+                                    for (k, &gv) in gc.iter().enumerate() {
+                                        let t = base + k;
+                                        let ia = av.idx(t);
+                                        let ib = bv.idx(t);
+                                        let (da, db) = back(sd_ref[ia], od_ref[ib]);
+                                        la.push((ia, gv * da));
+                                        lb.push((ib, gv * db));
+                                    }
+                                    (la, lb)
+                                })
+                                .collect();
+                            for part in pa {
+                                for (i, v) in part {
+                                    sgm[i] += v;
+                                }
+                            }
+                            for part in pb {
+                                for (i, v) in part {
+                                    ogm[i] += v;
+                                }
+                            }
+                        }
                     }
                 }
             }));
@@ -959,36 +1710,45 @@ impl Tensor {
     /// 非测试构建里没有调用点；测试在分步参考实现里用它补齐公式。
     #[allow(dead_code)]
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
-        let data = self.data.borrow().iter().map(|a| a + scalar).collect();
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        // 非连续先物化，下文按行主序线性读
+        let x = self.contiguous();
+        let data = x.decode().iter().map(|a| a + scalar).collect();
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i];
-                }
+                let g_ref: &[f32] = &g;
+                // 加标量的反向是恒等映射：整段梯度逐位搬运，按元素并行
+                sgm.par_iter_mut()
+                    .zip(g_ref.par_iter())
+                    .for_each(|(s, &gv)| *s += gv);
             }));
         }
         result
     }
 
     pub fn mul_scalar(&self, scalar: f32) -> Tensor {
-        let data = self.data.borrow().iter().map(|a| a * scalar).collect();
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        // 非连续先物化，下文按行主序线性读
+        let x = self.contiguous();
+        let data: Vec<f32> = x
+            .decode()
+            .par_iter()
+            .map(|&a| a * scalar)
+            .collect();
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i] * scalar;
-                }
+                let g_ref: &[f32] = &g;
+                sgm.par_iter_mut()
+                    .zip(g_ref.par_iter())
+                    .for_each(|(s, &gv)| *s += gv * scalar);
             }));
         }
         result
@@ -1003,13 +1763,14 @@ impl Tensor {
     /// 在语义上闭合（有 `sub` 就该有 `neg`），代价只是一个 `allow(dead_code)`。
     #[allow(dead_code)]
     pub fn neg(&self) -> Tensor {
-        let data = self.data.borrow().iter().map(|a| -a).collect();
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        // 非连续先物化，下文按行主序线性读
+        let x = self.contiguous();
+        let data = x.decode().iter().map(|a| -a).collect();
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
@@ -1023,19 +1784,20 @@ impl Tensor {
     /// ReLU：c = max(0, x)，∂x = g * (x>0)
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn relu(&self) -> Tensor {
-        let sd = self.data.borrow();
+        // 非连续先物化，下文按行主序线性读
+        let x = self.contiguous();
+        let sd = x.decode();
         let data = sd.iter().map(|&a| a.max(0.0)).collect();
         let mask: Vec<f32> = sd
             .iter()
             .map(|&a| if a > 0.0 { 1.0 } else { 0.0 })
             .collect();
         drop(sd);
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
@@ -1049,15 +1811,16 @@ impl Tensor {
     /// tanh：c = tanh(x)，∂x = g * (1 - c²)
     #[allow(dead_code)]
     pub fn tanh(&self) -> Tensor {
-        let sd = self.data.borrow();
+        // 非连续先物化，下文按行主序线性读
+        let x = self.contiguous();
+        let sd = x.decode();
         let data: Vec<f32> = sd.iter().map(|&a| a.tanh()).collect();
         drop(sd);
-        let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(data.clone(), x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
@@ -1069,12 +1832,14 @@ impl Tensor {
     }
 
     /// GELU（用 tanh 近似）：c = 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
-    /// 这是 GPT 系列使用的激活函数。
+    /// 这是现代 LLM使用的激活函数。
     /// 反向：dGELU/dx = 0.5(1+t) + 0.5x(1-t²)·da/dx，其中 a = √(2/π)(x+0.044715x³)，t = tanh(a)
     pub fn gelu(&self) -> Tensor {
         const SQRT_2_PI: f32 = 0.797_884_560_8; // sqrt(2/π)
         const COEF: f32 = 0.044_715;
-        let sd = self.data.borrow();
+        // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 sd）
+        let x = self.contiguous();
+        let sd = x.decode();
         let sd_ref: &[f32] = &sd;
         let len = sd_ref.len();
         let mut data = vec![0.0f32; len];
@@ -1094,16 +1859,15 @@ impl Tensor {
                 }
             });
         drop(sd);
-        let mut result = Tensor::new(data.clone(), self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(data.clone(), x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            let sd = self.data.clone();
+            let sg = x.grad.clone();
+            let sd = x.data.clone();
             let tv = t_vals;
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
-                let x_b = sd.borrow();
+                let x_b = sd.decode();
                 let mut sgm = sg.borrow_mut();
                 // 提取为 Vec（Send），供 rayon 闭包安全使用
                 let g_vec: Vec<f32> = g.iter().copied().collect();
@@ -1156,14 +1920,20 @@ impl Tensor {
             self.shape, gate.shape,
             "SwiGLU 的两个输入形状必须一致"
         );
-        let sd = self.data.borrow();
-        let gd = gate.data.borrow();
+        // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 xd/gd）
+        let x = self.contiguous();
+        let g_in = gate.contiguous();
+        // swiglu(x, x)：判同一后只借一把锁（Mutex 不可重入），两个视图都指向它
+        let same_data = Shared::ptr_eq(&x.data, &g_in.data);
+        let sd = x.decode();
+        let gd = if same_data { None } else { Some(g_in.decode()) };
+        let gd_ref_owned: &[f32] = gd.as_deref().unwrap_or(&sd);
         let len = sd.len();
         let mut out_data = vec![0.0f32; len];
         let mut silu_vals = vec![0.0f32; len]; // SiLU(x) = x * sigmoid(x)
         let mut sig_vals = vec![0.0f32; len]; // sigmoid(x)
         let sd_ref: &[f32] = &sd;
-        let gd_ref: &[f32] = &gd;
+        let gd_ref: &[f32] = gd_ref_owned;
         // 并行：逐元素融合
         out_data
             .par_chunks_mut(4096)
@@ -1186,35 +1956,56 @@ impl Tensor {
         drop(sd);
         drop(gd);
 
-        let requires = self.req() || gate.req();
-        let mut result = Tensor::new(out_data, self.shape.clone(), requires);
+        let requires = x.req() || g_in.req();
+        let result = x.new_like(out_data, x.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
-            let sx = self.grad.clone();
-            let sg = gate.grad.clone();
-            let xd = self.data.clone();
-            let gd = gate.data.clone();
+            let sx = x.grad.clone();
+            let sg = g_in.grad.clone();
+            let xd = x.data.clone();
+            let gd = g_in.data.clone();
             let sv = silu_vals;
             let sig = sig_vals;
-            result.parents = Rc::new(vec![self.clone(), gate.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![x, g_in], Arc::new(move || {
+                // 梯度缓冲判同一：swiglu(x, x) 时 self 与 gate 共用同一把锁，
+                // Mutex 不可重入——同缓冲必须单锁、两份贡献依次叠加进同一块内存
+                let same_grad = Shared::ptr_eq(&sx, &sg);
                 let g = rg.borrow();
-                let x_b = xd.borrow();
-                let g_b = gd.borrow();
-                let mut gx = sx.borrow_mut();
-                let mut gg = sg.borrow_mut();
+                let x_b_guard = xd.decode();
+                let g_b_guard = if Shared::ptr_eq(&xd, &gd) {
+                    None
+                } else {
+                    Some(gd.decode())
+                };
+                let x_b: &[f32] = &x_b_guard;
+                let g_b: &[f32] = g_b_guard.as_deref().unwrap_or(&x_b_guard);
                 let len = g.len();
-                // gx 和 gg 写不同数组，可以安全并行
-                // 但 RefCell 限制同时可变借用。用索引分块处理。
                 let chunk = 4096;
-                for start in (0..len).step_by(chunk) {
-                    let end = (start + chunk).min(len);
-                    for i in start..end {
-                        let sig_v = sig[i];
-                        let silu_v = sv[i];
-                        gg[i] += g[i] * silu_v;
-                        let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
-                        gx[i] += g[i] * g_b[i] * dsig;
+                if same_grad {
+                    // 同一缓冲：∂gate = g·silu(x)，∂x = g·gate·dsigmoid，
+                    // 两笔都累加进同一块内存，合成一次 +=
+                    let mut gx = sx.borrow_mut();
+                    for start in (0..len).step_by(chunk) {
+                        let end = (start + chunk).min(len);
+                        for i in start..end {
+                            let sig_v = sig[i];
+                            let silu_v = sv[i];
+                            let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
+                            gx[i] += g[i] * silu_v + g[i] * g_b[i] * dsig;
+                        }
+                    }
+                } else {
+                    let mut gx = sx.borrow_mut();
+                    let mut gg = sg.borrow_mut();
+                    for start in (0..len).step_by(chunk) {
+                        let end = (start + chunk).min(len);
+                        for i in start..end {
+                            let sig_v = sig[i];
+                            let silu_v = sv[i];
+                            gg[i] += g[i] * silu_v;
+                            let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
+                            gx[i] += g[i] * g_b[i] * dsig;
+                        }
                     }
                 }
             }));
@@ -1223,23 +2014,27 @@ impl Tensor {
     }
 
     /// log：c = ln(x)，∂x = g / x（cross_entropy 已改用 log_softmax_last_dim，仅测试使用）
+    ///
+    /// 前向以 [`EPS`] 为下界再取 ln：与反向的 `g / max(x, EPS)` 保持一致。
+    /// 否则 x=0 时前向是 -inf、反向是 g/EPS，两个不一致的奇点相遇容易滚出 NaN。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn log(&self) -> Tensor {
-        let sd = self.data.borrow();
-        let data: Vec<f32> = sd.iter().map(|&a| a.ln()).collect();
+        // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 sd）
+        let x = self.contiguous();
+        let sd = x.decode();
+        let data: Vec<f32> = sd.iter().map(|&a| a.max(EPS).ln()).collect();
         drop(sd);
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            let sd = self.data.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            let sd = x.data.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
-                let sd_b = sd.borrow();
+                let sd_b = sd.decode();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
-                    sgm[i] += g[i] / (sd_b[i] + EPS);
+                    sgm[i] += g[i] / sd_b[i].max(EPS);
                 }
             }));
         }
@@ -1248,18 +2043,19 @@ impl Tensor {
 
     /// 幂：c = x^p，∂x = g * p * x^(p-1)
     pub fn pow(&self, p: f32) -> Tensor {
-        let sd = self.data.borrow();
+        // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 sd）
+        let x = self.contiguous();
+        let sd = x.decode();
         let data: Vec<f32> = sd.iter().map(|&a| a.powf(p)).collect();
         drop(sd);
-        let mut result = Tensor::new(data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            let sd = self.data.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            let sd = x.data.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
-                let sd_b = sd.borrow();
+                let sd_b = sd.decode();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
                     sgm[i] += g[i] * p * sd_b[i].powf(p - 1.0);
@@ -1289,48 +2085,61 @@ impl Tensor {
             self.rank(),
             other.rank()
         );
-        if self.rank() == 2 {
-            return self.matmul_2d(other);
+        // 入口物化：permute 视图（如权重 transpose）先 gather 成连续缓冲，
+        // matmul_data 按行主序线性读；连续时 contiguous() 只是克隆句柄、零开销。
+        let a = self.contiguous();
+        let b = other.contiguous();
+        if a.rank() == 2 {
+            return a.matmul_2d(&b);
         }
         // 3D 批量
-        assert_eq!(self.shape[0], other.shape[0], "批量维度必须一致");
-        let (b, m, k1) = (self.shape[0], self.shape[1], self.shape[2]);
-        let (_, k2, n) = (other.shape[0], other.shape[1], other.shape[2]);
+        assert_eq!(a.shape[0], b.shape[0], "批量维度必须一致");
+        let (m, k1) = (a.shape[1], a.shape[2]);
+        let (k2, n) = (b.shape[1], b.shape[2]);
         assert_eq!(k1, k2, "矩阵乘法维度不匹配");
 
-        let sd = self.data.borrow();
-        let od = other.data.borrow();
-        let out_data = matmul_data(&sd, &od, m, k1, n, b, false, false);
+        // x@x：判同一后只借一把锁（Mutex 不可重入），两个视图都指向它
+        let same_data = Shared::ptr_eq(&a.data, &b.data);
+        let sd = a.decode();
+        let od = if same_data { None } else { Some(b.decode()) };
+        let od_ref: &[f32] = od.as_deref().unwrap_or(&sd);
+        let out_data = matmul_data(&sd, od_ref, m, k1, n, a.shape[0], false, false);
         drop(sd);
         drop(od);
 
-        let requires = self.req() || other.req();
-        let mut result = Tensor::new(out_data, vec![b, m, n], requires);
+        let requires = a.req() || b.req();
+        let mut result = a.new_like(out_data, vec![a.shape[0], m, n], requires);
         if requires {
-            matmul_backward(&mut result, self, other, m, k1, n, b);
+            matmul_backward(&mut result, &a, &b, m, k1, n, a.shape[0]);
         }
         result
     }
 
     fn matmul_2d(&self, other: &Tensor) -> Tensor {
-        let (m, k1) = (self.shape[0], self.shape[1]);
-        let (k2, n) = (other.shape[0], other.shape[1]);
+        // 入口物化（matmul 已物化过，这里承接直接调用者）
+        let a = self.contiguous();
+        let b = other.contiguous();
+        let (m, k1) = (a.shape[0], a.shape[1]);
+        let (k2, n) = (b.shape[0], b.shape[1]);
         assert_eq!(
             k1, k2,
             "矩阵乘法维度不匹配：{:?} x {:?}",
-            self.shape, other.shape
+            a.shape, b.shape
         );
 
-        let sd = self.data.borrow();
-        let od = other.data.borrow();
-        let out_data = matmul_data(&sd, &od, m, k1, n, 1, false, false);
+        // x@x：判同一后只借一把锁（Mutex 不可重入），两个视图都指向它
+        let same_data = Shared::ptr_eq(&a.data, &b.data);
+        let sd = a.decode();
+        let od = if same_data { None } else { Some(b.decode()) };
+        let od_ref: &[f32] = od.as_deref().unwrap_or(&sd);
+        let out_data = matmul_data(&sd, od_ref, m, k1, n, 1, false, false);
         drop(sd);
         drop(od);
 
-        let requires = self.req() || other.req();
-        let mut result = Tensor::new(out_data, vec![m, n], requires);
+        let requires = a.req() || b.req();
+        let mut result = a.new_like(out_data, vec![m, n], requires);
         if requires {
-            matmul_backward(&mut result, self, other, m, k1, n, 1);
+            matmul_backward(&mut result, &a, &b, m, k1, n, 1);
         }
         result
     }
@@ -1345,55 +2154,69 @@ impl Tensor {
     /// 只支持 2D × 2D：调用方（[`crate::layers::Linear`]）会先把 3D 输入展平成 2D。
     /// `W` 不参与求导这件事由调用方保证，这里不看 `W.requires_grad`。
     pub fn matmul_frozen(&self, w: &Tensor) -> Tensor {
-        assert_eq!(self.rank(), 2, "matmul_frozen 的左操作数必须为 2D");
+        // 入口物化（permute 视图先 gather 成连续缓冲）
+        let a = self.contiguous();
+        let w = w.contiguous();
+        assert_eq!(a.rank(), 2, "matmul_frozen 的左操作数必须为 2D");
         assert_eq!(w.rank(), 2, "matmul_frozen 的右操作数必须为 2D");
-        let (m, k1) = (self.shape[0], self.shape[1]);
+        let (m, k1) = (a.shape[0], a.shape[1]);
         let (k2, n) = (w.shape[0], w.shape[1]);
         assert_eq!(
             k1, k2,
             "矩阵乘法维度不匹配：{:?} x {:?}",
-            self.shape, w.shape
+            a.shape, w.shape
         );
 
-        let sd = self.data.borrow();
-        let wd = w.data.borrow();
-        let out_data = matmul_data(&sd, &wd, m, k1, n, 1, false, false);
+        // x@W：W 是独立权重参数，正常不会与 x 同一张量；仍判同一防 Mutex 死锁
+        let same_data = Shared::ptr_eq(&a.data, &w.data);
+        let sd = a.decode();
+        let wd = if same_data { None } else { Some(w.decode()) };
+        let wd_ref: &[f32] = wd.as_deref().unwrap_or(&sd);
+        let out_data = matmul_data(&sd, wd_ref, m, k1, n, 1, false, false);
         drop(sd);
         drop(wd);
 
         // 左操作数不需要梯度（推理，或输入本身是常量）→ 反向整段省掉
-        if !self.req() {
-            return Tensor::from_vec(out_data, vec![m, n]);
+        if !a.req() {
+            // 出口继承左操作数 dtype：bf16 流下同样走 encode 落盘
+            return a.new_like(out_data, vec![m, n], false);
         }
-        let x_bwd = self.clone();
+        let x_bwd = a.clone();
         let w_bwd = w.clone();
-        Tensor::external(out_data, vec![m, n], vec![self.clone()], move |grad| {
+        let out_dtype = a.dtype();
+        let result = Tensor::external(out_data, vec![m, n], vec![a], move |grad| {
             Box::new(move || {
                 let g = grad.borrow();
-                let wd = w_bwd.data.borrow();
+                let wd = w_bwd.decode();
                 // dx = g @ Wᵀ：g 是 [m, n]，W 是 [k, n]（按 n 转置读）→ [m, k]
                 let dx = matmul_data(&g, &wd, m, n, k1, 1, false, true);
                 x_bwd.accumulate_grad(&dx, 1.0);
             })
-        })
+        });
+        // external 固定按 f32 落盘，源是 bf16 时补一次原地 encode 对齐 dtype
+        if matches!(out_dtype, DType::Bf16) {
+            result.to_bf16();
+        }
+        result
     }
 
     // ---------- 归约运算 ----------
 
     /// 求和成标量，梯度均匀传给每个元素
     pub fn sum(&self) -> Tensor {
-        let total = self.data.borrow().iter().sum();
-        let mut result = Tensor::new(vec![total], vec![], self.requires_grad.get());
-        if self.req() {
+        // 入口物化：非连续视图先 gather（连续时零开销），下文按缓冲线性求和
+        let a = self.contiguous();
+        // 并行归约：各线程算部分和再合并（大张量求和不再占满一个核）
+        let total: f32 = a.decode().par_iter().sum();
+        let result = a.new_like(vec![total], vec![], a.requires_grad.load(Ordering::Relaxed));
+        if a.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = a.grad.clone();
+            record(&result, vec![a], Arc::new(move || {
                 let g = rg.borrow()[0];
                 let mut sgm = sg.borrow_mut();
-                for v in sgm.iter_mut() {
-                    *v += g;
-                }
+                // 并行：标量梯度均匀摊给每个元素，各写各的槽、无冲突
+                sgm.par_iter_mut().for_each(|v| *v += g);
             }));
         }
         result
@@ -1402,42 +2225,47 @@ impl Tensor {
     /// 沿最后一维求和，**保持维度**：[..., D] -> [..., 1]
     /// 反向：梯度广播回最后一维
     ///
-    /// 主路径上需要求和的地方都用了更专门的融合算子，所以这个方法在非测试构建里没有调用点。
-    /// 它是**分步参考实现**：测试用它把归一化、注意力打分等公式按定义一步步写出来，
+    /// 主路径上需要求和的地方多用更专门的融合算子，但 MoE 辅助损失等路径仍直接调用它。
+    /// 它也是**分步参考实现**：测试用它把归一化、注意力打分等公式按定义一步步写出来，
     /// 再与融合算子比对数值（见 [`Tensor::mul`] 的说明）。
-    #[allow(dead_code)]
     pub fn sum_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "sum_last_dim 需要至少 1 维");
+        // 非连续（permute 视图）先物化，下文按行主序线性读
+        let a = self.contiguous();
         let (pre, d) = (
-            self.numel() / self.shape[self.rank() - 1],
-            self.shape[self.rank() - 1],
+            a.numel() / a.shape[a.rank() - 1],
+            a.shape[a.rank() - 1],
         );
-        let sd = self.data.borrow();
+        let sd = a.decode();
+        let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; pre];
-        for p in 0..pre {
-            let mut s = 0.0;
-            for j in 0..d {
-                s += sd[p * d + j];
-            }
-            out_data[p] = s;
-        }
+        // 并行：每行（长度 d）独立求和，行间无依赖；行内求和顺序不变
+        out_data
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(p, slot)| {
+                *slot = sd_ref[p * d..p * d + d].iter().sum();
+            });
         drop(sd);
-        let mut new_shape = self.shape.clone();
+        let mut new_shape = a.shape.clone();
         *new_shape.last_mut().unwrap() = 1;
 
-        let mut result = Tensor::new(out_data, new_shape, self.requires_grad.get());
-        if self.req() {
+        let result = a.new_like(out_data, new_shape, a.requires_grad.load(Ordering::Relaxed));
+        if a.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = a.grad.clone();
+            record(&result, vec![a], Arc::new(move || {
                 let g = rg.borrow();
+                let g_ref: &[f32] = &g;
                 let mut sgm = sg.borrow_mut();
-                for p in 0..pre {
-                    for j in 0..d {
-                        sgm[p * d + j] += g[p];
-                    }
-                }
+                // 并行：按行切分，每行只写自己那 d 个元素，行间无依赖
+                sgm.par_chunks_mut(d)
+                    .zip(g_ref.par_iter())
+                    .for_each(|(row, &gv)| {
+                        for v in row.iter_mut() {
+                            *v += gv;
+                        }
+                    });
             }));
         }
         result
@@ -1447,14 +2275,15 @@ impl Tensor {
     ///
     /// 数值稳定技巧：先减去每行最大值再 exp（防止指数爆炸）。
     /// 反向公式：∂x_i = s_i * (g_i - Σ_j g_j * s_j)
-    #[allow(dead_code)]
     pub fn softmax_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "softmax_last_dim 需要至少 1 维");
+        // 非连续先物化，下文按行主序线性读
+        let a = self.contiguous();
         let (rows, d) = (
-            self.numel() / self.shape[self.rank() - 1],
-            self.shape[self.rank() - 1],
+            a.numel() / a.shape[a.rank() - 1],
+            a.shape[a.rank() - 1],
         );
-        let sd = self.data.borrow();
+        let sd = a.decode();
         let mut out_data = vec![0.0f32; rows * d];
         // 先存 softmax 结果（反向需要）
         for r in 0..rows {
@@ -1473,13 +2302,12 @@ impl Tensor {
         }
         drop(sd);
 
-        let mut result = Tensor::new(out_data.clone(), self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = a.new_like(out_data.clone(), a.shape.clone(), a.requires_grad.load(Ordering::Relaxed));
+        if a.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
+            let sg = a.grad.clone();
             let (_rows, d) = (rows, d);
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![a], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for r in 0.._rows {
@@ -1489,6 +2317,64 @@ impl Tensor {
                     }
                     for i in 0..d {
                         sgm[r * d + i] += out_data[r * d + i] * (g[r * d + i] - dot);
+                    }
+                }
+            }));
+        }
+        result
+    }
+
+    /// 沿最后一维做 logsumexp：`c = log(Σ_j e^{x_j})`，输出形状的末维改成 1。
+    ///
+    /// 数值稳定：先减行内最大值再 exp，最后把 max 加回来——logits 多大都不会溢出。
+    /// 反向公式就是 softmax：`∂x_j = g · softmax(x)_j`（减 max 是常数平移，
+    /// 不改变 `e^{x_j}/Σe^{x_i}` 这个比值）。
+    ///
+    /// 用途是 MoE 的 router z-loss（第 32 课）：`L_z = mean(logsumexp(logits)²)`，
+    /// 惩罚过大的门控 logits，防止路由器 softmax 过尖后饱和（PaLM 等都加了它）。
+    /// 不要用 `log(exp(x).sum())` 裸拼——logits 稍大 exp 就直接溢出成 inf。
+    pub fn logsumexp_last_dim(&self) -> Tensor {
+        assert!(self.rank() >= 1, "logsumexp_last_dim 需要至少 1 维");
+        // 非连续先物化，下文按行主序线性读
+        let a = self.contiguous();
+        let (pre, d) = (
+            a.numel() / a.shape[a.rank() - 1],
+            a.shape[a.rank() - 1],
+        );
+        let sd = a.decode();
+        let mut out_data = vec![0.0f32; pre];
+        let mut sm = vec![0.0f32; pre * d]; // 归一化前是 exp，归一化后是 softmax（反向要用）
+        for p in 0..pre {
+            let row = &sd[p * d..(p + 1) * d];
+            let mut maxv = f32::NEG_INFINITY;
+            for &v in row {
+                maxv = maxv.max(v);
+            }
+            let mut sum = 0.0;
+            for j in 0..d {
+                let e = (row[j] - maxv).exp();
+                sm[p * d + j] = e;
+                sum += e;
+            }
+            out_data[p] = maxv + sum.ln(); // sum ≥ 1（最大值那项恰好是 e⁰），ln 安全
+            for j in 0..d {
+                sm[p * d + j] /= sum;
+            }
+        }
+        drop(sd);
+        let mut new_shape = a.shape.clone();
+        *new_shape.last_mut().unwrap() = 1;
+
+        let result = a.new_like(out_data, new_shape, a.requires_grad.load(Ordering::Relaxed));
+        if a.req() {
+            let rg = result.grad.clone();
+            let sg = a.grad.clone();
+            record(&result, vec![a], Arc::new(move || {
+                let g = rg.borrow();
+                let mut sgm = sg.borrow_mut();
+                for p in 0..pre {
+                    for j in 0..d {
+                        sgm[p * d + j] += g[p] * sm[p * d + j];
                     }
                 }
             }));
@@ -1510,14 +2396,16 @@ impl Tensor {
     /// d_γ_j = Σ_r d_y[r,j] · norm[r,j]，d_β_j = Σ_r d_y[r,j]
     /// ```
     pub fn layernorm(&self, gamma: &Tensor, beta: &Tensor, eps: f32) -> Tensor {
-        let d = *self.shape.last().unwrap();
+        // 非连续先物化，前后向均按行主序线性读（反向闭包还按缓冲读 xd）
+        let x = self.contiguous();
+        let d = *x.shape.last().unwrap();
         assert_eq!(gamma.rank(), 1, "LayerNorm 的 γ 必须是一维");
         assert_eq!(gamma.shape, beta.shape, "LayerNorm 的 γ/β 形状必须一致");
         assert_eq!(gamma.shape[0], d, "LayerNorm 的 γ/β 长度必须等于输入最后一维");
-        let rows = self.numel() / d;
-        let sd = self.data.borrow();
-        let gv = gamma.data.borrow();
-        let bv = beta.data.borrow();
+        let rows = x.numel() / d;
+        let sd = x.decode();
+        let gv = gamma.decode();
+        let bv = beta.decode();
         let sd_ref: &[f32] = &sd;
         let gv_ref: &[f32] = &gv;
         let bv_ref: &[f32] = &bv;
@@ -1553,20 +2441,24 @@ impl Tensor {
         drop(gv);
         drop(bv);
 
-        let requires = self.req() || gamma.req() || beta.req();
-        let mut result = Tensor::new(out, self.shape.clone(), requires);
+        let requires = x.req() || gamma.req() || beta.req();
+        let result = x.new_like(out, x.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
-            let sx = self.grad.clone();
+            let sx = x.grad.clone();
             let sg = gamma.grad.clone();
             let sb = beta.grad.clone();
-            let xd = self.data.clone();
+            let xd = x.data.clone();
             let gd = gamma.data.clone();
-            result.parents = Rc::new(vec![self.clone(), gamma.clone(), beta.clone()]);
-            result.backward = Some(Rc::new(move || {
-                let g: Vec<f32> = rg.borrow().to_vec();
-                let x_b: Vec<f32> = xd.borrow().to_vec();
-                let gam: Vec<f32> = gd.borrow().to_vec();
+            record(&result, vec![x, gamma.clone(), beta.clone()], Arc::new(move || {
+                // 不做 to_vec 拷贝：decode 一次转只读切片，两遍计算共享同一份数据
+                // （切片是 Sync，可安全带进下面的并行闭包）
+                let g_b = rg.borrow();
+                let x_bd = xd.decode();
+                let gam_b = gd.decode();
+                let g: &[f32] = &g_b;
+                let x_b: &[f32] = &x_bd;
+                let gam: &[f32] = &gam_b;
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
                 let mut gb = sb.borrow_mut();
@@ -1630,12 +2522,14 @@ impl Tensor {
     /// d_γ_j = Σ_r d_y[r,j] · (x[r,j] · is_r)
     /// ```
     pub fn rmsnorm(&self, gamma: &Tensor, eps: f32) -> Tensor {
-        let d = *self.shape.last().unwrap();
+        // 非连续先物化，前后向均按行主序线性读（反向闭包还按缓冲读 xd）
+        let x = self.contiguous();
+        let d = *x.shape.last().unwrap();
         assert_eq!(gamma.rank(), 1, "RMSNorm 的 γ 必须是一维");
         assert_eq!(gamma.shape[0], d, "RMSNorm 的 γ 长度必须等于输入最后一维");
-        let rows = self.numel() / d;
-        let sd = self.data.borrow();
-        let gv = gamma.data.borrow();
+        let rows = x.numel() / d;
+        let sd = x.decode();
+        let gv = gamma.decode();
         let sd_ref: &[f32] = &sd;
         let gv_ref: &[f32] = &gv;
         let mut out = vec![0.0f32; rows * d];
@@ -1660,20 +2554,23 @@ impl Tensor {
         drop(sd);
         drop(gv);
 
-        let requires = self.req() || gamma.req();
-        let mut result = Tensor::new(out, self.shape.clone(), requires);
+        let requires = x.req() || gamma.req();
+        let result = x.new_like(out, x.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
-            let sx = self.grad.clone();
+            let sx = x.grad.clone();
             let sg = gamma.grad.clone();
-            let xd = self.data.clone();
+            let xd = x.data.clone();
             let gd = gamma.data.clone();
             let ir = inv_rms;
-            result.parents = Rc::new(vec![self.clone(), gamma.clone()]);
-            result.backward = Some(Rc::new(move || {
-                let g: Vec<f32> = rg.borrow().to_vec();
-                let x_b: Vec<f32> = xd.borrow().to_vec();
-                let gam: Vec<f32> = gd.borrow().to_vec();
+            record(&result, vec![x, gamma.clone()], Arc::new(move || {
+                // 不做 to_vec 拷贝：decode 一次转只读切片，供两遍计算共享（见 layer_norm 反向的注释）
+                let g_b = rg.borrow();
+                let x_bd = xd.decode();
+                let gam_b = gd.decode();
+                let g: &[f32] = &g_b;
+                let x_b: &[f32] = &x_bd;
+                let gam: &[f32] = &gam_b;
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
                 // 第一遍：顺序计算 dg
@@ -1715,40 +2612,45 @@ impl Tensor {
         result
     }
 
-    /// 注意力（缩放点积 + 因果掩码）：O = softmax(Q·Kᵀ/√d + M) · V
+    /// 注意力（缩放点积 + 因果屏蔽）：O = softmax(Q·Kᵀ/√d) · V
     ///
-    /// **2026-09-16 重写（性能）**：原实现是"Flash Attention 分块 + 在线 softmax"的
-    /// 标量三重循环版本。逐算子插桩显示它占单步 78% 的时间（flash_f 4.6s + flash_b 8.7s
-    /// / 17.1s），有效算力只有 0.12~0.24 GFLOP/s，比 `matmul_data` 慢约 100 倍——
-    /// 瓶颈既不是访存也不是算法，而是没走上已经分块/向量化/可走 GPU 的矩阵乘内核。
+    /// **CPU 路径（`flash_forward_cpu`）：真正的分块 + 在线 softmax**。
+    /// 按输出行（`B*H × T`）rayon 并行，行内按 `block_size` 个 K/V 为一块串行扫描：
+    /// - 打分只对可见键计算（query i 只看 `j <= i + visible_before`），**不物化**
+    ///   `[T, T_total]` 掩码——原先每次前向都要 O(T×T_total) 的分配与填充；
+    /// - 行内在线 softmax：维护运行最大值 m 与指数和 l，新块并入时旧累计乘
+    ///   `exp(m_old - m_new)` 重标定，最终除以 l。中间 P **从不落地**，
+    ///   每行工作集只有 O(block_size + head_dim)，而不是 O(T_total)；
+    /// - `block_size` 是真实的分块参数（钳到 ≥ 1），控制每次读入的 K/V 块宽。
     ///
-    /// 现流程（数学上与标准 attention 完全一致）：
-    /// ```text
-    /// Q' = Q / √d                       // 缩放挪到 Q 上，只要 524K 次乘法
-    /// S  = Q'·Kᵀ                        // matmul_data [BH,T,T_total]，一次算完
-    /// P  = softmax(S + M)               // 融合内核，每行一遍过
-    /// O  = P·V                          // matmul_data
-    /// ```
-    /// 反向同样全用矩阵乘：dV = Pᵀ·dO、dP = dO·Vᵀ、dS = P⊙(dP - ΣdP·P)、
-    /// dQ = dS·K·scale、dK = dSᵀ·Q'。
+    /// **反向不保留 P**：前后向之间 CPU 侧不留 O(T²)；反向时矩阵乘重算 scores、
+    /// `causal_softmax_cpu` 归一化出 P，再走既有的
+    /// dV = Pᵀ·dO、dP = dO·Vᵀ、dS = P⊙(dP - ΣdP·P)、dQ = dS·K·scale、dK = dSᵀ·Q'。
     ///
-    /// **代价**：P 与 dP 需要 O(T²) 的显存（原实现存 P 也已是 O(T²)），
-    /// 换来的是 6 次大矩阵乘走内核，单步注意力从 ~13.3s 降到亚秒级。
+    /// **GPU 常驻路径不变**（`gpu::attn_forward`）：S/P 留在显存、反向一次提交；
+    /// 它与 `LLM_GPU_PROBE` 的逐算子录制按真实掩码 buffer 消费——只有走这两条路时
+    /// 才物化掩码（[`causal_mask_data`]）。GPU 掩码与核内屏蔽同为后缀因果，逐位一致。
     ///
     /// - q: [B*H, T, head_dim]
-    /// - k: [B*H, T_total, head_dim]
-    /// - v: [B*H, T_total, head_dim]
-    /// - mask: [T, T_total]（因果掩码，-inf 的位置屏蔽）
-    /// - _block_size: 兼容旧接口保留（现在的分块由 matmul_data 内部负责）
+    /// - k/v: [B*H, T_total, head_dim]（T_total >= T）
+    /// - mask: 可选的 `[T, T_total]` 后缀因果掩码（0 / -inf），只被 GPU/probe 路径消费；
+    ///   传 `None` 时 GPU 需要的话在本函数内物化一次，CPU 分块核始终在核内屏蔽
+    /// - block_size: CPU 分块的 K/V 块宽（钳到 ≥ 1）
     ///
     /// 返回 out: [B*H, T, head_dim]
     pub fn flash_attention(
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        mask: &Tensor,
-        _block_size: usize,
+        mask: Option<&Tensor>,
+        block_size: usize,
     ) -> Tensor {
+        // 非连续（视图）先物化：前后向都按行主序线性读，反向闭包还按缓冲读 K/V。
+        // parents/grad 绑定随遮蔽自动指向物化张量，梯度经 contiguous 反向 1:1 回流视图
+        let q = q.contiguous();
+        let k = k.contiguous();
+        let v = v.contiguous();
+        let mask = mask.map(|m| m.contiguous());
         assert_eq!(q.rank(), 3, "flash_attention: Q 必须为 3D");
         assert_eq!(k.rank(), 3, "flash_attention: K 必须为 3D");
         assert_eq!(v.rank(), 3, "flash_attention: V 必须为 3D");
@@ -1756,57 +2658,128 @@ impl Tensor {
         let t_total = k.shape[1];
         assert_eq!(k.shape, v.shape, "K 和 V 形状必须一致");
         assert_eq!(k.shape[2], head_dim, "K/V 的 head_dim 必须与 Q 一致");
-        assert_eq!(k.shape[0], bh, "K/V 的 batch*head 必须与 Q 一致");
+        // GQA：允许 K/V 扁平组数 kv_bh 小于 Q 的 bh（kv_bh = bh / n_rep）。
+        // CPU 分块核按 Q 头 hh → KV 头 hh/n_rep 核内索引，省掉 repeat_kv 物化；
+        // GPU 内核按 Q 的 bh 布局读 K/V，进入前在核外物化展开（见下）。
+        let kv_bh = k.shape[0];
+        assert!(
+            kv_bh > 0 && bh % kv_bh == 0,
+            "flash_attention: K/V 的 batch*head（{kv_bh}）必须整除 Q 的（{bh}）"
+        );
+        let n_rep = bh / kv_bh;
+        assert!(
+            t <= t_total,
+            "flash_attention: K/V 长度（{t_total}）必须 >= Q 长度（{t}）"
+        );
+        // mask 为物化后的 Option<Tensor>，用引用匹配避免 move（后文 GPU 分支还要读）
+        if let Some(m) = &mask {
+            assert_eq!(
+                m.shape.as_slice(),
+                &[t, t_total],
+                "flash_attention: mask 必须是 [T, T_total]"
+            );
+        }
 
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let md = mask.data.borrow();
-        let mask_data: &[f32] = &md;
+        // 后缀因果的可见范围：与 causal_mask_data 物化的掩码逐位一致（分块核内屏蔽用）
+        let visible_before = t_total - t;
 
         // 读取输入数据
-        let qd = q.data.borrow();
-        let kd = k.data.borrow();
-        let vd = v.data.borrow();
+        let qd = q.decode();
+        let kd = k.decode();
+        let vd = v.decode();
 
-        // 1) Q' = Q / √d：把缩放挪到 Q 上（只 524K 次乘法），
-        //    这样 S = Q'·Kᵀ 就是最终打分，softmax 内核不必带 scale 参数。
-        //    数学上等价于"先算 Q·Kᵀ 再乘 scale"，与标准实现逐位一致。
+        // 1) Q' = Q / √d：把缩放挪到 Q 上，块内打分不必带 scale（数学上与先乘等价）
         let mut q_scaled: Vec<f32> = qd.to_vec();
         q_scaled.par_iter_mut().for_each(|v| *v *= scale);
 
-        // 2)~4) 前向：优先走「常驻显存」路径。
-        //    S = Q'·Kᵀ → P = softmax(S+mask) → O = P·V 三个算子录进**一次提交**，
-        //    S（33.6MB）与 P（33.6MB）全程留在显存，只把 O（4.2MB）回读给 CPU，
-        //    P 的显存句柄随结果留到反向用 —— 逐算子路径要把 P 回读 33.6MB、下一步再原样传回，
-        //    一来一回 67MB/层/次纯属白跑（实测单步回读 1.46GB，91% 的时间花在等回读）。
-        //    失败（GPU 不可用/尺寸太小）自动回退下面的逐算子路径，数值行为不变。
+        // 2) 前向分流：GPU 常驻 →（probe 时）逐算子录制 → CPU 分块在线 softmax
         #[cfg(feature = "gpu")]
-        let gpu_attn =
-            crate::gpu::attn_forward(&q_scaled, &kd, &vd, mask_data, bh, t, t_total, head_dim);
-        #[cfg(feature = "gpu")]
-        let (out_data, cache) = match gpu_attn {
-            Some(r) => {
-                let out = r.out.clone();
-                (out, AttnCache::Gpu(Box::new(r)))
-            }
-            None => {
-                let (o, p) =
-                    attn_forward_ops(&q_scaled, &kd, &vd, mask_data, bh, t, t_total, head_dim);
-                (o, AttnCache::Cpu(p))
-            }
-        };
-        #[cfg(not(feature = "gpu"))]
         let (out_data, cache) = {
-            let (o, p) = attn_forward_ops(&q_scaled, &kd, &vd, mask_data, bh, t, t_total, head_dim);
-            (o, AttnCache::Cpu(p))
+            // GQA n_rep>1：GPU 内核按 Q 的 bh 扁平布局读 K/V，核外先物化展开
+            //（CPU 分块核不必物化，直接核内索引共享 KV 头）
+            let k_exp: Option<Vec<f32>> = (n_rep > 1).then(|| repeat_flat(&kd, kv_bh, n_rep));
+            let v_exp: Option<Vec<f32>> = (n_rep > 1).then(|| repeat_flat(&vd, kv_bh, n_rep));
+            let kd_g: &[f32] = match &k_exp {
+                Some(v) => v,
+                None => &kd,
+            };
+            let vd_g: &[f32] = match &v_exp {
+                Some(v) => v,
+                None => &vd,
+            };
+            // GPU 常驻与 probe 录制要真实掩码 buffer；CPU 分块核核内屏蔽，不必物化
+            let mask_owned: Option<Vec<f32>> = (mask.is_none() && crate::gpu::is_available())
+                .then(|| causal_mask_data(t, t_total));
+            // mask 现为 Option<Tensor>（物化后的常量），as_ref 取引用借解码视图的生命周期
+            let mask_guard = mask.as_ref().map(|m| m.decode());
+            let mask_data: Option<&[f32]> = match (&mask_guard, &mask_owned) {
+                (Some(g), _) => Some(&g[..]),
+                (None, Some(v)) => Some(&v[..]),
+                (None, None) => None,
+            };
+            // S = Q'·Kᵀ → P = softmax(S+mask) → O = P·V 录进一次提交，
+            // S 与 P 全程留在显存，只把 O 回读；P 的句柄留到反向（见 `AttnCache::Gpu`）
+            let gpu_attn = match mask_data {
+                Some(md) => {
+                    crate::gpu::attn_forward(&q_scaled, kd_g, vd_g, md, bh, t, t_total, head_dim)
+                }
+                None => None,
+            };
+            match gpu_attn {
+                Some(r) => {
+                    let out = r.out.clone();
+                    (out, AttnCache::Gpu(Box::new(r)))
+                }
+                None => match mask_data {
+                    // LLM_GPU_PROBE 形状录制：拆回逐算子，让 matmul 记录真实训练形状
+                    Some(md) if crate::gpu::probe_active() => {
+                        let (o, _p) =
+                            attn_forward_ops(&q_scaled, kd_g, vd_g, md, bh, t, t_total, head_dim);
+                        (o, AttnCache::Cpu)
+                    }
+                    _ => (
+                        flash_forward_cpu(
+                            &q_scaled,
+                            &kd,
+                            &vd,
+                            bh,
+                            n_rep,
+                            t,
+                            t_total,
+                            head_dim,
+                            visible_before,
+                            block_size,
+                        ),
+                        AttnCache::Cpu,
+                    ),
+                },
+            }
         };
+        // 纯 CPU 构建下没有 Gpu 缓存变体，cache 不会被闭包读取
+        #[cfg(not(feature = "gpu"))]
+        let (out_data, _cache) = (
+            flash_forward_cpu(
+                &q_scaled,
+                &kd,
+                &vd,
+                bh,
+                n_rep,
+                t,
+                t_total,
+                head_dim,
+                visible_before,
+                block_size,
+            ),
+            AttnCache::Cpu,
+        );
 
         drop(qd);
         drop(kd);
         drop(vd);
-        drop(md);
 
         let requires = q.req() || k.req() || v.req();
-        let mut result = Tensor::new(out_data, vec![bh, t, head_dim], requires);
+        let result = q.new_like(out_data, vec![bh, t, head_dim], requires);
         if requires {
             let rg = result.grad.clone();
             let sq = q.grad.clone();
@@ -1814,8 +2787,7 @@ impl Tensor {
             let sv = v.grad.clone();
             let k_data = k.data.clone();
             let v_data = v.data.clone();
-            result.parents = Rc::new(vec![q.clone(), k.clone(), v.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![q.clone(), k.clone(), v.clone()], Arc::new(move || {
                 let g = rg.borrow();
                 // 常驻显存路径：dV/dP/dS/dQ/dK 五个算子录进一次提交，只回读 dQ/dK/dV（各 4.2MB）
                 #[cfg(feature = "gpu")]
@@ -1827,41 +2799,62 @@ impl Tensor {
                                 sgm[i] += v * scale;
                             }
                         }
+                        // GQA：GPU 收到的是核外展开后的 dK/dV（bh 组），按 n_rep
+                        // 相邻副本求和折回 kv_bh 组再写父梯度；n_rep==1 直接 move 零拷贝
+                        let dk_final =
+                            if n_rep > 1 { fold_repeat_grad(&dk_out, kv_bh, n_rep) } else { dk_out };
+                        let dv_final =
+                            if n_rep > 1 { fold_repeat_grad(&dv_out, kv_bh, n_rep) } else { dv_out };
                         {
                             let mut sgm = sk.borrow_mut();
-                            for (i, v) in dk_out.iter().enumerate() {
+                            for (i, v) in dk_final.iter().enumerate() {
                                 sgm[i] += v;
                             }
                         }
                         {
                             let mut sgm = sv.borrow_mut();
-                            for (i, v) in dv_out.iter().enumerate() {
+                            for (i, v) in dv_final.iter().enumerate() {
                                 sgm[i] += v;
                             }
                         }
                         return;
                     }
                 }
-                // 逐算子（或纯 CPU）路径：P 在 CPU 上；常驻路径反向失败时把 P 回读出来兜底
-                let p: Rc<Vec<f32>> = match &cache {
-                    AttnCache::Cpu(p) => p.clone(),
-                    #[cfg(feature = "gpu")]
-                    AttnCache::Gpu(r) => {
-                        Rc::new(r.read_p().expect("常驻显存反向失败，回读 P 也失败"))
-                    }
-                };
+                // CPU 路径（也兜底 GPU 常驻反向失败）：前后向之间不保留 P，
+                // 反向用矩阵乘重算 scores = Q'·Kᵀ，再由 causal_softmax_cpu 归一化出 P。
+                // dP/dS 本来就是 O(T²)，重算 scores 不改变反向工作集的量级。
                 // 反向：全部交给矩阵乘内核（旧的标量三重循环只有 0.24 GFLOP/s，慢 100 倍）
                 // softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]·P[i,k])
                 // 注意必须用 V 算 dP（out_i = Σ_j P_ij·V_j，故 ∂out_i/∂P_ij 的因子是 V_j）；
                 // 用 K 会让 dP/dS/dQ/dK 全部错误（实测 dQ 偏差 2.7 倍）。
-                let kd_b = k_data.borrow();
-                let vd_b = v_data.borrow();
+                let kd_b = k_data.decode();
+                let vd_b = v_data.decode();
+                // GQA：核内索引只在前向省物化；反向 matmul 链要求 Q/K 扁平 bh 相等，
+                // 这里把 K/V 物化展开到 bh 组参与计算，dK/dV 算完再折回 kv_bh 组
+                let k_exp: Option<Vec<f32>> =
+                    (n_rep > 1).then(|| repeat_flat(&kd_b, kv_bh, n_rep));
+                let v_exp: Option<Vec<f32>> =
+                    (n_rep > 1).then(|| repeat_flat(&vd_b, kv_bh, n_rep));
+                let kd_use: &[f32] = match &k_exp {
+                    Some(v) => v,
+                    None => &kd_b,
+                };
+                let vd_use: &[f32] = match &v_exp {
+                    Some(v) => v,
+                    None => &vd_b,
+                };
+                // 重算 scores 并做后缀因果 softmax，得到与前向逐位一致的 P（含掩码位置为 0）
+                // （参数顺序与 attn_forward_ops 一致：m=t, k=head_dim, n=t_total）
+                let scores =
+                    matmul_data(&q_scaled, kd_use, t, head_dim, t_total, bh, false, true);
+                let p = causal_softmax_cpu(&scores, bh * t, t, t_total, visible_before);
                 // dV = Pᵀ·dO
                 let dv_out = matmul_data(&p, &g, t_total, t, head_dim, bh, true, false);
                 // dP = dO·Vᵀ
-                let mut ds = matmul_data(&g, &vd_b, t, head_dim, t_total, bh, false, true);
+                let mut ds = matmul_data(&g, vd_use, t, head_dim, t_total, bh, false, true);
                 drop(g);
                 drop(vd_b);
+                drop(v_exp);
                 // dS ← P ⊙ (dP - Σ_j dP·P)：逐行独立，按行并行（一行读两遍写一遍）
                 let p_ref: &[f32] = &p;
                 ds.par_chunks_mut(t_total).enumerate().for_each(|(r, drow)| {
@@ -1875,24 +2868,31 @@ impl Tensor {
                     }
                 });
                 // dQ = (dS·K)·scale（前向里 Q 先被缩成 Q' = Q·scale，故 dQ 要乘回来）；dK = dSᵀ·Q'
-                let dq_out = matmul_data(&ds, &kd_b, t, t_total, head_dim, bh, false, false);
+                let dq_out = matmul_data(&ds, kd_use, t, t_total, head_dim, bh, false, false);
                 let dk_out = matmul_data(&ds, &q_scaled, t_total, t, head_dim, bh, true, false);
                 drop(kd_b);
+                drop(k_exp);
                 {
                     let mut sgm = sq.borrow_mut();
                     for (i, v) in dq_out.iter().enumerate() {
                         sgm[i] += v * scale;
                     }
                 }
+                // GQA：dK/dV 是展开后（bh 组）的结果，按 n_rep 相邻副本求和折回
+                // kv_bh 组再写父梯度（n_rep==1 直接 move 零拷贝）
+                let dk_final =
+                    if n_rep > 1 { fold_repeat_grad(&dk_out, kv_bh, n_rep) } else { dk_out };
+                let dv_final =
+                    if n_rep > 1 { fold_repeat_grad(&dv_out, kv_bh, n_rep) } else { dv_out };
                 {
                     let mut sgm = sk.borrow_mut();
-                    for (i, v) in dk_out.iter().enumerate() {
+                    for (i, v) in dk_final.iter().enumerate() {
                         sgm[i] += v;
                     }
                 }
                 {
                     let mut sgm = sv.borrow_mut();
-                    for (i, v) in dv_out.iter().enumerate() {
+                    for (i, v) in dv_final.iter().enumerate() {
                         sgm[i] += v;
                     }
                 }
@@ -1909,27 +2909,30 @@ impl Tensor {
     /// 一个算子替代 `add` + `softmax_last_dim` 两个算子，训练热路径里每层 block 一次。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn masked_softmax(&self, mask: &Tensor) -> Tensor {
-        let d = *self.shape.last().unwrap();
+        // 非连续先物化，前后向均按行主序线性读
+        let x = self.contiguous();
+        let mask = mask.contiguous();
+        let d = *x.shape.last().unwrap();
         assert!(
-            mask.rank() <= self.rank(),
+            mask.rank() <= x.rank(),
             "mask 维度必须 <= 输入（mask {:?} vs x {:?}）",
             mask.shape,
-            self.shape
+            x.shape
         );
         // mask 必须是输入形状的精确右后缀（逐维相等）。尺寸 1 的维只有当目标对应维也是 1
         // 时才会出现（如 t=1 的 KV cache 单步生成），此时"源下标 = flat % numel"依然成立。
-        let off = self.rank() - mask.rank();
+        let off = x.rank() - mask.rank();
         assert_eq!(
-            &self.shape[off..],
+            &x.shape[off..],
             mask.shape.as_slice(),
             "mask 必须是输入的右后缀（x {:?} vs mask {:?}）",
-            self.shape,
+            x.shape,
             mask.shape
         );
         let m_n = mask.numel();
-        let rows = self.numel() / d;
-        let sd = self.data.borrow();
-        let md = mask.data.borrow();
+        let rows = x.numel() / d;
+        let sd = x.decode();
+        let md = mask.decode();
         // GPU 优先：训练里 scores 是 [B*H,T,T_total]（~200 万元素），GPU 计算 ~2ms，
         // CPU 计算 ~30ms。太小（推理单 token）或 GPU 不可用时自动回退 CPU。
         #[cfg(feature = "gpu")]
@@ -1940,15 +2943,14 @@ impl Tensor {
         drop(sd);
         drop(md);
 
-        let requires = self.req() || mask.req();
-        let out_shared = Rc::new(out);
-        let mut result = Tensor::new(out_shared.as_ref().clone(), self.shape.clone(), requires);
+        let requires = x.req() || mask.req();
+        let out_shared = Arc::new(out);
+        let result = x.new_like(out_shared.as_ref().clone(), x.shape.clone(), requires);
         if requires {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
+            let sg = x.grad.clone();
             let out = out_shared;
-            result.parents = Rc::new(vec![self.clone(), mask.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![x, mask], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 // 反向同样优先 GPU（p = 前向概率），失败回退 CPU
@@ -1981,14 +2983,15 @@ impl Tensor {
     ///
     /// 反向：`grad_input_i = grad_output_i - softmax(x_i) · Σ grad_output_j`
     /// （比 softmax+log 的链式法则更简洁，不需存储中间的 softmax 结果乘以 log 的梯度）
-    #[allow(dead_code)]
     pub fn log_softmax_last_dim(&self) -> Tensor {
         assert!(self.rank() >= 1, "log_softmax 至少需要 1 维");
+        // 非连续先物化，下文按行主序线性读
+        let a = self.contiguous();
         let (rows, d) = (
-            self.numel() / self.shape[self.rank() - 1],
-            self.shape[self.rank() - 1],
+            a.numel() / a.shape[a.rank() - 1],
+            a.shape[a.rank() - 1],
         );
-        let sd = self.data.borrow();
+        let sd = a.decode();
         let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; rows * d];
         // 存 softmax 值（反向需要）
@@ -2020,13 +3023,15 @@ impl Tensor {
             });
         drop(sd);
 
-        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = a.new_like(out_data, a.shape.clone(), a.requires_grad.load(Ordering::Relaxed));
+        if a.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
-                let g: Vec<f32> = rg.borrow().to_vec();
+            let sg = a.grad.clone();
+            record(&result, vec![a], Arc::new(move || {
+                // 不做 to_vec 拷贝：borrow 后转只读切片，再 borrow_mut 梯度槽
+                // （rg 与 sg 是两把不同的锁，顺序无关）
+                let g_b = rg.borrow();
+                let g: &[f32] = &g_b;
                 let mut sgm = sg.borrow_mut();
                 // 并行：同样按行切分，行间无依赖（每一行只写自己的 d 个元素）
                 sgm.par_chunks_mut(d).enumerate().for_each(|(r, grow)| {
@@ -2061,16 +3066,20 @@ impl Tensor {
     /// 训练是单线程的，调用顺序确定，所以结果仍可复现。
     pub fn dropout(&self, p: f32, training: bool) -> Tensor {
         assert!((0.0..=1.0).contains(&p), "dropout 概率 p 必须在 [0, 1] 之间");
+        // 非连续先物化，下文按行主序线性读
+        let x = self.contiguous();
         if !training || p == 0.0 {
-            // 推理或不丢弃：恒等（需要梯度时设 requires_grad）
-            return Tensor::new(self.data.borrow().clone(), self.shape.clone(), self.requires_grad.get());
+            // 推理或不丢弃：恒等（需要梯度时设 requires_grad）。
+            // 先拷贝再构造：decode 持锁不能与 new_like 内的 dtype() 加锁同处一条语句
+            let id = x.decode().to_vec();
+            return x.new_like(id, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
         }
         if p >= 1.0 {
-            return Tensor::new(vec![0.0; self.numel()], self.shape.clone(), self.requires_grad.get());
+            return x.new_like(vec![0.0; x.numel()], x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
         }
         let keep = 1.0 - p;
         let scale = 1.0 / keep;
-        let sd = self.data.borrow();
+        let sd = x.decode();
         let len = sd.len();
         let mut mask = vec![0.0f32; len];
         // 独立随机流：thread_local 计数器推进 + splitmix64 打散，
@@ -2098,12 +3107,11 @@ impl Tensor {
         let out_data: Vec<f32> = sd.iter().zip(&mask).map(|(x, m)| x * m).collect();
         drop(sd);
 
-        let mut result = Tensor::new(out_data, self.shape.clone(), self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(out_data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            let sg = x.grad.clone();
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..g.len() {
@@ -2119,10 +3127,12 @@ impl Tensor {
     /// 按行索引取值：table [V, D]，indices [N] -> out [N, D]。
     /// 反向：梯度 scatter-add 回 table 对应行（Embedding 用）。
     pub fn gather_rows(&self, indices: &[usize]) -> Tensor {
-        assert_eq!(self.rank(), 2, "gather_rows 的 table 必须为 2 维");
-        let (v, d) = (self.shape[0], self.shape[1]);
+        // 非连续先物化，前后向均按行主序线性读
+        let x = self.contiguous();
+        assert_eq!(x.rank(), 2, "gather_rows 的 table 必须为 2 维");
+        let (v, d) = (x.shape[0], x.shape[1]);
         let n = indices.len();
-        let sd = self.data.borrow();
+        let sd = x.decode();
         let mut out_data = vec![0.0f32; n * d];
         for (i, &idx) in indices.iter().enumerate() {
             assert!(idx < v, "gather 索引越界：{} >= {}", idx, v);
@@ -2133,13 +3143,12 @@ impl Tensor {
         drop(sd);
         let idx_vec = indices.to_vec();
 
-        let mut result = Tensor::new(out_data, vec![n, d], self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(out_data, vec![n, d], x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
+            let sg = x.grad.clone();
             let d2 = d;
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for i in 0..idx_vec.len() {
@@ -2163,14 +3172,16 @@ impl Tensor {
     /// gather → expert → scatter 三步，而不是把每个专家都跑满全部 token 再用掩码筛掉——
     /// 后者算出来的数值一样，却把稀疏激活省下的计算量全还回去了。
     pub fn scatter_add_rows(&self, indices: &[usize], n_out: usize) -> Tensor {
-        assert_eq!(self.rank(), 2, "scatter_add_rows 的 rows 必须为 2 维");
+        // 非连续先物化，前后向均按行主序线性读
+        let x = self.contiguous();
+        assert_eq!(x.rank(), 2, "scatter_add_rows 的 rows 必须为 2 维");
         assert_eq!(
             indices.len(),
-            self.shape[0],
+            x.shape[0],
             "indices 数量必须等于 rows 的行数"
         );
-        let d = self.shape[1];
-        let sd = self.data.borrow();
+        let d = x.shape[1];
+        let sd = x.decode();
         let mut out_data = vec![0.0f32; n_out * d];
         for (i, &idx) in indices.iter().enumerate() {
             assert!(idx < n_out, "scatter 索引越界：{} >= {}", idx, n_out);
@@ -2181,13 +3192,12 @@ impl Tensor {
         drop(sd);
         let idx_vec = indices.to_vec();
 
-        let mut result = Tensor::new(out_data, vec![n_out, d], self.requires_grad.get());
-        if self.req() {
+        let result = x.new_like(out_data, vec![n_out, d], x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
             let rg = result.grad.clone();
-            let sg = self.grad.clone();
+            let sg = x.grad.clone();
             let d2 = d;
-            result.parents = Rc::new(vec![self.clone()]);
-            result.backward = Some(Rc::new(move || {
+            record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
                 for (i, &row) in idx_vec.iter().enumerate() {
@@ -2200,13 +3210,50 @@ impl Tensor {
         result
     }
 
+    /// 取 2 维张量的第 `col` 列：`[R, C] -> [R, 1]`，`out[i] = self[i, col]`。
+    ///
+    /// 反向把 `[R, 1]` 的梯度写回 grad 的第 col 列——每行只有一个落点，`+=` 即可。
+    ///
+    /// 用途是 MoE 取门控权重的第 e 列：原实现是"右乘 one-hot 列向量"的
+    /// `matmul([n,E], [E,1])`，为了把梯度送回路由器把 n×E 次乘加全跑了一遍；
+    /// 现在 `gather_rows(sel).select_col(e)` 两步只碰真正需要的 n_e 个元素。
+    pub fn select_col(&self, col: usize) -> Tensor {
+        // 非连续先物化，前后向均按行主序线性读
+        let x = self.contiguous();
+        assert_eq!(x.rank(), 2, "select_col 的输入必须为 2 维");
+        let (rows, cols) = (x.shape[0], x.shape[1]);
+        assert!(col < cols, "列索引越界：{} >= {}", col, cols);
+        let sd = x.decode();
+        let mut out_data = vec![0.0f32; rows];
+        for i in 0..rows {
+            out_data[i] = sd[i * cols + col];
+        }
+        drop(sd);
+
+        let result = x.new_like(out_data, vec![rows, 1], x.requires_grad.load(Ordering::Relaxed));
+        if x.req() {
+            let rg = result.grad.clone();
+            let sg = x.grad.clone();
+            let c2 = cols;
+            record(&result, vec![x], Arc::new(move || {
+                let g = rg.borrow();
+                let mut sgm = sg.borrow_mut();
+                for i in 0..g.len() {
+                    sgm[i * c2 + col] += g[i];
+                }
+            }));
+        }
+        result
+    }
+
     // ---------- 自动微分核心（实现见 autograd.rs） ----------
 }
 
 impl std::fmt::Display for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Tensor shape={:?}:\n", self.shape)?;
-        let data = self.data.borrow();
+        // data() 按逻辑序返回（非连续视图会 gather），打印与形状一致
+        let data = self.data();
         if self.rank() == 0 {
             return write!(f, "[ {} ]", data[0]);
         }
@@ -2694,7 +3741,7 @@ mod tests {
         let out_std = attn_std.matmul(&v);
 
         // Flash attention
-        let out_flash = Tensor::flash_attention(&q, &k, &v, &mask, 2);
+        let out_flash = Tensor::flash_attention(&q, &k, &v, Some(&mask), 2);
 
         let std_data = out_std.data();
         let flash_data = out_flash.data();
@@ -2756,7 +3803,7 @@ mod tests {
         let q_f = Tensor::param(q_data, vec![bh, t, d]);
         let k_f = Tensor::param(k_data, vec![bh, t, d]);
         let v_f = Tensor::param(v_data, vec![bh, t, d]);
-        let out_flash = Tensor::flash_attention(&q_f, &k_f, &v_f, &mask, bs);
+        let out_flash = Tensor::flash_attention(&q_f, &k_f, &v_f, Some(&mask), bs);
         out_flash.sum().backward();
 
         for (name, a, b) in [
@@ -2776,6 +3823,84 @@ mod tests {
                  跨块 P 未随运行最大值同步缩放，反向已指数放大"
             );
         }
+    }
+
+    /// GQA：K/V 少头（kv_bh = bh / n_rep）直接进 flash，必须与「显式 repeat 展开成
+    /// bh 组后再进 flash」逐位一致 —— 前向输出相同，反向 dQ 相同、dK/dV 折回后相同。
+    ///
+    /// 这是核内索引方案（CPU 分块核按 Q 头 `hh / n_rep` 取共享 KV 头，省掉
+    /// repeat_kv 物化）与旧「先物化展开再算」的等价性回归：头序必须互逆
+    /// （输出头 i ← 源头 i / n_rep），dK/dV 需按 n_rep 相邻副本求和折回 kv_bh 组。
+    #[test]
+    fn test_flash_attention_gqa_matches_expanded() {
+        use crate::rng::Rng;
+        let (bh, n_rep, t, d, bs) = (4usize, 2usize, 16usize, 8usize, 4usize);
+        let kv_bh = bh / n_rep;
+        let mut rng = Rng::new(13);
+        let amp = 3.0f32;
+        let q_data: Vec<f32> = (0..bh * t * d).map(|_| rng.randn() * amp).collect();
+        let k_data: Vec<f32> = (0..kv_bh * t * d).map(|_| rng.randn() * amp).collect();
+        let v_data: Vec<f32> = (0..kv_bh * t * d).map(|_| rng.randn()).collect();
+
+        // 因果掩码
+        let mut mask_data = vec![f32::NEG_INFINITY; t * t];
+        for i in 0..t {
+            for j in 0..=i {
+                mask_data[i * t + j] = 0.0;
+            }
+        }
+        let mask = Tensor::from_vec(mask_data, vec![t, t]);
+
+        // ---- 参考：显式把 K/V 展开成 bh 组（走 n_rep=1 的普通 flash 路径）----
+        let kx = repeat_flat(&k_data, kv_bh, n_rep);
+        let vx = repeat_flat(&v_data, kv_bh, n_rep);
+        let q_s = Tensor::param(q_data.clone(), vec![bh, t, d]);
+        let k_s = Tensor::param(kx.clone(), vec![bh, t, d]);
+        let v_s = Tensor::param(vx, vec![bh, t, d]);
+        let out_std = Tensor::flash_attention(&q_s, &k_s, &v_s, Some(&mask), bs);
+        let out_std_data = out_std.data();
+        out_std.sum().backward();
+
+        // ---- GQA：K/V 只有 kv_bh 组，靠核内索引共享 ----
+        let q_f = Tensor::param(q_data, vec![bh, t, d]);
+        let k_f = Tensor::param(k_data, vec![kv_bh, t, d]);
+        let v_f = Tensor::param(v_data, vec![kv_bh, t, d]);
+        let out_gqa = Tensor::flash_attention(&q_f, &k_f, &v_f, Some(&mask), bs);
+        assert_eq!(out_gqa.shape(), &[bh, t, d], "GQA 前向形状应为 [bh, t, d]");
+        out_gqa.sum().backward();
+
+        // 前向逐位一致
+        for (i, (a, b)) in out_std_data.iter().zip(out_gqa.data().as_slice()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5 * a.abs().max(1.0),
+                "前向第 {i} 个元素不一致：{a} vs {b}"
+            );
+        }
+
+        // dQ：两边都是 bh 组，直接比
+        let (dq_s, dq_f) = (q_s.grad(), q_f.grad());
+        assert_rel_close("dQ", &dq_s, &dq_f);
+
+        // dK/dV：参考梯度是展开形状（bh 组），折回 kv_bh 组后再与 GQA 梯度比
+        let dk_fold = fold_repeat_grad(&k_s.grad(), kv_bh, n_rep);
+        assert_rel_close("dK(折回)", &dk_fold, &k_f.grad());
+        let dv_fold = fold_repeat_grad(&v_s.grad(), kv_bh, n_rep);
+        assert_rel_close("dV(折回)", &dv_fold, &v_f.grad());
+    }
+
+    /// 相对误差断言：最大绝对误差 / 参考量级 < 1e-3
+    fn assert_rel_close(name: &str, want: &[f32], got: &[f32]) {
+        assert_eq!(want.len(), got.len(), "{name} 长度不一致");
+        let max_err = want
+            .iter()
+            .zip(got)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let ref_mag = want.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+        assert!(
+            max_err / ref_mag < 1e-3,
+            "{name} 梯度不一致：最大绝对误差 {max_err}（参考量级 {ref_mag}）"
+        );
     }
 
     /// 常驻显存路径（`gpu::attn_forward` + `AttnResident::backward`）的数值校验。
@@ -2891,7 +4016,7 @@ mod tests {
         let kt = Tensor::param(k, vec![bh, tt, hd]);
         let vt = Tensor::param(v, vec![bh, tt, hd]);
         let mt = Tensor::from_vec(mask, vec![t, tt]);
-        let out = Tensor::flash_attention(&qt, &kt, &vt, &mt, 64);
+        let out = Tensor::flash_attention(&qt, &kt, &vt, Some(&mt), 64);
         out.sum().backward();
 
         for (name, a, b) in [
@@ -2911,5 +4036,139 @@ mod tests {
                 "{name} 与纯循环参考不一致：最大绝对误差 {max_err}（参考量级 {ref_mag}）"
             );
         }
+    }
+
+    // ==================== bf16 混合精度（批次 10b） ====================
+
+    /// ① RNE 编解码：往返精度、精确值无损、半数就近取偶、inf/NaN 特判。
+    #[test]
+    fn test_bf16_codec_rne_roundtrip() {
+        // 普通值：round-to-nearest-even 相对误差 ≤ 半个 bf16 ulp（2^-8，留 1% 余量）
+        for &x in &[1.0f32, -1.0, 0.5, 3.14159, -0.001234, 65504.0, 1e-30, -7.75] {
+            let r = bf16_to_f32(f32_to_bf16(x));
+            let rel = ((r - x) / x).abs();
+            assert!(rel <= 2.0f32.powi(-8) * 1.01, "{x} -> {r} 相对误差 {rel}");
+        }
+        // bf16 能精确表示的值往返无损（含 -0 的符号位）
+        for &x in &[0.0f32, 1.0, -2.5, 1024.0, 0.75, 19.0] {
+            assert_eq!(bf16_to_f32(f32_to_bf16(x)), x);
+        }
+        assert_eq!(
+            bf16_to_f32(f32_to_bf16(-0.0)).to_bits(),
+            (-0.0f32).to_bits(),
+            "-0 符号位必须保留"
+        );
+        // 就近取偶：恰好半数时向尾数最低位为 0 的一侧靠拢
+        // 0x3F808000 恰是 0x3F80（1.0）与 0x3F81 的正中 → 取偶数 0x3F80
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3F80_8000)), 0x3F80);
+        // 0x3F818000 恰是 0x3F81 与 0x3F82 的正中 → 取偶数 0x3F82
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3F81_8000)), 0x3F82);
+        // ±∞ 按位无损；NaN 特判保证转换后仍是 NaN（纯 RNE 可能把 NaN 尾数进成全 0 → ∞）
+        assert_eq!(
+            bf16_to_f32(f32_to_bf16(f32::INFINITY)).to_bits(),
+            f32::INFINITY.to_bits()
+        );
+        assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
+    }
+
+    /// ② `to_bf16()`：真 u16 存储（内存减半依据）、克隆句柄同步、decode 容差、幂等。
+    #[test]
+    fn test_to_bf16_real_u16_storage() {
+        let vals: Vec<f32> = (0..64).map(|i| i as f32 * 0.37).collect();
+        let t = Tensor::param(vals.clone(), vec![8, 8]);
+        assert_eq!(t.dtype(), DType::F32);
+        t.to_bf16();
+        assert_eq!(t.dtype(), DType::Bf16);
+        // 物理存储确实是 u16 变体——"内存真实减半"的直接依据
+        assert!(matches!(&*t.data.borrow(), Buffer::Bf16(u) if u.len() == 64));
+        // 单层锁槽：克隆句柄同步看到新变体
+        assert_eq!(t.clone().dtype(), DType::Bf16);
+        // decode 数值在 bf16 相对误差（2^-8）内
+        for (orig, dec) in vals.iter().zip(t.data().iter()) {
+            let rel = ((dec - orig) / orig.abs().max(1e-6)).abs();
+            assert!(rel <= 2.0f32.powi(-8) * 1.01, "{orig} -> {dec} 相对误差 {rel}");
+        }
+        // 重复转换幂等
+        t.to_bf16();
+        assert_eq!(t.dtype(), DType::Bf16);
+    }
+
+    /// ③ 算子出口 `new_like` 继承 dtype：bf16 进、bf16 出，数值对齐 f32 参考。
+    #[test]
+    fn test_bf16_ops_preserve_dtype() {
+        let a_d = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_d = vec![5.0f32, 6.0, 7.0, 8.0];
+        // f32 参考
+        let c_ref = Tensor::from_vec(a_d.clone(), vec![2, 2])
+            .matmul(&Tensor::from_vec(b_d.clone(), vec![2, 2]));
+        let s_ref = Tensor::from_vec(a_d.clone(), vec![2, 2])
+            .add(&Tensor::from_vec(b_d.clone(), vec![2, 2]));
+
+        let a = Tensor::param(a_d, vec![2, 2]);
+        let b = Tensor::param(b_d, vec![2, 2]);
+        a.to_bf16();
+        b.to_bf16();
+        // 出口 dtype 继承左操作数 / 主输入
+        let c = a.matmul(&b);
+        let s = a.add(&b);
+        assert_eq!(c.dtype(), DType::Bf16);
+        assert_eq!(s.dtype(), DType::Bf16);
+        // 1..8 与其乘积在 bf16 内均精确表示 → 与 f32 参考完全相等
+        assert_eq!(c.data(), c_ref.data());
+        assert_eq!(s.data(), s_ref.data());
+
+        // 非精确值：输入编码、累加、出口编码各一档，保守界 3×2^-8 ≈ 2^-6
+        let p_d = vec![0.1f32, 0.2, 0.3, 0.4];
+        let q_d = vec![1.1f32, 2.2, 3.3, 4.4];
+        let pref = Tensor::from_vec(p_d.clone(), vec![2, 2])
+            .matmul(&Tensor::from_vec(q_d.clone(), vec![2, 2]))
+            .data();
+        let p = Tensor::param(p_d, vec![2, 2]);
+        let q = Tensor::param(q_d, vec![2, 2]);
+        p.to_bf16();
+        q.to_bf16();
+        let got = p.matmul(&q).data();
+        for (r, g) in pref.iter().zip(&got) {
+            let rel = ((g - r) / r.abs().max(1e-6)).abs();
+            assert!(rel <= 2.0f32.powi(-6), "参考 {r} vs bf16 {g} 相对误差 {rel}");
+        }
+    }
+
+    /// ④ `decode_mut` 就地更新语义（master weights）：Drop 时 encode 回写 u16 存储。
+    #[test]
+    fn test_bf16_decode_mut_writes_back() {
+        let t = Tensor::param(vec![1.0f32, 2.0], vec![2]);
+        t.to_bf16();
+        {
+            let mut g = t.decode_mut();
+            g[0] = 3.5; // 3.5 / -0.25 在 bf16 内精确
+            g[1] = -0.25;
+        } // Drop → 并行 encode 回槽内 u16
+        assert_eq!(t.dtype(), DType::Bf16);
+        assert_eq!(t.data(), vec![3.5, -0.25]);
+        // F32 张量的 decode_mut 仍是直接锁借位，语义不变
+        let f = Tensor::param(vec![1.0f32], vec![1]);
+        {
+            let mut g = f.decode_mut();
+            g[0] = 9.0;
+        }
+        assert_eq!(f.data(), vec![9.0]);
+    }
+
+    /// ⑤ 反向传播：参数存 bf16 时梯度缓冲恒 f32，数值与解析值一致。
+    #[test]
+    fn test_bf16_backward_grad_stays_f32() {
+        // loss = sum(x²) ⇒ dloss/dx = 2x；选值均在 bf16 内精确表示
+        let x = Tensor::param(vec![1.5f32, -2.0, 0.75], vec![3]);
+        x.to_bf16();
+        assert_eq!(x.dtype(), DType::Bf16);
+        let y = x.mul(&x);
+        assert_eq!(y.dtype(), DType::Bf16); // 出口同样 encode 落盘
+        y.sum().backward();
+        // grad 是 f32 缓冲（grad() 返回 Vec<f32>），值 = 2x 完全精确
+        assert_eq!(x.grad(), vec![3.0, -4.0, 1.5]);
+        // 梯度缓冲不参与 bf16 约定：数据转 bf16 不影响已攒下的梯度
+        let z = x.mul(&x);
+        assert_eq!(z.dtype(), DType::Bf16);
     }
 }

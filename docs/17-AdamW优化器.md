@@ -1,8 +1,8 @@
 # 第 17 课：AdamW 优化器 —— 给梯度下降装上"惯性"和"自适应步长"
 
 > 代码位置：[src/optim.rs](../src/optim.rs)（`SGD` / `AdamW`）
-> 代码位置：[src/train.rs](../src/train.rs)（`train_gpt` 中 AdamW 的用法）
-> 演示入口：[src/main.rs](../src/main.rs)（演示 3：训练小 GPT）
+> 代码位置：[src/train.rs](../src/train.rs)（`train_transformer` 中 AdamW 的用法）
+> 演示入口：[src/main.rs](../src/main.rs)（演示 3：训练小 Transformer）
 
 ---
 
@@ -24,12 +24,17 @@
 impl Optimizer for SGD {
     /// 更新一步：θ = θ - lr * g（原位更新，避免每次克隆整份数据）
     fn step(&mut self) {
+        let lr = self.lr;
         for p in &self.params {
+            if !p.requires_grad() {
+                continue; // 冻结参数跳过
+            }
             let g = p.grad.borrow();
             let mut d = p.data.borrow_mut();
-            for j in 0..d.len() {
-                d[j] -= self.lr * g[j];
-            }
+            let g_ref: &[f32] = &g;
+            d.par_iter_mut()          // 参数内按元素并行（rayon）
+                .zip(g_ref.par_iter())
+                .for_each(|(dv, &gv)| *dv -= lr * gv);
         }
     }
 }
@@ -123,7 +128,7 @@ v̂_t = v_t / (1 - β2^t)
 | 是否被自适应步长缩放 | 是（被 `1/√v̂` 缩放，强度不稳定） | 否（恒定 `lr·wd`，与梯度历史无关） |
 | 实际效果 | 衰减幅度时大时小，难调 | 衰减可预期、好调超参 |
 
-在现代 LLM 训练里（GPT 系列等）几乎都用 AdamW，就是因为这个"可预期"的衰减。
+在现代 LLM 训练里（主流 LLM）几乎都用 AdamW，就是因为这个"可预期"的衰减。
 
 ---
 
@@ -144,23 +149,31 @@ fn step(&mut self) {
     let wd = self.weight_decay;
 
     for i in 0..self.params.len() {
+        if !self.params[i].requires_grad() {
+            continue; // 冻结参数：不更新、也不做权重衰减
+        }
         let g = self.params[i].grad.borrow();
         let mut d = self.params[i].data.borrow_mut();
+        let g_ref: &[f32] = &g;
         let mi = &mut self.m[i];
         let vi = &mut self.v[i];
-        for j in 0..d.len() {
-            let gv = g[j];
-            // 1. 更新动量
-            mi[j] = beta1 * mi[j] + (1.0 - beta1) * gv;
-            vi[j] = beta2 * vi[j] + (1.0 - beta2) * gv * gv;
-            // 2. 偏差修正
-            let m_hat = mi[j] / bc1;
-            let v_hat = vi[j] / bc2;
-            // 3. 更新：θ -= lr * m_hat/(√v_hat + eps) + lr * wd * θ（权重衰减解耦）
-            let step = lr * m_hat / (v_hat.sqrt() + eps);
-            let decay = lr * wd * d[j];
-            d[j] = d[j] - step - decay;   // 原位更新，不新建张量
-        }
+        // 参数内按元素并行；单元素内的运算顺序与串行版一致，数值不变
+        mi.par_iter_mut()
+            .zip(vi.par_iter_mut())
+            .zip(d.par_iter_mut())
+            .zip(g_ref.par_iter())
+            .for_each(|(((mv, vv), dv), &gv)| {
+                // 1. 更新动量
+                *mv = beta1 * *mv + (1.0 - beta1) * gv;
+                *vv = beta2 * *vv + (1.0 - beta2) * gv * gv;
+                // 2. 偏差修正
+                let m_hat = *mv / bc1;
+                let v_hat = *vv / bc2;
+                // 3. 更新：θ -= lr * m_hat/(√v_hat + eps) + lr * wd * θ（权重衰减解耦）
+                let step = lr * m_hat / (v_hat.sqrt() + eps);
+                let decay = lr * wd * *dv;
+                *dv = *dv - step - decay;   // 原位更新，不新建张量
+            });
     }
 }
 ```
@@ -173,13 +186,16 @@ fn step(&mut self) {
 | `bc1 = 1.0 - self.beta1.powi(t)` | `1 - β1^t` | 一阶动量修正系数（t 从 1 开始） |
 | `bc2 = 1.0 - self.beta2.powi(t)` | `1 - β2^t` | 二阶动量修正系数 |
 | `let g = self.params[i].grad.borrow(); let mut d = self.params[i].data.borrow_mut();` | —— | 借用第 `i` 个参数的梯度与数据，后续全部**原位读写** |
-| `mi[j] = beta1 * mi[j] + (1.0 - beta1) * gv;` | `m_t = β1·m_{t-1} + (1-β1)·g_t` | 一阶动量：新旧梯度按 9:1 加权 |
-| `vi[j] = beta2 * vi[j] + (1.0 - beta2) * gv * gv;` | `v_t = β2·v_{t-1} + (1-β2)·g_t²` | 二阶动量：梯度**平方**，恒正 |
-| `let m_hat = mi[j] / bc1;` | `m̂_t = m_t/(1-β1^t)` | 修正初期被低估的一阶动量 |
-| `let v_hat = vi[j] / bc2;` | `v̂_t = v_t/(1-β2^t)` | 修正初期被低估的二阶动量 |
+| `if !self.params[i].requires_grad() { continue; }` | —— | 冻结参数（LoRA 主干）跳过：不走梯度步、也不吃权重衰减 |
+| `*mv = beta1 * *mv + (1.0 - beta1) * gv;` | `m_t = β1·m_{t-1} + (1-β1)·g_t` | 一阶动量：新旧梯度按 9:1 加权 |
+| `*vv = beta2 * *vv + (1.0 - beta2) * gv * gv;` | `v_t = β2·v_{t-1} + (1-β2)·g_t²` | 二阶动量：梯度**平方**，恒正 |
+| `let m_hat = *mv / bc1;` | `m̂_t = m_t/(1-β1^t)` | 修正初期被低估的一阶动量 |
+| `let v_hat = *vv / bc2;` | `v̂_t = v_t/(1-β2^t)` | 修正初期被低估的二阶动量 |
 | `let step = lr * m_hat / (v_hat.sqrt() + eps);` | `lr·m̂/(√v̂+ε)` | Adam 更新步长：方向 m̂，大小被 √v̂ 自适应缩放 |
-| `let decay = lr * wd * d[j];` | `lr·wd·θ` | 解耦的权重衰减，**不经过 √v̂ 缩放** |
-| `d[j] = d[j] - step - decay;` | `θ ← θ - step - decay` | 参数**原位更新**（直接改 `data`，不新建张量） |
+| `let decay = lr * wd * *dv;` | `lr·wd·θ` | 解耦的权重衰减，**不经过 √v̂ 缩放** |
+| `*dv = *dv - step - decay;` | `θ ← θ - step - decay` | 参数**原位更新**（直接改 `data`，不新建张量）|
+
+> 四路 `par_iter_mut().zip(...)`（m、v、data、grad）把四条同长数组按元素对齐并行遍历——这就是原来 `for j in 0..d.len()` 里的 `j`，现在由 zip 自动对位。
 
 四个值得停下来想一想的细节：
 
@@ -190,8 +206,8 @@ fn step(&mut self) {
    opt.step();
    ```
    调度器只负责改 `lr`，AdamW 的 `m`、`v` 状态跨步累积、完全不受影响。
-3. **权重衰减项用的是 `d[j]`（更新前的旧参数）**：这就是"解耦"——衰减直接作用在参数本身，而不是作用在梯度上。
-4. **`m`、`v` 与参数逐元素对齐**：`AdamW::new` 里 `params.iter().map(|p| vec![0.0f32; p.numel()])`，每个参数张量配一个同长度的一阶/二阶动量数组，更新时按 `j` 同步遍历。
+3. **权重衰减项用的是 `*dv`（更新前的旧参数）**：这就是"解耦"——衰减直接作用在参数本身，而不是作用在梯度上。
+4. **`m`、`v` 与参数逐元素对齐**：`AdamW::new` 里 `params.iter().map(|p| vec![0.0f32; p.numel()])`，每个参数张量配一个同长度的一阶/二阶动量数组，更新时四路 zip 同步遍历。
 
 ---
 
@@ -221,7 +237,7 @@ AdamW {
 | `weight_decay` | 0.1（`config/config.json`） | 权重衰减强度 | 常用 0.01~0.1；越大正则化越强（`TrainConfig::default()` 为 0.01，`demo` 走默认值） |
 | `lr` | 调度器控制 | 基础步长 | 配合 warmup/cosine（第 18 课） |
 
-本项目在 `train_gpt` 里这样接入：
+本项目在 `train_transformer` 里这样接入：
 
 ```rust
 let mut opt = AdamW::new(cfg.max_lr, params.clone(), cfg.weight_decay);
@@ -240,7 +256,7 @@ opt.zero_grad();
 
 > 核心内容已全部实现，这里是进阶拓展。
 
-1. **对比 SGD vs AdamW**：临时把 `train_gpt` 里的 `AdamW::new(...)` 换成 `SGD::new(0.01, params.clone())`（去掉 `opt.lr = scheduler.lr()` 那行，因为 `SGD::lr` 是私有字段），跑 600 步看 loss——体会 AdamW 在小语料上的收敛速度优势。
+1. **对比 SGD vs AdamW**：临时把 `train_transformer` 里的 `AdamW::new(...)` 换成 `SGD::new(0.01, params.clone())`（去掉 `opt.lr = scheduler.lr()` 那行，因为 `SGD::lr` 是私有字段），跑 600 步看 loss——体会 AdamW 在小语料上的收敛速度优势。
 2. **手推第一步**：假设某参数 `θ=1.0`、`g=0.5`、`lr=0.001`、`wd=0.01`，手算 `t=1` 时 `m_hat`、`v_hat`、`step`、`decay`，再在 `AdamW::step` 里加一行 `println!` 验证。
 3. **看偏差修正的效果**：把 `bc1`、`bc2` 改成恒为 1.0（不修正），训练对比 loss 曲线——训练初期应该明显变慢。
 4. **调权重衰减**：把 `wd` 从 0.01 改成 0.1 和 0.0，观察训练后 loss 与生成文本的差异，体会正则化的作用。

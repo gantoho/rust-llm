@@ -6,8 +6,8 @@
     "n_layer": 4,
     "block_size": 512,
     "n_kv_head": 0,
-    "use_rmsnorm": false,
-    "use_swiglu": false,
+    "use_rmsnorm": true,
+    "use_swiglu": true,
     "dropout": 0.1
   },
   "train": {

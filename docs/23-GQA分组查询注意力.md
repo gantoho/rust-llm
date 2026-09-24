@@ -69,25 +69,24 @@ MHA:  c_k = Linear(n_embd, n_embd)        # n_head * head_dim
 GQA:  c_k = Linear(n_embd, n_kv_head * head_dim)   # 更小！
 ```
 
-### 4.2 头复制（repeat_kv）
+### 4.2 共享头（核内索引，不物化）
 
-GQA 前向时，先把 K/V 的每个头复制 `n_rep = n_head / n_kv_head` 次，
-然后和标准 MHA 一样计算注意力。
+GQA 前向时，Q 有 `n_head` 个头、K/V 只有 `n_kv_head` 个头。早期实现先用 `repeat_kv`
+把每个 KV 头复制 `n_rep = n_head / n_kv_head` 次再算注意力；现在**不再物化**：
+`flash_attention` 的 CPU 分块核按 Q 头 `hh / n_rep` 直接索引共享的 KV 头
+（GPU 路径在算子入口核外展开），省掉整块拷贝与反向的跨副本求和节点。
 
-```rust
-fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
-    // [B*n_kv_head, T, head_dim] -> [B*n_head, T, head_dim]
-    // 每个 KV 头复制 n_rep 次
-}
+```
+Q 头 hh → KV 头 hh / n_rep   （核内索引，零物化）
 ```
 
 ### 4.3 计算流程
 
 ```
-Q: [B, T, n_head, head_dim]
-K: [B, T, n_kv_head, head_dim] → repeat → [B, T, n_head, head_dim]
-V: [B, T, n_kv_head, head_dim] → repeat → [B, T, n_head, head_dim]
-# 后续和标准 MHA 完全一样
+Q: [B, T, n_head, head_dim] → 拆头 [B*n_head, T, head_dim]
+K: [B, T, n_kv_head, head_dim] → 拆头 [B*n_kv_head, T, head_dim]   # 不复制！
+V: [B, T, n_kv_head, head_dim] → 拆头 [B*n_kv_head, T, head_dim]   # 不复制！
+flash_attention 内部：Q 头 hh 按 hh / n_rep 取共享 KV 头计算
 ```
 
 ---
@@ -130,4 +129,4 @@ GQA KV Cache = 2 * n_layer * n_kv_head * T * head_dim
 - GQA = 多个 Q 头共享一组 K/V 头，是 MHA 和 MQA 的折中
 - KV Cache 缩小 `n_head / n_kv_head` 倍，推理显存大幅降低
 - 训练时几乎不影响效果（LLaMA 2 验证）
-- 实现：K/V 投影维度变小 + 前向时 repeat_kv 复制
+- 实现：K/V 投影维度变小 + flash_attention 核内按 `hh / n_rep` 索引共享头（零物化）

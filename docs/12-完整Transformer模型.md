@@ -1,24 +1,24 @@
-# 第 12 课：完整 GPT 模型 —— 把积木拼成能预测下一个词的模型
+# 第 12 课：完整 Transformer 模型 —— 把积木拼成能预测下一个词的模型
 
-> 代码位置：[src/model.rs](../src/model.rs)（`GPTConfig` / `GPT` / `TransformerBlock`）
+> 代码位置：[src/model.rs](../src/model.rs)（`TransformerConfig` / `Transformer` / `TransformerBlock`）
 > 代码位置：[src/attention.rs](../src/attention.rs)（`MultiHeadAttention` / `KVCache`）
 > 代码位置：[src/layers.rs](../src/layers.rs)（`Embedding` / `Linear` / `LayerNorm` / `gelu`）
-> 演示入口：[src/main.rs](../src/main.rs)（演示 3：训练小 GPT 并生成文本）
+> 演示入口：[src/main.rs](../src/main.rs)（演示 3：训练小 Transformer 并生成文本）
 
 ---
 
 ## 1. 本课要搞懂的问题
 
-1. 一个完整的 GPT 由哪几大块组成？各自负责什么？
+1. 一个完整的 Transformer 由哪几大块组成？各自负责什么？
 2. Transformer Block 内部的数据是怎么流动的？pre-norm 到底"pre"在哪？
-3. 输入一串 token id，经过 `GPT::forward` 后形状怎么一步步变成 logits？
-4. `GPTConfig::tiny` 里每个数字（64 / 4 / 2 / 32）分别代表什么？
+3. 输入一串 token id，经过 `Transformer::forward` 后形状怎么一步步变成 logits？
+4. `TransformerConfig::tiny` 里每个数字（64 / 4 / 2 / 32）分别代表什么？
 
 ---
 
-## 2. GPT 架构总览
+## 2. Transformer 架构总览
 
-把前几课的积木全部拼起来，就是完整的 GPT：
+把前几课的积木全部拼起来，就是完整的 Transformer：
 
 ```
               ┌───────────────────────────────┐
@@ -42,9 +42,9 @@
 对应的 Rust 结构体（`src/model.rs`）：
 
 ```rust
-/// 完整的 GPT 模型
-pub struct GPT {
-    pub cfg: GPTConfig,
+/// 完整的 Transformer 模型
+pub struct Transformer {
+    pub cfg: TransformerConfig,
     tok_emb: Embedding,          // 同时充当 lm_head（权重绑定）
     blocks: Vec<TransformerBlock>,
     ln_f: NormLayer,
@@ -55,18 +55,18 @@ pub struct GPT {
 
 | 字段 | 类型 | 作用 | 对应积木（第几课） |
 |------|------|------|------------------|
-| `cfg` | `GPTConfig` | 保存模型配置（维度、层数……） | —— |
+| `cfg` | `TransformerConfig` | 保存模型配置（维度、层数……） | —— |
 | `tok_emb` | `Embedding` | token id → 向量，查表 `[V, D]`；**权重绑定**：输出头直接复用它的转置，不再单独建 `lm_head` | 第 12 课（`layers.rs`） |
 | `blocks` | `Vec<TransformerBlock>` | N 层 Transformer Block，重复堆叠 | 第 9-11 课 |
 | `ln_f` | `NormLayer` | 输出前的最后归一化（`LayerNorm` / `RMSNorm` 二选一） | 第 11 课 |
 | `dropout` | `f32` | Dropout 概率，来自 `cfg.dropout`（0 表示不丢弃） | —— |
 
-位置信息哪里去了？—— 第 11 课的正弦位置编码（`pos_emb`）在第 20 课被 **RoPE** 取代：不再向输入加位置向量，而是在每个注意力层内部对 Q/K 做旋转（见第 20 课与 `MultiHeadAttention::forward`）。所以 `GPT` 结构体里已经没有 `pos_emb` 字段了。
+位置信息哪里去了？—— 第 11 课的正弦位置编码（`pos_emb`）在第 20 课被 **RoPE** 取代：不再向输入加位置向量，而是在每个注意力层内部对 Q/K 做旋转（见第 20 课与 `MultiHeadAttention::forward`）。所以 `Transformer` 结构体里已经没有 `pos_emb` 字段了。
 
-在 `GPT::new` 里把它们创建出来：
+在 `Transformer::new` 里把它们创建出来：
 
 ```rust
-pub fn new(cfg: GPTConfig, rng: &mut Rng) -> Self {
+pub fn new(cfg: TransformerConfig, rng: &mut Rng) -> Self {
     // GQA 校验：n_head 必须能被 n_kv_head 整除（n_kv_head = 0 表示与 n_head 相同）
     let n_kv = if cfg.n_kv_head == 0 { cfg.n_head } else { cfg.n_kv_head };
     assert!(
@@ -80,7 +80,7 @@ pub fn new(cfg: GPTConfig, rng: &mut Rng) -> Self {
     let blocks = (0..cfg.n_layer)
         .map(|_| TransformerBlock::new(&cfg, rng))
         .collect();
-    GPT {
+    Transformer {
         cfg: cfg.clone(),
         tok_emb: Embedding::new(vocab_size, n_embd, rng),
         blocks,
@@ -112,7 +112,7 @@ x ──► LN1 ──► MultiHeadAttention ──► (+残差) ──► LN2 �
 ```rust
 /// Transformer Block（第 11 课）
 ///
-/// 结构（GPT-2 风格，pre-norm）：
+/// 结构（经典风格，pre-norm）：
 ///   x -> LayerNorm -> Attention -> 残差 +
 ///   x -> LayerNorm -> MLP(GELU)  -> 残差 +
 struct TransformerBlock {
@@ -169,11 +169,11 @@ MLP:  D → 4D → D
    更容易学非线性）
 ```
 
-`4D` 是 GPT-2 论文里的惯例比例。MLP 和注意力形成互补：**注意力负责"找谁相关"，MLP 负责"想清楚该怎么表达"。**
+`4D` 是原版论文里的惯例比例。MLP 和注意力形成互补：**注意力负责"找谁相关"，MLP 负责"想清楚该怎么表达"。**
 
 ---
 
-## 4. GPT::forward 数据流
+## 4. Transformer::forward 数据流
 
 ### 4.1 输入与输出
 
@@ -202,7 +202,7 @@ pub fn forward(
 | 4. 逐层 Transformer Block | `x = block.forward(&x, &mask, cache, base, training);` | `[B, T, D]` → `[B, T, D]`（层内拆头又合并，形状不变） |
 | 5. 最终归一化 + 输出头 | `ln_f.forward(&x)` 然后 `reshape(vec![b * t, d])`，`x.matmul(&tok_emb.table.transpose())` | `[B, T, D] → [B*T, D] → [B*T, V]` |
 
-下面是 `forward` 主体（即 `forward_core`，`GPT::forward` 拿到它的结果后再乘输出头；这里省略 GPU 常驻分支）：
+下面是 `forward` 主体（即 `forward_core`，`Transformer::forward` 拿到它的结果后再乘输出头；这里省略 GPU 常驻分支）：
 
 ```rust
 let d = self.cfg.n_embd;
@@ -256,7 +256,7 @@ self.forward_core(idx, b, t, kv_cache, training)
 
 1. **位置信息来自 RoPE 而不是相加**：第 11 课的做法是 `x = tok + pos_emb`（把正弦位置向量加进去）；第 20 课之后改为在注意力内部对 Q/K 做旋转（`rotary_pair`），`forward_core` 不再需要 `pos_emb` 表，只把 `base` 传给各层——KV cache 推理时，新 token 的绝对位置是 `base + j`（第 25 课）。
 2. **因果掩码的构造**：`j > i + base` 的位置设为 `-inf`。也就是说第 i 个 token 只能看到"它自己和它前面的"（含 KV cache 里的历史位置），未来位置在 softmax 后概率为 0——保证模型只能预测下一个词、不能偷看答案。
-3. **权重绑定的输出头**：`tok_emb.table` 是 `[V, D]`，它的转置 `[D, V]` 恰好可以把 `[D]` 向量打分成 `[V]` 个词的分数（"第 i 行 = 第 i 个词的嵌入"与当前向量做点积）。这与 GPT 的"输入输出共享词嵌入"做法一致，省掉了一份独立的 `lm_head` 参数（第 5.2 节参数量里会体现）。
+3. **权重绑定的输出头**：`tok_emb.table` 是 `[V, D]`，它的转置 `[D, V]` 恰好可以把 `[D]` 向量打分成 `[V]` 个词的分数（"第 i 行 = 第 i 个词的嵌入"与当前向量做点积）。这与 Transformer 的"输入输出共享词嵌入"做法一致，省掉了一份独立的 `lm_head` 参数（第 5.2 节参数量里会体现）。
 
 ### 4.3 一张形状变化总表
 
@@ -277,12 +277,12 @@ self.forward_core(idx, b, t, kv_cache, training)
 
 ---
 
-## 5. GPTConfig::tiny 配置解读
+## 5. TransformerConfig::tiny 配置解读
 
 ```rust
 /// 一个小配置，适合学习演示（其余字段与 Default 一致）
 pub fn tiny(vocab_size: usize) -> Self {
-    GPTConfig {
+    TransformerConfig {
         vocab_size,
         ..Default::default()
     }
@@ -294,7 +294,7 @@ pub fn tiny(vocab_size: usize) -> Self {
 | `vocab_size` | 由调用者传入 | 词表大小（有多少种 token） | 决定 `tok_emb` 表行数（兼输出头的宽度） |
 | `n_embd` | 64 | 隐藏维度 D：每个 token 的向量长度 | 所有层的宽度，模型"容量"的核心 |
 | `n_head` | 4 | 注意力头数 | `head_dim = D / H = 64 / 4 = 16`，每个头在 16 维子空间找相关性 |
-| `n_layer` | 2 | Transformer Block 层数 | 网络深度（原版 GPT-2 是 12~48 层） |
+| `n_layer` | 2 | Transformer Block 层数 | 网络深度（大型解码器是 12~48 层） |
 | `block_size` | 32 | 最大上下文长度 | 训练/推理的最大 token 数；RoPE 的绝对位置 = `base + j` 不受此表限制 |
 
 ### 5.1 由配置推导出的关键数字
@@ -319,7 +319,7 @@ pub fn tiny(vocab_size: usize) -> Self {
 | `lm_head` | **0（权重绑定，复用 tok_emb 转置）** | **0** |
 | **总计** | —— | **≈ 106,500（约 10.6 万参数）** |
 
-> 真实 GPT-2 Small 有 1.17 亿参数（n_embd=768、n_layer=12、n_head=12）。我们的 tiny 把它缩小了约 1000 倍，纯粹是为了**能在普通 CPU 上几秒钟跑一步训练**，把原理讲清楚。
+> 经典 base 规模模型有 1.17 亿参数（n_embd=768、n_layer=12、n_head=12）。我们的 tiny 把它缩小了约 1000 倍，纯粹是为了**能在普通 CPU 上几秒钟跑一步训练**，把原理讲清楚。
 
 ---
 
@@ -327,8 +327,8 @@ pub fn tiny(vocab_size: usize) -> Self {
 
 > 核心内容已全部实现，这里是进阶拓展。
 
-1. **手推数据流**：设 `vocab=50, b=2, t=3`，用 tiny 配置，写出 `GPT::forward` 里每一步张量的形状（从 `idx` 到 `logits`），对照第 4.3 节的表检查。
-2. **改配置**：自己加一个 `GPTConfig::small`，比如 `n_embd=128, n_head=8, n_layer=4, block_size=64`。注意 `head_dim = 128/8 = 16` 仍成立；再按 5.2 节的表估一下参数量。
+1. **手推数据流**：设 `vocab=50, b=2, t=3`，用 tiny 配置，写出 `Transformer::forward` 里每一步张量的形状（从 `idx` 到 `logits`），对照第 4.3 节的表检查。
+2. **改配置**：自己加一个 `TransformerConfig::small`，比如 `n_embd=128, n_head=8, n_layer=4, block_size=64`。注意 `head_dim = 128/8 = 16` 仍成立；再按 5.2 节的表估一下参数量。
 3. **验证 logits 形状**：在 `main.rs` 演示 3 里，`model.forward(...)` 之后加一行打印 `logits.shape()`，确认是 `[B*T, V]`。
 4. **看 Block 内部分工**：把 MLP 的隐藏维改成 `2 * cfg.n_embd`（2 倍而不是 4 倍；GELU MLP 的隐藏维在 `MLPEnum::new_gelu` 里由 `MLP_RATIO` 决定，`src/layers.rs:270`），训练看 loss 变化——体会 MLP 宽度对模型能力的影响。
 5. **思考**：我们的输出头就是 `tok_emb.table` 的转置（权重绑定）。为什么可以这样做？相比"独立的 lm_head"省了多少参数？（提示：`[V, D]` 和 `[D, V]` 互为转置，`lm_head` 的参数量 `64×V+V` 恰好被省掉了。）
@@ -337,11 +337,11 @@ pub fn tiny(vocab_size: usize) -> Self {
 
 ## 7. 本课总结
 
-- GPT 由 **token embedding + N 层 Transformer Block + 最终 LayerNorm + 权重绑定输出头** 四大部分组成（位置信息由第 20 课的 RoPE 在注意力内部提供，不再有独立的 `pos_emb` 表）
+- Transformer 由 **token embedding + N 层 Transformer Block + 最终 LayerNorm + 权重绑定输出头** 四大部分组成（位置信息由第 20 课的 RoPE 在注意力内部提供，不再有独立的 `pos_emb` 表）
 - Transformer Block 是 **pre-norm** 结构：`LN → Attention → 残差`，再 `LN → MLP(GELU) → 残差`；MLP 做 `D → 4D → D` 的升维降维
-- `GPT::forward` 数据流：`idx [B*T] → [B, T, D] → ... → [B*T, V]`，只有进出输出头时形状变化，层内形状始终 `[B, T, D]`
+- `Transformer::forward` 数据流：`idx [B*T] → [B, T, D] → ... → [B*T, V]`，只有进出输出头时形状变化，层内形状始终 `[B, T, D]`
 - 因果掩码保证"只能看过去"，RoPE 保证"知道相对位置"
-- 输出头权重绑定：`x @ tok_emb.tableᵀ`，与 GPT 的"输入输出共享词嵌入"一致
+- 输出头权重绑定：`x @ tok_emb.tableᵀ`，与 Transformer 的"输入输出共享词嵌入"一致
 - `tiny` 配置：`n_embd=64`、`n_head=4`（head_dim=16）、`n_layer=2`、`block_size=32`，约 10.6 万参数，CPU 上几分钟就能跑一轮训练
 
-- 下一课：写训练循环（前向 → 算损失 → 反向传播 → 更新参数），让这个 GPT 真的学会生成文本！
+- 下一课：写训练循环（前向 → 算损失 → 反向传播 → 更新参数），让这个 Transformer 真的学会生成文本！

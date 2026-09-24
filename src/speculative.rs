@@ -52,7 +52,7 @@
 use crate::attention::KVCache;
 use crate::layers::Linear;
 use crate::loss::cross_entropy_loss;
-use crate::model::GPT;
+use crate::model::Transformer;
 use crate::module::Module;
 use crate::rng::Rng;
 use crate::sample::{KvOpts, SampleOpts, probs_from_logits, sample_from_probs};
@@ -161,14 +161,14 @@ pub trait Drafter {
 /// 抽成独立类型是因为推测解码与草稿模型都要这套账目：`sync` 负责把缓存对齐、
 /// `feed` 负责一次吃进若干 token 并把 logits 行交回来。
 pub struct TargetStream<'a> {
-    model: &'a GPT,
+    model: &'a Transformer,
     cache: Vec<KVCache>,
 }
 
 impl<'a> TargetStream<'a> {
     /// 按推理侧设置构造（`kv.enable` 被忽略：推测解码必须配缓存，否则
     /// "一次前向验证 γ+1 个位置"这件事本身就不成立）
-    pub fn new(model: &'a GPT, kv: KvOpts) -> Self {
+    pub fn new(model: &'a Transformer, kv: KvOpts) -> Self {
         TargetStream {
             model,
             cache: model.new_kv_cache_with(kv.sink, kv.bits),
@@ -356,7 +356,7 @@ impl<'a> SpecDecoder<'a> {
     /// - `vocab`：字节级词表（[`crate::tokenizer::Tokenizer::vocab_bytes`]），
     ///   用来做 UTF-8 掩码；char 分词器传 `None`。
     pub fn new(
-        model: &'a GPT,
+        model: &'a Transformer,
         kv: KvOpts,
         gamma: usize,
         opts: SampleOpts,
@@ -482,7 +482,7 @@ pub struct ModelDrafter<'a> {
 }
 
 impl<'a> ModelDrafter<'a> {
-    pub fn new(model: &'a GPT, kv: KvOpts) -> Self {
+    pub fn new(model: &'a Transformer, kv: KvOpts) -> Self {
         ModelDrafter {
             stream: TargetStream::new(model, kv),
             greedy: false,
@@ -490,7 +490,7 @@ impl<'a> ModelDrafter<'a> {
     }
 
     /// 用贪心草稿的构造器
-    pub fn greedy(model: &'a GPT, kv: KvOpts) -> Self {
+    pub fn greedy(model: &'a Transformer, kv: KvOpts) -> Self {
         ModelDrafter {
             stream: TargetStream::new(model, kv),
             greedy: true,
@@ -550,7 +550,7 @@ impl Drafter for ModelDrafter<'_> {
 /// 这迫使主干把更长的未来信息编码进去——这是 MTP 作为训练信号的价值所在。
 ///
 /// 与 DeepSeek-V3 的做法有一处刻意的差别：那里 MTP 头与主干的输出头共享词嵌入，
-/// 这里各头独立成小矩阵。共享权重需要改 `GPT` 的输出头结构（牵动 checkpoint 布局），
+/// 这里各头独立成小矩阵。共享权重需要改 `Transformer` 的输出头结构（牵动 checkpoint 布局），
 /// 而本课要验证的是"多未来 token 的预测与它的草稿用途"，独立小头已经足够表达。
 pub struct MtpHeads {
     heads: Vec<Linear>,
@@ -594,7 +594,7 @@ impl MtpHeads {
 
     /// MTP 训练损失：各头交叉熵之和 / 头数。
     ///
-    /// - `hidden`：主干的隐状态 `[b*t, n_embd]`（一般来自 [`GPT::forward_hidden`]）
+    /// - `hidden`：主干的隐状态 `[b*t, n_embd]`（一般来自 [`Transformer::forward_hidden`]）
     /// - `tokens`：同一次前向对应的输入 token `[b*t]`（展平）
     /// - `b` / `t`：batch 与序列长度。第 k 个头的目标是 `tokens[i + k + 1]`。
     ///
@@ -640,7 +640,7 @@ impl Module for MtpHeads {
 /// 分布彼此**条件独立**（都只条件于同一个隐状态），比自回归草稿"糊"一些，
 /// 所以接受率通常更低——这正是"草稿算力 vs 接受率"的取舍。
 pub struct MtpDrafter<'a> {
-    backbone: &'a GPT,
+    backbone: &'a Transformer,
     stream: TargetStream<'a>,
     heads: MtpHeads,
 }
@@ -648,7 +648,7 @@ pub struct MtpDrafter<'a> {
 impl<'a> MtpDrafter<'a> {
     /// `backbone` 一般就是目标模型（MTP 头本来就挂在它的隐状态上），
     /// 也可以传一个更小的模型当草稿底座。
-    pub fn new(backbone: &'a GPT, n_heads: usize, kv: KvOpts, rng: &mut Rng) -> Self {
+    pub fn new(backbone: &'a Transformer, n_heads: usize, kv: KvOpts, rng: &mut Rng) -> Self {
         let heads = MtpHeads::new(
             backbone.cfg.n_embd,
             backbone.cfg.vocab_size,
@@ -667,9 +667,6 @@ impl<'a> MtpDrafter<'a> {
         &self.heads
     }
 
-    pub fn heads_mut(&mut self) -> &mut MtpHeads {
-        &mut self.heads
-    }
 }
 
 impl Drafter for MtpDrafter<'_> {
@@ -721,7 +718,7 @@ impl Drafter for MtpDrafter<'_> {
 /// 清空，所以同一个 drafter 可以反复传给不同的 prompt。
 #[allow(clippy::too_many_arguments)]
 pub fn speculative_generate(
-    model: &GPT,
+    model: &Transformer,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_new: usize,
@@ -772,22 +769,27 @@ pub fn speculative_generate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GPTConfig;
+    use crate::model::TransformerConfig;
     use crate::optim::Optimizer;
     use crate::sample::generate;
 
     /// 极小模型：推测解码的统计检验要跑几千轮，模型必须便宜到"每轮几乎免费"。
     /// `block_size` 给足，避免滑动窗口溢出（溢出后 `rollback` 不是严格可逆，
     /// 单测里只验证窗口内的严格等价）。
-    fn tiny_model(vocab: usize, seed: u64) -> GPT {
-        let cfg = GPTConfig {
+    fn tiny_model(vocab: usize, seed: u64) -> Transformer {
+        let cfg = TransformerConfig {
             n_embd: 8,
             n_head: 2,
             n_layer: 1,
             block_size: 64,
-            ..GPTConfig::tiny(vocab)
+            // 固定经典风格（LayerNorm + GELU）：本模块验证的是推测解码的账目与
+            // 等价性，不让默认架构（RMSNorm + SwiGLU）改变随机初始化后的贪心轨迹
+            // （未训练模型一旦提前吐 EOS，"生成满 20 个 token"的断言就落空）
+            use_rmsnorm: false,
+            use_swiglu: false,
+            ..TransformerConfig::tiny(vocab)
         };
-        GPT::new(cfg, &mut Rng::new(seed))
+        Transformer::new(cfg, &mut Rng::new(seed))
     }
 
     /// 近似贪心：top_k = 1 + 极低温度 → 分布退化成单点，采样结果与 argmax 等价

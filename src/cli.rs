@@ -9,10 +9,10 @@
 //! cargo run -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16] [--lora-targets q,k,v] [--steps 1000] [--lr 1e-4]
 //! cargo run -- finetune --config config/config.json --pretrained ckpt-lora --resume-lora   # 链式续训旧适配层
 //! cargo run -- preset   [--name small] [--output config/config.json]
-//! cargo run -- demo     # 端到端演示（XOR + BPE + 内置语料小 GPT）
+//! cargo run -- demo     # 端到端演示（XOR + BPE + 内置语料小 Transformer）
 //! cargo run -- bench    # 性能基准（固定小模型测训练 / 推理吞吐）
 //! cargo run -- quant    --config config/config.json [--ckpt ...] [--bits int8|int4]
-//!                       [--method rtn|gptq|awq] [--act-order true|false] [--damp 0.01] [--block 128]
+//!                       [--method rtn|hess|awq] [--act-order true|false] [--damp 0.01] [--block 128]
 //!                       [--calib-file data/calib.txt] [--calib-samples 64] [--alpha 0.5]
 //!                       [--out checkpoints/quant.ckpt] [--eval]
 //! cargo run -- distributed [--dp 4] [--tp 2] [--pp 2] [--micro-batches 4] [--steps 40]
@@ -40,9 +40,9 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "llm_from_scratch",
-    about = "从零实现的 GPT 语言模型（算法纯手写，零深度学习框架依赖）",
-    long_about = "一个完整的 GPT 语言模型训练与推理框架，全部算法纯 Rust 手写实现。\n\
-                   支持 GPT-2 和 LLaMA 风格架构（RoPE、RMSNorm、SwiGLU、GQA）、\n\
+    about = "从零实现的 Transformer 语言模型（算法纯手写，零深度学习框架依赖）",
+    long_about = "一个完整的 Transformer 语言模型训练与推理框架，全部算法纯 Rust 手写实现。\n\
+                   支持经典与 LLaMA 风格架构（RoPE、RMSNorm、SwiGLU、GQA）、\n\
                    KV Cache 加速推理、监督微调（SFT）、Beam Search 生成、GPU 加速等。"
 )]
 pub struct Cli {
@@ -274,7 +274,7 @@ pub enum Cmd {
         #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
         output: String,
     },
-    /// 端到端演示：XOR + BPE + 内置语料小 GPT
+    /// 端到端演示：XOR + BPE + 内置语料小 Transformer
     Demo,
     /// Scaling Laws 实验：多规模实测扫描 + 幂律拟合 + Chinchilla 最优配比与算力/时长估算
     Scaling {
@@ -356,6 +356,9 @@ pub enum Cmd {
         /// 均衡辅助损失系数 α（对照组用 0）
         #[arg(long, default_value_t = 0.01)]
         aux_coef: f32,
+        /// router z-loss 系数 β（`L_z = β·mean(logsumexp(logits)²)`，0 = 不加）
+        #[arg(long, default_value_t = 0.0)]
+        z_loss: f32,
         /// 容量因子扫描（逗号分隔；0 = 不限容量）
         #[arg(long, default_value = "0,1.0,1.25,2.0")]
         capacity_factors: String,
@@ -363,7 +366,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
-    /// 权重量化（第 33 课）：RTN / GPTQ / AWQ 三种 weight-only 量化，出报告并可落盘
+    /// 权重量化（第 33 课）：RTN / Hessian 量化 / AWQ 三种 weight-only 量化，出报告并可落盘
     Quant {
         /// 配置文件路径
         #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
@@ -377,9 +380,9 @@ pub enum Cmd {
         /// 量化位宽：int8 = 每权重 1 字节，int4 = 每权重半字节
         #[arg(long, default_value = "int8", value_parser = ["int8", "int4"])]
         bits: String,
-        /// 量化算法：rtn = 直接取整（不需要校准集），gptq = Hessian 误差补偿，
+        /// 量化算法：rtn = 直接取整（不需要校准集），hess = Hessian 误差补偿，
         /// awq = 激活感知缩放
-        #[arg(long, default_value = "rtn", value_parser = ["rtn", "gptq", "awq"])]
+        #[arg(long, default_value = "rtn", value_parser = ["rtn", "hess", "awq"])]
         method: String,
         /// 校准文本文件/目录/通配符（缺省用 `data/corpus/` 下的内置语料）。
         /// `rtn` 不需要它，给了也会被忽略（RTN 只用权重本身）
@@ -393,17 +396,17 @@ pub enum Cmd {
         /// 想快速试一遍算法就把它压小（如 512），正式量化再放开
         #[arg(long, default_value_t = 0)]
         calib_tokens: usize,
-        /// GPTQ：是否按激活重要性重排序输入通道（act-order）。
+        /// Hessian 量化：是否按激活重要性重排序输入通道（act-order）。
         /// 开 = 高重要性通道先量化、把误差甩给后面的通道，同一位宽下加权误差更低
         #[arg(long, default_value = "true", value_parser = ["true", "false"])]
         act_order: String,
-        /// GPTQ：Hessian 阻尼系数 `H += damp·(trace(H)/n)·I`，把最小特征值抬离 0。
+        /// Hessian 量化：阻尼系数 `H += damp·(trace(H)/n)·I`，把最小特征值抬离 0。
         /// 0 = 不加阻尼（病态 H 下 Cholesky 失败，该层退回 RTN）
-        #[arg(long, default_value_t = crate::quant::GPTQ_DAMP)]
+        #[arg(long, default_value_t = crate::quant::HESS_DAMP)]
         damp: f32,
-        /// GPTQ：分块大小（按输入通道计），0 = 不分块。
-        /// 只影响补偿量的批处理粒度，不改变数学结果（见 `gptq_block_size_does_not_change_result`）
-        #[arg(long, default_value_t = crate::quant::GPTQ_BLOCK)]
+        /// Hessian 量化：分块大小（按输入通道计），0 = 不分块。
+        /// 只影响补偿量的批处理粒度，不改变数学结果（见 `hess_block_size_does_not_change_result`）
+        #[arg(long, default_value_t = crate::quant::HESS_BLOCK)]
         block: usize,
         /// AWQ 的缩放指数 α（`s = mean|x|^α`）：0 = 关闭缩放（等价 RTN）；
         /// 不给 = 逐层在 0~1 的网格上按代理误差搜索最优 α（每层可能选到不同的值）
@@ -482,7 +485,7 @@ pub struct RagArgs {
 
 /// 对齐实验的参数（第 36 课）。
 ///
-/// 四件套共用一个小 GPT 主干：奖励模型与 DPO 各自的训练步数分开给，方便单独观察
+/// 四件套共用一个小 Transformer 主干：奖励模型与 DPO 各自的训练步数分开给，方便单独观察
 /// 「先训好裁判」与「再拿裁判的信号改策略」两个阶段；`beta` / `clip_eps` / `kl_coef`
 /// 是三种算法各自的那个"松紧旋钮"。
 #[derive(Args, Debug, Clone)]

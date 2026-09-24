@@ -29,4 +29,4 @@ FFN(x) = max(0, xW_1 + b_1)W_2 + b_2
 
 Weight tying between the input embedding and the output embedding layers reduces the total parameter count while maintaining performance.
 
-The original Transformer achieved state-of-the-art results on English-to-German and English-to-French translation benchmarks, with significantly less training time than previous architectures. This work laid the foundation for modern large language models including BERT, GPT, and their successors.
+The original Transformer achieved state-of-the-art results on English-to-German and English-to-French translation benchmarks, with significantly less training time than previous architectures. This work laid the foundation for modern large language models including BERT, T5, and their successors.

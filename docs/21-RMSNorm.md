@@ -2,9 +2,9 @@
 
 > 代码位置：[src/tensor.rs](../src/tensor.rs)（`Tensor::rmsnorm` 融合算子）
 > 代码位置：[src/layers.rs](../src/layers.rs)（`RMSNorm` 层、`NormLayer` 枚举）
-> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `GPT` 使用 `NormLayer`）
+> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `Transformer` 使用 `NormLayer`）
 >
-> 配置开关：`config/config.json` → `model.use_rmsnorm: true`（示例值；仓库当前 `config/config.json` 里是 `false`，需手动改为 `true` 才能启用 RMSNorm）
+> 配置开关：`config/config.json` → `model.use_rmsnorm: true`（**默认已启用**，改回 `false` 则退回 LayerNorm）
 
 ---
 
@@ -67,7 +67,7 @@ LayerNorm 的核心作用是"把每层的输入拉回标准分布"。但研究�
 
 | 模型 | 归一化 |
 |------|--------|
-| GPT-2/3 | LayerNorm |
+| 经典解码器 | LayerNorm |
 | LLaMA / LLaMA 2 / LLaMA 3 | **RMSNorm** |
 | Mistral / Mixtral | **RMSNorm** |
 | Qwen / Qwen2 | **RMSNorm** |
@@ -110,7 +110,7 @@ d_γ_j = Σ_r d_y[r,j] * (x[r,j] * is_r)
 
 ### 6.2 `NormLayer` 枚举
 
-为了兼容 GPT-2（LayerNorm）和 LLaMA（RMSNorm），用枚举统一接口：
+为了兼容经典风格（LayerNorm）和 LLaMA（RMSNorm），用枚举统一接口：
 
 ```rust
 pub enum NormLayer {

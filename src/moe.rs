@@ -53,16 +53,25 @@
 //!    间接影响。后续工作（DeepSeek-V3 的 loss-free 均衡偏置、expert-choice 路由）正是
 //!    为了绕开这个软/硬错配。
 //!
+//!    与它互补的是 **router z-loss**（PaLM / Mixtral 都加了，`model.moe_z_loss_coef`）：
+//!
+//!    ```text
+//!    L_z = (1/n) · Σ_i log²(Σ_j e^{logits_ij})      = mean(logsumexp(logits)²)
+//!    ```
+//!
+//!    α 压平的是路由**概率**，β 按住的是门控 logits 的**幅度**：logits 越推越大 ⇒
+//!    softmax 过尖 ⇒ 路由器饱和、梯度消失。尤其 K = 1 + 重归一化口径下主损失给不了
+//!    路由器梯度（§2），z-loss 是那时少数还能直接训路由器的信号之一。
+//!
 //! 另外实现了**容量因子**（每个专家最多处理多少 token，Switch Transformer 的
 //! Token Dropping）：超出的分配直接丢弃。这是真实 MoE 训练里 GPU 显存与
 //! All-to-All 通信量的硬上限，代价是某些 token 少走了一个专家。
 
 use crate::layers::{Linear, MLPEnum, swiglu_hidden};
-use crate::model::GPTConfig;
+use crate::model::TransformerConfig;
 use crate::module::Module;
 use crate::rng::Rng;
-use crate::tensor::Tensor;
-use std::cell::RefCell;
+use crate::tensor::{Shared, Tensor};
 
 // ==================== 路由 ====================
 
@@ -129,11 +138,19 @@ pub fn top_k_gate(
     let mut mask = vec![0.0f32; n_tokens * n_expert];
     let mut routed = vec![0usize; n_expert];
     let mut dropped = 0usize;
-    // 每行排序用的下标缓冲，循环外分配一次复用
+    // 每行选择用的下标缓冲，循环外分配一次复用（select_nth 会把它打乱，
+    // 但它始终是 0..n_expert 的一个排列，下一轮照样能直接用）
     let mut order: Vec<usize> = (0..n_expert).collect();
     for i in 0..n_tokens {
         let row = &logits[i * n_expert..(i + 1) * n_expert];
-        order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+        // 只挑前 k 大：select_nth_unstable_by 期望 O(E) 切出前 k 名（无序），
+        // 再对这 k 个排 O(k log k)——整行 O(E log E) 全排序是浪费（E=256、k=2 时差两个数量级）。
+        // 比较器与全排序完全一致（值降序、并列下标升序），路由行为逐位不变
+        //（对拍测试：`test_top_k_gate_matches_full_sort`）。
+        order.select_nth_unstable_by(k - 1, |&a, &b| {
+            row[b].total_cmp(&row[a]).then(a.cmp(&b))
+        });
+        order[..k].sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
         for &e in &order[..k] {
             penalty[i * n_expert + e] = 0.0;
             mask[i * n_expert + e] = 1.0;
@@ -295,21 +312,24 @@ pub struct MoELayer {
     pub capacity_factor: f32,
     /// 均衡辅助损失系数 α（0 = 不加；损失的**平方**等更花哨的变体不在本课范围）
     pub aux_coef: f32,
+    /// router z-loss 系数 β（`L_z = β·mean(logsumexp(logits)²)`，0 = 不加）。
+    /// 与 α 互补：α 压平路由概率，β 按住门控 logits 的幅度（见文件头 §4）。
+    pub z_loss_coef: f32,
     /// 门控权重的求和口径（见文件头 §2）：
     /// - `false`（默认，Mixtral / DeepSeek / Qwen 式）：Top-K 内部**重归一化**，`Σw = 1`。
     ///   ⚠️ K = 1 时权重恒为 1，主损失给不了路由器梯度——K = 1 请置 `true`。
     /// - `true`（Switch Transformer 式）：用**全部专家**上的 softmax 原概率，`Σw < 1`。
     pub switch_gate: bool,
-    /// 最近一次前向的路由统计（`forward` 走 `&self`，所以用 `RefCell`）
-    stats: RefCell<RouteStats>,
+    /// 最近一次前向的路由统计（`forward` 走 `&self`，所以用 `Shared` 内部 `Mutex`）
+    stats: Shared<RouteStats>,
 }
 
 impl MoELayer {
-    /// 按模型配置建层：专家数、Top-K、容量因子、辅助损失系数都取自 [`GPTConfig`]。
+    /// 按模型配置建层：专家数、Top-K、容量因子、辅助损失系数都取自 [`TransformerConfig`]。
     ///
     /// 专家的隐藏维度与稠密 MLP 完全一致（[`MLPEnum`] 同一套建层函数），
     /// 这样"把某层的稠密 FFN 换成 MoE"在参数口径上是干净可比的。
-    pub fn new(cfg: &GPTConfig, rng: &mut Rng) -> Self {
+    pub fn new(cfg: &TransformerConfig, rng: &mut Rng) -> Self {
         let d = cfg.n_embd;
         assert!(
             cfg.n_expert >= 2,
@@ -327,6 +347,7 @@ impl MoELayer {
             "model.moe_capacity_factor 不能为负（0 = 不限容量）"
         );
         assert!(cfg.moe_aux_coef >= 0.0, "model.moe_aux_coef 不能为负");
+        assert!(cfg.moe_z_loss_coef >= 0.0, "model.moe_z_loss_coef 不能为负");
         let experts = (0..cfg.n_expert)
             .map(|_| {
                 if cfg.use_swiglu {
@@ -343,8 +364,9 @@ impl MoELayer {
             top_k: cfg.moe_top_k,
             capacity_factor: cfg.moe_capacity_factor,
             aux_coef: cfg.moe_aux_coef,
+            z_loss_coef: cfg.moe_z_loss_coef,
             switch_gate: cfg.moe_switch_gate,
-            stats: RefCell::new(RouteStats::default()),
+            stats: Shared::new(RouteStats::default()),
         }
     }
 
@@ -355,10 +377,10 @@ impl MoELayer {
         self.forward_with_aux(x).0
     }
 
-    /// 前向 + 均衡辅助损失。
+    /// 前向 + 辅助损失（均衡 α · L_aux + router z-loss β · L_z，任一非 0 就加）。
     ///
-    /// 返回 `(输出, 加权后的辅助损失)`；`aux_coef == 0` 时第二项为 `None`
-    /// （不加就当它不存在，别在计算图里留一个恒等于 0 的节点）。
+    /// 返回 `(输出, 加权后的辅助损失)`；`aux_coef` 与 `z_loss_coef` 都为 0 时第二项为
+    /// `None`（不加就当它不存在，别在计算图里留一个恒等于 0 的节点）。
     ///
     /// 输入可以是 `[B, T, d]`（Transformer 里就是它）或 `[N, d]`，输出形状不变。
     pub fn forward_with_aux(&self, x: &Tensor) -> (Tensor, Option<Tensor>) {
@@ -402,10 +424,9 @@ impl MoELayer {
             }
             let xe = x2.gather_rows(sel); // [n_e, d]：只取分到自己的 token
             let ye = self.experts[e].forward(&xe); // [n_e, d]
-            // 取 w 的第 e 列：右乘 one-hot 列向量，[n,E] @ [E,1] = [n,1]。
-            // 必须走 matmul 才能把梯度送回路由器；直接读 w 的显存会把这条路掐断。
-            let w_col = w.matmul(&one_hot_col(e, self.n_expert));
-            let we = w_col.gather_rows(sel); // [n_e, 1]
+            // 取 w 的第 e 列再按 sel 取行：两步都是带梯度的索引算子，
+            // 路由器照常拿得到梯度；比原来"右乘 one-hot 的整表 matmul"少算 n×E 次乘加
+            let we = w.gather_rows(sel).select_col(e); // [n_e, 1]
             let contrib = we.mul(&ye); // [n_e, d]（[n_e,1] 广播到 [n_e,d]）
             let scattered = contrib.scatter_add_rows(sel, n); // 散射回原位相加
             out = Some(match out {
@@ -422,7 +443,18 @@ impl MoELayer {
         let f = Tensor::from_vec(plan.f.clone(), vec![self.n_expert, 1]);
         let aux_raw = f.mul(&p_mean).sum().mul_scalar(self.n_expert as f32);
 
-        // 5. 统计（供训练日志 / 诊断读取；值本身不参与计算图）
+        // 5. router z-loss：L_z = mean_i log²(Σ_j e^{logits_ij})（PaLM 的经典正则）。
+        //    与 α 互补：α 压平路由**概率**，β 按住 logits 的**幅度**——logits 越推越大
+        //    ⇒ softmax 过尖 ⇒ 路由饱和、梯度消失。走 logsumexp 算子（减行 max，数值稳定），
+        //    不用 log(exp(...)) 裸拼（logits 稍大就溢出成 inf）。
+        let z_raw = if self.z_loss_coef > 0.0 {
+            let lse = logits.logsumexp_last_dim(); // [n, 1]
+            Some(lse.pow(2.0).sum().mul_scalar(1.0 / n as f32))
+        } else {
+            None
+        };
+
+        // 6. 统计（供训练日志 / 诊断读取；值本身不参与计算图）
         {
             let mut st = self.stats.borrow_mut();
             st.counts = plan.sel.iter().map(|s| s.len()).collect();
@@ -436,11 +468,17 @@ impl MoELayer {
         } else {
             out.reshape(x.shape().to_vec())
         };
-        let aux = if self.aux_coef > 0.0 {
-            Some(aux_raw.mul_scalar(self.aux_coef))
-        } else {
-            None
-        };
+        let mut aux: Option<Tensor> = None;
+        if self.aux_coef > 0.0 {
+            aux = Some(aux_raw.mul_scalar(self.aux_coef));
+        }
+        if let Some(z) = z_raw {
+            let z = z.mul_scalar(self.z_loss_coef);
+            aux = Some(match aux {
+                None => z,
+                Some(a) => a.add(&z),
+            });
+        }
         (out, aux)
     }
 
@@ -490,13 +528,6 @@ impl Module for MoELayer {
     }
 }
 
-/// 第 e 个专家的 one-hot 列向量 `[E, 1]`（取门控权重矩阵的第 e 列用）
-fn one_hot_col(e: usize, n_expert: usize) -> Tensor {
-    let mut data = vec![0.0f32; n_expert];
-    data[e] = 1.0;
-    Tensor::from_vec(data, vec![n_expert, 1])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +542,7 @@ mod tests {
     /// 要测 K = 1 的路由器梯度，就必须走 switch 口径。K ≥ 2 两条口径都留着梯度，
     /// 默认的重归一化口径才是 Mixtral 的真实做法，所以只在 K = 1 时切换。
     fn build(d: usize, n_expert: usize, top_k: usize, seed: u64) -> MoELayer {
-        let cfg = GPTConfig {
+        let cfg = TransformerConfig {
             vocab_size: 16,
             n_embd: d,
             n_expert,
@@ -562,6 +593,109 @@ mod tests {
                 assert_eq!(plan.mask[i * e + j] == 1.0, selected, "选中掩码与选择不一致");
             }
         }
+    }
+
+    /// top-k 选择（select_nth）与全排序参考逐字段一致：sel / penalty / mask / routed / f。
+    /// 性能改造（整行 O(E log E) → O(E) + O(k log k)）不得改变任何路由行为，
+    /// 尤其"并列时按下标升序"的确定性——这里刻意量化 logits 制造大量并列。
+    #[test]
+    fn test_top_k_gate_matches_full_sort() {
+        let (n, e, k) = (17usize, 13usize, 3usize);
+        let mut rng = Rng::new(123);
+        // 量化到 0.25 步长：13 个专家、8 个不同取值，必然大量并列
+        let logits: Vec<f32> = (0..n * e)
+            .map(|_| (rng.next_f32() * 8.0).floor() * 0.25)
+            .collect();
+        let got = top_k_gate(&logits, n, e, k, usize::MAX);
+
+        // 参考实现：改造前的整行全排序
+        let mut sel_ref: Vec<Vec<usize>> = vec![Vec::new(); e];
+        let mut penalty_ref = vec![f32::NEG_INFINITY; n * e];
+        let mut mask_ref = vec![0.0f32; n * e];
+        let mut routed_ref = vec![0usize; e];
+        for i in 0..n {
+            let row = &logits[i * e..(i + 1) * e];
+            let mut order: Vec<usize> = (0..e).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+            for &j in &order[..k] {
+                penalty_ref[i * e + j] = 0.0;
+                mask_ref[i * e + j] = 1.0;
+                routed_ref[j] += 1;
+                sel_ref[j].push(i);
+            }
+        }
+        assert_eq!(got.sel, sel_ref, "sel 与全排序不一致");
+        assert_eq!(got.routed, routed_ref, "routed 与全排序不一致");
+        assert_eq!(got.penalty, penalty_ref, "penalty 与全排序不一致");
+        assert_eq!(got.mask, mask_ref, "mask 与全排序不一致");
+        assert_eq!(got.dropped, 0, "不限容量不该有丢弃");
+        let f_ref: Vec<f32> = routed_ref
+            .iter()
+            .map(|&c| c as f32 / (n * k) as f32)
+            .collect();
+        assert_eq!(got.f, f_ref, "f 与全排序不一致");
+    }
+
+    /// router z-loss 的数值与梯度：K = 1 + 重归一化口径下主损失给不了路由器梯度
+    /// （文件头 §2 的坑），z-loss 必须能把梯度补上；系数为 0 时不留任何节点。
+    #[test]
+    fn test_z_loss_value_and_router_gradient() {
+        let (d, e, n) = (4usize, 3usize, 6usize);
+        let x = rand_x(n, d, 8);
+        let cfg = TransformerConfig {
+            vocab_size: 16,
+            n_embd: d,
+            n_expert: e,
+            moe_top_k: 1,
+            moe_switch_gate: false, // 重归一化：主损失梯度恒为 0（正是 z-loss 的用武之地）
+            moe_z_loss_coef: 1.0,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(23);
+        let layer = MoELayer::new(&cfg, &mut rng);
+
+        let (_, aux) = layer.forward_with_aux(&x);
+        let aux = aux.expect("β > 0 时应返回辅助损失");
+
+        // 数值对拍：mean(logsumexp(logits)²)，纯手算参考
+        let logits = layer.router.forward(&x).data();
+        let mut z_ref = 0.0f32;
+        for i in 0..n {
+            let row = &logits[i * e..(i + 1) * e];
+            let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let s: f32 = row.iter().map(|&v| (v - m).exp()).sum();
+            let lse = m + s.ln();
+            z_ref += lse * lse;
+        }
+        z_ref /= n as f32;
+        assert!(
+            (aux.item() - z_ref).abs() < 1e-4,
+            "z-loss 数值不对：实测 {}，手算 {z_ref}",
+            aux.item()
+        );
+
+        // 梯度：β · L_z 必须送到路由器（重归一化 K = 1 的主路径给不了）
+        zero_grad_all(&layer);
+        aux.backward();
+        let gsum: f32 = layer.router.weight.grad().iter().map(|g| g.abs()).sum();
+        assert!(gsum > 1e-6, "z-loss 必须给路由器梯度，实测 {gsum}");
+
+        // β = 0（默认）且 α = 0 ⇒ 不返回（也不在计算图里留恒零节点）
+        let layer0 = MoELayer::new(
+            &TransformerConfig {
+                vocab_size: 16,
+                n_embd: d,
+                n_expert: e,
+                moe_top_k: 1,
+                moe_switch_gate: false,
+                ..Default::default()
+            },
+            &mut Rng::new(23),
+        );
+        assert!(
+            layer0.forward_with_aux(&x).1.is_none(),
+            "β = 0 且 α = 0 时不该返回辅助损失"
+        );
     }
 
     /// 门控权重：只在 Top-K 上做 softmax ⇒ 恰好 K 个非零、和为 1；
@@ -817,7 +951,7 @@ mod tests {
         let (d, e) = (4usize, 3usize);
         let x = rand_x(4, d, 6);
         let router_grad_sum = |switch_gate: bool| -> f32 {
-            let cfg = GPTConfig {
+            let cfg = TransformerConfig {
                 vocab_size: 16,
                 n_embd: d,
                 n_expert: e,
@@ -885,7 +1019,7 @@ mod tests {
     fn test_sparse_stats_matches_real_layer() {
         for use_swiglu in [false, true] {
             let (d, e, k) = (8usize, 4usize, 2usize);
-            let cfg = GPTConfig {
+            let cfg = TransformerConfig {
                 vocab_size: 16,
                 n_embd: d,
                 n_expert: e,
@@ -967,12 +1101,16 @@ mod tests {
             .map(|_| (0..d * d).map(|_| rng.randn() * 0.5).collect())
             .collect();
         let head = Linear::new(d, d, &mut rng);
-        let cfg = GPTConfig {
+        let cfg = TransformerConfig {
             vocab_size: 16,
             n_embd: d,
             n_expert: e,
             moe_top_k: k,
             moe_aux_coef: 0.01,
+            // 固定 GELU 专家：本测验证 MoE 路由 + 训练能收敛，不测激活函数。
+            // SwiGLU 在 d=8 时 hidden 被 256 对齐抬到 256（正常是 32），
+            // 80 步 toy 训练下学不动
+            use_swiglu: false,
             ..Default::default()
         };
         let moe = MoELayer::new(&cfg, &mut rng);

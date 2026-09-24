@@ -1,4 +1,4 @@
-//! GPT 模型（第 9-12、19 课）
+//! Transformer 模型（第 9-12、19 课）
 //!
 //! 结构（从下到上）：
 //! 1. token embedding：每个 token id -> 向量
@@ -24,19 +24,17 @@ use crate::quant::{
 };
 use crate::rng::Rng;
 use crate::rope::{self, RopeScaling, RopeSpec};
-use crate::tensor::Tensor;
+use crate::tensor::{Shared, Tensor};
 use crate::tokenizer::Tokenizer;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// LayerNorm 数值稳定常数（防止方差为 0 时除零）
 const LN_EPS: f32 = 1e-5;
 
-/// 模型配置（`config/config.json` 里可调，缺省字段用 [`GPTConfig::default`]）
+/// 模型配置（`config/config.json` 里可调，缺省字段用 [`TransformerConfig::default`]）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub struct GPTConfig {
+pub struct TransformerConfig {
     /// 词表大小；0 表示"由分词器决定"（训练时自动填入）
     pub vocab_size: usize,
     pub n_embd: usize,     // 隐藏维度
@@ -48,9 +46,9 @@ pub struct GPTConfig {
     /// 0 表示与 n_head 相同（标准 Multi-Head Attention）。
     /// LLaMA 2 70B 用 n_head=64, n_kv_head=8；Mistral 7B 用 n_head=32, n_kv_head=8。
     pub n_kv_head: usize,
-    /// 是否使用 RMSNorm（true = LLaMA 风格，false = GPT-2 风格 LayerNorm）
+    /// 是否使用 RMSNorm（true = LLaMA 风格，false = 经典风格 LayerNorm）
     pub use_rmsnorm: bool,
-    /// 是否使用 SwiGLU MLP（true = LLaMA 风格，false = GPT-2 风格 GELU MLP）
+    /// 是否使用 SwiGLU MLP（true = LLaMA 风格，false = 经典风格 GELU MLP）
     pub use_swiglu: bool,
     /// Dropout 概率（0 = 不丢弃）。用于注意力权重和残差连接。
     pub dropout: f32,
@@ -67,6 +65,12 @@ pub struct GPTConfig {
     pub moe_capacity_factor: f32,
     /// 负载均衡辅助损失系数 α（`L_aux = α·E·Σ f_i·p_i`）。0 = 不加（默认）。
     pub moe_aux_coef: f32,
+    /// router z-loss 系数 β（`L_z = β·mean(logsumexp(logits)²)`）。0 = 不加（默认）。
+    /// 与 α 互补：α 压平路由**概率分布**，β 按住门控 logits 的**幅度**——
+    /// logits 越推越大 ⇒ softmax 过尖 ⇒ 路由器饱和、梯度消失。
+    /// 尤其 `moe_top_k = 1` + 重归一化口径时主损失给不了路由器梯度，
+    /// β > 0 是那时少数能直接训路由器的信号（PaLM 的经典正则）。
+    pub moe_z_loss_coef: f32,
     /// 门控权重的求和口径（详见 [`crate::moe`] 文件头 §2）：
     /// - `false`（默认）：Top-K 内部**重归一化**（Mixtral / DeepSeek / Qwen 式），`Σw = 1`。
     ///   ⚠️ `moe_top_k = 1` 时权重恒等于 1，主损失给不了路由器任何梯度——
@@ -74,7 +78,7 @@ pub struct GPTConfig {
     /// - `true`：用**全部专家**上的 softmax 原概率（Switch Transformer 式），`Σw < 1`。
     pub moe_switch_gate: bool,
     // ---- RoPE 频率（第 20 课长度外推）----
-    /// RoPE 的频率底数：10 000 = 原始 RoPE / GPT-NeoX；LLaMA-3 用 500 000。
+    /// RoPE 的频率底数：10 000 = 原始 RoPE 论文；LLaMA-3 用 500 000。
     /// 底数本身就是一种静态的频率缩放，改它必须与训练时保持一致。
     pub rope_base: f32,
     /// RoPE 的长度外推方式（[`crate::rope::RopeScaling`]）：
@@ -92,22 +96,23 @@ pub struct GPTConfig {
     pub rope_train_ctx: usize,
 }
 
-impl Default for GPTConfig {
+impl Default for TransformerConfig {
     fn default() -> Self {
-        GPTConfig {
+        TransformerConfig {
             vocab_size: 0,
             n_embd: 64,
             n_head: 4,
             n_layer: 2,
             block_size: 32,
             n_kv_head: 0,
-            use_rmsnorm: false,
-            use_swiglu: false,
+            use_rmsnorm: true,
+            use_swiglu: true,
             dropout: 0.0,
             n_expert: 1,
             moe_top_k: 1,
             moe_capacity_factor: 0.0,
             moe_aux_coef: 0.0,
+            moe_z_loss_coef: 0.0,
             moe_switch_gate: false,
             rope_base: rope::ROPE_BASE,
             rope_scaling: RopeScaling::None,
@@ -116,7 +121,7 @@ impl Default for GPTConfig {
     }
 }
 
-impl GPTConfig {
+impl TransformerConfig {
     /// YaRN 分段边界要用的训练窗口（`rope_train_ctx = 0` 时即 `block_size`）
     pub fn rope_train_ctx(&self) -> usize {
         if self.rope_train_ctx == 0 {
@@ -133,7 +138,7 @@ impl GPTConfig {
 
     /// 一个小配置，适合学习演示（其余字段与 Default 一致）
     pub fn tiny(vocab_size: usize) -> Self {
-        GPTConfig {
+        TransformerConfig {
             vocab_size,
             ..Default::default()
         }
@@ -244,7 +249,7 @@ impl Module for Ffn {
 
 /// Transformer Block（第 11 课）
 ///
-/// 结构（GPT-2 风格，pre-norm）：
+/// 结构（经典风格，pre-norm）：
 ///   x -> LayerNorm -> Attention -> 残差 +
 ///   x -> LayerNorm -> MLP(GELU)  -> 残差 +
 ///
@@ -260,12 +265,12 @@ struct TransformerBlock {
     ffn: Ffn,
     dropout: f32,
     /// 最近一次前向里 MoE 子层的均衡辅助损失（稠密配置恒为 `None`）。
-    /// `forward` 只拿到 `&self`，所以用 `RefCell`；训练循环在 `forward` 之后把它取走。
-    aux: RefCell<Option<Tensor>>,
+    /// `forward` 只拿到 `&self`，所以用 `Shared`（内部 `Mutex`）；训练循环在 `forward` 之后把它取走。
+    aux: Shared<Option<Tensor>>,
 }
 
 impl TransformerBlock {
-    fn new(cfg: &GPTConfig, rng: &mut Rng) -> Self {
+    fn new(cfg: &TransformerConfig, rng: &mut Rng) -> Self {
         let ffn = if cfg.n_expert > 1 {
             Ffn::Moe(MoELayer::new(cfg, rng))
         } else if cfg.use_swiglu {
@@ -286,7 +291,7 @@ impl TransformerBlock {
             ln2: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
             ffn,
             dropout: cfg.dropout,
-            aux: RefCell::new(None),
+            aux: Shared::new(None),
         }
     }
 
@@ -310,7 +315,7 @@ impl TransformerBlock {
     fn forward(
         &self,
         x: &Tensor,
-        mask: &Tensor,
+        mask: Option<&Tensor>,
         kv_cache: Option<&mut KVCache>,
         base: usize,
         training: bool,
@@ -384,7 +389,7 @@ impl TransformerBlock {
     /// 内核直接读 `weight` 等于**绕过量化**：数值上倒是不亏（f32 更准），
     /// 但"量化后的模型到底什么效果"就测不出来了，报告与实测会互相矛盾。
     #[cfg(feature = "gpu")]
-    fn attn_resident(&self, x: &Tensor, mask: &Tensor, training: bool) -> Option<Tensor> {
+    fn attn_resident(&self, x: &Tensor, mask: Option<&Tensor>, training: bool) -> Option<Tensor> {
         use crate::attention::{expand_kv_head, fold_kv_head_grad};
 
         if !crate::tensor::grad_enabled() || self.attn.has_lora() || self.attn.has_quant() {
@@ -421,10 +426,10 @@ impl TransformerBlock {
         let n_kv = self.attn.n_kv_head;
         let n_rep = self.attn.n_head / n_kv;
         let hd = d / self.attn.n_head;
-        let wk_d = ck.weight.data.borrow();
-        let bk_d = ck.bias.data.borrow();
-        let wv_d = cv.weight.data.borrow();
-        let bv_d = cv.bias.data.borrow();
+        let wk_d = ck.weight.decode();
+        let bk_d = ck.bias.decode();
+        let wv_d = cv.weight.decode();
+        let bv_d = cv.bias.decode();
         let (wk_exp, bk_exp, wv_exp, bv_exp) = if n_rep > 1 {
             (
                 expand_kv_head(&wk_d[..], d, n_kv, hd, n_rep),
@@ -440,19 +445,31 @@ impl TransformerBlock {
         } else {
             (&wk_d[..], &bk_d[..], &wv_d[..], &bv_d[..])
         };
+        // 掩码：调用方（forward_core）已为常驻路径物化好时直接借用；
+        // 收到 None 时在此兜底物化一次 —— 常驻内核要真实 [t, t_total] buffer，
+        // 而训练态无 KV cache，t_total = t，后缀因果退化为标准因果。
+        let mask_guard = mask.map(|m| m.decode());
+        let mask_owned;
+        let md: &[f32] = match &mask_guard {
+            Some(g) => g,
+            None => {
+                mask_owned = crate::tensor::causal_mask_data(t, t);
+                &mask_owned
+            }
+        };
         let res = crate::gpu::attn_layer_forward(&crate::gpu::AttnLayerArgs {
-            x: &x.data.borrow(),
-            gamma: &gamma.data.borrow(),
-            beta: &beta.data.borrow(),
-            wq: &cq.weight.data.borrow(),
-            bq: &cq.bias.data.borrow(),
+            x: &x.decode(),
+            gamma: &gamma.decode(),
+            beta: &beta.decode(),
+            wq: &cq.weight.decode(),
+            bq: &cq.bias.decode(),
             wk,
             bk,
             wv,
             bv,
-            wproj: &cp.weight.data.borrow(),
-            bproj: &cp.bias.data.borrow(),
-            mask: &mask.data.borrow(),
+            wproj: &cp.weight.decode(),
+            bproj: &cp.bias.decode(),
+            mask: md,
             b,
             t,
             d,
@@ -556,13 +573,13 @@ impl TransformerBlock {
         let (w1, b1, w2, b2) = self.ffn.gelu_weights()?;
         let hid = w1.shape()[1];
         let res = crate::gpu::mlp_forward(
-            &x.data.borrow(),
-            &gamma.data.borrow(),
-            &beta.data.borrow(),
-            &w1.data.borrow(),
-            &b1.data.borrow(),
-            &w2.data.borrow(),
-            &b2.data.borrow(),
+            &x.decode(),
+            &gamma.decode(),
+            &beta.decode(),
+            &w1.decode(),
+            &b1.decode(),
+            &w2.decode(),
+            &b2.decode(),
             b * t,
             d,
             hid,
@@ -612,18 +629,18 @@ impl Module for TransformerBlock {
     }
 }
 
-/// 完整的 GPT 模型
-pub struct GPT {
-    pub cfg: GPTConfig,
+/// 完整的 Transformer 模型
+pub struct Transformer {
+    pub cfg: TransformerConfig,
     tok_emb: Embedding,
     blocks: Vec<TransformerBlock>,
     ln_f: NormLayer,
     /// Dropout 概率（残差/嵌入层用）
     dropout: f32,
-    /// LoRA 微调状态：`Some` 表示主干已冻结、每层 Q/K/V 都挂了适配器（见 [`GPT::apply_lora`]）。
+    /// LoRA 微调状态：`Some` 表示主干已冻结、每层 Q/K/V 都挂了适配器（见 [`Transformer::apply_lora`]）。
     /// checkpoint 头也记录它，加载时据此重放同样的注入，参数名才能对上。
     pub lora: Option<LoRAConfig>,
-    /// 最近一次部署量化的记录（[`GPT::quantize_weights`] 写入，checkpoint 头读出/写入）。
+    /// 最近一次部署量化的记录（[`Transformer::quantize_weights`] 写入，checkpoint 头读出/写入）。
     ///
     /// 它只记**参数**（位宽 / 算法 / 字节口径），不记整数码：存档里的权重始终是 f32
     /// （见 [`crate::checkpoint::save`]），任何现有加载路径都能直接读；真要在部署时省显存，
@@ -631,7 +648,7 @@ pub struct GPT {
     pub(crate) quant: Option<QuantMeta>,
 }
 
-/// 校准期一层的统计累加器（[`GPT::calibrate`] 内部用）。
+/// 校准期一层的统计累加器（[`Transformer::calibrate`] 内部用）。
 ///
 /// 之所以先"累加原始和"、最后才除以 token 数：`H = Σ xᵀx` 是**唯一**需要
 /// 逐 token 累加的量，中途做除法会白费 `n` 次乘法/除法，而且浮点误差更差
@@ -640,12 +657,12 @@ pub struct GPT {
 /// `dim` 记的是 `(rows, cols)` = `(输入维度, 输出通道)`：本项目 `Linear.weight`
 /// 是 `[in_features, out_features]`，于是 `H` 必须落在**输入维度**上
 /// （`[rows, rows]`），`mean|x|` 也按**输入通道**排列——这与
-/// [`crate::quant::gptq_quantize`] / [`crate::quant::awq_scales`] 的约定严格一致。
+/// [`crate::quant::hess_quantize`] / [`crate::quant::awq_scales`] 的约定严格一致。
 struct Acc {
     /// 该层的参数名前缀（与 checkpoint / 日志里的名字同源）
     name: String,
-    /// 前向钩子：`forward` 每次都会把本次输入写进来（`Tensor` 内部是 `Rc`，只加引用计数）
-    hook: Rc<RefCell<Tensor>>,
+    /// 前向钩子：`forward` 每次都会把本次输入写进来（克隆 `Shared` 句柄只加引用计数）
+    hook: Shared<Tensor>,
     /// `(输入维度, 输出通道)`
     dim: (usize, usize),
     /// `Σ xᵀx`：`full_hessian` 时是行优先 `[rows, rows]`（对称，两个三角都填，
@@ -653,7 +670,7 @@ struct Acc {
     hessian: Vec<f32>,
     /// 是否在存全矩阵。由 [`CalibOpts::full_hessian_max_dim`] 决定：全矩阵是 `4·in²`
     /// 字节/层，`in` 大起来能吃掉几十 MB，超预算时只留对角——
-    /// 代价见 [`HessianKind::Diagonal`]（GPTQ 随之退化成 RTN）。
+    /// 代价见 [`HessianKind::Diagonal`]（Hessian 量化随之退化成 RTN）。
     full_hessian: bool,
     /// 每个输入通道的 `Σ|x|`（长度 = `rows`）
     abs_sum: Vec<f32>,
@@ -661,8 +678,8 @@ struct Acc {
     rows_seen: usize,
 }
 
-impl GPT {
-    pub fn new(cfg: GPTConfig, rng: &mut Rng) -> Self {
+impl Transformer {
+    pub fn new(cfg: TransformerConfig, rng: &mut Rng) -> Self {
         // GQA 校验
         let n_kv = if cfg.n_kv_head == 0 { cfg.n_head } else { cfg.n_kv_head };
         assert!(
@@ -676,7 +693,7 @@ impl GPT {
         let blocks = (0..cfg.n_layer)
             .map(|_| TransformerBlock::new(&cfg, rng))
             .collect();
-        GPT {
+        Transformer {
             cfg: cfg.clone(),
             tok_emb: Embedding::new(vocab_size, n_embd, rng),
             blocks,
@@ -685,40 +702,6 @@ impl GPT {
             lora: None,
             quant: None,
         }
-    }
-
-    /// 扩大词表：在词嵌入（= 输出头，权重绑定）表尾追加若干行，新行按 N(0, 0.02) 初始化。
-    ///
-    /// 用于"给已经训过的模型加新 token"：新增特殊 token（BOS / EOS / PAD）、
-    /// 领域词、新语言都靠它。旧行的数值**一行都不动**，新行从零开始学；
-    /// 训练侧只需继续训练，新增行就会自己收敛。
-    ///
-    /// 只支持**变大**：缩小词表要重排索引、还要丢弃对应的输出头行，语义上
-    /// 是另一个操作（"裁词表"），不在这里混着做。
-    ///
-    /// 旧 checkpoint 的 `tok_emb.table` 行数比模型少时，
-    /// [`crate::checkpoint::load_params`] 按**前缀行**恢复，新行保留这里的初始化值，
-    /// 因此"加 EOS 就要重训"这件事不会发生。
-    pub fn resize_vocab(&mut self, new_vocab: usize, rng: &mut Rng) {
-        let old_vocab = self.cfg.vocab_size;
-        assert!(
-            new_vocab >= old_vocab,
-            "resize_vocab 只支持扩大词表：{} -> {}",
-            old_vocab,
-            new_vocab
-        );
-        if new_vocab == old_vocab {
-            return;
-        }
-        let d = self.cfg.n_embd;
-        let std = 0.02; // 与 Embedding::new 的初始化一致，新增行与前缀行同尺度
-        let mut data = Vec::with_capacity(new_vocab * d);
-        {
-            data.extend_from_slice(&self.tok_emb.table.data_ref());
-        }
-        data.extend((old_vocab * d..new_vocab * d).map(|_| rng.randn() * std));
-        self.tok_emb.table = Tensor::param(data, vec![new_vocab, d]);
-        self.cfg.vocab_size = new_vocab;
     }
 
     /// 把模型切成 LoRA 微调形态：**冻结全部主干**，再按 `lora.targets` 给每层挂上低秩适配器。
@@ -734,7 +717,7 @@ impl GPT {
     /// - GPU 常驻显存快路（直接读权重显存、绕过 [`Linear::forward`]）整体让路
     ///
     /// 本方法是**覆盖式**的：已有的适配层会被换成一整套全新的（B = 0），上一轮学到的
-    /// 增量随之丢弃。要接着训旧适配层，用 [`GPT::resume_lora`]。
+    /// 增量随之丢弃。要接着训旧适配层，用 [`Transformer::resume_lora`]。
     ///
     /// `rng` 只用于初始化 A（B 恒为 0），随后会被 checkpoint 的真实值覆盖。
     pub fn apply_lora(&mut self, lora: &LoRAConfig, rng: &mut Rng) {
@@ -752,7 +735,7 @@ impl GPT {
 
     /// 链式续训：沿用**已经注入**的适配层（数值全部保留），只冻结主干、把 A/B 解冻。
     ///
-    /// 与 [`GPT::apply_lora`] 的区别：后者会重挂一套全新的 A/B，把上一轮学到的增量丢掉。
+    /// 与 [`Transformer::apply_lora`] 的区别：后者会重挂一套全新的 A/B，把上一轮学到的增量丢掉。
     /// 前提是模型上已有适配层——通常来自 `load_model_and_tokenizer` 按存档头重放注入
     /// （见 [`crate::checkpoint::Checkpoint::lora`]），此时 `self.lora` 里已经是存档的
     /// rank / alpha / targets，不需要也不应该再由命令行指定。
@@ -775,7 +758,7 @@ impl GPT {
 
     /// 把全部适配层的增量合并进主干，并丢弃适配层（推理加速用，见 [`Linear::merge_lora`]）。
     ///
-    /// 合并后 [`GPT::has_lora`] 为 false、`self.lora` 为 `None`：模型回到普通形态，
+    /// 合并后 [`Transformer::has_lora`] 为 false、`self.lora` 为 `None`：模型回到普通形态，
     /// 前向不再有每层那两次小矩阵乘与一次相加。**不可逆**——合并后的存档再也分不出
     /// 主干与适配层，也就无法再链式续训；所以只在推理命令上显式开启（`--merge-lora`），
     /// 训练路径不碰它。
@@ -821,14 +804,14 @@ impl GPT {
             .any(|b| b.attn.has_quant() || b.ffn.has_quant())
     }
 
-    /// 与 [`GPT::has_quant`] 同义的可读别名，供部署侧做"是否还要再量化一次"的判断。
+    /// 与 [`Transformer::has_quant`] 同义的可读别名，供部署侧做"是否还要再量化一次"的判断。
     pub fn is_quantized(&self) -> bool {
         self.has_quant()
     }
 
     /// 可量化投影的 `(参数名前缀, &Linear)`（MoE 除外，见 [`Ffn::named_linears`]）。
     ///
-    /// 名字与 [`GPT::named_parameters`] 里 `.weight` 的前缀严格一致——校准统计、
+    /// 名字与 [`Transformer::named_parameters`] 里 `.weight` 的前缀严格一致——校准统计、
     /// 量化报告、checkpoint 参数表三处共用同一套名字，任何一处对不上都会被立刻发现，
     /// 而不是变成"某层悄悄退回 RTN"。
     fn named_linears(&self) -> Vec<(String, &Linear)> {
@@ -870,7 +853,7 @@ impl GPT {
     }
 
     /// 量化前整模型的 f32 权重字节数（投影 + 词嵌入表）。
-    /// 与 [`GPT::quant_bytes`] 配对使用，两者之比才是真实的压缩率。
+    /// 与 [`Transformer::quant_bytes`] 配对使用，两者之比才是真实的压缩率。
     pub fn f32_bytes(&self) -> usize {
         self.weight_bytes().0
     }
@@ -887,11 +870,11 @@ impl GPT {
 
     /// 用一批文本做**激活校准**：跑一遍前向，把每层输入的二阶统计采下来。
     ///
-    /// - GPTQ 要 `H = XᵀX`（输入通道之间的相关性），逐列补偿误差全靠它；
+    /// - Hessian 量化要 `H = XᵀX`（输入通道之间的相关性），逐列补偿误差全靠它；
     /// - AWQ 要每通道的 `mean|x|`（哪些通道"重要"），据此决定把动态范围让给谁。
     ///
     /// 全程 `no_grad`：校准只读激活、不碰梯度（这些统计量不需要求导，建图纯属浪费内存）。
-    /// 前向走 [`GPT::forward_hidden`] 而不是 [`GPT::forward`]——输出头那次
+    /// 前向走 [`Transformer::forward_hidden`] 而不是 [`Transformer::forward`]——输出头那次
     /// `[tokens, vocab]` 的大矩阵乘对任何一层的输入统计都没有贡献。
     ///
     /// 选项见 [`CalibOpts`]：
@@ -904,7 +887,7 @@ impl GPT {
     ///   逐层独立，所以"宽层退化成对角、窄层保留全矩阵"是完全合法的混合策略——
     ///   显存开销由最宽的那一层决定，而不是由"最宽那层的全矩阵"决定。之所以要有这个
     ///   旋钮：全矩阵是 `4·in²` 字节/层，`in = 4096` 时单层 64 MB，比很多层的权重还大；
-    ///   而退化成对角后 `H⁻¹` 也是对角阵，补偿量恒为 0，GPTQ 随之变成 RTN。
+    ///   而退化成对角后 `H⁻¹` 也是对角阵，补偿量恒为 0，Hessian 量化随之变成 RTN。
     ///   代价的完整说明见 [`CalibOpts::full_hessian_max_dim`] 与 [`HessianKind`]。
     ///
     /// 结束后钩子（[`Linear::capture`]）会被拆掉：它只在采集期有意义，
@@ -936,7 +919,7 @@ impl GPT {
         for (name, lin) in self.named_linears_mut() {
             let (rows, cols) = lin.dims();
             let full_hessian = rows <= opts.full_hessian_max_dim;
-            let hook = Rc::new(RefCell::new(Tensor::from_vec(vec![0.0], vec![1])));
+            let hook = Shared::new(Tensor::from_vec(vec![0.0], vec![1]));
             lin.capture = Some(hook.clone());
             accs.push(Acc {
                 name,
@@ -960,7 +943,7 @@ impl GPT {
                 let x = t.data_ref();
                 // 钩子里存的是这一层的输入，形状 `[tokens, 输入维度]`——累加的宽度必须用
                 // `dim.0`（输入维度）而不是 `dim.1`（输出通道），否则要么切片越界，
-                // 要么把统计算到错误的轴上（Hessian 落错轴 = GPTQ 的补偿方向全反）。
+                // 要么把统计算到错误的轴上（Hessian 落错轴 = Hessian 量化的补偿方向全反）。
                 let (inp, n) = (acc.dim.0, t.shape()[0]);
                 if t.rank() != 2 || t.shape()[1] != inp {
                     continue; // 钩子没被这次前向碰到（例如该层不存在）——跳过即可
@@ -1004,7 +987,7 @@ impl GPT {
                 continue;
             }
             let inv = 1.0 / acc.rows_seen as f32;
-            // 累加用的是裸和 `Σ xᵀx`，而 GPTQ 的阻尼、act-order 的重要性都按
+            // 累加用的是裸和 `Σ xᵀx`，而 Hessian 量化的阻尼、act-order 的重要性都按
             // "均值"的量级来定（`trace(H)/n`），所以这里必须一次性折算；
             // 折算因子对全矩阵与对角是同一个，两条路径的统计口径完全一致。
             let scaled: Vec<f32> = acc.hessian.iter().map(|v| v * inv).collect();
@@ -1025,22 +1008,22 @@ impl GPT {
         stats
     }
 
-    /// 逐层量化全部投影，返回本次量化的报告（同时把记录写进 [`GPT::quant_meta`]）。
+    /// 逐层量化全部投影，返回本次量化的报告（同时把记录写进 [`Transformer::quant_meta`]）。
     ///
     /// - `opts` 带全了算法参数：分组方向（默认 [`QAxis::Col`] = **每个输出通道一个
     ///   scale**，同一列的元素共同决定一个输出通道的贡献，数值尺度最接近，是权重量化的
     ///   通行口径；[`QAxis::Row`] 是"每个输入通道一个 scale"，本项目留给 KV cache 的 K）、
-    ///   GPTQ 的 `act_order`/`damp`/`block`、AWQ 的 α（`None` = 逐层在网格上搜索）。
+    ///   Hessian 量化的 `act_order`/`damp`/`block`、AWQ 的 α（`None` = 逐层在网格上搜索）。
     /// - `calib` 为 `None` 或某层缺统计时，该层**退回 RTN**：量化是部署前的最后一步，
     ///   在这里失败会卡死整条流水线，而"这层没吃到补偿"只是精度略降。
     /// - 词嵌入表不量化：它的行由词表决定、前向时每个 token 只用一行，
     ///   省下来的字节远不如"每个 token 都要整块参与矩阵乘"的投影；而它的输出直接
     ///   决定采样分布，是数值上最敏感的地方。收益小、代价大，留 f32。
     /// - 已挂 LoRA 适配器的层会被跳过（见 [`Linear::quantize_weight`]）：量化会只看
-    ///   主干权重，适配器带来的那点增量会被静默丢掉。调用方应先 [`GPT::merge_lora`]。
+    ///   主干权重，适配器带来的那点增量会被静默丢掉。调用方应先 [`Transformer::merge_lora`]。
     ///
     /// 返回**逐层**报告（`Vec<QuantReport>`），要整模型口径的摘要（总压缩比、最差层、
-    /// 跳过层数）再调一次 [`GPT::quant_summary`]。
+    /// 跳过层数）再调一次 [`Transformer::quant_summary`]。
     pub fn quantize_weights(
         &mut self,
         bits: QBits,
@@ -1071,7 +1054,7 @@ impl GPT {
     /// 把逐层报告汇总成**整模型口径**的摘要（`quant` 子命令的打印入口）。
     ///
     /// 总字节在这里现算（而不是抄 [`QuantMeta`] 里的快照）：摘要在
-    /// [`GPT::dequantize_weights`] 之后再调用，就该如实反映"已经烘焙回 f32"这个事实。
+    /// [`Transformer::dequantize_weights`] 之后再调用，就该如实反映"已经烘焙回 f32"这个事实。
     /// 跳过的层数由"可量化投影总数 − 实到的报告数"推出——[`Linear::quantize_weight`]
     /// 返回 `None` 的唯一原因就是"这层不该量化"（LoRA 或形状不合法），
     /// 所以这个减法不会把别的原因算成"跳过"。
@@ -1080,18 +1063,23 @@ impl GPT {
             "quant_summary 必须在 quantize_weights 之后调用：没有 QuantMeta 就不知道算法与位宽",
         );
         let (f32_bytes, quant_bytes) = (self.f32_bytes(), self.quant_bytes());
+        // 降级层数 = 逐层报告里 method 与请求（QuantMeta 里记的那份）不符者：
+        // 逐层报告记的是**实际**用掉的算法（Linear::quantize_weight 如实回填），
+        // 两者对不上就说明这层退回了 RTN——汇总出来，摘要里就藏不住了。
+        let degraded = reports.iter().filter(|r| r.method != meta.method).count();
         QuantSummary {
             method: meta.method,
             bits: meta.bits,
             f32_bytes,
             quant_bytes,
             skipped: self.named_linears().len().saturating_sub(reports.len()),
+            degraded,
             layers: reports,
         }
     }
 
     /// 把所有量化层**烘焙**回 f32 权重（AWQ 的输入缩放也一并除掉），但保留
-    /// [`GPT::quant_meta`] 的记录。
+    /// [`Transformer::quant_meta`] 的记录。
     ///
     /// 存档里写的始终是 f32（见 [`crate::checkpoint::save`]）：任何现有加载路径都能直接读，
     /// 不必让 checkpoint 格式长出第二种参数编码。记录留住是为了让加载端知道
@@ -1206,11 +1194,11 @@ impl GPT {
         self.forward_core(idx, b, t, None, training)
     }
 
-    /// 同 [`GPT::forward_hidden`]，但**带 KV cache**。
+    /// 同 [`Transformer::forward_hidden`]，但**带 KV cache**。
     ///
     /// 推测解码的多 Token 预测草稿（见 [`crate::speculative::MtpDrafter`]）需要
-    /// "增量缓存 + 隐状态"两者兼得：只走 [`GPT::forward`] 拿不到隐状态，
-    /// 只走 [`GPT::forward_hidden`] 则每轮都要把整段上下文重算一遍，
+    /// "增量缓存 + 隐状态"两者兼得：只走 [`Transformer::forward`] 拿不到隐状态，
+    /// 只走 [`Transformer::forward_hidden`] 则每轮都要把整段上下文重算一遍，
     /// 草稿那点省下来的时间又全还回去了。
     pub fn forward_hidden_cached(
         &self,
@@ -1246,7 +1234,7 @@ impl GPT {
     fn blocks_resident(
         &self,
         x: &Tensor,
-        mask: &Tensor,
+        mask: Option<&Tensor>,
         b: usize,
         t: usize,
         training: bool,
@@ -1301,8 +1289,8 @@ impl GPT {
                 b2.clone(),
             ]);
             if n_rep > 1 {
-                let (wk, bk) = (ck.weight.data.borrow(), ck.bias.data.borrow());
-                let (wv, bv) = (cv.weight.data.borrow(), cv.bias.data.borrow());
+                let (wk, bk) = (ck.weight.decode(), ck.bias.decode());
+                let (wv, bv) = (cv.weight.decode(), cv.bias.decode());
                 kv_expanded.push([
                     expand_kv_head(&wk[..], d, n_kv, hd, n_rep),
                     expand_kv_head(&bk[..], 1, n_kv, hd, n_rep),
@@ -1313,8 +1301,9 @@ impl GPT {
         }
         // 借用只在这一段里存活：`guards` 借用了 `params`，出块后 `params` 才能进反向闭包
         let res = {
-            let guards: Vec<std::cell::Ref<'_, Vec<f32>>> =
-                params.iter().map(|p| p.data.borrow()).collect();
+            // decode 视图：bf16 参数解码成 f32 后供整叠快路读（GPU 路径恒 f32）
+            let guards: Vec<crate::tensor::DataGuard<'_>> =
+                params.iter().map(|p| p.decode()).collect();
             let layers: Vec<StackLayerArgs> = (0..self.blocks.len())
                 .map(|i| {
                     let s = &guards[i * STACK_PARAMS_PER_LAYER..][..STACK_PARAMS_PER_LAYER];
@@ -1345,11 +1334,21 @@ impl GPT {
                     }
                 })
                 .collect();
-            let xd = x.data.borrow();
-            let md = mask.data.borrow();
+            let xd = x.decode();
+            // 掩码：整叠快路只在训练态（无 KV cache、base=0）被调用，t_total = t；
+            // 调用方已物化时直接借用，否则在此兜底物化一次供整叠共享
+            let mask_guard = mask.map(|m| m.decode());
+            let mask_owned;
+            let md: &[f32] = match &mask_guard {
+                Some(g) => g,
+                None => {
+                    mask_owned = crate::tensor::causal_mask_data(t, t);
+                    &mask_owned
+                }
+            };
             crate::gpu::stack_forward(&StackArgs {
                 x: &xd,
-                mask: &md,
+                mask: md,
                 layers: &layers,
                 b,
                 t,
@@ -1421,29 +1420,27 @@ impl GPT {
             .unwrap_or((0, 0));
         let base = seen;
 
-        // 3. 因果掩码：scores 形状 [B*H, T, T_total]，广播 mask [T, T_total]
-        //    缓存本次之后保留 min(seen + t, window) 个位置（window = 0 表示不丢弃）
+        // 3. 因果掩码（条件物化）：CPU 分块核在核内屏蔽（query i 只算
+        //    j <= visible_before + i），逐算子 CPU 路径同样不必物化 —— 只有
+        //    GPU 常驻/整叠/probe 路径要真实 [T, T_total] buffer，且只在训练态
+        //    （无 KV cache、base=0，此时 t_total = t）才走，这时才物化一次供全栈共享；
+        //    attn_resident / blocks_resident 收到 None 时还会各自兜底物化。
         assert!(
             window == 0 || t <= window,
             "单次前向的 token 数（{t}）不能超过 KV cache 窗口（{window}）"
         );
-        let t_total = if window == 0 {
-            seen + t
-        } else {
-            (seen + t).min(window)
+        #[cfg(feature = "gpu")]
+        let mask: Option<Tensor> = {
+            let t_total = if window == 0 {
+                seen + t
+            } else {
+                (seen + t).min(window)
+            };
+            (crate::gpu::is_available() && kv_cache.is_none() && base == 0)
+                .then(|| Tensor::from_vec(crate::tensor::causal_mask_data(t, t_total), vec![t, t_total]))
         };
-        // 缓存里位于"本次新增的第一个 token"左侧（含自身）的位置数：
-        // query i 只能看到下标 j <= visible_before + i 的 key
-        let visible_before = t_total - t;
-        let mut mask_data = vec![0.0f32; t * t_total];
-        for i in 0..t {
-            for j in 0..t_total {
-                if j > i + visible_before {
-                    mask_data[i * t_total + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        let mask = Tensor::from_vec(mask_data, vec![t, t_total]);
+        #[cfg(not(feature = "gpu"))]
+        let mask: Option<Tensor> = None;
 
         // 4. 整叠 Block 的 GPU 常驻快路：子层边界也留在显存（前向/反向各一次提交）
         //
@@ -1458,7 +1455,7 @@ impl GPT {
         //    `LLM_GPU_STACK`（**只要设置了就生效**，值本身不参与判断，`is_some`）。
         #[cfg(feature = "gpu")]
         if kv_cache.is_none() && base == 0 && std::env::var_os("LLM_GPU_STACK").is_some() {
-            if let Some(out) = self.blocks_resident(&x, &mask, b, t, training) {
+            if let Some(out) = self.blocks_resident(&x, mask.as_ref(), b, t, training) {
                 return self.ln_f.forward(&out).reshape(vec![b * t, d]);
             }
         }
@@ -1467,7 +1464,7 @@ impl GPT {
         let mut x = x;
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = kv_cache.as_mut().map(|c| &mut c[i]);
-            x = block.forward(&x, &mask, cache, base, training);
+            x = block.forward(&x, mask.as_ref(), cache, base, training);
         }
 
         // 6. 最终归一化（输出头由 forward / 常驻显存路径各自完成）
@@ -1515,7 +1512,7 @@ impl GPT {
     }
 }
 
-impl Module for GPT {
+impl Module for Transformer {
     fn parameters(&self) -> Vec<Tensor> {
         let mut ps = self.tok_emb.parameters();
         for block in &self.blocks {
@@ -1540,7 +1537,7 @@ mod tests {
     #[test]
     fn test_kv_cache_matches_full_forward() {
         let mut rng = Rng::new(42);
-        let model = GPT::new(GPTConfig::tiny(32), &mut rng);
+        let model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         let v = model.cfg.vocab_size;
         let seq = vec![1, 5, 7, 3, 9, 2, 8, 4, 6, 0]; // 10 个 token，都小于词表 32
 
@@ -1576,7 +1573,7 @@ mod tests {
     #[test]
     fn test_set_rope_extends_window_without_touching_weights() {
         let mut rng = Rng::new(7);
-        let mut model = GPT::new(GPTConfig::tiny(32), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         let train_ctx = model.cfg.rope_train_ctx();
         let new_ctx = train_ctx * 4;
 
@@ -1613,10 +1610,10 @@ mod tests {
     #[test]
     fn test_kv_cache_sliding_window_matches_full_window_forward() {
         let mut rng = Rng::new(42);
-        let mut cfg = GPTConfig::tiny(32);
+        let mut cfg = TransformerConfig::tiny(32);
         cfg.block_size = 8; // 小窗口：3 倍长度就要滑动多次
         cfg.n_layer = 1; // 见上方说明：多层时两条路径不等价
-        let model = GPT::new(cfg, &mut rng);
+        let model = Transformer::new(cfg, &mut rng);
         let w = model.cfg.block_size;
         let v = model.cfg.vocab_size;
         let seq: Vec<usize> = (0..w * 3).map(|i| (i * 7 + 1) % v).collect();
@@ -1661,7 +1658,7 @@ mod tests {
     #[test]
     fn test_apply_lora_freezes_backbone_and_trains_adapters_only() {
         let mut rng = Rng::new(7);
-        let mut model = GPT::new(GPTConfig::tiny(32), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         let total: usize = model.parameters().iter().map(|p| p.numel()).sum();
         let lora = LoRAConfig {
             rank: 4,
@@ -1753,7 +1750,7 @@ mod tests {
     #[test]
     fn test_lora_targets_control_where_adapters_land() {
         let mut rng = Rng::new(3);
-        let mut model = GPT::new(GPTConfig::tiny(32), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         let lora = LoRAConfig {
             rank: 2,
             alpha: 2.0,
@@ -1798,7 +1795,7 @@ mod tests {
     #[test]
     fn test_merge_lora_matches_two_branch_forward() {
         let mut rng = Rng::new(9);
-        let mut model = GPT::new(GPTConfig::tiny(32), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         model.apply_lora(
             &LoRAConfig {
                 rank: 4,
@@ -1855,7 +1852,7 @@ mod tests {
             alpha: 8.0,
             ..Default::default()
         };
-        let mut model = GPT::new(GPTConfig::tiny(32), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         model.apply_lora(&lora, &mut rng);
         // 灌成非零：B 初始为零，全零的存档"保没保住"看不出来
         for (i, p) in model.lora_parameters().iter().enumerate() {
@@ -1877,7 +1874,7 @@ mod tests {
         // 加载端：按存档头重放注入，再灌参数（与 `load_model_and_tokenizer` 同序）
         let ckpt = checkpoint::load_header(&path);
         let mut rng2 = Rng::new(999);
-        let mut restored = GPT::new(ckpt.model.clone(), &mut rng2);
+        let mut restored = Transformer::new(ckpt.model.clone(), &mut rng2);
         restored.apply_lora(
             ckpt.lora.as_ref().expect("存档应带 LoRA 形态"),
             &mut rng2,
@@ -1941,7 +1938,7 @@ mod tests {
             ("LayerNorm + GQA", false, 1),
             ("RMSNorm + GQA", true, 2),
         ] {
-            let cfg = GPTConfig {
+            let cfg = TransformerConfig {
                 vocab_size: 32,
                 n_embd: 32,
                 n_head: 4,
@@ -1956,7 +1953,7 @@ mod tests {
             // 同一种子、同一批数据跑两遍：`resident = true` 走常驻显存，`false` 走逐算子
             let run = |resident: bool| {
                 let mut rng = Rng::new(11);
-                let model = GPT::new(cfg.clone(), &mut rng);
+                let model = Transformer::new(cfg.clone(), &mut rng);
                 crate::gpu::probe_capture(!resident);
                 let logits = model.forward(&idx, b, t, None, true);
                 let loss = cross_entropy_loss(&logits, &targets);
@@ -1989,7 +1986,7 @@ mod tests {
     /// 模型级量化（第 33 课）的端到端闭环，一次把五件事串起来验证：
     ///
     /// 1. **校准真的采到了统计**——`n_tokens` 与 H 的对角（`E[x²] > 0`）都要立得住；
-    ///    采不到就会静默退回 RTN，而 RTN 与 GPTQ 的报告长得一模一样，不查这一项
+    ///    采不到就会静默退回 RTN，而 RTN 与 Hessian 量化的报告长得一模一样，不查这一项
     ///    根本发现不了"补偿压根没生效"。
     /// 2. **两种 Hessian 模式都由阈值真实切换**——默认（阈值 1024）在 tiny 配置下是
     ///    全矩阵，把阈值压到 0 就必须整片退化成对角；这是"大层省内存"这条路的开关，
@@ -2005,12 +2002,12 @@ mod tests {
         let text = "abcdefghij".repeat(16);
         let tok = Tokenizer::from_name("char", &text, 0);
         let mut rng = Rng::new(2024);
-        let mut model = GPT::new(GPTConfig::tiny(64), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(64), &mut rng);
         let ids = tok.encode(&text);
         let seq = ids.len().min(model.cfg.block_size);
         // 量化层是推理专用的（见 [`Linear::forward`] 的断言），所以这里整段前向
         // 都跑在 `no_grad` 下；否则量化后的那次 `loss_of` 会直接 panic 在断言上。
-        let loss_of = |m: &GPT| {
+        let loss_of = |m: &Transformer| {
             crate::tensor::no_grad(|| {
                 let logits = m.forward(&ids[..seq], 1, seq, None, false);
                 cross_entropy_loss(&logits, &ids[1..=seq]).item()
@@ -2031,14 +2028,14 @@ mod tests {
             assert_eq!(
                 h.dim(),
                 a.len(),
-                "{name} 的 Hessian 阶数必须等于输入维度（落错轴 = GPTQ 的补偿方向全反）"
+                "{name} 的 Hessian 阶数必须等于输入维度（落错轴 = Hessian 量化的补偿方向全反）"
             );
             let d = h.diagonal();
             assert!(d.iter().all(|v| v.is_finite()), "{name} 的 Hessian 有非有限值");
             assert!(d.iter().any(|v| *v > 0.0), "{name} 的 Hessian 恒为零 = 没采到");
         }
 
-        // 2) 阈值 1024 ≫ tiny 的隐层宽度 ⇒ 必须走全矩阵（GPTQ 的补偿信息才有来源）
+        // 2) 阈值 1024 ≫ tiny 的隐层宽度 ⇒ 必须走全矩阵（Hessian 量化的补偿信息才有来源）
         assert!(
             stats.per_layer.iter().all(|(_, c)| c.hessian.as_ref().unwrap().is_full()),
             "默认阈值下 tiny 模型应存全矩阵 Hessian"
@@ -2066,10 +2063,10 @@ mod tests {
             );
         }
 
-        // 3) 量化（GPTQ：校准统计真的被用上）+ 4) loss 对比
+        // 3) 量化（Hessian 量化：校准统计真的被用上）+ 4) loss 对比
         let reports = model.quantize_weights(
             QBits::Int8,
-            QuantMethod::Gptq,
+            QuantMethod::Hess,
             Some(&stats),
             QuantOpts::default(),
         );
@@ -2105,7 +2102,7 @@ mod tests {
         // 记录必须与实测口径一致（存档头写的就是这一份）
         let meta = model.quant_meta().expect("量化后应留下记录");
         assert_eq!(meta.bits, QBits::Int8);
-        assert_eq!(meta.method, QuantMethod::Gptq);
+        assert_eq!(meta.method, QuantMethod::Hess);
         assert_eq!(
             (meta.orig_bytes, meta.quant_bytes),
             (summary.f32_bytes, summary.quant_bytes)
@@ -2122,19 +2119,19 @@ mod tests {
         );
     }
 
-    /// 对角 Hessian（`full_hessian_max_dim = 0`）之下 GPTQ 必须表现得和 RTN 一样：
+    /// 对角 Hessian（`full_hessian_max_dim = 0`）之下 Hessian 量化必须表现得和 RTN 一样：
     /// 这不是"实现退化"，而是**数学结论**——`H` 是对角阵时 `H⁻¹` 也是对角阵，
     /// 加权误差 `tr((W-Ŵ)ᵀH(W-Ŵ))` 变成逐列可分的二次型，跨通道补偿系数恒为 0。
     ///
-    /// 为什么要专门测它：全矩阵与对角两条路走的是同一段 `gptq_quantize`，一旦哪天
+    /// 为什么要专门测它：全矩阵与对角两条路走的是同一段 `hess_quantize`，一旦哪天
     /// "对角"被当成"全矩阵的一半"来实现（例如把非对角位置读成 0 却仍走 Cholesky
     /// 求逆再乘），两者就会悄悄分叉，而单看报告里的误差是发现不了的。
     #[test]
-    fn diagonal_calibration_makes_gptq_degenerate_to_rtn() {
+    fn diagonal_calibration_makes_hess_degenerate_to_rtn() {
         let text = "abcdefghij".repeat(16);
         let tok = Tokenizer::from_name("char", &text, 0);
         let mut rng = Rng::new(7);
-        let mut model = GPT::new(GPTConfig::tiny(64), &mut rng);
+        let mut model = Transformer::new(TransformerConfig::tiny(64), &mut rng);
         let diag = CalibOpts {
             full_hessian_max_dim: 0,
             ..CalibOpts::default()
@@ -2145,7 +2142,7 @@ mod tests {
 
         let reports = model.quantize_weights(
             QBits::Int8,
-            QuantMethod::Gptq,
+            QuantMethod::Hess,
             Some(&stats),
             QuantOpts::default(),
         );
@@ -2153,9 +2150,9 @@ mod tests {
         assert!(!reports.is_empty());
         assert!(reports.iter().all(|r| r.rel_err.is_finite()));
         // 逐位等于 RTN：把同一份权重用 RTN 再量化一遍，码值必须一模一样
-        let mut rtn_model = GPT::new(GPTConfig::tiny(64), &mut Rng::new(7));
+        let mut rtn_model = Transformer::new(TransformerConfig::tiny(64), &mut Rng::new(7));
         let rtn = rtn_model.quantize_weights(QBits::Int8, QuantMethod::Rtn, None, QuantOpts::default());
-        let gptq_codes: Vec<_> = model
+        let hess_codes: Vec<_> = model
             .named_linears()
             .iter()
             .map(|(_, l)| l.quant.as_ref().unwrap().q.bytes().to_vec())
@@ -2165,8 +2162,8 @@ mod tests {
             .iter()
             .map(|(_, l)| l.quant.as_ref().unwrap().q.bytes().to_vec())
             .collect();
-        assert_eq!(gptq_codes.len(), rtn_codes.len());
-        assert_eq!(gptq_codes, rtn_codes, "对角 Hessian 下 GPTQ 应与 RTN 逐位一致");
-        assert_eq!(rtn.len(), gptq_codes.len());
+        assert_eq!(hess_codes.len(), rtn_codes.len());
+        assert_eq!(hess_codes, rtn_codes, "对角 Hessian 下 Hessian 量化应与 RTN 逐位一致");
+        assert_eq!(rtn.len(), hess_codes.len());
     }
 }

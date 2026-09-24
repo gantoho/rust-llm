@@ -492,10 +492,6 @@ impl DataParallel {
         DataParallel { world: World::new(world_size) }
     }
 
-    pub fn world_size(&self) -> usize {
-        self.world.size()
-    }
-
     /// 最近一次梯度同步的通信量
     pub fn log(&self) -> &CommLog {
         self.world.log()
@@ -588,23 +584,6 @@ impl ZeroOptimizer {
         // 每 rank 一个只装"自己那段"的 AdamW：状态量随分片一起缩小到 1/N
         let opts = shards.iter().map(|t| AdamW::new(lr, vec![t.clone()], weight_decay)).collect();
         ZeroOptimizer { stage, world: World::new(world_size), ranges, opts, shards, total }
-    }
-
-    pub fn stage(&self) -> ZeroStage {
-        self.stage
-    }
-
-    pub fn total_params(&self) -> usize {
-        self.total
-    }
-
-    /// 每 rank 负责的扁平参数区间
-    pub fn ranges(&self) -> &[(usize, usize)] {
-        &self.ranges
-    }
-
-    pub fn log(&self) -> &CommLog {
-        self.world.log()
     }
 
     /// 每 rank 实际常驻的优化器状态字节数（m + v 各 4 字节/元素）
@@ -1549,7 +1528,7 @@ impl RankPlan {
 mod tests {
     use super::*;
     use crate::loss::cross_entropy_loss_masked;
-    use crate::model::{GPT, GPTConfig};
+    use crate::model::{Transformer, TransformerConfig};
     use crate::module::Module;
     use crate::optim::{AdamW, Optimizer, SGD};
     use crate::rng::Rng;
@@ -1722,16 +1701,16 @@ mod tests {
 
     // ---------- 数据并行 ----------
 
-    /// 小 GPT，同种子 → 同初值（DP 的多份"副本"靠这个构造）
-    fn tiny_gpt(vocab: usize, seed: u64) -> GPT {
-        let cfg = GPTConfig {
+    /// 小 Transformer，同种子 → 同初值（DP 的多份"副本"靠这个构造）
+    fn tiny_transformer(vocab: usize, seed: u64) -> Transformer {
+        let cfg = TransformerConfig {
             n_embd: 16,
             n_head: 2,
             n_layer: 2,
             block_size: 32,
-            ..GPTConfig::tiny(vocab)
+            ..TransformerConfig::tiny(vocab)
         };
-        GPT::new(cfg, &mut Rng::new(seed))
+        Transformer::new(cfg, &mut Rng::new(seed))
     }
 
     /// 一批随机 token id（语言模型的损失只要求 id 合法）
@@ -1750,7 +1729,7 @@ mod tests {
     }
 
     /// 一个 batch 的平均交叉熵
-    fn batch_loss(model: &GPT, ids: &[usize], targets: &[usize], b: usize, t: usize) -> Tensor {
+    fn batch_loss(model: &Transformer, ids: &[usize], targets: &[usize], b: usize, t: usize) -> Tensor {
         assert_eq!(ids.len(), b * t, "ids 个数应与 b×t 一致");
         assert_eq!(targets.len(), b * t, "targets 个数应与 b×t 一致");
         let logits = model.forward(ids, b, t, None, false);
@@ -1766,7 +1745,7 @@ mod tests {
         let seed = 7u64;
 
         // 参照组：单进程，整个 batch 一次算完、更新一步
-        let full = tiny_gpt(vocab, seed);
+        let full = tiny_transformer(vocab, seed);
         let full_params = full.parameters();
         let mut opt_full = SGD::new(0.05, full_params.clone());
         opt_full.zero_grad();
@@ -1774,7 +1753,7 @@ mod tests {
         opt_full.step();
 
         // DP 组：两份**同初值**副本，各吃一半数据
-        let replicas: Vec<GPT> = (0..world_size).map(|_| tiny_gpt(vocab, seed)).collect();
+        let replicas: Vec<Transformer> = (0..world_size).map(|_| tiny_transformer(vocab, seed)).collect();
         for r in 1..world_size {
             assert_eq!(
                 replicas[r].parameters()[0].data(),
@@ -1830,11 +1809,11 @@ mod tests {
         let targets = next_targets(&ids);
         let seed = 5u64;
 
-        let merged = tiny_gpt(vocab, seed);
+        let merged = tiny_transformer(vocab, seed);
         batch_loss(&merged, &ids, &targets, 4, t).backward();
         let want = flatten_grads(&merged.parameters());
 
-        let acc = tiny_gpt(vocab, seed);
+        let acc = tiny_transformer(vocab, seed);
         let params = acc.parameters();
         for half in 0..2 {
             let lo = half * 2 * t;
@@ -1865,7 +1844,7 @@ mod tests {
 
         // 参照组：vanilla DP（每个 rank 一份完整优化器状态）
         let ref_losses: Vec<f32> = {
-            let replicas: Vec<GPT> = (0..n).map(|_| tiny_gpt(vocab, seed)).collect();
+            let replicas: Vec<Transformer> = (0..n).map(|_| tiny_transformer(vocab, seed)).collect();
             let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
             let mut opts: Vec<AdamW> =
                 per_rank.iter().map(|p| AdamW::new(lr, p.clone(), wd)).collect();
@@ -1896,7 +1875,7 @@ mod tests {
         };
 
         for stage in [ZeroStage::One, ZeroStage::Two] {
-            let replicas: Vec<GPT> = (0..n).map(|_| tiny_gpt(vocab, seed)).collect();
+            let replicas: Vec<Transformer> = (0..n).map(|_| tiny_transformer(vocab, seed)).collect();
             let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
             let total: usize = per_rank[0].iter().map(|p| p.numel()).sum();
             let mut zero = ZeroOptimizer::new(stage, n, total, lr, wd);

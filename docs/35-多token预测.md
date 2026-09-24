@@ -2,7 +2,7 @@
 
 > **本课已落地为可运行代码**：`src/speculative.rs` 的 `MtpHeads`（K 个 `Linear` 头 + 各头交叉熵损失）
 > 与 `MtpDrafter`（把 MTP 头当推测解码的草稿）+ `speculative` 子命令的第五节实验。
-> 与已有代码的衔接：预测头复用 `src/layers.rs` 的 `Linear` 层，主干隐状态由 `GPT::forward_hidden_cached`
+> 与已有代码的衔接：预测头复用 `src/layers.rs` 的 `Linear` 层，主干隐状态由 `Transformer::forward_hidden_cached`
 > 提供；训练时只更新各头参数（主干可冻结），推理时一次前向即可给出往后 γ 个位置的分布。
 
 ---
@@ -193,7 +193,7 @@ cargo run --release -- speculative --gamma 4 --max-new 48
 
 > 核心内容已全部实现（`src/speculative.rs` 的 `MtpHeads` / `MtpDrafter`），这里是进阶拓展。
 
-1. **实现 MTP 训练**：在现有 GPT 模型上添加 3 个额外预测头，实现 K=4 的多 token 预测。
+1. **实现 MTP 训练**：在现有 Transformer 模型上添加 3 个额外预测头，实现 K=4 的多 token 预测。
 2. **对比实验**：在相同数据和步数下，分别用 NTP 和 MTP 训练小模型，对比 loss 曲线和生成质量。
 3. **MTP + 推测解码**：用 MTP 的 Head 2~K 作为草稿头，Head 1 做验证，实现推测解码。
 4. **代码 vs 文本**：分别在代码和自然语言数据上训练 MTP，观察哪种数据获益更大。

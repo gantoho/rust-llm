@@ -75,7 +75,7 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
-class GPT(nn.Module):
+class Transformer(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, n_layers, d_ff, max_len, dropout=0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)

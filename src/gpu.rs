@@ -3273,11 +3273,6 @@ pub struct AttnResident {
 }
 
 impl AttnResident {
-    /// 把 P 回读到 CPU（只用于常驻反向失败时的兜底）
-    pub fn read_p(&self) -> Option<Vec<f32>> {
-        self.p.read()
-    }
-
     /// 常驻显存版的反向：五个算子录进一次提交，只回读 dQ/dK/dV（各 4.2MB）。
     /// 返回的 dQ 未乘回 scale（调用方负责，与前向把缩放挪到 Q 上对应）。
     pub fn backward(&self, dout: &[f32]) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
@@ -3759,7 +3754,7 @@ pub fn lm_head_ce(
 
 // ==================== MLP 子层常驻显存（前向 / 反向各一次提交） ====================
 //
-// 子层结构（GPT-2 风格）：x → LayerNorm/RMSNorm → Linear₁ → GELU → Linear₂ → dropout → 残差 +
+// 子层结构（经典风格）：x → LayerNorm/RMSNorm → Linear₁ → GELU → Linear₂ → dropout → 残差 +
 //
 // 逐算子版这一段要付的代价：
 // - 前向：LN 在 CPU（逐元素 + rayon）、两次线性投影各自一次「提交 + 轮询」往返、
@@ -3872,7 +3867,7 @@ impl MlpResident {
 /// `w1` `[d, hid]`、`b1` `[hid]`、`w2` `[hid, d]`、`b2` `[d]`。
 ///
 /// `is_rms` 切换归一化模式（RMSNorm 时 `beta` 的内容被内核丢弃，只需长度合法）。
-/// 只覆盖 GPT-2 风格的 GELU MLP（SwiGLU 由调用方让路）；
+/// 只覆盖经典风格的 GELU MLP（SwiGLU 由调用方让路）；
 /// 形状/规模不合适或 GPU 不可用时返回 None，调用方回退逐算子路径，数值行为不变。
 #[allow(clippy::too_many_arguments)]
 pub fn mlp_forward(
@@ -4479,6 +4474,14 @@ pub fn probe_capture(on: bool) {
     if on {
         PROBE_SHAPES.lock().unwrap().clear();
     }
+}
+
+/// 当前是否处于 `LLM_GPU_PROBE` 录制模式。
+///
+/// 录制模式下常驻路径整体关闭（`recorder()` 返回 None），`Tensor::flash_attention`
+/// 需要这个信号把前向拆回逐算子（`attn_forward_ops`），让 matmul 记录真实训练形状。
+pub fn probe_active() -> bool {
+    PROBE_CAPTURE.load(Ordering::Relaxed)
 }
 
 /// 回放录制到的形状，**按形状分组**打印批量提交下的真实吞吐。

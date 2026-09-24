@@ -2,7 +2,7 @@
 
 > 代码位置：[src/layers.rs](../src/layers.rs)（`LoraAdapter` 适配层）、
 > [src/attention.rs](../src/attention.rs)（`MultiHeadAttention::apply_lora`）、
-> [src/model.rs](../src/model.rs)（`GPT::apply_lora` 冻结 + 注入）、
+> [src/model.rs](../src/model.rs)（`Transformer::apply_lora` 冻结 + 注入）、
 > [src/tensor.rs](../src/tensor.rs)（`Tensor::matmul_frozen` 冻结权重的反向）
 >
 > 算法论文：*LoRA: Low-Rank Adaptation of Large Language Models* (Hu et al., 2021)
@@ -191,7 +191,7 @@ pub fn scaling(&self) -> f32 { self.alpha / self.rank as f32 }
 // 1. 加载预训练模型（checkpoint 的头里若记了 LoRA 形态，会先按它重建适配层再灌参数）
 let (mut model, tokenizer, _) = load_model_and_tokenizer("checkpoints/zh/latest.ckpt", ...)?;
 
-// 2. 先冻结整网，再按 targets 给对应投影挂上适配器（顺序不能反：见 GPT::apply_lora 的注释）
+// 2. 先冻结整网，再按 targets 给对应投影挂上适配器（顺序不能反：见 Transformer::apply_lora 的注释）
 let lora = LoRAConfig { rank: 8, alpha: 8.0, targets: LoRATargets::default() };  // 缺省 q,k,v
 model.apply_lora(&lora, &mut rng);
 
@@ -229,7 +229,7 @@ Q/K/V 是注意力里信息量最大的一组，缺省选它是因为参数量�
 | `q,k,v,o` | 再加 `c_proj` | 4 | 32,768（1.75%） |
 | `all` | 再加 MLP 的两个线性层 | 6 | 73,728（3.85%） |
 
-（上表数字实跑自 [config/config.json](../config/config.json) 的 1.84M 小模型；GPT-2 风格 MLP 是 2 个线性层，
+（上表数字实跑自 [config/config.json](../config/config.json) 的 1.84M 小模型；经典风格 MLP 是 2 个线性层，
 换成 SwiGLU 时是 3 个，`all` 的每层对数相应变成 8。）
 别名：`proj` / `c_proj` → `o`，`ffn` / `mlp` → `mlp`；大小写与空格随意、重复项自动去重、没命中的词直接报错。
 **挂载结构写进 checkpoint 头部**（`lora.targets`），推理端按头部记录重建，不需要再传一遍——
@@ -262,7 +262,7 @@ LoRA **已完整接入**：`finetune` 就是"LoRA 版的 SFT"——同一套训�
 
 还有一个容易踩的坑：`requires_grad` 必须是**共享标志**。本项目早期它是普通 `bool`，
 而 `Tensor` 派生了 `Clone`——在模型上冻结、优化器手里那份仍是 `true`，冻结就失效了。
-现在它是 `Rc<Cell<bool>>`，模型与优化器看的是同一个开关。
+现在它是 `Arc<AtomicBool>`，模型与优化器看的是同一个开关。
 
 ### 8.2 命令行用法
 
@@ -393,7 +393,7 @@ alpha 这一档多一个条件，是为了让"没写配置 + 只传 `--lora-rank
 不说明就悄悄丢掉旧增量是危险的，所以这条路径会额外打一行 `[warn]` 提示，
 并把 `--resume-lora` 的写法直接印出来。
 
-实现上只有三步差异（[`GPT::resume_lora`](../src/model.rs)）：**不覆盖**（沿用已注入的 A/B）、
+实现上只有三步差异（[`Transformer::resume_lora`](../src/model.rs)）：**不覆盖**（沿用已注入的 A/B）、
 **解冻**（把 `lora_parameters()` 逐个 `set_requires_grad(true)`，其余仍是 `false`）、
 **rank 必须一致**（结构来自存档，想换 rank 只能重挂）。
 

@@ -1,7 +1,7 @@
-# 第 16 课：训练小 GPT —— 看 loss 从 1.63 一路降到 0.15
+# 第 16 课：训练小 Transformer —— 看 loss 从 1.63 一路降到 0.15
 
-> 代码位置：[src/main.rs](../src/main.rs)（`demo_gpt`）
-> 代码位置：[src/train.rs](../src/train.rs)（`train_gpt` / `LRScheduler` / `clip_grad_norm`）
+> 代码位置：[src/main.rs](../src/main.rs)（`demo_transformer`）
+> 代码位置：[src/train.rs](../src/train.rs)（`train_transformer` / `LRScheduler` / `clip_grad_norm`）
 > 代码位置：[src/data.rs](../src/data.rs)（`CORPUS` / `DataLoader`）
 > 代码位置：[src/sample.rs](../src/sample.rs)（`generate` / `sample_token`）
 
@@ -9,7 +9,7 @@
 
 ## 1. 本课要搞懂的问题
 
-1. `demo_gpt` 从数据到生成文本，完整流程分哪几步？
+1. `demo_transformer` 从数据到生成文本，完整流程分哪几步？
 2. 只有 669 个字符的小语料，训练日志里的 `step / lr / loss / tok/s` 四列怎么读？
 3. 日志里为什么看不到 warmup 段？lr 从 `0.002945` 一路衰减到 `0.000300` 是怎么来的？
 4. temperature、top-k、top-p 三个参数是怎么配合采样的？
@@ -17,20 +17,20 @@
 
 ---
 
-## 2. 训练全景：demo_gpt 做了什么
+## 2. 训练全景：demo_transformer 做了什么
 
 `src/main.rs` 的演示 3（第 12-21 课）是本节的主角：
 
 ```rust
-fn demo_gpt() {
-    println!("=== 演示 3：训练小 GPT 并生成文本 ===");
+fn demo_transformer() {
+    println!("=== 演示 3：训练小 Transformer 并生成文本 ===");
 
     let mut rng = Rng::new(1234);
     let tokenizer = Tokenizer::char(CORPUS);
     let vocab_size = tokenizer.vocab_size();
     println!("  语料 {} 字符，字符词表 {} 个", CORPUS.len(), vocab_size);
 
-    let model = GPT::new(GPTConfig::tiny(vocab_size), &mut rng);
+    let model = Transformer::new(TransformerConfig::tiny(vocab_size), &mut rng);
 
     // 训练（第 13、17、18 课：训练循环 + AdamW + warmup/cosine 调度）
     let loader = DataLoader::new(CORPUS, &tokenizer, model.cfg.block_size, 8);
@@ -43,7 +43,7 @@ fn demo_gpt() {
         eval_every: 100,
         ..config::TrainConfig::default()
     };
-    train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
 
     // 生成 1（无 cache）：全量前向用滑动窗口，可以生成超过 block_size 的长文本
     // 三次生成共用同一套采样参数（含重复惩罚，见第 15 课第 7 节）
@@ -78,9 +78,9 @@ fn demo_gpt() {
 | 步骤 | 代码 | 做了什么 |
 |------|------|---------|
 | 1. 分词 | `Tokenizer::char(CORPUS)` | 扫描语料，得到 35 个字符的词表 |
-| 2. 建模型 | `GPT::new(GPTConfig::tiny(vocab_size), &mut rng)` | 用 tiny 配置（n_embd=64、n_head=4、n_layer=2、block_size=32）初始化模型 |
+| 2. 建模型 | `Transformer::new(TransformerConfig::tiny(vocab_size), &mut rng)` | 用 tiny 配置（n_embd=64、n_head=4、n_layer=2、block_size=32）初始化模型 |
 | 3. 造数据 | `DataLoader::new(CORPUS, &tokenizer, 32, 8)` | 把 669 字符的语料切成 token 序列，按 block_size=32 切块、batch_size=8 |
-| 4. 训练 | `train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, ...)` | 600 步，峰值学习率 3e-3，前 50 步 warmup，每 100 步打印一次（其余参数取 `TrainConfig::default()`） |
+| 4. 训练 | `train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, ...)` | 600 步，峰值学习率 3e-3，前 50 步 warmup，每 100 步打印一次（其余参数取 `TrainConfig::default()`） |
 | 5. 生成 | `generate(&model, &tokenizer, "Once upon a", 80, &opts, false, &mut rng)` | 给定开头，最多续写 80 个字符（采样参数打包在 `opts: SampleOpts` 里） |
 
 > 注意：训练用的是字符级分词器，所以"1 个字符 = 1 个 token"，语料 669 个字符就是 669 个 token。这让后面的数字（32、80）可以直接按"字符数"理解。
@@ -124,27 +124,27 @@ fn sample_region(&self, rng: &mut Rng, lo: usize, hi: usize, tag: &str) -> (Vec<
 关键点：
 
 - **随机采样而非顺序扫描**：每次 `sample_batch` 都在语料里随机挑起点。语料只有 669 token，但 600 步 × 8 个 batch 会反复"看到"语料的不同片段（有些片段会被重复看，有的可能一次都没被抽到）——小语料训练天然就是"背课文"。
-- 返回的 x、y 都是 `[B*T] = [8×32] = [256]` 的展平数组，正好满足 `GPT::forward(idx, b=8, t=32, kv_cache, training)` 的输入要求（训练时 `kv_cache` 传 `None`、`training` 传 `true`）。
+- 返回的 x、y 都是 `[B*T] = [8×32] = [256]` 的展平数组，正好满足 `Transformer::forward(idx, b=8, t=32, kv_cache, training)` 的输入要求（训练时 `kv_cache` 传 `None`、`training` 传 `true`）。
 
 ---
 
 ## 4. 超参数一览
 
-`train_gpt` 的调用参数与 `GPTConfig::tiny` 汇总：
+`train_transformer` 的调用参数与 `TransformerConfig::tiny` 汇总：
 
 | 超参数 | 值 | 含义 |
 |--------|----|------|
 | `steps` | 600 | 总训练步数 |
 | `batch_size` | 8 | 每步采样 8 条序列（每条 32 token） |
-| `block_size` | 32 | 最大上下文长度，来自 `GPTConfig::tiny` |
+| `block_size` | 32 | 最大上下文长度，来自 `TransformerConfig::tiny` |
 | `max_lr` | 3e-3 | 学习率峰值 |
 | `warmup_steps` | 50 | 前 50 步学习率从 0 线性爬升到峰值 |
 | `min_lr` | 3e-4 | cosine 衰减的终点，作为第 4 个参数传给 `LRScheduler::new`（demo 用 `TrainConfig::default()` 的值，恰好是 max_lr × 0.1） |
 | `weight_decay` | 0.01 | AdamW 的权重衰减（第 17 课） |
-| `grad_clip`（梯度裁剪） | 1e6 | 梯度范数上限，取自 `TrainConfig::default()`（demo 没覆盖，等于基本不裁剪） |
+| `grad_clip`（梯度裁剪） | 1.0 | 梯度范数上限，取自 `TrainConfig::default()`（demo 没覆盖） |
 | `eval_every` | 100 | 每 100 步打印一次日志 |
 
-模型参数量：`train_gpt` 开头会打印一行"开始训练"（真实数字就在其中）：
+模型参数量：`train_transformer` 开头会打印一行"开始训练"（真实数字就在其中）：
 
 ```
 开始训练：char（vocab=35）模型参数 102336 | 语料 669 tokens（训练 669 / 验证 0）| batch=8 block=32
@@ -159,7 +159,7 @@ fn sample_region(&self, rng: &mut Rng, lo: usize, hi: usize, tag: &str) -> (Vec<
 运行 `cargo run --release -- demo`，演示 3 会打印（这是**真实运行输出**，不是编的）：
 
 ```
-=== 演示 3：训练小 GPT 并生成文本 ===
+=== 演示 3：训练小 Transformer 并生成文本 ===
   语料 669 字符，字符词表 35 个
 开始训练：char（vocab=35）模型参数 102336 | 语料 669 tokens（训练 669 / 验证 0）| batch=8 block=32
 step   100 | lr 0.002945 | loss 1.6252 | 3221 tok/s
@@ -177,14 +177,14 @@ step   600 | lr 0.000300 | loss 0.1513 | 3731 tok/s
 
 | 列 | 含义 | 从哪来 |
 |----|------|--------|
-| `step` | 训练步数（从 1 开始数，日志显示 100、200、…、600） | `train_gpt` 打印的是 `step + 1` |
+| `step` | 训练步数（从 1 开始数，日志显示 100、200、…、600） | `train_transformer` 打印的是 `step + 1` |
 | `lr` | 打印时刻 `scheduler` 里的学习率 | `scheduler.lr()`，且是在本步 `scheduler.step()` **之后**读取的（`src/train.rs:450` → `:505` / `:515`）——即"下一步要用"的 lr，不是本步已用的 `cur_lr` |
 | `loss` | 本步 batch 的平均交叉熵 | `forward_loss(&model, &x, &y, b, t, accum)`（内部调用 `cross_entropy_loss`，返回的是未缩放的原始 loss） |
 | `tok/s` | 训练吞吐：已处理 token 数 ÷ 已耗时 | `tps = steps_done × batch_size × block_size / elapsed` |
 
-> demo 没有验证集，所以日志里没有 `val` / `ppl` 两列；有验证集时 `train_gpt` 还会打印 `val {:.4} (ppl {:.1})`。
+> demo 没有验证集，所以日志里没有 `val` / `ppl` 两列；有验证集时 `train_transformer` 还会打印 `val {:.4} (ppl {:.1})`。
 
-`train_gpt` 的循环分两档：**每步**做「采样 → 前向+损失 → 反向」；「裁剪 → 更新 → 清零 → 调度器前进」只在**每个累积窗口结束时**执行一次（`accum_steps = 1` 时才是每步一次，demo 就是这种默认情况）。日志打印也在累积窗口结束时，另有每 `eval_every` 步的评估：
+`train_transformer` 的循环分两档：**每步**做「采样 → 前向+损失 → 反向」；「裁剪 → 更新 → 清零 → 调度器前进」只在**每个累积窗口结束时**执行一次（`accum_steps = 1` 时才是每步一次，demo 就是这种默认情况）。日志打印也在累积窗口结束时，另有每 `eval_every` 步的评估：
 
 ```rust
 for step in start_step..cfg.steps {
@@ -261,7 +261,7 @@ lr(step) = max_lr × (step + 1) / warmup_steps     （step < 50 时）
 ### 5.4 cosine 衰减：从峰值平滑降回 min_lr
 
 第 50 步之后走 cosine 曲线，从 `max_lr = 0.003` 平滑降到 `min_lr = 0.0003`（`config::TrainConfig::default()`
-里恰好等于 `max_lr × 0.1`，但 `train_gpt` 并不做这个换算，直接用 `cfg.min_lr`）：
+里恰好等于 `max_lr × 0.1`，但 `train_transformer` 并不做这个换算，直接用 `cfg.min_lr`）：
 
 ```
 lr = min_lr + (max_lr - min_lr) × 0.5 × (1 + cos(π × progress))
@@ -351,8 +351,8 @@ lr
 
 > 核心内容已全部实现，这里是进阶拓展。
 
-1. **改种子观察差异**：把 `demo_gpt` 里 `Rng::new(1234)` 改成别的数字（如 42），重新 `cargo run --release -- demo`。loss 曲线和生成文本都会变——思考：为什么损失曲线也会变？（提示：采样 batch 的随机起点变了）
-2. **改 warmup**：把 `train_gpt` 的 `warmup_steps` 从 50 改成 5 和 500，分别跑一次，对比前 100 步的 loss。体会"warmup 太短容易起飞、太长浪费步数"。
+1. **改种子观察差异**：把 `demo_transformer` 里 `Rng::new(1234)` 改成别的数字（如 42），重新 `cargo run --release -- demo`。loss 曲线和生成文本都会变——思考：为什么损失曲线也会变？（提示：采样 batch 的随机起点变了）
+2. **改 warmup**：把 `train_transformer` 的 `warmup_steps` 从 50 改成 5 和 500，分别跑一次，对比前 100 步的 loss。体会"warmup 太短容易起飞、太长浪费步数"。
 3. **改生成参数**：把 `generate` 的 `temperature` 改成 0.2 和 1.5 各跑一次。观察文本变得更"死板/重复"还是更"发散/乱"。
 4. **数 token**：验证第 5.4 节——打印 `scheduler.lr()` 在 step 100、600 的计算过程，对照日志里的 `0.002945` 和 `0.000300`。
 5. **思考**：loss 从 1.63 降到 0.15，但为什么不能说"模型学会了英语"？模型"学会"的到底是什么？
@@ -361,7 +361,7 @@ lr
 
 ## 9. 本课总结
 
-- `demo_gpt` 五步走：分词 → 建模型 → 造数据 → `train_gpt` 训练 600 步 → `generate` 采样生成
+- `demo_transformer` 五步走：分词 → 建模型 → 造数据 → `train_transformer` 训练 600 步 → `generate` 采样生成
 - 数据是自监督的：x 是 32 个 token，y 是 x 右移一位，预测"下一个字符"
 - 真实日志：loss `1.63 → 0.15`，前 300 步降得最快；lr 从 `0.002945` 一路 cosine 衰减到 `0.000300`（warmup 段因 `eval_every=100` 没有打印点）
 - 生成用 `temperature=0.8 + top-k=10 + top-p=0.9`：先缩放、再截断、再按概率随机抽样

@@ -22,11 +22,11 @@
 
 use crate::config::TrainConfig;
 use crate::data::DataLoader;
-use crate::model::{GPT, GPTConfig};
+use crate::model::{Transformer, TransformerConfig};
 use crate::module::Module;
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
-use crate::train::train_gpt;
+use crate::train::train_transformer;
 
 // ==================== 幂律拟合 ====================
 
@@ -192,7 +192,7 @@ pub fn flops_train(n_params: f64, n_tokens: f64) -> f64 {
 }
 
 /// 一层 Transformer Block 的参数量（不含嵌入与最终归一化）
-pub fn params_per_layer(cfg: &GPTConfig) -> usize {
+pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
     let d = cfg.n_embd;
     let n_kv = if cfg.n_kv_head == 0 {
         cfg.n_head
@@ -221,14 +221,14 @@ pub fn params_per_layer(cfg: &GPTConfig) -> usize {
 ///
 /// 减去嵌入层是有道理的：词嵌入的规模由**词表**决定，与"模型有多深多宽"无关，
 /// 把它算进去会让小模型的 N 虚高（本项目的 512 词表下嵌入约占 2 层小模型的一半）。
-pub fn params_non_embedding(cfg: &GPTConfig) -> usize {
+pub fn params_non_embedding(cfg: &TransformerConfig) -> usize {
     let d = cfg.n_embd;
     let final_norm = if cfg.use_rmsnorm { d } else { 2 * d };
     cfg.n_layer * params_per_layer(cfg) + final_norm
 }
 
 /// 全部参数量（含词嵌入）。本项目输出头与词嵌入**共享同一张表**，所以只算一份。
-pub fn params_total(cfg: &GPTConfig) -> usize {
+pub fn params_total(cfg: &TransformerConfig) -> usize {
     params_non_embedding(cfg) + cfg.vocab_size * cfg.n_embd
 }
 
@@ -341,7 +341,7 @@ pub fn optimal_for_params(params: f64) -> Allocation {
 /// 过训练 / 欠训练：固定算力预算 `C`，把数据量放大到最优值的 `k` 倍（模型相应变小）。
 ///
 /// `k = 1` 就是 20:1 最优点；`k > 1` 是"小模型喂更多数据"（LLaMA-3 8B 训 15T token
-/// 就是 k ≈ 94），`k < 1` 是"大模型数据不够"（GPT-3 的 k ≈ 0.09）。
+/// 就是 k ≈ 94），`k < 1` 是"大模型数据不够"（175B 级模型的 k ≈ 0.09）。
 ///
 /// 注意这里固定的是**训练算力**。实际部署要看**总成本**（训练 + 推理）：推理量大时，
 /// 过训练的小模型总账更划算——这就是"为什么故意偏离 Chinchilla"的答案。
@@ -536,11 +536,11 @@ fn scan_train_config(sc: &ScanConfig, steps: usize) -> TrainConfig {
 
 /// 按 `(层数, 宽度)` 造出扫描用的模型配置（块大小与头数按约束修正）
 pub fn scan_model_config(
-    base: &GPTConfig,
+    base: &TransformerConfig,
     n_layer: usize,
     n_embd: usize,
     block_size: usize,
-) -> GPTConfig {
+) -> TransformerConfig {
     let n_head = pick_n_head(n_embd, base.n_head.max(1));
     let mut cfg = base.clone();
     cfg.vocab_size = base.vocab_size;
@@ -563,28 +563,23 @@ pub fn scan_model_config(
 ///
 /// `sizes` 是 `(层数, 宽度)` 列表。返回按给定顺序排列的实测点。
 pub fn params_scan(
-    base: &GPTConfig,
+    base: &TransformerConfig,
     sizes: &[(usize, usize)],
-    train_text: &str,
+    docs: &[String],
     val_text: Option<&str>,
     tokenizer: &Tokenizer,
     sc: &ScanConfig,
 ) -> Vec<ScanPoint> {
     assert!(!sizes.is_empty(), "扫描至少要给一个规模");
-    // 语料只分词一次：DataLoader 只取决于 block/batch 与文本，与模型规模无关，
+    // 语料只分词一次：DataLoader 只取决于 block/batch 与文档，与模型规模无关，
     // 放在循环里会让每个规模都重新分词整份语料（这一步比训练本身还慢）。
-    let loader = DataLoader::from_texts(
-        train_text,
-        val_text,
-        tokenizer,
-        sc.block_size,
-        sc.batch_size,
-    );
+    let loader =
+        DataLoader::from_documents(docs, val_text, tokenizer, sc.block_size, sc.batch_size);
     let mut points = Vec::with_capacity(sizes.len());
     for &(n_layer, n_embd) in sizes {
         let cfg = scan_model_config(base, n_layer, n_embd, sc.block_size);
         let mut rng = Rng::new(sc.seed);
-        let model = GPT::new(cfg.clone(), &mut rng);
+        let model = Transformer::new(cfg.clone(), &mut rng);
         // 参数口径必须与真实建层逐位一致：两处公式一旦漂移，6ND 与 Chinchilla 表就全错了。
         // 放在这里而不是只放测试里，是因为扫描本身就要用实测参数量。
         let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
@@ -602,7 +597,7 @@ pub fn params_scan(
             sc.batch_size * sc.block_size,
             sc.tokens_per_point(sc.steps) / 1e6,
         );
-        let loss = train_gpt(&model, tokenizer, &loader, &tcfg, None, None, &mut rng);
+        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng);
         points.push(ScanPoint {
             label: format!("{n_layer}x{n_embd}"),
             n_layer,
@@ -622,9 +617,9 @@ pub fn params_scan(
 /// 对应文档的"过训练分析"练习：数据量翻倍带来的 loss 下降是递减的（幂律），
 /// 从曲线上就能看出"再堆数据还值不值"。
 pub fn tokens_scan(
-    cfg: &GPTConfig,
+    cfg: &TransformerConfig,
     multiples: &[usize],
-    train_text: &str,
+    docs: &[String],
     val_text: Option<&str>,
     tokenizer: &Tokenizer,
     sc: &ScanConfig,
@@ -632,10 +627,11 @@ pub fn tokens_scan(
     assert!(!multiples.is_empty(), "数据量扫描至少要给一个倍数");
     assert!(multiples.iter().all(|&k| k >= 1), "数据量倍数必须 >= 1");
     let mut rng = Rng::new(sc.seed);
-    let model = GPT::new(cfg.clone(), &mut rng);
+    let model = Transformer::new(cfg.clone(), &mut rng);
     let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
     assert_eq!(measured, params_total(cfg));
-    let loader = DataLoader::from_texts(train_text, val_text, tokenizer, sc.block_size, sc.batch_size);
+    let loader =
+        DataLoader::from_documents(docs, val_text, tokenizer, sc.block_size, sc.batch_size);
     let mut points = Vec::with_capacity(multiples.len());
     for &k in multiples {
         let steps = sc.steps * k;
@@ -647,7 +643,7 @@ pub fn tokens_scan(
             sc.tokens_per_point(steps) / 1e6,
             params_non_embedding(cfg),
         );
-        let loss = train_gpt(&model, tokenizer, &loader, &tcfg, None, None, &mut rng);
+        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng);
         points.push(ScanPoint {
             label: format!("x{k}"),
             n_layer: cfg.n_layer,
@@ -734,16 +730,16 @@ mod tests {
     #[test]
     fn test_param_accounting_matches_real_model() {
         let configs = [
-            GPTConfig {
+            TransformerConfig {
                 vocab_size: 512,
                 n_embd: 64,
                 n_head: 4,
                 n_layer: 2,
                 block_size: 32,
-                ..GPTConfig::default()
+                ..TransformerConfig::default()
             },
             // LLaMA 风格：RMSNorm + SwiGLU + GQA
-            GPTConfig {
+            TransformerConfig {
                 vocab_size: 512,
                 n_embd: 128,
                 n_head: 8,
@@ -753,12 +749,12 @@ mod tests {
                 use_rmsnorm: true,
                 use_swiglu: true,
                 dropout: 0.1,
-                ..GPTConfig::default()
+                ..TransformerConfig::default()
             },
         ];
         for cfg in configs {
             let mut rng = Rng::new(7);
-            let model = GPT::new(cfg.clone(), &mut rng);
+            let model = Transformer::new(cfg.clone(), &mut rng);
             let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
             assert_eq!(
                 measured,
@@ -963,12 +959,16 @@ mod tests {
             max_lr: 5e-3,
             seed: 3,
         };
-        let base = GPTConfig {
+        let base = TransformerConfig {
             vocab_size: tokenizer.vocab_size(),
-            ..GPTConfig::default()
+            // 固定经典风格（LayerNorm + GELU）：本测验证的是 scaling 律本身，
+            // 不让归一化/激活的架构变量干扰 150 步 toy 训练下的 loss 排序
+            use_rmsnorm: false,
+            use_swiglu: false,
+            ..TransformerConfig::default()
         };
         let sizes = [(1usize, 32usize), (2, 64), (4, 128)];
-        let points = params_scan(&base, &sizes, &corpus, None, &tokenizer, &sc);
+        let points = params_scan(&base, &sizes, &[corpus.clone()], None, &tokenizer, &sc);
 
         assert_eq!(points.len(), 3);
         // 固定 token 预算：每个点见到的 token 数必须完全相同
@@ -1024,11 +1024,11 @@ mod tests {
             max_lr: 5e-3,
             seed: 5,
         };
-        let cfg = GPTConfig {
+        let cfg = TransformerConfig {
             vocab_size: tokenizer.vocab_size(),
-            ..GPTConfig::default()
+            ..TransformerConfig::default()
         };
-        let points = tokens_scan(&cfg, &[1, 2, 4], &corpus, None, &tokenizer, &sc);
+        let points = tokens_scan(&cfg, &[1, 2, 4], &[corpus.clone()], None, &tokenizer, &sc);
         assert_eq!(points.len(), 3);
         for w in points.windows(2) {
             assert!(

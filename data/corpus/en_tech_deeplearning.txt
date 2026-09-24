@@ -6,7 +6,7 @@ Convolutional Neural Networks (CNNs) revolutionized computer vision. By applying
 
 Recurrent Neural Networks (RNNs) and their variants, LSTMs and GRUs, handle sequential data like text and time series. They maintain a hidden state that captures information from previous inputs, making them ideal for language modeling and machine translation.
 
-The Transformer architecture, introduced in 2017, changed everything. By using self-attention mechanisms, Transformers can process entire sequences in parallel, dramatically improving both speed and performance. This led to the development of large language models like GPT, BERT, and their successors.
+The Transformer architecture, introduced in 2017, changed everything. By using self-attention mechanisms, Transformers can process entire sequences in parallel, dramatically improving both speed and performance. This led to the development of large language models like T5, BERT, and their successors.
 
 Training deep learning models requires large datasets and significant computational power. GPUs and TPUs have become essential tools, capable of performing trillions of calculations per second. The optimization process uses gradient descent and backpropagation to adjust millions or even billions of parameters.
 

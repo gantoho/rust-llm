@@ -1,7 +1,7 @@
 # 第 32 课：MoE 混合专家模型（Mixture of Experts）
 
-> **本课已落地为可运行代码**：核心实现在 [`src/moe.rs`](../src/moe.rs)（971 行，含 12 个单测），
-> 接线在 [`src/model.rs`](../src/model.rs)（`GPTConfig.n_expert` / `moe_top_k` 等 5 个字段 +
+> **本课已落地为可运行代码**：核心实现在 [`src/moe.rs`](../src/moe.rs)（1174 行，含 14 个单测），
+> 接线在 [`src/model.rs`](../src/model.rs)（`TransformerConfig.n_expert` / `moe_top_k` 等 6 个字段 +
 > `Ffn` 枚举二选一），演示在 `cargo run --release -- moe`（见文末「本项目实现」）。
 > 专家网络直接复用 `src/layers.rs` 的 `MLPEnum`（GELU 或 SwiGLU）。
 
@@ -9,7 +9,7 @@
 
 ## 为什么需要 MoE？
 
-当模型参数量从 7B 增长到 175B（GPT-3）乃至万亿级别时，**每个 token 都经过全部参数**的 Dense 模型面临两个根本瓶颈：
+当模型参数量从 7B 增长到 175B乃至万亿级别时，**每个 token 都经过全部参数**的 Dense 模型面临两个根本瓶颈：
 
 1. **计算成本**：FLOPs 与参数量成正比，训练一个 175B 模型需要数千 GPU 运行数月。
 2. **推理延迟**：每生成一个 token 都要跑完所有参数，延迟不可接受。
@@ -169,13 +169,13 @@ impl MoELayer {
 
 核心代码在 [`src/moe.rs`](../src/moe.rs)，接线在 [`src/model.rs`](../src/model.rs)，
 演示命令是 `cargo run --release -- moe`（[`src/main.rs`](../src/main.rs) 的 `cmd_moe`）。
-12 个单测全部与 CPU 参考实现对齐。
+14 个单测全部与 CPU 参考实现对齐。
 
 ### 公开 API
 
 | 项目 | 说明 |
 |------|------|
-| `top_k_gate` | 纯函数路由：`logits → Top-K`（并列按下标、**确定性**），返回 `RoutePlan` |
+| `top_k_gate` | 纯函数路由：`logits → Top-K`（并列按下标、**确定性**），返回 `RoutePlan`；选择用 `select_nth_unstable_by` O(E) 部分选择 + 对前 K 排序，不做全排序 |
 | `RoutePlan` | 一次路由的完整结果：`sel`（各专家实际处理的 token 行号，已按容量截断）、`penalty`（未选中 −∞）、`mask`（选中 1 / 其余 0）、`f`（分配比例）、`dropped` / `routed` |
 | `expert_capacity` | `ceil(cf · n·K/E)`；`cf ≤ 0` → `usize::MAX`（不限） |
 | `MoELayer` | 专家集合 + 路由器；`forward` / `forward_with_aux` / `route_plan` / `stats` |
@@ -187,9 +187,10 @@ impl MoELayer {
 逐专家跑，而不是「全跑一遍再用掩码筛掉」：
 
 1. `gather_rows(x2, &sel[e])` 取出分到专家 `e` 的 token（`[n_e, d]`）；
-2. 过该专家的 FFN（`MLPEnum`，GELU / SwiGLU 与 `GPTConfig` 保持一致）；
-3. 取门控权重矩阵 `w` 的第 `e` 列——实现上是 `w.matmul(one_hot_col(e, E))`，
-   **必须走矩阵乘**，直接读显存会把送回路由器的那条梯度掐断；
+2. 过该专家的 FFN（`MLPEnum`，GELU / SwiGLU 与 `TransformerConfig` 保持一致）；
+3. 取门控权重矩阵 `w` 的第 `e` 列——实现上是 `w.gather_rows(sel).select_col(e)`，
+   两步都是**带梯度的索引算子**（直接读显存会把送回路由器的那条梯度掐断，
+   早先的 `w.matmul(one_hot_col(e, E))` 语义等价但要多算 n×E 次乘加）；
 4. `we.mul(&ye)` 加权（`[n_e,1]` 广播到 `[n_e,d]`）；
 5. `scatter_add_rows(sel, n)` 散射回原位累加。
 
@@ -199,7 +200,7 @@ impl MoELayer {
 
 ### 门控口径：K = 1 的梯度陷阱
 
-由 `GPTConfig.moe_switch_gate` 切换：
+由 `TransformerConfig.moe_switch_gate` 切换：
 
 | 口径 | 做法 | `Σw` | K = 1 时 | 代表模型 |
 |------|------|------|----------|----------|
@@ -236,6 +237,19 @@ impl MoELayer {
 这正是后续工作（DeepSeek-V3 的 loss-free 均衡偏置、expert-choice 路由）要绕开的软/硬错配，
 也是「辅助损失系数要调小」的真实原因：它压的是概率分布，不是分配结果。
 
+### Router z-loss：压 logits 的幅度
+
+与 `L_aux` 互补的第二项：`L_z = β·mean(logsumexp(logits)²)`
+（`TransformerConfig.moe_z_loss_coef`，默认 0，CLI `--z-loss`）。
+
+- `L_aux` 压的是**概率**有多平（α），`L_z` 压的是 **logits 幅度**有多小（β）——
+  logits 越大 `logsumexp` 越大，z-loss 直接罚它；
+- 数值上走 `Tensor::logsumexp_last_dim()`（减行 max 稳定化），反向即 `g·softmax`；
+- 对 K = 1 重归一化口径尤其有意义：那里主损失给不了路由器梯度，
+  z-loss 是不依赖路由结果的额外训练信号（单测 `test_z_loss_value_and_router_gradient`
+  手算对拍数值并断言路由器拿得到非零梯度）；
+- 与 α 项合并进 `forward_with_aux` 的第二个返回值，任一为 0 就不加。
+
 ### 容量因子与 Token Dropping
 
 `capacity = ceil(cf · n·K/E)`，超出的分配按 token 顺序**先到先得**地丢弃（Switch 的做法：
@@ -250,7 +264,7 @@ cf = 2     → 每专家容量 256        丢弃 862/32768 = 2.63% ｜读到 tok
 ```
 
 `cf = 1.0` 在偏斜路由上照样丢近 25%——容量按**平均负载**算，而负载根本不均。
-**推理时必须 `cf = 0`**，否则同一句话换个批大小就换个答案（`GPTConfig` 默认就是 0）。
+**推理时必须 `cf = 0`**，否则同一句话换个批大小就换个答案（`TransformerConfig` 默认就是 0）。
 
 ### 参数 / 计算量口径
 
@@ -266,7 +280,7 @@ CLI 里有一处 `assert_eq!` 把「公式算出的参数」与「建层实测�
 
 ### 接线方式
 
-`GPTConfig` 新增 5 个 MoE 字段（都带 `#[serde(default)]`，旧 `config.json` 无需改动）：
+`TransformerConfig` 新增 6 个 MoE 字段（都带 `#[serde(default)]`，旧 `config.json` 无需改动）：
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -274,13 +288,14 @@ CLI 里有一处 `assert_eq!` 把「公式算出的参数」与「建层实测�
 | `moe_top_k` | 1 | Top-K（须 `1 ≤ K ≤ E`） |
 | `moe_capacity_factor` | 0.0 | 容量因子，0 = 不限（推理必须 0） |
 | `moe_aux_coef` | 0.0 | 辅助损失系数 α |
+| `moe_z_loss_coef` | 0.0 | router z-loss 系数 β（`β·mean(logsumexp(logits)²)`） |
 | `moe_switch_gate` | false | 门控口径（见上表；`moe_top_k = 1` 时应置 `true`） |
 
 `TransformerBlock` 的前馈子层是一个 `Ffn` 枚举（`MLPEnum` 或 `MoELayer`）。两者接口一致
 （`forward` / `parameters` / `named_parameters`），所以残差、dropout、GPU 常驻快路全都不用改。
-`GPT::aux_loss()` 把各层 `L_aux` 累加（每层已在 `MoELayer` 内乘过 α），训练侧用
+`Transformer::aux_loss()` 把各层 `L_aux` 累加（每层已在 `MoELayer` 内乘过 α），训练侧用
 `scale_grad_only(a, 1/accum)` 只缩放梯度、不改数值——与交叉熵在梯度累积下的处理手法一致。
-另有 `GPT::route_stats()`（合并各层统计，训练日志用）与 `GPT::set_moe_capacity_factor()`。
+另有 `Transformer::route_stats()`（合并各层统计，训练日志用）与 `Transformer::set_moe_capacity_factor()`。
 
 ### 运行方式
 
@@ -298,6 +313,7 @@ cargo run --release -- moe --experts 4,8,16 --aux-coef 0.01
 | `--batch-size` / `--block-size` / `--lr` | `8` / `64` / `3e-3` | 训练超参 |
 | `--n-embd` / `--n-layer` | `64` / `2` | 模型规模 |
 | `--aux-coef` | `0.01` | 辅助损失系数 α（对照组固定为 0） |
+| `--z-loss` | `0.0` | router z-loss 系数 β（0 = 不加） |
 | `--capacity-factors` | `0,1.0,1.25,2.0` | 容量因子扫描（0 = 不限） |
 | `--seed` | `42` | 各组共用，保证初始权重逐位一致、可比 |
 

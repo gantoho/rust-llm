@@ -4,7 +4,7 @@
 //!
 //! 本模块实现两种：
 //! - `CharTokenizer`：按字符切分（简单直观，适合小模型学习）
-//! - `BPETokenizer`：字节对编码（现代 GPT 的实际方案，能压缩常见词/子词）
+//! - `BPETokenizer`：字节对编码（现代 Transformer 的实际方案，能压缩常见词/子词）
 //!
 //! 两种分词器都支持序列化/反序列化（save/load），训练后可持久化，推理时直接加载。
 //!
@@ -12,7 +12,8 @@
 //! （[`SpecialTokens`]：BOS / EOS / PAD，见该结构体的文档）。它们让"序列在哪里结束"
 //! 成为一个可以学习的符号，而不是靠语料里凑巧高频的字符组合来暗示。
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{Read, Write};
 
 /// 把 JSON 美化成文本写到文件（父目录不存在时自动创建）。
@@ -86,24 +87,6 @@ impl CharTokenizer {
         })
     }
 
-    /// 保存到文件（JSON 格式）
-    pub fn save(&self, path: &str) {
-        write_json(path, &self.to_json());
-    }
-
-    /// 从文件加载（独立使用，Tokenizer::load 会自动调用 from_json 避免重复读文件）
-    #[allow(dead_code)]
-    pub fn load(path: &str) -> Self {
-        let mut f = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
-        let mut text = String::new();
-        f.read_to_string(&mut text)
-            .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
-        Self::from_json(&json)
-    }
-
     /// 从已解析的 JSON 值构造
     pub fn from_json(json: &serde_json::Value) -> Self {
         let chars: Vec<char> = json["chars"]
@@ -137,18 +120,32 @@ pub struct BPETokenizer {
     vocab: Vec<Vec<u8>>,
 }
 
+/// 增量调整 pair 频次（delta = ±1），并把新值推进优先队列。
+///
+/// 队列里同一 pair 可能积累多个条目，pop 时按 `pair_freq` 当前值校验，
+/// 不一致的视为过期直接丢弃（懒删除）——避免每轮合并后重建整个堆。
+fn bump_pair(
+    pair_freq: &mut HashMap<(u16, u16), usize>,
+    heap: &mut BinaryHeap<(usize, Reverse<(u16, u16)>)>,
+    pair: (u16, u16),
+    delta: i32,
+) {
+    let e = pair_freq.entry(pair).or_insert(0);
+    let new = *e as i32 + delta;
+    debug_assert!(new >= 0, "pair {pair:?} 频次不应减为负数");
+    *e = new as usize;
+    if *e > 0 {
+        heap.push((*e, Reverse(pair)));
+    }
+}
+
 impl BPETokenizer {
     /// 在语料上训练 BPE，目标词表大小 = 256 + 合并次数
+    ///
+    /// **全量语料参与统计**（历史实现只取前 1MB，大语料采样无代表性）；
+    /// 训练用「增量频次 + 优先队列」，不再每次合并都全量重扫重建统计。
     pub fn train(corpus: &str, target_vocab: usize) -> Self {
-        // 语料过长时采样，避免 BPE 训练耗时过长
-        let max_train_bytes: usize = 1_000_000; // 1MB 足以学到良好的合并规则
-        let train_bytes = if corpus.len() > max_train_bytes {
-            println!("  语料 {} 字节，采样前 {} 字节用于 BPE 训练", corpus.len(), max_train_bytes);
-            &corpus.as_bytes()[..max_train_bytes]
-        } else {
-            corpus.as_bytes()
-        };
-        Self::train_bytes(train_bytes, target_vocab)
+        Self::train_bytes(corpus.as_bytes(), target_vocab)
     }
 
     fn train_bytes(data: &[u8], target_vocab: usize) -> Self {
@@ -157,23 +154,37 @@ impl BPETokenizer {
         let mut merges: Vec<(u16, u16)> = Vec::new();
         let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
 
+        // pair -> 当前频次：初始扫一遍，之后随每次合并增量增减，
+        // 不再像旧实现那样每轮全量重扫语料重建 HashMap（O(merges × corpus) 的主项之一）
+        let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
+        for w in ids.windows(2) {
+            *pair_freq.entry((w[0], w[1])).or_insert(0) += 1;
+        }
+        // 最大堆：键 (频次, Reverse(pair))，频次最高者在顶、平手取 pair 值小者
+        // （确定性 tie-break，与旧实现的 max_by 规则一致）。
+        // 频次每次变化都 push 新条目，pop 时按 pair_freq 校验，过期条目直接丢弃（懒删除）。
+        let mut heap: BinaryHeap<(usize, Reverse<(u16, u16)>)> = BinaryHeap::new();
+        for (&p, &f) in &pair_freq {
+            if f > 0 {
+                heap.push((f, Reverse(p)));
+            }
+        }
+
         let target_merges = target_vocab - 256;
         let log_interval = if target_merges >= 20 { target_merges / 20 } else { 1 };
+        // 双缓冲交替复用：每轮合并结果写进 buf 再 swap，避免逐轮重新分配大 Vec
+        let mut buf: Vec<u16> = Vec::with_capacity(ids.len());
 
-        while vocab.len() < target_vocab {
-            // 统计相邻 pair 频率（每次重新扫描，但语料已采样到1MB）
-            let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
-            for pair in ids.windows(2) {
-                *pair_freq.entry((pair[0], pair[1])).or_insert(0) += 1;
-            }
-            // 找最高频 pair（频率相同取 pair 值小者，保证确定性）
-            let best = match pair_freq
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                .map(|(&k, _)| k)
-            {
-                Some(pair) => pair,
-                None => break,
+        'train: while vocab.len() < target_vocab {
+            // 弹出所有过期条目，取当前真实最高频 pair；堆空说明没有可合并的 pair
+            let best = loop {
+                match heap.pop() {
+                    Some((f, Reverse(p))) if f > 0 && pair_freq.get(&p).copied() == Some(f) => {
+                        break p
+                    }
+                    Some(_) => continue, // 频次已过期（该 pair 后来被合并改动过）
+                    None => break 'train, // 语料已无可合并 pair（如单字节语料）
+                }
             };
 
             // 创建新 token
@@ -183,19 +194,30 @@ impl BPETokenizer {
             vocab.push(new_bytes);
             merges.push(best);
 
-            // 合并 ids 中所有该 pair（单次扫描重建）
-            let mut new_ids: Vec<u16> = Vec::with_capacity(ids.len());
+            // 单次扫描合并该 pair，同时**增量**更新受影响 pair 的频次。
+            // 每处合并只影响三个旧 pair：左邻 (prev, a)、本身 (a, b)、右邻 (b, next)，
+            // 对应两个新 pair：(prev, N) 与 (N, next) —— 不需要重扫全语料重新统计。
+            buf.clear();
             let mut i = 0;
             while i < ids.len() {
                 if i + 1 < ids.len() && ids[i] == best.0 && ids[i + 1] == best.1 {
-                    new_ids.push(new_id);
+                    if let Some(&prev) = buf.last() {
+                        bump_pair(&mut pair_freq, &mut heap, (prev, best.0), -1);
+                        bump_pair(&mut pair_freq, &mut heap, (prev, new_id), 1);
+                    }
+                    bump_pair(&mut pair_freq, &mut heap, best, -1);
+                    if let Some(&next) = ids.get(i + 2) {
+                        bump_pair(&mut pair_freq, &mut heap, (best.1, next), -1);
+                        bump_pair(&mut pair_freq, &mut heap, (new_id, next), 1);
+                    }
+                    buf.push(new_id);
                     i += 2;
                 } else {
-                    new_ids.push(ids[i]);
+                    buf.push(ids[i]);
                     i += 1;
                 }
             }
-            ids = new_ids;
+            std::mem::swap(&mut ids, &mut buf);
 
             let merge_count = merges.len();
             if merge_count % log_interval == 0 || merge_count <= 5 {
@@ -214,7 +236,7 @@ impl BPETokenizer {
 
     /// 文本 -> token id 序列
     ///
-    /// 贪心合并（GPT-2 的标准实现）：按优先级从高到低，对每条合并规则在序列上
+    /// 贪心合并（通行的标准实现）：按优先级从高到低，对每条合并规则在序列上
     /// 做一趟扫描替换。复杂度 O(len × 合并数)，大语料也能秒级完成。
     pub fn encode(&self, text: &str) -> Vec<usize> {
         let mut ids: Vec<u16> = text.as_bytes().iter().map(|&b| b as u16).collect();
@@ -279,24 +301,6 @@ impl BPETokenizer {
             "merges": self.merges.iter().map(|(a, b)| vec![*a, *b]).collect::<Vec<_>>(),
             "vocab": self.vocab.iter().map(|v| v.clone()).collect::<Vec<_>>(),
         })
-    }
-
-    /// 保存到文件（JSON 格式）
-    pub fn save(&self, path: &str) {
-        write_json(path, &self.to_json());
-    }
-
-    /// 从文件加载（独立使用，Tokenizer::load 会自动调用 from_json 避免重复读文件）
-    #[allow(dead_code)]
-    pub fn load(path: &str) -> Self {
-        let mut f = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
-        let mut text = String::new();
-        f.read_to_string(&mut text)
-            .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("解析分词器文件 {path} 失败: {e}"));
-        Self::from_json(&json)
     }
 
     /// 从已解析的 JSON 值构造
@@ -509,11 +513,6 @@ impl Tokenizer {
     /// 序列起始标记 id；旧分词器返回 `None`
     pub fn bos_id(&self) -> Option<usize> {
         self.specials.map(|s| s.bos)
-    }
-
-    /// 填充标记 id（对齐 / 变长 batch 用）；旧分词器返回 `None`
-    pub fn pad_id(&self) -> Option<usize> {
-        self.specials.map(|s| s.pad)
     }
 
     fn is_special(&self, id: usize) -> bool {

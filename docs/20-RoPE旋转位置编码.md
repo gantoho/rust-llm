@@ -40,7 +40,7 @@ x = token_embedding + pos_emb
 
 ### 2.2 外推（extrapolation）差
 
-我们的模型 `block_size = 32`（`GPTConfig::tiny`），训练时位置只见过 `0..32`。如果推理时生成更长的序列：
+我们的模型 `block_size = 32`（`TransformerConfig::tiny`），训练时位置只见过 `0..32`。如果推理时生成更长的序列：
 
 - 位置 32、33…… 的 pos_emb 向量虽然能算出来（正弦函数对任意 pos 都有定义），
 - 但模型**从没见过这种输入分布**，注意力分数可能畸变，输出质量断崖式下跌。
@@ -203,10 +203,10 @@ RoPE 和这个流程是无缝衔接的：
 新 token 的绝对位置 = 缓存长度 base + 它在当前窗口里的下标 j
 ```
 
-`base`（已缓存的位置数）由 `GPT::forward_core` 算出来传给每层（第 25 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
+`base`（已缓存的位置数）由 `Transformer::forward_core` 算出来传给每层（第 25 课的设计），`MultiHeadAttention::forward` 里 `positions` 就是这么构造的：
 
 ```rust
-// src/model.rs（GPT::forward_core）：base = 缓存长度
+// src/model.rs（Transformer::forward_core）：base = 缓存长度
 let base = kv_cache
     .as_ref()
     .map(|c| c.first().map(|k| k.seq_len()).unwrap_or(0))
@@ -242,32 +242,52 @@ for _ in 0..b {
 ```rust
 /// 预计算每个 (位置, 对偶下标) 的 cos/sin 表，长度 rows × (D/2)。
 /// 同一批 positions 的三角只算一次：前向、反向、Q/K 复用。
-fn build_cos_sin_tab(positions: &[usize], d: usize) -> (Vec<f32>, Vec<f32>) {
-    let rows = positions.len();
-    let half = d / 2;
-    let mut c_tab = vec![0.0f32; rows * half];
-    let mut s_tab = vec![0.0f32; rows * half];
-    let mut freq = vec![0.0f32; half];
-    for i in 0..half {
-        freq[i] = 10000f32.powf((2 * i) as f32 / d as f32);
-    }
-    for r in 0..rows {
-        let pos = positions[r] as f32;
-        for i in 0..half {
-            let theta = pos / freq[i];
-            c_tab[r * half + i] = theta.cos();
-            s_tab[r * half + i] = theta.sin();
+///
+/// 记忆化（线程本地单槽，key = d + spec + positions）：命中时只做两次
+/// Arc 指针克隆，不再重算三角、不再分配 Vec。
+fn build_cos_sin_tab(
+    positions: &[usize],
+    d: usize,
+    spec: &RopeSpec,
+) -> (Arc<Vec<f32>>, Arc<Vec<f32>>) {
+    TAB_SLOT.with(|slot| {
+        // 命中：直接返回共享的 Arc 表（零拷贝）
+        if let Some((cd, cs, cpos, tab)) = slot.as_ref() {
+            if *cd == d && *cs == *spec && cpos.as_slice() == positions {
+                return (tab.0.clone(), tab.1.clone());
+            }
         }
-    }
-    (c_tab, s_tab)
+        // 未命中：查频率表缓存（FREQ_SLOT，只与 (d, spec) 有关），再逐位置建表
+        let fm = freq_and_mscale(d, spec);
+        let freq = &fm.0;
+        let mscale = fm.1;
+        let rows = positions.len();
+        let half = d / 2;
+        let mut c_tab = vec![0.0f32; rows * half];
+        let mut s_tab = vec![0.0f32; rows * half];
+        for r in 0..rows {
+            let pos = positions[r] as f32;
+            for i in 0..half {
+                let theta = pos * freq[i];
+                c_tab[r * half + i] = theta.cos() * mscale;
+                s_tab[r * half + i] = theta.sin() * mscale;
+            }
+        }
+        let tab = (Arc::new(c_tab), Arc::new(s_tab));
+        *slot = Some((d, *spec, positions.to_vec(), tab.clone()));
+        tab
+    })
 }
 
 /// 用现成的 cos/sin 表旋转一个张量（[rows, D]）。
 /// 反向用旋转矩阵的转置 R(θ)ᵀ 回传梯度，闭包直接查表。
-fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
+fn rotate_with_tab(x: &Tensor, c_tab: &Arc<Vec<f32>>, s_tab: &Arc<Vec<f32>>) -> Tensor {
     let (rows, d) = (x.shape[0], x.shape[1]);
     let sd = x.data.borrow();
     let sd_ref: &[f32] = &sd;
+    // Arc 表先解引用成只读切片再进并行闭包（&[f32] 跨线程共享，无需逐线程克隆表）
+    let ct_f: &[f32] = c_tab;
+    let st_f: &[f32] = s_tab;
     let mut out_data = vec![0.0f32; rows * d];
     let half = d / 2;
     // 并行：每行旋转独立，行间无依赖
@@ -275,7 +295,7 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
         let base = r * d;
         let ct_base = r * half;
         for i in 0..half {
-            let (c, s) = (c_tab[ct_base + i], s_tab[ct_base + i]);
+            let (c, s) = (ct_f[ct_base + i], st_f[ct_base + i]);
             let (a, b) = (sd_ref[base + 2 * i], sd_ref[base + 2 * i + 1]);
             out_row[2 * i] = a * c - b * s;
             out_row[2 * i + 1] = a * s + b * c;
@@ -287,20 +307,24 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
     if x.req() {
         let rg = result.grad.clone();
         let sg = x.grad.clone();
-        let ct = c_tab.to_vec();
-        let st = s_tab.to_vec();
-        result.parents = Rc::new(vec![x.clone()]);
-        result.backward = Some(Rc::new(move || {
-            // 先把梯度拷出 RefCell，再并行写回（Ref<Vec<f32>> 不是 Sync）
-            let g_local: Vec<f32> = rg.borrow().to_vec();
+        // cos/sin 表用 Arc 共享给反向闭包（闭包要求 'static），不 to_vec 克隆整张表
+        let ct = Arc::clone(c_tab);
+        let st = Arc::clone(s_tab);
+        record(&result, vec![x.clone()], Arc::new(move || {
+            // 梯度 borrow 一次转只读切片，不做 to_vec 拷贝；
+            // 切片是 Sync，可安全带进下面的并行闭包（Ref 本身不是）
+            let g_b = rg.borrow();
+            let g_ref: &[f32] = &g_b;
+            let ct_ref: &[f32] = &ct;
+            let st_ref: &[f32] = &st;
             let mut sgm = sg.borrow_mut();
             // 并行：每行独立计算梯度，行间无依赖（与前向一致）
             sgm.par_chunks_mut(d).enumerate().for_each(|(r, sgm_row)| {
                 let g_base = r * d;
                 let ct_base = r * (d / 2);
                 for i in 0..d / 2 {
-                    let (c, s) = (ct[ct_base + i], st[ct_base + i]);
-                    let (ga, gb) = (g_local[g_base + 2 * i], g_local[g_base + 2 * i + 1]);
+                    let (c, s) = (ct_ref[ct_base + i], st_ref[ct_base + i]);
+                    let (ga, gb) = (g_ref[g_base + 2 * i], g_ref[g_base + 2 * i + 1]);
                     // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
                     sgm_row[2 * i] += ga * c + gb * s;
                     sgm_row[2 * i + 1] += -ga * s + gb * c;
@@ -315,9 +339,14 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
 对外只暴露两个入口——`rotary`（旋转单个张量，仅供测试）和 `rotary_pair`（一次建表同时旋转 Q/K）：
 
 ```rust
-pub fn rotary_pair(&self, other: &Tensor, positions: &[usize]) -> (Tensor, Tensor) {
+pub fn rotary_pair(
+    &self,
+    other: &Tensor,
+    positions: &[usize],
+    spec: &RopeSpec,
+) -> (Tensor, Tensor) {
     let d = self.shape[1];
-    let (c_tab, s_tab) = build_cos_sin_tab(positions, d);
+    let (c_tab, s_tab) = build_cos_sin_tab(positions, d, spec); // 命中缓存则零拷贝
     (
         rotate_with_tab(self, &c_tab, &s_tab),
         rotate_with_tab(other, &c_tab, &s_tab),
@@ -344,9 +373,10 @@ pub fn rotary_pair(&self, other: &Tensor, positions: &[usize]) -> (Tensor, Tenso
 几个值得注意的设计点：
 
 1. **建表两层循环 + 旋转按行并行**：建表时外层按行 `r`、内层按对 `i`，`cos/sin` 每个 `(r, i)` 只算一次；旋转时用 `par_chunks_mut(d).enumerate().for_each(...)` 把每一行分给一个任务并行处理，行内只做查表乘加，不再碰任何三角函数（反向闭包同样按行并行）。
-2. **`drop(sd)`**：读完输入数据后立刻释放借用，之后才创建结果张量和反向闭包——避免闭包捕获时和 `self.data` 的借用纠缠。
-3. **`requires_grad` 分支**：如果输入不需要梯度（比如纯推理），就直接返回普通结果，不建 `parents`/`backward`，省下计算图的维护开销。这和第 25 课 KV cache 推理时"纯数据拼接、无梯度"的思路一致。
-4. **反向闭包查同一张表**：反向闭包为了"自包含"（只捕获 `ct`/`st` 两份表拷贝 + `rg`/`sg` 两个 Rc），直接查表取值，**不再重算 `theta/cos/sin`**。代价是闭包多持有两张表，好处是前向建的三角表被完整复用。
+2. **两层缓存**：`FREQ_SLOT` 按 `(d, spec)` 记忆化频率表（`powf` 与 YaRN 温度只算一次），`TAB_SLOT` 按 `(d, spec, positions)` 记忆化整张 cos/sin 表——同一次前向里 6 层注意力的 positions 完全相同，只有第 1 层真正建表，其余各层拿到共享的 `Arc` 表（零拷贝）。解码时 positions 逐 token 变化导致整表未命中，但频率表仍命中，每 token 只剩 rows×D/2 次三角计算。
+3. **`drop(sd)`**：读完输入数据后立刻释放借用，之后才创建结果张量和反向闭包——避免闭包捕获时和 `self.data` 的借用纠缠。
+4. **`requires_grad` 分支**：如果输入不需要梯度（比如纯推理），就直接返回普通结果，不建 `parents`/`backward`，省下计算图的维护开销。这和第 25 课 KV cache 推理时"纯数据拼接、无梯度"的思路一致。
+5. **反向闭包查同一张表**：反向闭包为了"自包含"（只捕获 `ct`/`st` 两份 `Arc` 克隆 + `rg`/`sg` 两个 Arc），直接查表取值，**不再重算 `theta/cos/sin`**。因为表是 `Arc` 共享的，闭包持有一份克隆几乎零成本，前向建的三角表被完整复用。
 
 ---
 
@@ -394,7 +424,7 @@ sgm_row[2 * i + 1] += -ga * s + gb * c;
 > 本仓库初版实现确实写反过，已修复并补了逐元素断言。
 
 对训练的影响：本课已经把 RoPE 接进了 `MultiHeadAttention`（`src/attention.rs`），训练和 KV cache 推理都用它。
-`GPT` 已不再有 `pos_emb` 字段，位置信息完全由注意力内部旋转 Q/K 提供（见第 10 节）。
+`Transformer` 已不再有 `pos_emb` 字段，位置信息完全由注意力内部旋转 Q/K 提供（见第 10 节）。
 
 ---
 
@@ -486,7 +516,7 @@ RoPE 有两个可选的接入时机：
 | 拆头之后 | 每个头是 `[T, head_dim]` | 逐头旋转，更贴近"每头各转各的"的原始论文写法 |
 
 我们的 `rotary_pair` 接口（输入 `[rows, D]` + 每行的 `positions`）两种都支持，只要最后一维是偶数即可——
-`GPTConfig::tiny` 里 `n_embd=64`、`head_dim=16`，都满足。
+`TransformerConfig::tiny` 里 `n_embd=64`、`head_dim=16`，都满足。
 
 ### 10.3 实际接入方式（本仓库已接入）
 
@@ -517,7 +547,7 @@ let (q, k) = (
 4. 由于 K/V 已旋转并缓存，**推理模式（KV cache）和训练模式行为一致**，不会像正弦编码那样需要区分两套位置逻辑。这一点有专门的测试守着（`src/model.rs` 的 `test_kv_cache_matches_full_forward`）。
 5. `rotary_pair` 的反向按 `R(θ)ᵀ` 实现并通过 `test_rotary_grad_exact` 逐元素验证。
 
-> 替换还是叠加？本仓库选了**替换**：`GPT` 结构体里没有 `pos_emb` 字段（第 11 课的正弦编码在接入 RoPE 后已删除），
+> 替换还是叠加？本仓库选了**替换**：`Transformer` 结构体里没有 `pos_emb` 字段（第 11 课的正弦编码在接入 RoPE 后已删除），
 > 位置信息完全由注意力内部旋转 Q/K 提供。叠加方案（保留 `pos_emb` 再加 RoPE）一般没必要，且会稀释 RoPE 的相对位置特性。
 
 ---
@@ -549,8 +579,8 @@ let (q, k) = (
 - 旋转是**正交变换**：`R(θ)ᵀR(θ) = I`，范数不变 → 数值稳定、不破坏 LayerNorm。
 - **相对位置性质**：`q_m · k_n = qᵀR((n-m)θ)k`，点积只与位置差 `n - m` 有关——位置被"编死"进了打分公式。
 - 与 **KV cache 天然兼容**：新 token 按 `base + j` 旋转自己的 Q/K，历史 K 已旋转、直接复用。
-- `src/rope.rs` 的实现分三层：`build_cos_sin_tab` 预计算 cos/sin 表 → `rotate_with_tab` 查表旋转 → `rotary_pair` 一次建表同时旋转 Q/K；反向按正交矩阵的转置 `R(θ)ᵀ` 回传（已修复并通过 `test_rotary_grad_exact` 验证）。
+- `src/rope.rs` 的实现分三层：`build_cos_sin_tab` 预计算 cos/sin 表（线程本地双槽缓存：`FREQ_SLOT` 按 `(d, spec)` 记忆化频率表、`TAB_SLOT` 按 `(d, spec, positions)` 记忆化整表，命中即 `Arc` 零拷贝）→ `rotate_with_tab` 查表旋转 → `rotary_pair` 一次建表同时旋转 Q/K；反向按正交矩阵的转置 `R(θ)ᵀ` 回传（已修复并通过 `test_rotary_grad_exact` 验证）。
 - `test_rotary` 三个断言分别验证：正交性（范数不变）、`pos=0` 恒等、梯度范数守恒；`test_rotary_grad_exact` 逐元素验证梯度方向。
-- 实际接入：在 `MultiHeadAttention` 拆头前、KV cache append 之前对 Q/K 旋转（只转 Q/K、不转 V），已完成接入；`GPT` 已无 `pos_emb` 字段（第 11 课正弦编码被替换）。
+- 实际接入：在 `MultiHeadAttention` 拆头前、KV cache append 之前对 Q/K 旋转（只转 Q/K、不转 V），已完成接入；`Transformer` 已无 `pos_emb` 字段（第 11 课正弦编码被替换）。
 
 - 下一课（第 21 课）：RMSNorm 均方根归一化

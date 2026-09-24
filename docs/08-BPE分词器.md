@@ -111,25 +111,15 @@ BPE（Byte Pair Encoding，字节对编码）源自数据压缩算法，规则�
 
 ## 5. BPE 训练：train()
 
-### 5.1 语料采样：超过 1MB 就截断
+### 5.1 全量语料：不再截断
 
-BPE 训练的主循环每次合并都要**重新扫描整个语料**统计 pair 频率，语料一大就会慢得离谱。所以 `train()` 先做一次上限截断，再交给内部实现：
+早期实现的训练主循环每次合并都要**重新扫描整个语料**统计 pair 频率，语料一大就慢得离谱，所以曾按 1MB 上限截断。现在训练改成了**增量更新**（见 5.3）：初始只全量扫一遍建频次表，之后每轮合并只调整受影响的几个 pair，代价与语料大小脱钩——因此截断已删除，**全量语料都参与统计**：
 
 ```rust
 pub fn train(corpus: &str, target_vocab: usize) -> Self {
-    // 语料过长时采样，避免 BPE 训练耗时过长
-    let max_train_bytes: usize = 1_000_000; // 1MB 足以学到良好的合并规则
-    let train_bytes = if corpus.len() > max_train_bytes {
-        println!("  语料 {} 字节，采样前 {} 字节用于 BPE 训练", corpus.len(), max_train_bytes);
-        &corpus.as_bytes()[..max_train_bytes]
-    } else {
-        corpus.as_bytes()
-    };
-    Self::train_bytes(train_bytes, target_vocab)
+    Self::train_bytes(corpus.as_bytes(), target_vocab)
 }
 ```
-
-注意截断点是**字节**而不是字符，可能落在一个多字节 UTF-8 字符中间——这对字节级 BPE 没有影响（字节序列本身就是它的输入）。
 
 ### 5.2 初始化：字节级词表
 
@@ -147,54 +137,95 @@ let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
 
 - 任何 UTF-8 文本都可以拆成字节，**不存在"词表外"字符**（OOV = 0）
 - 中文等多语言文本也能直接编码（一个汉字是 3 个字节）
-- GPT-2 等真实模型用的就是字节级 BPE
+- 早期真实大模型用的就是字节级 BPE
 
-### 5.3 训练主循环：统计 → 选择 → 合并 → 替换
+### 5.3 训练主循环：初始统计 → 堆选优 → 单遍合并 + 增量更新
+
+训练分三段：**初始只全量扫一遍**建立 pair 频次表和最大堆；之后**每轮合并只单遍扫一遍序列**，顺手增量调整受影响的几个 pair 频次——不再每轮重建统计（旧实现是 O(merges × 语料)，现在是 O(语料 + merges × 合并命中数)）。
+
+**第一步：初始统计**
 
 ```rust
-while vocab.len() < target_vocab {
-    // 1. 统计相邻 pair 频率
-    let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
-    for pair in ids.windows(2) {
-        *pair_freq.entry((pair[0], pair[1])).or_insert(0) += 1;
-    }
-    // 2. 找最高频的 pair（频率相同取 pair 值小者，保证确定性）
-    let Some(&best) = pair_freq
-        .iter()
-        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-        .map(|(k, _)| k)
-    else {
-        break; // 没有可合并的 pair 了
-    };
-    // 3. 合并：新符号 = 两个符号的字节拼接
-    let new_id = vocab.len() as u16;
-    let mut new_bytes = vocab[best.0 as usize].clone();
-    new_bytes.extend_from_slice(&vocab[best.1 as usize]);
-    vocab.push(new_bytes);
-    merges.push(best);
-
-    // 4. 替换 ids 中所有该 pair
-    let mut new_ids: Vec<u16> = Vec::with_capacity(ids.len());
-    let mut i = 0;
-    while i < ids.len() {
-        if i + 1 < ids.len() && ids[i] == best.0 && ids[i + 1] == best.1 {
-            new_ids.push(new_id);
-            i += 2;               // 一次吞掉两个符号
-        } else {
-            new_ids.push(ids[i]);
-            i += 1;
-        }
-    }
-    ids = new_ids;
+// pair -> 当前频次：初始扫一遍，之后随每次合并增量增减
+let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
+for w in ids.windows(2) {
+    *pair_freq.entry((w[0], w[1])).or_insert(0) += 1;
 }
+// 最大堆：键 (频次, Reverse(pair))，频次最高者在顶、平手取 pair 值小者
+// （确定性 tie-break，保证结果与旧实现的 max_by 规则一致）
+let mut heap: BinaryHeap<(usize, Reverse<(u16, u16)>)> = BinaryHeap::new();
+for (&p, &f) in &pair_freq {
+    if f > 0 {
+        heap.push((f, Reverse(p)));
+    }
+}
+```
+
+**第二步：每轮选优 —— 堆 + 懒删除**
+
+频次每次变化都往堆里 push 新条目，旧条目不删（懒删除）；pop 时拿 `pair_freq` 的当前值校验，对不上就说明过期、丢弃继续弹：
+
+```rust
+let best = loop {
+    match heap.pop() {
+        Some((f, Reverse(p))) if f > 0 && pair_freq.get(&p).copied() == Some(f) => break p,
+        Some(_) => continue, // 频次已过期（该 pair 后来被合并改动过）
+        None => break 'train, // 语料已无可合并 pair（如单字节语料）
+    }
+};
+```
+
+**第三步：单遍合并 + 增量更新频次**
+
+创建新 token 的逻辑不变（`vocab.push` + `merges.push`）。关键是替换阶段：每处合并只影响**三个旧 pair**——左邻 `(prev, a)`、本身 `(a, b)`、右邻 `(b, next)`——对应**两个新 pair** `(prev, N)` 和 `(N, next)`，用 `bump_pair` 增量 ±1 即可，不需要重扫全语料重新统计：
+
+```rust
+fn bump_pair(
+    pair_freq: &mut HashMap<(u16, u16), usize>,
+    heap: &mut BinaryHeap<(usize, Reverse<(u16, u16)>)>,
+    pair: (u16, u16),
+    delta: i32,
+) {
+    let e = pair_freq.entry(pair).or_insert(0);
+    let new = *e as i32 + delta;
+    debug_assert!(new >= 0, "pair {pair:?} 频次不应减为负数");
+    *e = new as usize;
+    if *e > 0 {
+        heap.push((*e, Reverse(pair))); // 新值入堆，旧条目靠懒删除失效
+    }
+}
+```
+
+```rust
+buf.clear();
+let mut i = 0;
+while i < ids.len() {
+    if i + 1 < ids.len() && ids[i] == best.0 && ids[i + 1] == best.1 {
+        if let Some(&prev) = buf.last() {
+            bump_pair(&mut pair_freq, &mut heap, (prev, best.0), -1);
+            bump_pair(&mut pair_freq, &mut heap, (prev, new_id), 1);
+        }
+        bump_pair(&mut pair_freq, &mut heap, best, -1);
+        if let Some(&next) = ids.get(i + 2) {
+            bump_pair(&mut pair_freq, &mut heap, (best.1, next), -1);
+            bump_pair(&mut pair_freq, &mut heap, (new_id, next), 1);
+        }
+        buf.push(new_id);
+        i += 2;
+    } else {
+        buf.push(ids[i]);
+        i += 1;
+    }
+}
+std::mem::swap(&mut ids, &mut buf); // 双缓冲交替复用，避免逐轮重新分配大 Vec
 ```
 
 | 步骤 | 代码 | 说明 |
 |------|------|------|
-| ① 统计 | `ids.windows(2)` 滑窗 | 每相邻两个 id 组成 pair，用 HashMap 计数 |
-| ② 选择 | `pair_freq.iter().max_by(...)` | 频率最高者；**频率相同取 pair 数值更小的**（保证结果确定）|
+| ① 初始统计 | `ids.windows(2)` 滑窗 | 只在开头扫一遍，建 `pair_freq` + 堆 |
+| ② 选择 | `heap.pop()` + 频次校验 | 频率最高者；**频率相同取 pair 数值更小的**（`Reverse` 保证结果确定）；过期条目懒删除 |
 | ③ 合并 | `vocab.push` + `merges.push` | 新符号的内容 = 两个旧符号内容拼接；id = 当前词表长度（从 256 起）|
-| ④ 替换 | 单遍 while 扫描 | 把序列里所有该 pair 替换成新 id，再进入下一轮 |
+| ④ 替换 | 单遍 while 扫描 + `bump_pair` | 把序列里所有该 pair 换成新 id，顺带增量更新受影响 pair 的频次，再进入下一轮 |
 
 训练结束后得到两份"产物"：
 
@@ -233,7 +264,7 @@ pub fn encode(&self, text: &str) -> Vec<usize> {
 
 要点：
 
-- **按规则优先级单趟扫描**（GPT-2 的标准实现）：从 `merges[0]` 到 `merges[最后]`，每条规则在序列上扫一遍，能合并就替换成它对应的新 token。复杂度 O(len × 合并数)，大语料也能秒级完成（若"每次只合并一个 pair 并全量重扫"是 O(n²×m)，174KB 语料会卡死）
+- **按规则优先级单趟扫描**（通行的标准实现）：从 `merges[0]` 到 `merges[最后]`，每条规则在序列上扫一遍，能合并就替换成它对应的新 token。复杂度 O(len × 合并数)，大语料也能秒级完成（若"每次只合并一个 pair 并全量重扫"是 O(n²×m)，174KB 语料会卡死）
 - `new_id = 256 + idx`：merge 下标 idx 直接映射成 token id——因为训练时第 idx 次合并恰好产生 id `256 + idx`
 - 字节 id（0~255）直接复用训练时的字节 → id 映射
 - 演示里 `"the garden"` 编码后只有 **2 个 token**（"the" 和 " garden" 都被压缩成了单个 token）
@@ -381,12 +412,12 @@ cargo run --release -- demo    # 演示 2（BPE）：词表 400（256 + 144 次�
 训练 BPE 分词器需要遍历整个语料统计频率，大语料可能耗时数十秒。序列化后可以：
 
 ```rust
-// 训练后保存
-let tok = BPETokenizer::train(corpus, 2048);
+// 训练后保存（统一 Tokenizer 入口）
+let tok = Tokenizer::bpe(corpus, 2048);
 tok.save("tokenizer.json");
 
 // 下次直接加载（秒级完成）
-let tok = BPETokenizer::load("tokenizer.json");
+let tok = Tokenizer::load("tokenizer.json");
 ```
 
 `config/config.json` 中通过 `tokenizer_file` 字段控制：

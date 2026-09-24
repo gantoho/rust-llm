@@ -1,7 +1,7 @@
 # 第 25 课：KV Cache —— 让逐 token 生成不再重复计算
 
 > 代码位置：[src/attention.rs](../src/attention.rs)（`KVCache` / `MultiHeadAttention`）
-> 代码位置：[src/model.rs](../src/model.rs)（`GPT::forward` / `forward_core`）
+> 代码位置：[src/model.rs](../src/model.rs)（`Transformer::forward` / `forward_core`）
 > 代码位置：[src/sample.rs](../src/sample.rs)（`generate`）
 > 演示入口：[src/main.rs](../src/main.rs)（演示 3：生成 1 / 生成 2 / 生成 3）
 
@@ -51,8 +51,8 @@
 
 ```rust
 pub struct KVCache {
-    k: Rc<RefCell<Vec<f32>>>, // 行优先 [1, T, D] 展平
-    v: Rc<RefCell<Vec<f32>>>,
+    k: Shared<Vec<f32>>, // 行优先 [1, T, D] 展平
+    v: Shared<Vec<f32>>,
     len: usize,    // 当前**保留**的位置数 T（滑动窗口下不会超过 window）
     seen: usize,   // 累计喂进来的位置总数，只增不减（RoPE 绝对位置基准）
     window: usize, // 保留上限；0 = 不丢弃
@@ -62,17 +62,17 @@ pub struct KVCache {
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
-| `k` / `v` | `Rc<RefCell<Vec<f32>>>` | 该层**保留**的 Key / Value，行优先展平成 `[1, T, D]` |
+| `k` / `v` | `Shared<Vec<f32>>` | 该层**保留**的 Key / Value，行优先展平成 `[1, T, D]` |
 | `len` | `usize` | 当前保留的位置数 T（不再靠 `shape()[1]` 反推） |
 | `seen` | `usize` | 累计喂进来的位置数，**只增不减**；新 token 的 RoPE 绝对位置基准（第 8 节） |
 | `window` | `usize` | 保留上限，超出就丢最旧的行；`0` = 不丢弃 |
 | `d` | `usize` | 隐藏维 D，第一次 `append` 时从 `k.shape()[2]` 确定 |
 
 > 为什么不用 `Option<Tensor>` 直接存张量？因为推理时"追加一个新位置"如果走「取旧数据 → 拼新数据 → 重新包成张量」，
-> 每步都要把整段历史复制一遍，T 步累计 O(T²) 拷贝。把 `Vec<f32>` 放进 `RefCell` 里就地 `extend`，
-> 历史数据一次都不用动。`Rc` 是为了让 `GPT::forward` 这类只读者也能共享同一块缓存。
+> 每步都要把整段历史复制一遍，T 步累计 O(T²) 拷贝。把 `Vec<f32>` 放进 `Shared`（`Arc<Mutex>`）里就地 `extend`，
+> 历史数据一次都不用动。`Shared` 是为了让 `Transformer::forward` 这类只读者也能共享同一块缓存。
 
-注意：**每个注意力层各有一个 `KVCache`**。`GPT::new_kv_cache` 返回 `Vec<KVCache>`，长度 = `n_layer`，并且每个都带上 `block_size` 大小的滑动窗口：
+注意：**每个注意力层各有一个 `KVCache`**。`Transformer::new_kv_cache` 返回 `Vec<KVCache>`，长度 = `n_layer`，并且每个都带上 `block_size` 大小的滑动窗口：
 
 ```rust
 pub fn new_kv_cache(&self) -> Vec<KVCache> {
@@ -421,7 +421,7 @@ println!(
 
 1. **在窗口内验证"完全相等"**：demo 的窗口内自检已经是 `a == b` 的严格比较，把它换成 `assert_eq!`、再把 prompt 与 `max_new` 调到刚好占满窗口（11 + 21 = 32），确认仍然相等——边界值最容易暴露 off-by-one。
 2. **打印两个计数器**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("seq_len = {}, seen = {}", cache.seq_len(), cache.positions_seen());`，跑 demo 的生成 2，观察一个在第 23 步停住、另一个继续涨到 80。
-3. **关掉滑动窗口看后果**：把 `GPT::new_kv_cache` 里的 `window` 改成 `0`（不丢弃），重新跑 demo 的生成 2——缓存长度会一路上涨到 91，模型被迫在 RoPE 外推区（训练只见过 `0..32`）做注意力，生成质量会明显劣化。这是"窗口不是可选项"最直观的证据。
+3. **关掉滑动窗口看后果**：把 `Transformer::new_kv_cache` 里的 `window` 改成 `0`（不丢弃），重新跑 demo 的生成 2——缓存长度会一路上涨到 91，模型被迫在 RoPE 外推区（训练只见过 `0..32`）做注意力，生成质量会明显劣化。这是"窗口不是可选项"最直观的证据。
 4. **对比计算量**：对 `block_size=32`、prompt 11、`max_new=80`，按第 6 节的表分别估算两种模式累计前向的位置数，再和 demo 里两种模式的实测耗时比一比。
 5. **（进阶）Attention Sink 与量化的叠加**：sink 已实现在 `KvCacheOpts::sink`（CLI `--kv-sink`），
    缓存量化已实现在 `--kv-bits`。把两个开关一起打开跑长文本生成，对比"只开 sink""只量化""都开"
@@ -434,7 +434,7 @@ println!(
 - 逐 token 生成时，历史位置的 K/V 每步都在被重复计算——全量模式累计 O(T²)，这是 KV Cache 要消灭的浪费
 - `KVCache` = 每层一份的 `Vec<f32>` 缓存（行优先展平的 `[1, T, D]`，外加 `len` / `seen` / `window` / `d`），
   `append` 就地 extend（不复制历史）+ 超窗 `drain` 丢最旧行，`seq_len` 读保留行数、`positions_seen` 读累计位置数
-- `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`GPT::forward_core` 用 `seen` 修正位置编码、并用 `min(seen + t, window)` 定掩码宽度
+- `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`Transformer::forward_core` 用 `seen` 修正位置编码、并用 `min(seen + t, window)` 定掩码宽度
 - 流程对比：首次前向整个 prompt 填缓存 → 之后每步只前向 1 个 token；全量模式则是每步重算整个窗口
 - 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致；demo 用**同 prompt + 同种子**自验证，单元测试守住"窗口内逐 token 相同"
 - 滑动窗口让生成长度不再受缓存容量限制：`seq_len` 封顶 `window`、`positions_seen` 继续累加，缓存里存的是已旋转的 K，绝对位置递增才能避免每步重旋转整段缓存

@@ -1,6 +1,6 @@
 //! 训练循环与学习率调度（第 13、18 课）
 //!
-//! 训练 GPT 的完整骨架：
+//! 训练 Transformer 的完整骨架：
 //! 1. 采样一个 batch
 //! 2. 前向算损失
 //! 3. 反向算梯度（开启 AMP 时先把 loss 乘上 scale）
@@ -25,7 +25,7 @@
 use crate::config::TrainConfig;
 use crate::data::BatchSource;
 use crate::loss::cross_entropy_loss_masked;
-use crate::model::GPT;
+use crate::model::Transformer;
 use crate::module::{Module, zero_grad_all};
 use crate::optim::{AdamW, Optimizer};
 use crate::rng::Rng;
@@ -118,8 +118,8 @@ impl MixedPrecision {
     /// 前向时 loss 被乘了 `scale`，反向出来的所有梯度都带着同一个因子，必须在更新参数前
     /// 除掉。少这一步不会让 AdamW 的更新方向出错（它按梯度自身的尺度自适应调步长），
     /// 但会有两处实打实的错误：
-    /// - 梯度裁剪的阈值被整体放大 `scale` 倍，裁剪等于失效（本项目默认 grad_clip 很大，
-    ///   看着"没坏"，换个正常阈值立刻暴露）；
+    /// - 梯度裁剪的阈值被整体放大 `scale` 倍，裁剪等于失效（若不 unscale，
+    ///   默认 grad_clip = 1.0 形同虚设，看着"没坏"，换个更小阈值立刻暴露）；
     /// - 进度日志里的梯度范数是假的，看不出真实量级，梯度异常时无法察觉。
     pub fn unscale_gradients(&self, params: &[Tensor]) {
         let inv_scale = 1.0 / self.scale;
@@ -199,7 +199,7 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
 /// 在验证集上评估：平均 loss（perplexity = e^loss）
 ///
 /// `eval_iters` 批的平均，调用方用固定种子的 Rng 可保证结果可复现。
-pub fn eval_loss(model: &GPT, loader: &dyn BatchSource, eval_iters: usize, rng: &mut Rng) -> f32 {
+pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usize, rng: &mut Rng) -> f32 {
     zero_grad_all(model); // 评估前清零梯度，避免残留影响
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
@@ -239,7 +239,7 @@ pub fn eval_loss(model: &GPT, loader: &dyn BatchSource, eval_iters: usize, rng: 
 /// 那条路径的 GPU 交叉熵核不接受逐位置权重，硬走会悄悄把掩码丢掉，
 /// 变成"以为在按回答算 loss、其实整个窗口都在算"。宁可慢一点，也不能错。
 fn forward_loss(
-    model: &GPT,
+    model: &Transformer,
     x: &[usize],
     y: &[usize],
     mask: Option<&[bool]>,
@@ -249,7 +249,7 @@ fn forward_loss(
 ) -> Tensor {
     let hidden = model.forward_hidden(x, batch_size, block_size, true);
     // 必须在 forward 之后**立刻**取走：每个 Block 只保留"最近一次前向"的那份辅助损失，
-    // 下一次前向会覆盖它（见 [`crate::model::GPT::aux_loss`]）。
+    // 下一次前向会覆盖它（见 [`crate::model::Transformer::aux_loss`]）。
     let aux = model.aux_loss();
     let base = cross_entropy_with_head(
         model,
@@ -287,7 +287,7 @@ fn scale_grad_only(t: Tensor, factor: f32) -> Tensor {
 /// `batch_size` / `block_size` 只被「输出头常驻显存」路径用来算行数，不带 GPU 时用不上。
 #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
 fn cross_entropy_with_head(
-    model: &GPT,
+    model: &Transformer,
     hidden: &Tensor,
     y: &[usize],
     mask: Option<&[bool]>,
@@ -305,7 +305,7 @@ fn cross_entropy_with_head(
         let d = hidden.shape()[1];
         let vocab = head.shape()[0];
         if let Some(resident) =
-            crate::gpu::lm_head_ce(&hidden.data.borrow(), &head.data.borrow(), y, rows, d, vocab)
+            crate::gpu::lm_head_ce(&hidden.decode(), &head.decode(), y, rows, d, vocab)
         {
             let hidden_bwd = hidden.clone();
             let head_bwd = head.clone();
@@ -379,8 +379,8 @@ impl MetricsLogger {
 /// - `resume_from = Some(path)` 时从 checkpoint 续训（恢复参数、优化器状态与步数）
 ///
 /// 返回最终的最优验证 loss（无验证集时为训练 loss 近似值）。
-pub fn train_gpt(
-    model: &GPT,
+pub fn train_transformer(
+    model: &Transformer,
     tokenizer: &Tokenizer,
     loader: &dyn BatchSource,
     cfg: &TrainConfig,
@@ -406,6 +406,21 @@ pub fn train_gpt(
         logln!(
             "已从 {path} 恢复：step={}，best_val_loss={:.4}",
             start_step, best_val_loss
+        );
+    }
+
+    // bf16 混合精度（批次 10b）：建模 / 断点恢复完成后统一把参数缓冲原地转为
+    // 真 u16 bf16 存储（内存减半）。原地换 Buffer 变体对所有克隆句柄可见——
+    // 模型各层与优化器参数表拿的是同一批 Arc，无需逐个更新。
+    // 必须放在 resume 之后：checkpoint 恢复按 f32 写入，顺序反了会盖掉转换。
+    if cfg.bf16 {
+        for p in &params {
+            p.to_bf16();
+        }
+        logln!(
+            "bf16 混合精度：{} 个参数张量转 u16 存储（内存减半）｜计算恒 f32｜AMP loss scaling {}",
+            params.len(),
+            if cfg.amp { "开启" } else { "关闭" },
         );
     }
 
@@ -497,185 +512,216 @@ pub fn train_gpt(
     let mut amp_skipped = 0usize; // 因梯度溢出被跳过的参数更新次数
     // 实际完成到的步数：早停会提前退出，结尾统计与 final.ckpt 都不能用 cfg.steps
     let mut last_step_done = start_step;
-    for step in start_step..cfg.steps {
-        // 1. 采样 batch（SFT 语料会额外带回 loss 掩码）
-        let (x, y, mask) = loader.sample_batch(rng);
-
-        // 2. 前向 + 损失（梯度累积时反向按 1/accum 缩放）
-        let t_seg = std::time::Instant::now();
-        let loss = forward_loss(&model, &x, &y, mask.as_deref(), batch_size, block_size, accum);
-        let fwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
-
-        // 3. 反向（梯度自动累加到现有梯度上）
-        let t_seg = std::time::Instant::now();
-        match amp.as_ref() {
-            // AMP：把 loss 乘上 scale 再反向，让整条反向链路的梯度落在更安全的数值区间
-            Some(mp) => mp.scale_loss(&loss).backward(),
-            None => loss.backward(),
-        }
-        let bwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
-
-        // 判定实验：第一步的反向跑完就收网，按形状回放测出「每步每个形状各花多少 ms」
-        #[cfg(feature = "gpu")]
-        if probe_on {
-            crate::gpu::probe_report();
-            crate::gpu::probe_fma();
-        }
-
-        // 每 accum 步才做一次梯度裁剪 + 优化器更新 + 清零
-        if (step + 1) % accum == 0 || step + 1 == cfg.steps {
-            // 4. AMP 溢出检查（此时梯度还带着 scale）
-            // 梯度里出现 Inf/NaN 就跳过本次参数更新：不跳的话 AdamW 的一阶/二阶矩会被
-            // Inf 污染，之后每一步都是 NaN，训练再也回不来。scale 同时自动收缩。
-            let overflow = match amp.as_mut() {
-                Some(mp) => !mp.check_and_update(&trainable),
-                None => false,
+    // —— 预取：让采样与前向/反向重叠 ——
+    // 第一批在进入 scope 前先采（否则 spawn 后立刻 recv 会白等一次采样），工作线程
+    // 从「第一批之后」的 rng 状态继续克隆采样，超前备好后续批次；每批附带采样后的
+    // rng 状态，主线程消费时回写——采样序列与串行完全一致（可复现训练依赖这点）。
+    let mut first_batch = (start_step < cfg.steps).then(|| loader.sample_batch(rng));
+    let worker_rng = rng.clone();
+    std::thread::scope(|s| {
+        // 有界通道：最多超前 2 批，采样快于计算时不会无限囤积内存；
+        // rx 在本闭包结束时丢弃（含早停 break），工作线程下一次 send 失败即自然退出
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(
+            Vec<usize>,
+            Vec<usize>,
+            Option<Vec<bool>>,
+            u64,
+        )>(2);
+        s.spawn(move || {
+            let mut wrng = worker_rng;
+            loop {
+                // 1. 采样 batch（SFT 语料会额外带回 loss 掩码）
+                let (x, y, mask) = loader.sample_batch(&mut wrng);
+                if tx.send((x, y, mask, wrng.state())).is_err() {
+                    break; // 接收端已丢弃（训练循环结束）→ 本线程退出
+                }
+            }
+        });
+        for step in start_step..cfg.steps {
+            // 取下一批：第一批已在 scope 外采好，其余等工作线程预取的结果
+            let (x, y, mask, worker_state) = match first_batch.take() {
+                Some(b) => (b.0, b.1, b.2, rng.state()),
+                None => rx.recv().expect("预取线程异常退出"),
             };
-            if overflow {
-                amp_skipped += 1;
-                let scale = amp.as_ref().map(|m| m.scale).unwrap_or(0.0);
-                logln!(
-                    "[amp] step {} 梯度溢出（Inf/NaN）：跳过本次参数更新，scale 收缩到 {:.0}（累计跳过 {} 次）",
-                    step + 1,
-                    scale,
-                    amp_skipped
-                );
-            } else if let Some(mp) = amp.as_ref() {
-                // 5. AMP 反缩放：把梯度除回真实尺度，必须在裁剪之前
-                mp.unscale_gradients(&trainable);
+            // 回写 rng：调用方看到的状态与串行采样逐位一致（断点续训/测试依赖）
+            rng.set_state(worker_state);
+
+            // 2. 前向 + 损失（梯度累积时反向按 1/accum 缩放）
+            let t_seg = std::time::Instant::now();
+            let loss = forward_loss(&model, &x, &y, mask.as_deref(), batch_size, block_size, accum);
+            let fwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
+
+            // 3. 反向（梯度自动累加到现有梯度上）
+            let t_seg = std::time::Instant::now();
+            match amp.as_ref() {
+                // AMP：把 loss 乘上 scale 再反向，让整条反向链路的梯度落在更安全的数值区间
+                Some(mp) => mp.scale_loss(&loss).backward(),
+                None => loss.backward(),
+            }
+            let bwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
+
+            // 判定实验：第一步的反向跑完就收网，按形状回放测出「每步每个形状各花多少 ms」
+            #[cfg(feature = "gpu")]
+            if probe_on {
+                crate::gpu::probe_report();
+                crate::gpu::probe_fma();
             }
 
-            // 周期性打印进度（在 zero_grad 之前，此时梯度有效）
-            {
-                let now = std::time::Instant::now();
-                let dt = now.duration_since(last_progress_t).as_secs_f64();
-                if dt >= progress_interval {
-                    let elapsed = now.duration_since(train_t0).as_secs_f64();
-                    let steps_done = step - start_step + 1;
-                    let steps_per_sec = steps_done as f64 / elapsed;
-                    let remaining = (cfg.steps - step - 1) as f64 / steps_per_sec.max(0.001);
-                    let tps = steps_done as f64 * batch_size as f64 * block_size as f64 / elapsed;
-                    // 裁剪**前**的原始梯度范数，末尾 `*` 表示本步会触发裁剪。
-                    // 不能打印 min(raw, grad_clip)：那样范数恒被压在阈值上限，
-                    // 梯度是否爆炸、裁剪是否频繁完全看不出来（曾经因此漏判梯度异常）。
-                    let raw_norm: f32 = trainable.iter().map(|p| {
-                        p.grad.borrow().iter().map(|g| g * g).sum::<f32>()
-                    }).sum::<f32>().sqrt();
-                    let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
+            // 每 accum 步才做一次梯度裁剪 + 优化器更新 + 清零
+            if (step + 1) % accum == 0 || step + 1 == cfg.steps {
+                // 4. AMP 溢出检查（此时梯度还带着 scale）
+                // 梯度里出现 Inf/NaN 就跳过本次参数更新：不跳的话 AdamW 的一阶/二阶矩会被
+                // Inf 污染，之后每一步都是 NaN，训练再也回不来。scale 同时自动收缩。
+                let overflow = match amp.as_mut() {
+                    Some(mp) => !mp.check_and_update(&trainable),
+                    None => false,
+                };
+                if overflow {
+                    amp_skipped += 1;
+                    let scale = amp.as_ref().map(|m| m.scale).unwrap_or(0.0);
                     logln!(
-                        "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | fwd {:.0}ms bwd {:.0}ms | {:.0}s | ~{:.0}s",
-                        step + 1, cfg.steps, loss.item(), raw_norm, clipped, scheduler.lr(),
-                        steps_per_sec, tps, fwd_ms, bwd_ms, elapsed, remaining
+                        "[amp] step {} 梯度溢出（Inf/NaN）：跳过本次参数更新，scale 收缩到 {:.0}（累计跳过 {} 次）",
+                        step + 1,
+                        scale,
+                        amp_skipped
                     );
-                    // 首步结束后打印一次 GPU dispatch 开销分解（上传/提交/同步各占多少）
-                    #[cfg(feature = "gpu")]
-                    if !gpu_diag_printed {
-                        gpu_diag_printed = true;
-                        crate::gpu::flush_diag_log();
+                } else if let Some(mp) = amp.as_ref() {
+                    // 5. AMP 反缩放：把梯度除回真实尺度，必须在裁剪之前
+                    mp.unscale_gradients(&trainable);
+                }
+
+                // 周期性打印进度（在 zero_grad 之前，此时梯度有效）
+                {
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(last_progress_t).as_secs_f64();
+                    if dt >= progress_interval {
+                        let elapsed = now.duration_since(train_t0).as_secs_f64();
+                        let steps_done = step - start_step + 1;
+                        let steps_per_sec = steps_done as f64 / elapsed;
+                        let remaining = (cfg.steps - step - 1) as f64 / steps_per_sec.max(0.001);
+                        let tps = steps_done as f64 * batch_size as f64 * block_size as f64 / elapsed;
+                        // 裁剪**前**的原始梯度范数，末尾 `*` 表示本步会触发裁剪。
+                        // 不能打印 min(raw, grad_clip)：那样范数恒被压在阈值上限，
+                        // 梯度是否爆炸、裁剪是否频繁完全看不出来（曾经因此漏判梯度异常）。
+                        let raw_norm: f32 = trainable.iter().map(|p| {
+                            p.grad.borrow().iter().map(|g| g * g).sum::<f32>()
+                        }).sum::<f32>().sqrt();
+                        let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
+                        logln!(
+                            "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | fwd {:.0}ms bwd {:.0}ms | {:.0}s | ~{:.0}s",
+                            step + 1, cfg.steps, loss.item(), raw_norm, clipped, scheduler.lr(),
+                            steps_per_sec, tps, fwd_ms, bwd_ms, elapsed, remaining
+                        );
+                        // 首步结束后打印一次 GPU dispatch 开销分解（上传/提交/同步各占多少）
+                        #[cfg(feature = "gpu")]
+                        if !gpu_diag_printed {
+                            gpu_diag_printed = true;
+                            crate::gpu::flush_diag_log();
+                        }
+                        last_progress_t = now;
                     }
-                    last_progress_t = now;
+                }
+
+                if overflow {
+                    // 坏梯度整批丢弃：不更新参数，也不推进学习率（本步没有真正发生）
+                    opt.zero_grad();
+                } else {
+                    // 6. 梯度裁剪
+                    clip_grad_norm(&trainable, cfg.grad_clip);
+
+                    // 7. 更新参数（设置当前学习率）
+                    let cur_lr = scheduler.lr();
+                    opt.lr = cur_lr;
+                    opt.step();
+
+                    // 8. 清零梯度
+                    opt.zero_grad();
+
+                    // 学习率调度：只在 optimizer 实际更新后递增
+                    scheduler.step();
                 }
             }
 
-            if overflow {
-                // 坏梯度整批丢弃：不更新参数，也不推进学习率（本步没有真正发生）
-                opt.zero_grad();
-            } else {
-                // 6. 梯度裁剪
-                clip_grad_norm(&trainable, cfg.grad_clip);
-
-                // 7. 更新参数（设置当前学习率）
-                let cur_lr = scheduler.lr();
-                opt.lr = cur_lr;
-                opt.step();
-
-                // 8. 清零梯度
-                opt.zero_grad();
-
-                // 学习率调度：只在 optimizer 实际更新后递增
-                scheduler.step();
-            }
-        }
-
-        // 周期性评估 + 存 checkpoint
-        let last = step + 1 == cfg.steps;
-        if (step + 1) % cfg.eval_every == 0 || last {
-            last_step_done = step + 1;
-            let val_loss = if loader.has_val() {
-                Some(eval_loss(model, loader, cfg.eval_iters, &mut eval_rng))
-            } else {
-                None
-            };
-            // 仅在本次验证 loss 严格更优时刷新 best（同时避免用 f32 相等比较）
-            let is_best = val_loss.is_some_and(|v| v < best_val_loss);
-            let mut should_stop = false;
-            if is_best {
-                best_val_loss = val_loss.unwrap();
-                no_improve_count = 0;
-            } else if val_loss.is_some() && patience > 0 {
-                no_improve_count += 1;
-                should_stop = no_improve_count >= patience;
-            }
-            // 早停不能在此处直接 break：必须先存 checkpoint、写指标、打印本步评估行。
-            // 否则最后一次评估会从日志里消失，且 latest.ckpt 停留在上一次评估
-            //（断点续训会拿到落后一个 eval 周期的过期权重）。真正 break 在块末尾。
-            if let Some(dir) = out_dir {
-                checkpoint::save(
-                    &format!("{dir}/latest.ckpt"),
-                    model,
-                    &opt,
-                    step + 1,
-                    best_val_loss,
-                );
-                if is_best && best_val_loss.is_finite() {
+            // 周期性评估 + 存 checkpoint
+            let last = step + 1 == cfg.steps;
+            if (step + 1) % cfg.eval_every == 0 || last {
+                last_step_done = step + 1;
+                let val_loss = if loader.has_val() {
+                    Some(eval_loss(model, loader, cfg.eval_iters, &mut eval_rng))
+                } else {
+                    None
+                };
+                // 仅在本次验证 loss 严格更优时刷新 best（同时避免用 f32 相等比较）
+                let is_best = val_loss.is_some_and(|v| v < best_val_loss);
+                let mut should_stop = false;
+                if is_best {
+                    best_val_loss = val_loss.unwrap();
+                    no_improve_count = 0;
+                } else if val_loss.is_some() && patience > 0 {
+                    no_improve_count += 1;
+                    should_stop = no_improve_count >= patience;
+                }
+                // 早停不能在此处直接 break：必须先存 checkpoint、写指标、打印本步评估行。
+                // 否则最后一次评估会从日志里消失，且 latest.ckpt 停留在上一次评估
+                //（断点续训会拿到落后一个 eval 周期的过期权重）。真正 break 在块末尾。
+                if let Some(dir) = out_dir {
                     checkpoint::save(
-                        &format!("{dir}/best.ckpt"),
+                        &format!("{dir}/latest.ckpt"),
                         model,
                         &opt,
                         step + 1,
                         best_val_loss,
                     );
+                    if is_best && best_val_loss.is_finite() {
+                        checkpoint::save(
+                            &format!("{dir}/best.ckpt"),
+                            model,
+                            &opt,
+                            step + 1,
+                            best_val_loss,
+                        );
+                    }
                 }
-            }
-            // 计算 tokens/sec
-            let elapsed = train_t0.elapsed().as_secs_f64().max(1e-9);
-            let tokens_processed = (step - start_step + 1) as f64 * batch_size as f64 * block_size as f64;
-            let tps = tokens_processed / elapsed;
-            metrics.log(step + 1, scheduler.lr(), loss.item(), val_loss, tps);
+                // 计算 tokens/sec
+                let elapsed = train_t0.elapsed().as_secs_f64().max(1e-9);
+                let tokens_processed = (step - start_step + 1) as f64 * batch_size as f64 * block_size as f64;
+                let tps = tokens_processed / elapsed;
+                metrics.log(step + 1, scheduler.lr(), loss.item(), val_loss, tps);
 
-            match val_loss {
-                Some(v) => {
-                    let marker = if is_best { " *" } else { "" };
-                    logln!(
-                        "step {:>5} | lr {:.6} | loss {:.4} | val {:.4} (ppl {:.1}) | {:.0} tok/s{marker}",
+                match val_loss {
+                    Some(v) => {
+                        let marker = if is_best { " *" } else { "" };
+                        logln!(
+                            "step {:>5} | lr {:.6} | loss {:.4} | val {:.4} (ppl {:.1}) | {:.0} tok/s{marker}",
+                            step + 1,
+                            scheduler.lr(),
+                            loss.item(),
+                            v,
+                            v.exp(),
+                            tps
+                        );
+                    }
+                    None => logln!(
+                        "step {:>5} | lr {:.6} | loss {:.4} | {:.0} tok/s",
                         step + 1,
                         scheduler.lr(),
                         loss.item(),
-                        v,
-                        v.exp(),
                         tps
-                    );
+                    ),
                 }
-                None => logln!(
-                    "step {:>5} | lr {:.6} | loss {:.4} | {:.0} tok/s",
-                    step + 1,
-                    scheduler.lr(),
-                    loss.item(),
-                    tps
-                ),
-            }
 
-            // 至此 checkpoint 已保存、指标已记录、评估行已打印，可以安全早停
-            if should_stop {
-                logln!(
-                    "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
-                    patience, best_val_loss, step + 1
-                );
-                break;
+                // 至此 checkpoint 已保存、指标已记录、评估行已打印，可以安全早停
+                if should_stop {
+                    logln!(
+                        "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
+                        patience, best_val_loss, step + 1
+                    );
+                    break;
+                }
             }
+            final_loss = loss.item();
         }
-        final_loss = loss.item();
-    }
+    }); // rx 在此丢弃 → 预取线程 send 失败自然退出，scope 负责 join
 
     let elapsed = train_t0.elapsed().as_secs_f64();
     // 实际完成的步数：早停时小于 cfg.steps - start_step，用 cfg.steps 会让「每步耗时」
@@ -722,7 +768,7 @@ pub fn train_gpt(
 mod tests {
     use super::*;
     use crate::data::DataLoader;
-    use crate::model::{GPT, GPTConfig};
+    use crate::model::{Transformer, TransformerConfig};
     use crate::tokenizer::Tokenizer;
 
     /// 跑一次极小的端到端训练（无验证集、不存 checkpoint），返回最终训练 loss。
@@ -731,7 +777,7 @@ mod tests {
                       back over the quick brown fox again and again and again.";
         let tokenizer = Tokenizer::char(corpus);
         let mut rng = Rng::new(11);
-        let model = GPT::new(GPTConfig::tiny(tokenizer.vocab_size()), &mut rng);
+        let model = Transformer::new(TransformerConfig::tiny(tokenizer.vocab_size()), &mut rng);
         let loader = DataLoader::new(corpus, &tokenizer, 16, 4);
         let tcfg = TrainConfig {
             seed: 11,
@@ -750,7 +796,7 @@ mod tests {
             ..TrainConfig::default()
         };
         let mut train_rng = Rng::new(11);
-        train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut train_rng)
+        train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut train_rng)
     }
 
     /// AMP 的损失缩放对 f32 训练是数值透明的：`scale` 恒为 2 的幂，乘/除 2^k 在 f32 下

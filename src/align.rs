@@ -5,7 +5,7 @@
 //! 成对信号既不需要人写标准答案，也比绝对打分稳定（人对"哪个更好"的共识远高于
 //! "打几分"），代价是需要一套把比较转成梯度的目标函数，本模块实现其中四种：
 //!
-//! - [`RewardModel`]：奖励模型（GPT 主干 + 标量头），Bradley-Terry 成对损失。
+//! - [`RewardModel`]：奖励模型（Transformer 主干 + 标量头），Bradley-Terry 成对损失。
 //!   一次训练之后它就成了一个可复用的"裁判"，PPO 与拒答采样都靠它打分。
 //! - DPO：**跳过**奖励模型，直接在偏好对上优化策略。
 //! - GRPO：同一 prompt 采一组回答，组内相对优势当权重。
@@ -13,7 +13,7 @@
 
 use crate::layers::Linear;
 use crate::loss::cross_entropy_loss_masked;
-use crate::model::GPT;
+use crate::model::Transformer;
 use crate::module::Module;
 use crate::rng::Rng;
 use crate::tensor::Tensor;
@@ -41,17 +41,17 @@ pub fn softplus(x: f32) -> f32 {
 
 // ==================== 奖励模型 ====================
 
-/// 奖励模型：GPT 主干 + 一个标量头，给一条完整回答打"有多好"的分数。
+/// 奖励模型：Transformer 主干 + 一个标量头，给一条完整回答打"有多好"的分数。
 ///
 /// 分数是**无界实数**，只有相对大小有意义——训练目标（Bradley-Terry）只看两个分数
 /// 的差，所以不存在"标定"问题，也没必要强制它落在某个区间。
 pub struct RewardModel {
-    backbone: GPT,
+    backbone: Transformer,
     head: Linear,
 }
 
 impl RewardModel {
-    pub fn new(backbone: GPT, rng: &mut Rng) -> Self {
+    pub fn new(backbone: Transformer, rng: &mut Rng) -> Self {
         let head = Linear::new(backbone.cfg.n_embd, 1, rng);
         RewardModel { backbone, head }
     }
@@ -173,7 +173,7 @@ impl MaskedSequence {
 /// 用 [`cross_entropy_loss_masked`] 的融合实现取 log_prob，再乘回有效位置数把它的
 /// "按位置平均"还原成"求和"：序列级目标必须是**和**——每一步的 log 概率都是独立
 /// 贡献，取平均会让长短回答的尺度不一致，DPO 里表现为"偏爱短回答"。
-pub fn sequence_logprob(model: &GPT, seq: &MaskedSequence, training: bool) -> Tensor {
+pub fn sequence_logprob(model: &Transformer, seq: &MaskedSequence, training: bool) -> Tensor {
     assert!(!seq.is_empty(), "空序列没有对数概率可言");
     assert!(seq.supervised() > 0, "没有任何监督位置，对数概率无从谈起");
     let t = seq.len();
@@ -186,7 +186,7 @@ pub fn sequence_logprob(model: &GPT, seq: &MaskedSequence, training: bool) -> Te
 }
 
 /// 只取值的版本（不建图），用于预计算参考模型的 logprob。
-pub fn sequence_logprob_value(model: &GPT, seq: &MaskedSequence) -> f32 {
+pub fn sequence_logprob_value(model: &Transformer, seq: &MaskedSequence) -> f32 {
     crate::tensor::no_grad(|| sequence_logprob(model, seq, false).item())
 }
 
@@ -194,7 +194,7 @@ pub fn sequence_logprob_value(model: &GPT, seq: &MaskedSequence) -> f32 {
 ///
 /// 参考模型全程冻结，它的 logprob 在训练过程中一个数都不会变——每步重算一遍
 /// 纯属浪费（DPO 的算力有一半花在这上面）。提前算好存成 f32，训练循环里只跑策略。
-pub fn precompute_reference_logprobs(reference: &GPT, samples: &[MaskedSequence]) -> Vec<f32> {
+pub fn precompute_reference_logprobs(reference: &Transformer, samples: &[MaskedSequence]) -> Vec<f32> {
     samples.iter().map(|s| sequence_logprob_value(reference, s)).collect()
 }
 
@@ -246,7 +246,7 @@ pub fn dpo_loss(
 ///
 /// `reference_logprobs[i] = (chosen, rejected)`，与 `pairs` 一一对应。
 pub fn dpo_batch_loss(
-    policy: &GPT,
+    policy: &Transformer,
     pairs: &[PreferencePair],
     reference_logprobs: &[(f32, f32)],
     beta: f32,
@@ -422,19 +422,19 @@ pub fn ppo_loss(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GPTConfig;
+    use crate::model::TransformerConfig;
     use crate::optim::{AdamW, Optimizer};
     use crate::tokenizer::Tokenizer;
 
-    fn tiny_backbone(vocab: usize, seed: u64) -> GPT {
-        let cfg = GPTConfig {
+    fn tiny_backbone(vocab: usize, seed: u64) -> Transformer {
+        let cfg = TransformerConfig {
             n_embd: 16,
             n_head: 2,
             n_layer: 2,
             block_size: 32,
-            ..GPTConfig::tiny(vocab)
+            ..TransformerConfig::tiny(vocab)
         };
-        GPT::new(cfg, &mut Rng::new(seed))
+        Transformer::new(cfg, &mut Rng::new(seed))
     }
 
     /// 合成偏好对：好回答 `"ab"×m + "c"`，坏回答 `"ab"×m + "a"`。
@@ -686,7 +686,7 @@ mod tests {
             &flatten_pairs(&pairs),
         ));
 
-        let margin = |m: &GPT| -> f32 {
+        let margin = |m: &Transformer| -> f32 {
             pairs
                 .iter()
                 .map(|p| {
@@ -695,7 +695,7 @@ mod tests {
                 })
                 .sum()
         };
-        let batch_loss = |m: &GPT| {
+        let batch_loss = |m: &Transformer| {
             crate::tensor::no_grad(|| {
                 dpo_batch_loss(m, &pairs, &reference_logprobs, 0.1, false).item()
             })
@@ -736,7 +736,7 @@ mod tests {
         ));
 
         let snapshot =
-            |m: &GPT| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
+            |m: &Transformer| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
         let ref_before = snapshot(&reference);
         let policy_before = snapshot(&policy);
 
@@ -851,7 +851,7 @@ mod tests {
         let good = masked_answer(&tok, "ab", "cab");
         let bad = masked_answer(&tok, "ab", "caa");
         let advantages = group_advantages(&[1.0, -1.0]);
-        let margin = |m: &GPT| sequence_logprob_value(m, &good) - sequence_logprob_value(m, &bad);
+        let margin = |m: &Transformer| sequence_logprob_value(m, &good) - sequence_logprob_value(m, &bad);
 
         let before = margin(&policy);
         let mut opt = AdamW::new(1e-3, policy.parameters(), 0.0);

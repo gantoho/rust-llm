@@ -55,6 +55,20 @@ impl Rng {
         assert!(n > 0, "choice 的范围必须大于 0");
         (self.next_u64() % n as u64) as usize
     }
+
+    /// 取出当前内部状态。
+    ///
+    /// 供批次预取使用：采样跑在工作线程的 rng 克隆上，每批采完要把状态回传给
+    /// 调用方的 rng（[`set_state`]），使采样序列与串行执行逐位一致、可复现。
+    pub(crate) fn state(&self) -> u64 {
+        self.state
+    }
+
+    /// 恢复到 [`Self::state`] 取出的状态（与之配对使用，只在预取回写时调用）。
+    pub(crate) fn set_state(&mut self, state: u64) {
+        // xorshift 从非零状态出发不会产生 0；这里只兜住配对误用，避免把生成器退化
+        self.state = if state == 0 { 1 } else { state };
+    }
 }
 
 #[cfg(test)]

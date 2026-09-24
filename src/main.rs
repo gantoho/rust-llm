@@ -8,7 +8,7 @@
 //! - `cargo run --release -- sft      --config config/config.json --pretrained ckpt [--sft-file "..."]`
 //! - `cargo run --release -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]`
 //! - `cargo run --release -- preset   [--name small] [--output config/config.json]`
-//! - `cargo run --release -- demo`    # 端到端演示（XOR / BPE / 内置语料小 GPT）
+//! - `cargo run --release -- demo`    # 端到端演示（XOR / BPE / 内置语料小 Transformer）
 //!
 //! 配套教程文档见 `docs/` 目录。
 //!
@@ -47,17 +47,18 @@ mod tokenizer;
 mod train;
 
 use cli::{AlignArgs, Cli, Cmd, DistArgs, RagArgs, RopeArgs, SpecArgs};
+use autograd::clear_tape;
 use config::Config;
 use data::{
-    BatchSource, CORPUS, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, load_text,
-    load_texts,
+    BatchSource, CORPUS, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, load_documents,
+    load_text, load_texts,
 };
 use layers::{Linear, tanh};
 use loss::cross_entropy_loss;
-use model::{GPT, GPTConfig};
+use model::{Transformer, TransformerConfig};
 use module::Module;
 use optim::{AdamW, Optimizer, SGD};
-use quant::{CalibOpts, GptqOpts, QBits, QuantMethod, QuantOpts};
+use quant::{CalibOpts, HessOpts, QBits, QuantMethod, QuantOpts};
 use rng::Rng;
 use rope::RopeScaling;
 use sample::{KvOpts, SampleOpts, generate, probs_from_logits, sample_from_probs};
@@ -88,9 +89,9 @@ fn q_bits_from_name(name: &str) -> QBits {
 fn q_method_from_name(name: &str) -> QuantMethod {
     match name {
         "rtn" => QuantMethod::Rtn,
-        "gptq" => QuantMethod::Gptq,
+        "hess" => QuantMethod::Hess,
         "awq" => QuantMethod::Awq,
-        other => panic!("未知的量化算法 '{other}'（可选：rtn / gptq / awq）"),
+        other => panic!("未知的量化算法 '{other}'（可选：rtn / hess / awq）"),
     }
 }
 
@@ -127,7 +128,7 @@ fn rope_scaling_from_cli(args: &RopeArgs) -> Option<RopeScaling> {
 ///
 /// 注意拿 `block_size`（= checkpoint 里记录的**训练**窗口）当 YaRN 的分段基准，
 /// 而不是覆盖后的 `--max-ctx`：模型"见过"的位置差上限没有因为推理放宽而变大。
-fn apply_rope_override(model: &mut GPT, args: &RopeArgs) -> Option<String> {
+fn apply_rope_override(model: &mut Transformer, args: &RopeArgs) -> Option<String> {
     let scaling = rope_scaling_from_cli(args);
     let base = args.rope_base;
     let max_ctx = args.max_ctx;
@@ -316,6 +317,7 @@ fn main() {
             n_embd,
             n_layer,
             aux_coef,
+            z_loss,
             capacity_factors,
             seed,
         } => cmd_moe(
@@ -328,6 +330,7 @@ fn main() {
             n_embd,
             n_layer,
             aux_coef,
+            z_loss,
             &capacity_factors,
             seed,
         ),
@@ -414,7 +417,7 @@ fn load_model_and_tokenizer(
     tcfg: &config::TrainConfig,
     seed: u64,
     tokenizer_path: Option<&str>,
-) -> (GPT, Tokenizer, checkpoint::Checkpoint) {
+) -> (Transformer, Tokenizer, checkpoint::Checkpoint) {
     let ckpt = checkpoint::load_header(ckpt_path);
     let tokenizer = if let Some(path) = tokenizer_path {
         let loaded = Tokenizer::load(path);
@@ -428,7 +431,7 @@ fn load_model_and_tokenizer(
         load_tokenizer_for_inference(tcfg, ckpt.model.vocab_size)
     };
     let mut rng = Rng::new(seed);
-    let mut model = GPT::new(ckpt.model.clone(), &mut rng);
+    let mut model = Transformer::new(ckpt.model.clone(), &mut rng);
     // LoRA 存档：先按头部记录重放注入（冻结主干 + 每层 Q/K/V 挂适配器），再恢复参数。
     // 顺序不能反——参数是**按名字**逐个对齐的，模型里少一套 `*.lora_a` / `*.lora_b`
     // 就会在 restore_params 处断言失败（见 [`checkpoint::CkptHeader`] 的 lora 字段）。
@@ -457,7 +460,7 @@ fn load_model_and_tokenizer(
 /// 只影响速度、不影响数值（`W + ΔW` 与"两条支路相加"在数学上同一个结果，只有浮点
 /// 累加顺序的差异）。但它是**不可逆**的——合并后模型里再没有 A/B，也就无法链式续训，
 /// 所以只在推理命令上显式开启，且不写回任何存档。
-fn maybe_merge_lora(model: &mut GPT, merge_lora: bool) {
+fn maybe_merge_lora(model: &mut Transformer, merge_lora: bool) {
     if !merge_lora {
         return;
     }
@@ -550,9 +553,10 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
         logln!("未检测到可用 GPU，本次训练走 CPU");
     }
 
-    let train_text = load_text(&tcfg.train_file);
+    let train_docs = load_documents(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
-    let tokenizer = build_tokenizer(tcfg, &train_text, 0); // 训练时词表由分词器决定
+    // 分词器语料 = 所有文档以 "\n" 相连，与 load_text 的拼接口径逐字一致
+    let tokenizer = build_tokenizer(tcfg, &train_docs.join("\n"), 0); // 训练时词表由分词器决定
 
     // 训练完成后保存分词器（out_dir 不存在时 save 会自动创建）
     let tok_path = tcfg.tokenizer_file.clone()
@@ -567,7 +571,7 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
     }
 
     let mut rng = Rng::new(tcfg.seed);
-    let mut model = GPT::new(model_cfg.clone(), &mut rng);
+    let mut model = Transformer::new(model_cfg.clone(), &mut rng);
     // 续训一个 LoRA 存档时同样要先重建适配层：checkpoint 头里记着 rank/alpha，
     // 少了这套参数名，load_with_opt 恢复参数时会直接断言失败。
     if let Some(path) = resume {
@@ -605,14 +609,14 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
             ),
         ],
     );
-    let loader = DataLoader::from_texts(
-        &train_text,
+    let loader = DataLoader::from_documents(
+        &train_docs,
         val_text.as_deref(),
         &tokenizer,
         model_cfg.block_size,
         tcfg.batch_size,
     );
-    let best = train::train_gpt(
+    let best = train::train_transformer(
         &model,
         &tokenizer,
         &loader,
@@ -653,10 +657,10 @@ fn cmd_eval(
     let (mut model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed, tokenizer_path);
     maybe_merge_lora(&mut model, merge_lora);
 
-    let train_text = load_text(&tcfg.train_file);
+    let train_docs = load_documents(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
-    let loader = DataLoader::from_texts(
-        &train_text,
+    let loader = DataLoader::from_documents(
+        &train_docs,
         val_text.as_deref(),
         &tokenizer,
         ckpt.model.block_size,
@@ -684,7 +688,7 @@ fn cmd_eval(
 /// 所以缺省给一份覆盖面最广的语料，真要贴合部署领域就用 `--calib-file` 显式指定。
 const DEFAULT_CALIB_DIR: &str = "data/corpus/";
 
-/// 权重量化：`quant --config config/config.json --bits int8 --method gptq --eval`
+/// 权重量化：`quant --config config/config.json --bits int8 --method hess --eval`
 ///
 /// 完整流程：加载 f32 模型 → （非 RTN 时）在校准集上采激活统计 → 逐层量化并出报告 →
 /// 可选地对比量化前后的验证 loss / 困惑度 → **把量化结果烘焙回 f32** 再落盘。
@@ -723,9 +727,9 @@ fn cmd_quant(
     // 分组方向固定为 `Col`（每个输出通道一个 scale）：这是权重量化的通行口径，
     // 见 [`QuantOpts::axis`]。算法参数一次性装进 `QuantOpts` 往下传——
     // 这样"用户选的算法"与"该算法的参数"永远是同一个对象里的两份，不会出现
-    // "命令行给了 GPTQ 的 damp，但实际跑的是 AWQ"这种没人会发现的错配。
+    // "命令行给了 Hessian 量化的 damp，但实际跑的是 AWQ"这种没人会发现的错配。
     let opts = QuantOpts {
-        gptq: GptqOpts {
+        hess: HessOpts {
             act_order,
             damp,
             block,
@@ -743,7 +747,7 @@ fn cmd_quant(
             ("checkpoint", ckpt_path.to_string()),
             ("位宽", bits.name().to_string()),
             ("算法", format!("{}{}", method.name(), method.describe())),
-            ("GPTQ 选项", opts.gptq.describe()),
+            ("Hessian 量化选项", opts.hess.describe()),
             (
                 "校准集",
                 match method {
@@ -783,10 +787,10 @@ fn cmd_quant(
     //    调用根本不需要它。所以把 `Option` 一路留着，不用就不付这份代价。
     let mut eval_rng = Rng::new(tcfg.seed);
     let (loss_before, eval_loader) = if do_eval {
-        let train_text = load_text(&tcfg.train_file);
+        let train_docs = load_documents(&tcfg.train_file);
         let val_text = tcfg.val_file.as_deref().map(read_text);
-        let loader = DataLoader::from_texts(
-            &train_text,
+        let loader = DataLoader::from_documents(
+            &train_docs,
             val_text.as_deref(),
             &tokenizer,
             ckpt.model.block_size,
@@ -905,13 +909,11 @@ fn cmd_quant(
 
     // 5) 烘焙回 f32 再落盘（见本函数文档）
     model.dequantize_weights();
-    // 存档格式要求"参数 / m / v"三段等长，所以必须给一个优化器。这里用一个全新
-    // （m = v = 0、t = 0）的实例占位：它是**合法**的续训起点（AdamW 的零状态 + 偏置校正
-    // 第一步就等价于从头累积），代价是存档体积是参数量的 3 倍——换来的是任何现有
-    // 加载路径都能直接读这个文件，不必为量化产物单独定义一种格式。
-    let placeholder = AdamW::new(tcfg.max_lr, model.parameters(), tcfg.weight_decay);
-    checkpoint::save(&out_path, &model, &placeholder, ckpt.step, ckpt.best_val_loss);
-    logln!("已写出：{out_path}（权重为反量化后的 f32，头部记录量化参数）");
+    // 权重 only 档：量化产物没有优化器状态可言，只写参数段（体积 1× 参数量而非 3×）。
+    // 头部 `weights_only: true` 让读取端按一段校验；续训方读到它会把动量补零，
+    // 拿到一个全新 AdamW 的合法起点（见 checkpoint::save_weights）。
+    checkpoint::save_weights(&out_path, &model, ckpt.step, ckpt.best_val_loss);
+    logln!("已写出：{out_path}（权重为反量化后的 f32，头部记录量化参数，权重 only 格式）");
     runlog::finish();
 }
 
@@ -997,7 +999,6 @@ fn cmd_generate(
             beam_size,
             length_penalty,
             kv,
-            &mut rng,
         )
     } else {
         // 采样生成
@@ -1423,7 +1424,7 @@ fn cmd_sft(
         );
     }
 
-    let best = train::train_gpt(
+    let best = train::train_transformer(
         &model,
         &tokenizer,
         &loader,
@@ -1530,7 +1531,7 @@ fn cmd_finetune(
         model.apply_lora(&lora_cfg, &mut rng);
         (lora_cfg.rank, lora_cfg.alpha, lora_cfg.targets.to_string())
     };
-    // LoRA 形态写回配置，交给训练循环与 runlog（train_gpt 的实际行为仍只读模型上的形态）
+    // LoRA 形态写回配置，交给训练循环与 runlog（train_transformer 的实际行为仍只读模型上的形态）
     cfg.train.lora = model.lora.clone();
     cfg.train.steps = steps;
     cfg.train.max_lr = lr;
@@ -1624,7 +1625,7 @@ fn cmd_finetune(
         loader.num_tokens(),
         100.0 * loader.supervised_ratio(),
     );
-    let best = train::train_gpt(
+    let best = train::train_transformer(
         &model,
         &tokenizer,
         &loader,
@@ -1663,7 +1664,7 @@ fn cmd_preset(name: &str, output: &str) {
     if cfg.model.use_rmsnorm {
         println!("  架构：LLaMA 风格（RMSNorm + SwiGLU + GQA）");
     } else {
-        println!("  架构：GPT-2 风格（LayerNorm + GELU + MHA）");
+        println!("  架构：经典风格（LayerNorm + GELU + MHA）");
     }
 }
 
@@ -1683,15 +1684,15 @@ fn cmd_bench(steps: usize, gen_tokens: usize) {
     let mut rng = Rng::new(1234);
     let tokenizer = Tokenizer::char(data::CORPUS);
     let vocab_size = tokenizer.vocab_size();
-    let gcfg = GPTConfig {
+    let gcfg = TransformerConfig {
         vocab_size,
         n_embd: 128,
         n_head: 4,
         n_layer: 2,
         block_size: 64,
-        ..GPTConfig::default()
+        ..TransformerConfig::default()
     };
-    let model = GPT::new(gcfg.clone(), &mut rng);
+    let model = Transformer::new(gcfg.clone(), &mut rng);
     let param_count: usize = model.parameters().iter().map(|p| p.numel()).sum();
     println!(
         "模型：n_layer={} n_embd={} n_head={} block={} vocab={} | 参数 {}",
@@ -1713,7 +1714,7 @@ fn cmd_bench(steps: usize, gen_tokens: usize) {
         ..config::TrainConfig::default()
     };
     let t0 = Instant::now();
-    train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
     let train_secs = t0.elapsed().as_secs_f64();
     let train_tokens = steps * batch * gcfg.block_size;
     println!(
@@ -1728,7 +1729,7 @@ fn cmd_bench(steps: usize, gen_tokens: usize) {
     // 单次生成只几十毫秒，计时抖动大；先预热一次（线程池/首次分配），
     // 再重复若干次取**最短**耗时作为吞吐上限，前后对比才稳定。
     fn bench_generate(
-        model: &GPT,
+        model: &Transformer,
         tokenizer: &Tokenizer,
         prompt: &str,
         n: usize,
@@ -1901,9 +1902,10 @@ fn cmd_scaling(
     );
 
     // 语料与分词器：整场扫描共用同一份，否则不同规模的 loss 之间没有可比性
-    let train_text = load_text(&cfg.train.train_file);
+    let train_docs = load_documents(&cfg.train.train_file);
     let val_text = cfg.train.val_file.as_deref().map(read_text);
-    let tokenizer = Tokenizer::from_name(&cfg.train.tokenizer, &train_text, cfg.train.bpe_vocab);
+    let tokenizer =
+        Tokenizer::from_name(&cfg.train.tokenizer, &train_docs.join("\n"), cfg.train.bpe_vocab);
 
     // 模型基底：沿用配置里的结构开关（RMSNorm / SwiGLU / GQA / dropout），只改层数与宽度
     let mut base = cfg.model.clone();
@@ -2034,7 +2036,7 @@ fn cmd_scaling(
     let pts = scaling::params_scan(
         &base,
         &sizes,
-        &train_text,
+        &train_docs,
         val_text.as_deref(),
         &tokenizer,
         &sc,
@@ -2093,7 +2095,7 @@ fn cmd_scaling(
     let tpts = scaling::tokens_scan(
         &small_cfg,
         &multiples,
-        &train_text,
+        &train_docs,
         val_text.as_deref(),
         &tokenizer,
         &tsc,
@@ -2184,13 +2186,14 @@ fn moe_model(
     n_expert: usize,
     top_k: usize,
     aux_coef: f32,
+    z_loss: f32,
     seed: u64,
-) -> GPT {
+) -> Transformer {
     assert!(
         n_embd % 4 == 0,
         "n_embd 必须能被 n_head=4 整除（实际 {n_embd}）"
     );
-    let cfg = GPTConfig {
+    let cfg = TransformerConfig {
         vocab_size: vocab,
         n_embd,
         n_head: 4,
@@ -2201,11 +2204,12 @@ fn moe_model(
         moe_top_k: top_k,
         moe_capacity_factor: 0.0,
         moe_aux_coef: aux_coef,
+        moe_z_loss_coef: z_loss,
         moe_switch_gate: n_expert > 1 && top_k == 1,
-        ..GPTConfig::default()
+        ..TransformerConfig::default()
     };
     let mut rng = Rng::new(seed);
-    GPT::new(cfg, &mut rng)
+    Transformer::new(cfg, &mut rng)
 }
 
 /// 跑若干批前向，累计各层 MoE 的专家负载（纯诊断：`no_grad`，不建计算图）。
@@ -2213,7 +2217,7 @@ fn moe_model(
 /// 单批的负载有随机性（哪些 token 恰好落在哪个专家上），要看"训练后路由是否真的被均衡了"
 /// 必须跨多批累计。这里用**训练区**采样：`moe` 子命令的加载器不切验证集
 /// （[`data::CORPUS`] 只有几百个 token），而且路由分布本就该看训练分布。
-fn moe_probe(model: &GPT, loader: &dyn BatchSource, batches: usize, rng: &mut Rng) -> moe::RouteStats {
+fn moe_probe(model: &Transformer, loader: &dyn BatchSource, batches: usize, rng: &mut Rng) -> moe::RouteStats {
     let mut counts: Vec<usize> = Vec::new();
     let (mut dropped, mut n_tokens) = (0usize, 0usize);
     let mut aux = 0.0f32;
@@ -2249,7 +2253,7 @@ fn moe_probe(model: &GPT, loader: &dyn BatchSource, batches: usize, rng: &mut Rn
 /// 几百步是跑不出来的（见 `cmd_moe` 第三节的实测）。但"辅助损失能不能把塌缩的路由
 /// 拉回均衡"是个可直接验证的命题——把初始状态直接摆到塌缩点上，隔离地只优化 L_aux
 /// 就够了，不必等主训练跑到那里。
-fn skew_router(model: &GPT, n_expert: usize) {
+fn skew_router(model: &Transformer, n_expert: usize) {
     let mut hit = 0usize;
     for (name, p) in model.named_parameters() {
         if name.ends_with(".moe.router.weight") {
@@ -2270,9 +2274,9 @@ fn skew_router(model: &GPT, n_expert: usize) {
 /// 隔离实验：**不跑主损失**，只优化 L_aux 若干步，看负载能不能从塌缩被推平。
 ///
 /// 返回 `(优化前的路由统计, 优化后的路由统计)`。调用前模型的 `moe_aux_coef` 必须 > 0
-/// （否则 [`GPT::aux_loss`] 返回 `None`）。
+/// （否则 [`Transformer::aux_loss`] 返回 `None`）。
 fn aux_only_balance(
-    model: &GPT,
+    model: &Transformer,
     loader: &dyn BatchSource,
     steps: usize,
     lr: f32,
@@ -2291,6 +2295,9 @@ fn aux_only_balance(
         let aux = model.aux_loss().expect("α > 0 时必有辅助损失");
         opt.zero_grad();
         aux.backward();
+        // 主损失那半张图被丢弃、永远不会被反向，其 tape 条目不可达也就不会被
+        // backward 回收——这里整图反完 aux 后显式清空，防止 demo 循环无限增长
+        clear_tape();
         opt.step();
     }
     let after = {
@@ -2346,6 +2353,7 @@ fn cmd_moe(
     n_embd: usize,
     n_layer: usize,
     aux_coef: f32,
+    z_loss: f32,
     factors_spec: &str,
     seed: u64,
 ) {
@@ -2376,6 +2384,7 @@ fn cmd_moe(
                 format!("n_layer={n_layer} n_embd={n_embd} n_head=4（GELU FFN）"),
             ),
             ("辅助损失系数 α", aux_coef.to_string()),
+            ("router z-loss 系数 β", z_loss.to_string()),
             ("容量因子扫描", factors_spec.to_string()),
             (
                 "分词器",
@@ -2392,7 +2401,7 @@ fn cmd_moe(
         moe::expert_param_count(n_embd, false)
     );
     // 稠密基线：与 MoE 只差前馈子层，逐位可比
-    let dense = moe_model(vocab, n_embd, n_layer, block_size, 1, 1, 0.0, seed);
+    let dense = moe_model(vocab, n_embd, n_layer, block_size, 1, 1, 0.0, 0.0, seed);
     let dense_params: usize = dense.parameters().iter().map(|p| p.numel()).sum();
     logln!("  稠密基线（n_expert=1）实测参数：{dense_params}");
     for &e in &experts_list {
@@ -2401,7 +2410,7 @@ fn cmd_moe(
             continue;
         }
         let k = top_k.min(e);
-        let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, aux_coef, seed);
+        let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, aux_coef, z_loss, seed);
         let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
         let ss = moe::sparse_stats(e, k, n_embd, false);
         let per_layer_total = ss.total_params();
@@ -2461,7 +2470,7 @@ fn cmd_moe(
     }
     let mut iso_summary: Vec<String> = Vec::new();
     for &iso_k in &iso_k_list {
-        let model = moe_model(vocab, 32, 1, 32, e, iso_k, 1.0, seed);
+        let model = moe_model(vocab, 32, 1, 32, e, iso_k, 1.0, 0.0, seed);
         skew_router(&model, e);
         let (b, a) = aux_only_balance(&model, &iso_loader, balance_steps, balance_lr, seed);
         logln!("  —— K = {iso_k} ——");
@@ -2519,7 +2528,7 @@ fn cmd_moe(
         ..config::TrainConfig::default()
     };
 
-    let mut skewed: Option<GPT> = None;
+    let mut skewed: Option<Transformer> = None;
     let mut end_to_end = Vec::new();
     for &alpha in &[0.0f32, aux_coef] {
         let tag = if alpha == 0.0 {
@@ -2527,10 +2536,10 @@ fn cmd_moe(
         } else {
             format!("α = {alpha}（加辅助损失）")
         };
-        let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, alpha, seed);
+        let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, alpha, z_loss, seed);
         let mut rng = Rng::new(seed);
         logln!("  —— {tag} ——");
-        let loss = train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+        let loss = train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
         let mut probe_rng = Rng::new(seed + 1);
         let st = moe_probe(&model, &loader, 16, &mut probe_rng);
         logln!("  训练收尾 loss = {loss:.4}");
@@ -2643,16 +2652,16 @@ fn cmd_distributed(args: &DistArgs) {
     let targets: Vec<usize> = (0..need).map(|i| ids[(i + 1) % need]).collect();
 
     let make_model = |s: u64| {
-        let cfg = GPTConfig {
+        let cfg = TransformerConfig {
             n_embd,
             n_head: 4,
             n_layer,
             block_size: t,
-            ..GPTConfig::tiny(vocab)
+            ..TransformerConfig::tiny(vocab)
         };
-        GPT::new(cfg, &mut Rng::new(s))
+        Transformer::new(cfg, &mut Rng::new(s))
     };
-    let batch_loss = |model: &GPT, ids: &[usize], targets: &[usize], b: usize| {
+    let batch_loss = |model: &Transformer, ids: &[usize], targets: &[usize], b: usize| {
         let logits = model.forward(ids, b, t, None, false);
         loss::cross_entropy_loss_masked(&logits, targets, None)
     };
@@ -2755,7 +2764,7 @@ fn cmd_distributed(args: &DistArgs) {
 
     // 参照组：vanilla DP —— 每个 rank 存一份完整的 m / v
     let ref_losses: Vec<f32> = {
-        let replicas: Vec<GPT> = (0..dp).map(|_| make_model(seed)).collect();
+        let replicas: Vec<Transformer> = (0..dp).map(|_| make_model(seed)).collect();
         let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
         let mut opts: Vec<AdamW> = per_rank.iter().map(|p| AdamW::new(lr, p.clone(), wd)).collect();
         let mut sync = distributed::DataParallel::new(dp);
@@ -2796,7 +2805,7 @@ fn cmd_distributed(args: &DistArgs) {
         (distributed::ZeroStage::One, "ZeRO-1"),
         (distributed::ZeroStage::Two, "ZeRO-2"),
     ] {
-        let replicas: Vec<GPT> = (0..dp).map(|_| make_model(seed)).collect();
+        let replicas: Vec<Transformer> = (0..dp).map(|_| make_model(seed)).collect();
         let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
         let mut zero = distributed::ZeroOptimizer::new(stage, dp, total_params, lr, wd);
         let mut flat: Vec<Vec<f32>> =
@@ -2843,8 +2852,8 @@ fn cmd_distributed(args: &DistArgs) {
         let per_step = 2 * (dp - 1) * total_params * std::mem::size_of::<f32>();
         logln!(
             "  {}：每步通信 {} B（= 2(N-1) × 参数量，与 vanilla DP 的 allreduce 同量；\
-             它内部拆成 reduce-scatter + all-gather 两段）\n  \
-             　　　每 rank 状态 {} ~ {} B（合计 {} B），vanilla DP 每 rank {} B → 单卡状态降到 1/{}",
+             它内部拆成 reduce-scatter + all-gather 两段）\n  \u{3000}\u{3000}\u{3000}\
+             每 rank 状态 {} ~ {} B（合计 {} B），vanilla DP 每 rank {} B → 单卡状态降到 1/{}",
             name,
             per_step,
             states.iter().min().copied().unwrap_or(0),
@@ -3208,7 +3217,7 @@ fn loss_curve(losses: &[f32], points: usize) -> String {
 /// 参考模型是否真的冻结，GRPO 看组内优势的两条数学性质与裁剪分支的梯度，
 /// PPO 看 KL(k3) 的两个"本该如此"与它把策略拴在原地的效果。
 ///
-/// 四件套共用同一套小 GPT 结构，只在初始化种子上分开：结构一样，差异才能全归给算法。
+/// 四件套共用同一套小 Transformer 结构，只在初始化种子上分开：结构一样，差异才能全归给算法。
 fn cmd_align(a: &AlignArgs) {
     let log_path = runlog::start("align");
     println!("运行日志：{log_path}");
@@ -3232,14 +3241,14 @@ fn cmd_align(a: &AlignArgs) {
     let t = a.block_size;
 
     let backbone = |s: u64| {
-        let cfg = GPTConfig {
+        let cfg = TransformerConfig {
             n_embd: a.n_embd,
             n_head: 4,
             n_layer: a.n_layer,
             block_size: t,
-            ..GPTConfig::tiny(vocab)
+            ..TransformerConfig::tiny(vocab)
         };
-        GPT::new(cfg, &mut Rng::new(s))
+        Transformer::new(cfg, &mut Rng::new(s))
     };
     let n_params: usize = backbone(a.seed).parameters().iter().map(|p| p.numel()).sum();
 
@@ -3413,9 +3422,9 @@ fn cmd_align(a: &AlignArgs) {
         .map(|c| (c[0], c[1]))
         .collect();
 
-    let snapshot = |m: &GPT| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
+    let snapshot = |m: &Transformer| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
     let ref_snapshot = snapshot(&reference);
-    let policy_margin = |m: &GPT| -> f32 {
+    let policy_margin = |m: &Transformer| -> f32 {
         dpo_pairs
             .iter()
             .map(|p| {
@@ -3424,7 +3433,7 @@ fn cmd_align(a: &AlignArgs) {
             })
             .sum::<f32>()
     };
-    let dpo_batch = |m: &GPT| -> f32 {
+    let dpo_batch = |m: &Transformer| -> f32 {
         tensor::no_grad(|| align::dpo_batch_loss(m, &dpo_pairs, &ref_logprobs, a.beta, false).item())
     };
 
@@ -3997,13 +4006,13 @@ fn cmd_rag(a: &RagArgs) {
     let tokenizer = Tokenizer::char(CORPUS);
     let vocab = tokenizer.vocab_size();
     let t = (a.chunk_size + 8).max(64);
-    let model = GPT::new(
-        GPTConfig {
+    let model = Transformer::new(
+        TransformerConfig {
             n_embd: a.n_embd,
             n_head: 4,
             n_layer: a.n_layer,
             block_size: t,
-            ..GPTConfig::tiny(vocab)
+            ..TransformerConfig::tiny(vocab)
         },
         &mut Rng::new(a.seed),
     );
@@ -4013,7 +4022,7 @@ fn cmd_rag(a: &RagArgs) {
     let lex_time = t0.elapsed();
     let t1 = std::time::Instant::now();
     let dense = rag::Retriever::build(
-        Box::new(rag::ModelEmbedder::new(std::rc::Rc::new(model), tokenizer)),
+        Box::new(rag::ModelEmbedder::new(std::sync::Arc::new(model), tokenizer)),
         chunks.clone(),
     );
     let dense_time = t1.elapsed();
@@ -4179,13 +4188,13 @@ fn cmd_speculative(s: &SpecArgs) {
     let vocab_bytes: Option<Vec<Vec<u8>>> = tokenizer.vocab_bytes().map(|v| v.to_vec());
 
     let build = |seed: u64| {
-        GPT::new(
-            GPTConfig {
+        Transformer::new(
+            TransformerConfig {
                 n_embd: s.n_embd,
                 n_head: 4,
                 n_layer: s.n_layer,
                 block_size: s.block_size,
-                ..GPTConfig::tiny(vocab)
+                ..TransformerConfig::tiny(vocab)
             },
             &mut Rng::new(seed),
         )
@@ -4681,7 +4690,7 @@ fn cmd_speculative(s: &SpecArgs) {
 fn run_demo() {
     demo_xor();
     demo_bpe();
-    demo_gpt();
+    demo_transformer();
     #[cfg(feature = "gpu")]
     demo_gpu();
 }
@@ -4766,16 +4775,16 @@ fn demo_bpe() {
     );
 }
 
-/// 演示 3（第 12-20、25 课）：训练小 GPT 并生成文本
-fn demo_gpt() {
-    println!("=== 演示 3：训练小 GPT 并生成文本 ===");
+/// 演示 3（第 12-20、25 课）：训练小 Transformer 并生成文本
+fn demo_transformer() {
+    println!("=== 演示 3：训练小 Transformer 并生成文本 ===");
 
     let mut rng = Rng::new(1234);
     let tokenizer = Tokenizer::char(CORPUS);
     let vocab_size = tokenizer.vocab_size();
     println!("  语料 {} 字符，字符词表 {} 个", CORPUS.len(), vocab_size);
 
-    let model = GPT::new(GPTConfig::tiny(vocab_size), &mut rng);
+    let model = Transformer::new(TransformerConfig::tiny(vocab_size), &mut rng);
 
     // 训练（第 13、17-18 课：训练循环 + AdamW + warmup/cosine 调度）
     let loader = DataLoader::new(CORPUS, &tokenizer, model.cfg.block_size, 8);
@@ -4789,7 +4798,7 @@ fn demo_gpt() {
         log_file: None, // 演示不落盘
         ..config::TrainConfig::default()
     };
-    train::train_gpt(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
 
     // 生成 1（无 cache）：全量前向用滑动窗口，可以生成超过 block_size 的长文本
     // 三次生成共用同一套采样参数（含重复惩罚），否则差异分不清是 cache 还是采样造成的

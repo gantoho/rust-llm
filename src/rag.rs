@@ -17,9 +17,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
-use crate::model::GPT;
+use crate::model::Transformer;
 use crate::tokenizer::Tokenizer;
 
 // ==================== 通用向量工具 ====================
@@ -338,22 +338,22 @@ impl Embedder for HashingEmbedder {
     }
 }
 
-/// 模型稠密向量：把文本喂进 GPT，取**最后一层隐状态按位置求均值**再归一化。
+/// 模型稠密向量：把文本喂进 Transformer，取**最后一层隐状态按位置求均值**再归一化。
 ///
 /// 这是三种检索器里唯一"懂语义"的：TF-IDF 与哈希只看字面重合，
 /// 问"怎么退款"可能检索不到写着"申请退货流程"的段落；稠密向量可以。
 /// 代价是慢（每个块都要过一次前向）且依赖模型质量——随机初始化的模型给出的
 /// 向量基本是噪声，必须用**训练过**的 checkpoint。
 ///
-/// 用 `Rc<GPT>` 而不是借用：`GPT` 不可克隆、也不实现 `Clone`，而检索器需要
-/// 和别的组件一起长期持有模型。`Rc` 只加一次引用计数，不拷贝权重。
+/// 用 `Arc<Transformer>` 而不是借用：`Transformer` 不可克隆、也不实现 `Clone`，而检索器需要
+/// 和别的组件一起长期持有模型。`Arc` 只加一次引用计数，不拷贝权重。
 pub struct ModelEmbedder {
-    model: Rc<GPT>,
+    model: Arc<Transformer>,
     tokenizer: Tokenizer,
 }
 
 impl ModelEmbedder {
-    pub fn new(model: Rc<GPT>, tokenizer: Tokenizer) -> Self {
+    pub fn new(model: Arc<Transformer>, tokenizer: Tokenizer) -> Self {
         ModelEmbedder { model, tokenizer }
     }
 }
@@ -662,7 +662,7 @@ pub fn build_rag_prompt(question: &str, hits: &[ScoredChunk], opts: &PromptOpts)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GPTConfig;
+    use crate::model::TransformerConfig;
     use crate::rng::Rng;
 
     /// 检查分块的通用不变量：全在字符边界上切、相邻块重叠恰为 `opts.overlap`、
@@ -945,14 +945,14 @@ mod tests {
     fn test_model_embedder_dim_and_determinism() {
         let tok_text = "甲乙丙丁戊己庚辛壬癸";
         let tok = Tokenizer::char(tok_text);
-        let cfg = GPTConfig {
+        let cfg = TransformerConfig {
             n_embd: 16,
             n_head: 2,
             n_layer: 2,
             block_size: 32,
-            ..GPTConfig::tiny(tok.vocab_size())
+            ..TransformerConfig::tiny(tok.vocab_size())
         };
-        let model = Rc::new(GPT::new(cfg, &mut Rng::new(7)));
+        let model = Arc::new(Transformer::new(cfg, &mut Rng::new(7)));
         let emb = ModelEmbedder::new(model, tok);
 
         assert_eq!(emb.dim(), 16, "池化输出维度应等于 n_embd");

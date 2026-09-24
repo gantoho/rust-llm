@@ -6,7 +6,7 @@
 //! 目录约定：配置文件放 `config/`、权重放 `checkpoints/`、日志放 `logs/`（见下方常量）。
 //! 所有产物路径在写盘前都会经过 [`ensure_parent_dir`] 自动建目录，产物不会散落到仓库根目录。
 
-use crate::model::GPTConfig;
+use crate::model::TransformerConfig;
 use serde::{Deserialize, Serialize};
 
 /// 默认配置文件路径（放在 `config/` 目录，保持仓库根目录整洁）
@@ -17,7 +17,7 @@ pub const DEFAULT_OUT_DIR: &str = "checkpoints";
 pub const DEFAULT_LOG_FILE: &str = "logs/train.csv";
 
 /// 确保目录本身存在（checkpoint 目录、日志目录等），不存在则递归创建。
-pub fn ensure_dir(dir: &str) {
+fn ensure_dir(dir: &str) {
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("创建目录 {dir} 失败: {e}"));
 }
 
@@ -45,7 +45,7 @@ pub struct TrainConfig {
     pub min_lr: f32,              // 最低学习率（cosine 衰减到它）
     pub warmup_steps: usize,      // 线性预热步数
     pub weight_decay: f32,        // AdamW 权重衰减
-    pub grad_clip: f32,           // 梯度裁剪阈值
+    pub grad_clip: f32,           // 梯度裁剪阈值（所有参数梯度总 L2 范数的上限，大模型常用 1.0）
     /// 动态损失缩放（AMP）开关：开启后训练循环把 loss 乘 `scale` 再反向，
     /// 更新参数前先做溢出检查（梯度含 Inf/NaN 就跳过本步更新）再反缩放回真实尺度。
     /// 详见 [`crate::train::MixedPrecision`]。
@@ -54,6 +54,11 @@ pub struct TrainConfig {
     pub amp_init_scale_log2: u32,
     /// AMP 缩放因子增长间隔：连续这么多步无溢出就把 scale 翻倍（上限 2^24）。
     pub amp_growth_interval: usize,
+    /// bf16 混合精度开关：开启后训练入口把全部参数缓冲**原地**转为真 u16 bf16 存储
+    /// （内存减半），算子入口 decode 成 f32、出口统一 encode 落盘；梯度与优化器
+    /// 始终在 f32 下计算（master weights 语义）。与 [`TrainConfig::amp`] 独立，
+    /// 两者可同时开。详见 [`crate::tensor::Tensor::to_bf16`]。
+    pub bf16: bool,
     pub eval_every: usize,        // 每 N 步评估一次验证集并保存 latest checkpoint
     pub eval_iters: usize,        // 评估时采样的批数
     pub tokenizer: String,        // "char" 字符级 / "bpe" BPE
@@ -215,10 +220,11 @@ impl Default for TrainConfig {
             min_lr: 3e-4,
             warmup_steps: 20,
             weight_decay: 0.01,
-            grad_clip: 1000000.0,
+            grad_clip: 1.0,
             amp: true,
             amp_init_scale_log2: 16,
             amp_growth_interval: 2000,
+            bf16: false,
             eval_every: 100,
             eval_iters: 20,
             tokenizer: "bpe".to_string(),
@@ -240,14 +246,14 @@ impl Default for TrainConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub model: GPTConfig,
+    pub model: TransformerConfig,
     pub train: TrainConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            model: GPTConfig::default(),
+            model: TransformerConfig::default(),
             train: TrainConfig::default(),
         }
     }
@@ -324,13 +330,13 @@ impl Config {
     /// 模型用 RoPE，**没有可学习的位置嵌入表**，所以没有 `block_size×d` 那一项。
     pub fn preset_small() -> Config {
         Config {
-            model: GPTConfig {
+            model: TransformerConfig {
                 vocab_size: 0,
                 n_embd: 256,
                 n_head: 8,
                 n_layer: 4,
                 block_size: 128,
-                ..GPTConfig::default()
+                ..TransformerConfig::default()
             },
             train: TrainConfig {
                 steps: 2000,
@@ -355,7 +361,7 @@ impl Config {
     /// - 约 26M 参数，GPU 推荐
     pub fn preset_medium() -> Config {
         Config {
-            model: GPTConfig {
+            model: TransformerConfig {
                 vocab_size: 0,
                 n_embd: 512,
                 n_head: 8,
@@ -365,7 +371,7 @@ impl Config {
                 use_rmsnorm: true,
                 use_swiglu: true,
                 dropout: 0.1,
-                ..GPTConfig::default()
+                ..TransformerConfig::default()
             },
             train: TrainConfig {
                 steps: 10000,
@@ -392,7 +398,7 @@ impl Config {
     /// - 约 79M 参数，需要 GPU
     pub fn preset_large() -> Config {
         Config {
-            model: GPTConfig {
+            model: TransformerConfig {
                 vocab_size: 0,
                 n_embd: 768,
                 n_head: 12,
@@ -402,7 +408,7 @@ impl Config {
                 use_rmsnorm: true,
                 use_swiglu: true,
                 dropout: 0.1,
-                ..GPTConfig::default()
+                ..TransformerConfig::default()
             },
             train: TrainConfig {
                 steps: 50000,
@@ -411,7 +417,7 @@ impl Config {
                 min_lr: 3e-5,
                 warmup_steps: 2000,
                 weight_decay: 0.1,
-                grad_clip: 1000000.0,
+                grad_clip: 1.0,
                 eval_every: 1000,
                 eval_iters: 100,
                 bpe_vocab: 4096,

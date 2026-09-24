@@ -4,7 +4,10 @@
 //! - MSE：回归任务（预测连续数值）
 //! - CrossEntropy：分类任务（预测属于哪个类别，LLM 用它）
 
+use crate::autograd::record;
 use crate::tensor::Tensor;
+use rayon::prelude::*;
+use std::sync::Arc;
 
 /// 均方误差：loss = mean((pred - target)²)
 #[allow(dead_code)] // 回归任务损失函数 API（测试 test_linear_regression_converges 已验证）
@@ -37,7 +40,10 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
 ///   等价于暗中改了学习率；按有效位置数归一化才让不同掩码比例的批次可比。
 /// - **`None` 与"全 true"必须等价**，否则预训练与微调的 loss 不可比。
 ///
-/// 使用 gather 索引直接取正确类别的 log_prob，避免分配 [B, vocab_size] 的 one-hot 矩阵。
+/// 融合实现：单次行并行 log-sum-exp 直接得到各行 NLL，不分配 [B, D] 的 log_probs
+/// 中间张量（原实现需三遍扫描：log_softmax + gather + 求和）；反向按行重算 softmax，
+/// 等价于 log_softmax+gather 反向的链式展开（∂loss/∂logit = mask/valid·(softmax−onehot)）。
+/// 行内运算顺序与 `log_softmax_last_dim` 一致，loss 数值逐位不变。
 pub fn cross_entropy_loss_masked(
     logits: &Tensor,
     targets: &[usize],
@@ -57,39 +63,72 @@ pub fn cross_entropy_loss_masked(
     // 有效位置数；全被屏蔽时用 1 兜底避免除零（此时 loss 恒为 0，不需要真的回传梯度）
     let valid = (0..b).filter(|&i| is_sup(i)).count().max(1);
 
-    let log_probs = logits.log_softmax_last_dim();
+    let targets_rc = Arc::new(targets.to_vec());
+    let mask_rc = mask.map(|m| Arc::new(m.to_vec()));
 
-    // gather 操作：直接取 log_probs[i, targets[i]]，省掉 one-hot 分配和乘法
-    let lp = log_probs.data.borrow();
-    let mut gathered = vec![0.0f32; b];
-    for (i, &t) in targets.iter().enumerate() {
-        // 屏蔽位不取 log_prob：给 0 既不贡献 loss，也让梯度那条路径彻底断开
-        gathered[i] = if is_sup(i) { lp[i * d + t] } else { 0.0 };
-    }
-    drop(lp);
-
-    // 构建标量 loss = -mean(gathered)，分母为有效位置数
-    let mean_loss: f32 = -gathered.iter().sum::<f32>() / valid as f32;
-    let mut result = Tensor::new(vec![mean_loss], vec![], log_probs.req());
-    if log_probs.req() {
-        let rg = result.grad.clone();
-        let sg = log_probs.grad.clone();
-        let targets_rc = std::rc::Rc::new(targets.to_vec());
-        let mask_rc = mask.map(|m| std::rc::Rc::new(m.to_vec()));
-        let d2 = d;
-        result.parents = std::rc::Rc::new(vec![log_probs]);
-        result.backward = Some(std::rc::Rc::new(move || {
-            let g = rg.borrow()[0];
-            let mut sgm = sg.borrow_mut();
-            let t = targets_rc.clone();
-            // 反向：d_loss/d_log_probs[i, targets[i]] = -1/valid，其余（含屏蔽位）为 0
-            let scale = -g / valid as f32;
-            for (i, &tgt) in t.iter().enumerate() {
-                let sup = mask_rc.as_ref().map_or(true, |m| m[i]);
-                if sup {
-                    sgm[i * d2 + tgt] += scale;
-                }
+    // 行并行前向：运算顺序镜像 log_softmax_last_dim（max → Σexp → ln → 取目标位）；
+    // 屏蔽位给 0：既不贡献 loss，也让梯度那条路径彻底断开
+    let lb = logits.decode();
+    let lr: &[f32] = &lb;
+    let t_ref: &[usize] = &targets_rc;
+    let row_nll: Vec<f32> = lr
+        .par_chunks(d)
+        .enumerate()
+        .map(|(i, row)| {
+            if !is_sup(i) {
+                return 0.0;
             }
+            let mut maxv = f32::NEG_INFINITY;
+            for j in 0..d {
+                maxv = maxv.max(row[j]);
+            }
+            let mut sum_exp = 0.0f32;
+            for j in 0..d {
+                sum_exp += (row[j] - maxv).exp();
+            }
+            // sum_exp ≥ 1（至少一项 e^0），ln 天然安全，无需防零常数
+            -(row[t_ref[i]] - maxv - sum_exp.ln())
+        })
+        .collect();
+    drop(lb);
+
+    // 标量 loss = Σ(每行 -log_prob) / 有效位置数（保序收集 + 顺序求和，与原实现逐位一致）
+    let mean_loss: f32 = row_nll.iter().sum::<f32>() / valid as f32;
+    let result = Tensor::new(vec![mean_loss], vec![], logits.req());
+    if logits.req() {
+        let rg = result.grad.clone();
+        let sg = logits.grad.clone();
+        let ld = logits.data.clone();
+        record(&result, vec![logits.clone()], Arc::new(move || {
+            let g = rg.borrow()[0];
+            // 反向重算行 softmax（不存中间张量）；不加 EPS，与 log_softmax 数值一致
+            let lb2 = ld.decode();
+            let lr2: &[f32] = &lb2;
+            let mut sgm = sg.borrow_mut();
+            let t: &[usize] = &targets_rc;
+            // 先降级为共享切片（&[bool] 是 Sync）再进并行闭包
+            let m_ref: Option<&[bool]> = mask_rc.as_ref().map(|m| m.as_slice());
+            let scale = g / valid as f32;
+            sgm.par_chunks_mut(d).enumerate().for_each(|(i, row)| {
+                let sup = m_ref.map_or(true, |m| m[i]);
+                if !sup {
+                    return; // 屏蔽位不回传梯度
+                }
+                let base = i * d;
+                let mut maxv = f32::NEG_INFINITY;
+                for j in 0..d {
+                    maxv = maxv.max(lr2[base + j]);
+                }
+                let mut sum_exp = 0.0f32;
+                for j in 0..d {
+                    sum_exp += (lr2[base + j] - maxv).exp();
+                }
+                let inv = 1.0 / sum_exp;
+                for j in 0..d {
+                    row[j] += scale * ((lr2[base + j] - maxv).exp() * inv);
+                }
+                row[t[i]] -= scale;
+            });
         }));
     }
     result

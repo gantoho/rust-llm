@@ -1,7 +1,7 @@
 # 第 19 课：Dropout —— 训练时的"随机失忆"
 
 > 代码位置：[src/tensor.rs](../src/tensor.rs)（`Tensor::dropout` 算子）
-> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `GPT` 中的 dropout 调用）
+> 代码位置：[src/model.rs](../src/model.rs)（`TransformerBlock` / `Transformer` 中的 dropout 调用）
 >
 > 配置开关：`config/config.json` → `model.dropout: 0.1`（推荐值 0.1~0.3）
 
@@ -69,7 +69,7 @@ d_x = d_out * mask / (1 - p)
 
 ## 5. Dropout 在 Transformer 中的位置
 
-GPT-2 论文中 Dropout 应用在两个地方：
+原版论文中 Dropout 应用在两个地方：
 
 ```
 x = x + Dropout(Attention(LN(x)))    # 注意力输出后
@@ -101,7 +101,7 @@ x = Dropout(TokenEmbedding(tokens))
 - 再用 splitmix64 finalizer 把计数器的低位规律性打散，避免相邻种子生成相关序列；
 - 最后跑 xorshift64* 得到 `[0,1)` 的均匀数。
 
-这样同一权重参数的 dropout 在每个训练步拿到的是**不同**的 mask，而不是每步重复同一张（详见 `src/tensor.rs:1968-1989`）。
+这样同一权重参数的 dropout 在每个训练步拿到的是**不同**的 mask，而不是每步重复同一张（详见 `src/tensor.rs:2548-2549`）。
 
 ### 6.2 训练/推理切换
 

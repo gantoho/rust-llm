@@ -26,7 +26,7 @@ Cargo.toml      wgpu / pollster 为可选依赖（feature = "gpu"）
 src/gpu.rs      GPU 上下文 + 19 个 WGSL 计算入口 + 「逐算子」与「常驻录制」两条路径
 src/tensor.rs   matmul / scale / add / relu / softmax 的分流点；
                 accumulate_grad / external / external_scalar_loss —— 常驻路径回注梯度的入口
-src/model.rs    TransformerBlock::forward、GPT::forward_core 里的常驻链路接线
+src/model.rs    TransformerBlock::forward、Transformer::forward_core 里的常驻链路接线
 src/train.rs    第一步打印 dispatch 分解、结尾打印稳态与「matmul 分流：GPU x / CPU y」
 ```
 
@@ -136,7 +136,7 @@ matmul / scale / add / relu / 掩码 softmax 都走它，`tensor.rs` 里按 FLOP
 （注意力子层的结果要作为前馈子层的输入）。这一点曾经写错过，代价很大，见 [§9](#9-踩坑记录)。
 
 **适用条件**（任一不满足就自动回退逐算子 → CPU）：训练模式（无 KV cache、`base = 0`）、
-GPT-2 风格的 GELU MLP（SwiGLU 由调用方让路）、形状与规模够大。
+经典风格的 GELU MLP（SwiGLU 由调用方让路）、形状与规模够大。
 
 归一化用 LayerNorm 还是 RMSNorm、K/V 是不是 GQA 的头数，都**不需要让路**——两者在参数层面
 就被抹平了：

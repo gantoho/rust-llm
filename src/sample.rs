@@ -11,7 +11,7 @@
 //! 结合使用：重复惩罚 -> temperature 调整锐度 -> top-k/top-p 截断 -> 按概率随机抽样。
 
 use crate::attention::KVCache;
-use crate::model::GPT;
+use crate::model::Transformer;
 use crate::quant::QBits;
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
@@ -51,7 +51,7 @@ impl KvOpts {
     }
 
     /// 按模型结构造出这一轮推理要用的缓存集合
-    fn build(&self, model: &GPT) -> Option<Vec<KVCache>> {
+    fn build(&self, model: &Transformer) -> Option<Vec<KVCache>> {
         self.enable
             .then(|| model.new_kv_cache_with(self.sink, self.bits))
     }
@@ -223,7 +223,7 @@ pub fn sample_from_probs(ids: &[usize], probs: &[f32], rng: &mut Rng) -> usize {
 /// 2. `opts.stop` 里的字符串出现（模板停止标记，给没学 EOS 的老权重兜底）
 /// 3. 生成到 `max_new` 个 token
 pub fn generate(
-    model: &GPT,
+    model: &Transformer,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_new: usize,
@@ -342,14 +342,13 @@ pub fn generate(
 /// 的含义。直接累加原始 logit 得到的数没有归一化，剪枝会系统性偏向"logit 整体偏大"的
 /// 路径，长度惩罚也会得到与注释相反的效果。
 pub fn beam_search(
-    model: &GPT,
+    model: &Transformer,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_new: usize,
     beam_size: usize,
     length_penalty: f32,
     kv: KvOpts,
-    _rng: &mut Rng,
 ) -> String {
     assert!(beam_size >= 1, "beam_size 必须 >= 1");
     let vocab_size = model.cfg.vocab_size;
@@ -555,13 +554,13 @@ pub(crate) fn pending_tail(vocab: &[Vec<u8>], ids: &[usize]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GPTConfig;
+    use crate::model::TransformerConfig;
 
-    fn tiny_setup() -> (GPT, Tokenizer) {
+    fn tiny_setup() -> (Transformer, Tokenizer) {
         let corpus = "the quick brown fox jumps over the lazy dog, and then runs away.";
         let tokenizer = Tokenizer::char(corpus);
         let mut rng = Rng::new(7);
-        let model = GPT::new(GPTConfig::tiny(tokenizer.vocab_size()), &mut rng);
+        let model = Transformer::new(TransformerConfig::tiny(tokenizer.vocab_size()), &mut rng);
         (model, tokenizer)
     }
 

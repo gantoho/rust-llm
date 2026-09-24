@@ -20,14 +20,16 @@
 //! 更长的上下文：**它们都只改频率表，不改旋转公式本身**，因此相对位置这个核心性质
 //! （注意力只取决于位置差）在缩放后依然成立。
 
-use std::rc::Rc;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::autograd::record;
 use crate::tensor::Tensor;
 
-/// RoPE 的频率底数：原始 RoPE / GPT-NeoX 用 10 000。
+/// RoPE 的频率底数：原始 RoPE 论文用 10 000。
 /// LLaMA-3 改成 500 000——把长波长维度整体拉长，本身就是一种静态的频率缩放。
 pub const ROPE_BASE: f32 = 10000.0;
 
@@ -134,32 +136,86 @@ impl RopeSpec {
     }
 }
 
+thread_local! {
+    /// 频率表缓存槽（线程本地单槽）：key = (d, spec) → (逆波长表, YaRN 温度系数)。
+    ///
+    /// 解码时每个 token 的 positions 都不同，整表缓存必然未命中；但 inv_freqs 的
+    /// D/2 个 powf 与 YaRN 分段边界只跟 (d, spec) 有关、与位置无关，单独缓存后
+    /// 逐 token 都能命中——每步建表从「half 次 powf + 三角」降到只剩三角。
+    static FREQ_SLOT: RefCell<Option<(usize, RopeSpec, Arc<(Vec<f32>, f32)>)>> =
+        RefCell::new(None);
+
+    /// 完整 cos/sin 表缓存槽（线程本地单槽）：key = (d, spec, positions)。
+    ///
+    /// 一次前向里 6 层注意力的 positions 完全相同，只有第 1 层真正建表，
+    /// 其余各层拿到共享的 Arc 表（零拷贝），省掉 rows×D/2 次三角计算与两次 Vec 分配。
+    static TAB_SLOT: RefCell<Option<(usize, RopeSpec, Vec<usize>, (Arc<Vec<f32>>, Arc<Vec<f32>>))>> =
+        RefCell::new(None);
+}
+
+/// (逆波长表, mscale)，按 (d, spec) 记忆化——见 [`FREQ_SLOT`] 的说明。
+fn freq_and_mscale(d: usize, spec: &RopeSpec) -> Arc<(Vec<f32>, f32)> {
+    FREQ_SLOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((cd, cs, tab)) = slot.as_ref() {
+            if *cd == d && *cs == *spec {
+                return tab.clone();
+            }
+        }
+        let freq = inv_freqs(d, spec);
+        // YaRN 的温度补偿：cos/sin 同步放大 → 旋转后的 Q/K 模长变大 → 注意力更"尖"
+        let mscale = match spec.scaling {
+            RopeScaling::Yarn { factor, mscale, .. } => yarn_mscale(factor, mscale),
+            _ => 1.0,
+        };
+        let tab = Arc::new((freq, mscale));
+        *slot = Some((d, *spec, tab.clone()));
+        tab
+    })
+}
+
 /// 预计算每个 (位置, 对偶下标) 的 cos/sin 表，长度 rows × (D/2)。
 /// 同一批 positions 的三角只算一次：前向、反向、Q/K 复用。
+///
+/// **记忆化**（线程本地单槽，key = d + spec + positions，见 [`TAB_SLOT`]）：
+/// 命中时只做两次 Arc 指针克隆，不再重算三角、不再分配 Vec——同一次前向中
+/// 第 2 层起的注意力全部命中；解码时 positions 逐 token 变化导致整表未命中，
+/// 但频率表缓存（[`FREQ_SLOT`]）仍命中，每 token 只剩 rows×D/2 次三角计算。
+/// key 里必须含 spec：[`crate::model::LLM::set_rope`] 会在推理期更换外推方式。
 ///
 /// 关键优化：频率表只与对偶下标有关，先算一遍 D/2 个逆波长，
 /// 再对每个位置做 `theta = pos · inv_freq[i]` 求 cos/sin——
 /// 原来在行内循环里重复计算 powf，rows=2048 时要算 26 万次 powf（约 30ms）。
-fn build_cos_sin_tab(positions: &[usize], d: usize, spec: &RopeSpec) -> (Vec<f32>, Vec<f32>) {
-    let rows = positions.len();
-    let half = d / 2;
-    let freq = inv_freqs(d, spec);
-    // YaRN 的温度补偿：cos/sin 同步放大 → 旋转后的 Q/K 模长变大 → 注意力更"尖"
-    let mscale = match spec.scaling {
-        RopeScaling::Yarn { factor, mscale, .. } => yarn_mscale(factor, mscale),
-        _ => 1.0,
-    };
-    let mut c_tab = vec![0.0f32; rows * half];
-    let mut s_tab = vec![0.0f32; rows * half];
-    for r in 0..rows {
-        let pos = positions[r] as f32;
-        for i in 0..half {
-            let theta = pos * freq[i];
-            c_tab[r * half + i] = theta.cos() * mscale;
-            s_tab[r * half + i] = theta.sin() * mscale;
+fn build_cos_sin_tab(
+    positions: &[usize],
+    d: usize,
+    spec: &RopeSpec,
+) -> (Arc<Vec<f32>>, Arc<Vec<f32>>) {
+    TAB_SLOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((cd, cs, cpos, tab)) = slot.as_ref() {
+            if *cd == d && *cs == *spec && cpos.as_slice() == positions {
+                return (tab.0.clone(), tab.1.clone());
+            }
         }
-    }
-    (c_tab, s_tab)
+        let fm = freq_and_mscale(d, spec);
+        let (freq, mscale) = (&fm.0, fm.1);
+        let rows = positions.len();
+        let half = d / 2;
+        let mut c_tab = vec![0.0f32; rows * half];
+        let mut s_tab = vec![0.0f32; rows * half];
+        for r in 0..rows {
+            let pos = positions[r] as f32;
+            for i in 0..half {
+                let theta = pos * freq[i];
+                c_tab[r * half + i] = theta.cos() * mscale;
+                s_tab[r * half + i] = theta.sin() * mscale;
+            }
+        }
+        let tab = (Arc::new(c_tab), Arc::new(s_tab));
+        *slot = Some((d, *spec, positions.to_vec(), tab.clone()));
+        tab
+    })
 }
 
 /// 逆波长表：`inv_freq[i] = 1 / λ_i`，`λ_i = base^(2i/d)`，于是 `θ_i = pos · inv_freq[i]`。
@@ -245,10 +301,13 @@ fn yarn_mscale(factor: f32, mscale: f32) -> f32 {
 
 /// 用现成的 cos/sin 表旋转一个张量（[rows, D]）。
 /// 反向用旋转矩阵的转置 R(θ)ᵀ 回传梯度，闭包直接查表。
-fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
+fn rotate_with_tab(x: &Tensor, c_tab: &Arc<Vec<f32>>, s_tab: &Arc<Vec<f32>>) -> Tensor {
     let (rows, d) = (x.shape[0], x.shape[1]);
-    let sd = x.data.borrow();
+    let sd = x.decode();
     let sd_ref: &[f32] = &sd;
+    // 表句柄先解引用成只读切片再进并行闭包（&[f32] 是 Sync，切片最轻量）
+    let ct_f: &[f32] = c_tab;
+    let st_f: &[f32] = s_tab;
     let mut out_data = vec![0.0f32; rows * d];
     let half = d / 2;
     // 并行：每行旋转独立，行间无依赖
@@ -259,7 +318,7 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
             let base = r * d;
             let ct_base = r * half;
             for i in 0..half {
-                let (c, s) = (c_tab[ct_base + i], s_tab[ct_base + i]);
+                let (c, s) = (ct_f[ct_base + i], st_f[ct_base + i]);
                 let (a, b) = (sd_ref[base + 2 * i], sd_ref[base + 2 * i + 1]);
                 out_row[2 * i] = a * c - b * s;
                 out_row[2 * i + 1] = a * s + b * c;
@@ -267,16 +326,20 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
         });
     drop(sd);
 
-    let mut result = Tensor::new(out_data, x.shape.clone(), x.req());
+    let result = x.new_like(out_data, x.shape.clone(), x.req());
     if x.req() {
         let rg = result.grad.clone();
         let sg = x.grad.clone();
-        let ct = c_tab.to_vec();
-        let st = s_tab.to_vec();
-        result.parents = Rc::new(vec![x.clone()]);
-        result.backward = Some(Rc::new(move || {
-            // 先把梯度拷出 RefCell，再并行写回（Ref<Vec<f32>> 不是 Sync）
-            let g_local: Vec<f32> = rg.borrow().to_vec();
+        // cos/sin 表用 Arc 共享给反向闭包（闭包要求 'static），不 to_vec 克隆整张表
+        let ct = Arc::clone(c_tab);
+        let st = Arc::clone(s_tab);
+        record(&result, vec![x.clone()], Arc::new(move || {
+            // 梯度 borrow 一次转只读切片，不做 to_vec 拷贝；
+            // 切片是 Sync，可安全带进下面的并行闭包（guard 本身不是）
+            let g_b = rg.borrow();
+            let g_ref: &[f32] = &g_b;
+            let ct_ref: &[f32] = &ct;
+            let st_ref: &[f32] = &st;
             let mut sgm = sg.borrow_mut();
             // 并行：每行独立计算梯度，行间无依赖（与前向一致）
             sgm.par_chunks_mut(d)
@@ -285,8 +348,8 @@ fn rotate_with_tab(x: &Tensor, c_tab: &[f32], s_tab: &[f32]) -> Tensor {
                     let g_base = r * d;
                     let ct_base = r * (d / 2);
                     for i in 0..d / 2 {
-                        let (c, s) = (ct[ct_base + i], st[ct_base + i]);
-                        let (ga, gb) = (g_local[g_base + 2 * i], g_local[g_base + 2 * i + 1]);
+                        let (c, s) = (ct_ref[ct_base + i], st_ref[ct_base + i]);
+                        let (ga, gb) = (g_ref[g_base + 2 * i], g_ref[g_base + 2 * i + 1]);
                         // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
                         sgm_row[2 * i] += ga * c + gb * s;
                         sgm_row[2 * i + 1] += -ga * s + gb * c;

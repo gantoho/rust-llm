@@ -9,15 +9,13 @@
 use crate::module::Module;
 use crate::quant::{
     LayerCalib, QAxis, QBits, QMatrix, QuantMethod, QuantOpts, QuantReport, QuantWeight,
-    awq_quantize, awq_quantize_search, awq_unfold_input, awq_unfold_weight, gptq_quantize,
+    awq_quantize, awq_quantize_search, awq_unfold_input, awq_unfold_weight, hess_quantize,
     quant_error,
 };
 use crate::rng::Rng;
-use crate::tensor::Tensor;
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::tensor::{Shared, Tensor};
 
-/// MLP 隐藏层放大系数（GPT-2 风格：输入维度的 4 倍）
+/// MLP 隐藏层放大系数（经典风格：输入维度的 4 倍）
 const MLP_RATIO: usize = 4;
 
 /// SwiGLU 的隐藏维度：`(2/3)·4d` 向上取 256 的倍数。
@@ -49,17 +47,17 @@ pub fn swiglu_hidden(d: usize) -> usize {
 /// 会让 `dW` 静默地恒为 0。因此 [`Linear::forward`] 在求导模式下遇到量化层会直接报错，
 /// 而不是让训练白跑（详见那里的说明）。
 ///
-/// `capture` 是**前向钩子**（校准用）：GPTQ 要各层输入的二阶统计 `XᵀX`、AWQ 要
+/// `capture` 是**前向钩子**（校准用）：Hessian 量化要各层输入的二阶统计 `XᵀX`、AWQ 要
 /// `mean|x|`，两者都只需要在校准集上**前向一次**即可采到。装上它，`forward` 就把
 /// 这一层的输入存进去；平时它是 `None`，`forward` 里只多一次 `Option` 判断，
-/// 没有任何其它开销。存的是 [`Tensor`] 的克隆——`Tensor` 内部是 `Rc<RefCell<_>>`，
-/// 克隆只是加一次引用计数，不会拷贝数据。
+/// 没有任何其它开销。存的是 [`Tensor`] 的克隆——克隆 `Shared` 句柄（内部 `Arc`）
+/// 只加一次引用计数，不会拷贝数据。
 pub struct Linear {
     pub weight: Tensor,
     pub bias: Tensor,
     pub lora: Option<LoraAdapter>,
     pub quant: Option<QuantWeight>,
-    pub capture: Option<Rc<RefCell<Tensor>>>,
+    pub capture: Option<Shared<Tensor>>,
 }
 
 impl Linear {
@@ -93,7 +91,7 @@ impl Linear {
     }
 
     /// 给本层挂上 LoRA 适配器（只加增量，不改动也不冻结主干——冻结由调用方显式做，
-    /// 见 [`crate::model::GPT::apply_lora`]）
+    /// 见 [`crate::model::Transformer::apply_lora`]）
     pub fn attach_lora(&mut self, rank: usize, alpha: f32, rng: &mut Rng) {
         let (in_dim, out_dim) = self.dims();
         self.lora = Some(LoraAdapter::new(in_dim, out_dim, rank, alpha, rng));
@@ -126,7 +124,7 @@ impl Linear {
                 .matmul(&lora.b.transpose())
                 .mul_scalar(lora.scaling())
         });
-        let mut w = self.weight.data_ref().clone();
+        let mut w = self.weight.data_ref().to_vec();
         assert_eq!(
             w.len(),
             delta.numel(),
@@ -150,7 +148,7 @@ impl Linear {
             // 公开库 API：维度不合法给可读错误（带实际维度信息）
             r => panic!("Linear 输入必须为 2D 或 3D，实际是 {r}D（形状 {:?}）", x.shape()),
         };
-        // 校准钩子：存的是展平后的 [tokens, in_features]——GPTQ 的 `XᵀX` 与 AWQ 的
+        // 校准钩子：存的是展平后的 [tokens, in_features]——Hessian 量化的 `XᵀX` 与 AWQ 的
         // `mean|x|` 都按"行 = 一个 token"累加，用 2D 视图能省掉下游再一次展平。
         if let Some(cap) = &self.capture {
             *cap.borrow_mut() = x.clone();
@@ -169,13 +167,13 @@ impl Linear {
             // 新建的叶子张量（`requires_grad = false`），AWQ 的输入缩放也不在计算图里，
             // 于是 `dW` 恒为 0——不报错、不更新，训练会"看起来在跑"却什么都没学到。
             // 与其让这种静默错误跑完几千步，不如在第一次前向就报出来：
-            // 要么在 `no_grad` 下推理，要么先 `GPT::dequantize_weights()` 烘焙回 f32 再训。
+            // 要么在 `no_grad` 下推理，要么先 `Transformer::dequantize_weights()` 烘焙回 f32 再训。
             Some(qw) => {
                 let dims = self.dims();
                 assert!(
                     !crate::tensor::grad_enabled(),
                     "量化层不能参与训练/反向（[in, out] = {dims:?}）：反量化路径不会产生 dW，\
-                     训练会静默地毫无进展。请在 no_grad 下推理，或先 GPT::dequantize_weights() \
+                     训练会静默地毫无进展。请在 no_grad 下推理，或先 Transformer::dequantize_weights() \
                      把权重烘焙回 f32"
                 );
                 let w = Tensor::from_vec(self.dequant_folded(), vec![dims.0, dims.1]);
@@ -224,11 +222,11 @@ impl Linear {
     /// （显存只省了一半），也没法把增量合并回去（合并要求主干先是 f32）。
     /// 调用方的正确顺序是**先 [`Self::merge_lora`] 再量化**。
     ///
-    /// `stats` 是这一层的校准统计（来自 [`crate::model::GPT::calibrate`]）：
-    /// GPTQ 需要 `H = XᵀX`、AWQ 需要 `mean|x|`。缺失或尺寸对不上时**退回 RTN**
+    /// `stats` 是这一层的校准统计（来自 [`crate::model::Transformer::calibrate`]）：
+    /// Hessian 量化需要 `H = XᵀX`、AWQ 需要 `mean|x|`。缺失或尺寸对不上时**退回 RTN**
     /// （RTN 只需要权重本身），这样"某一层没挂上钩子"不会让整次量化失败。
     ///
-    /// `opts` 带全了算法参数：分组方向、GPTQ 的 act-order/damp/block、
+    /// `opts` 带全了算法参数：分组方向、Hessian 量化的 act-order/damp/block、
     /// AWQ 的 α（`None` = 逐层在网格上搜索，见 [`awq_quantize_search`]）。
     pub fn quantize_weight(
         &mut self,
@@ -246,7 +244,7 @@ impl Linear {
             return None;
         }
         let axis: QAxis = opts.axis;
-        let w = self.weight.data_ref().clone();
+        let w = self.weight.data_ref().to_vec();
         // AWQ 实际用到的 α（其余算法恒为 None）：搜索模式下逐层可能不同，
         // 报告里必须如实写出来，否则复现时不知道该用哪个 α 重放。
         let mut used_alpha = None;
@@ -255,20 +253,23 @@ impl Linear {
                 QMatrix::quantize(&w, rows, cols, bits, axis),
                 QuantMethod::Rtn,
             ),
-            QuantMethod::Gptq => {
+            QuantMethod::Hess => {
                 // Hessian 定义在**输入维度**上（`[rows, rows]`），行数对不上就不做补偿
                 let h = stats
                     .and_then(|c| c.hessian.as_ref())
                     .filter(|h| h.dim() == rows);
                 let q = match h {
-                    Some(h) => gptq_quantize(&w, rows, cols, bits, axis, h, &opts.gptq),
+                    Some(h) => hess_quantize(&w, rows, cols, bits, axis, h, &opts.hess),
                     None => QMatrix::quantize(&w, rows, cols, bits, axis),
                 };
-                // 算法名如实记录：缺统计时这一层实际就是 RTN 建的，
-                // 标成 Gptq 会让"它其实没吃到补偿"永远查不出来（见报告处的说明）
+                // 算法名如实记录：**只有全矩阵 Hessian 才是真 Hessian 量化**——
+                // 对角 Hessian 的 H⁻¹ 是对角阵，补偿量恒为 0，hess_quantize 内部
+                // 直接走 hinv = None 的路径，码值与 RTN 逐位相同；缺统计同样退回 RTN。
+                // 标成 Hess 会让"这层其实没吃到补偿"永远查不出来（见报告处的说明）。
+                let real_hess = h.is_some_and(|h| h.is_full());
                 QuantWeight::new(
                     q,
-                    if h.is_some() { QuantMethod::Gptq } else { QuantMethod::Rtn },
+                    if real_hess { QuantMethod::Hess } else { QuantMethod::Rtn },
                 )
             }
             QuantMethod::Awq => {
@@ -311,7 +312,7 @@ impl Linear {
         };
         let e = quant_error(&w, &equiv);
         // 算法名取 `qw.method`（而不是请求的 `method`）：退回过 RTN 的层必须能一眼看出来，
-        // 否则报告会把"这层其实没吃到补偿"粉饰成一次成功的 GPTQ/AWQ。
+        // 否则报告会把"这层其实没吃到补偿"粉饰成一次成功的 Hessian 量化/AWQ。
         let report = QuantReport {
             name: name.to_string(),
             method: qw.method,
@@ -360,7 +361,7 @@ impl Linear {
     fn dequant_folded(&self) -> Vec<f32> {
         match &self.quant {
             Some(qw) => qw.q.dequantize(),
-            None => self.weight.data_ref().clone(),
+            None => self.weight.data_ref().to_vec(),
         }
     }
 
@@ -554,7 +555,7 @@ impl Module for NormLayer {
 /// out = hidden @ W_down
 /// ```
 ///
-/// 与 GPT-2 风格 MLP（GELU(x @ W1) @ W2）的区别：
+/// 与经典风格 MLP（GELU(x @ W1) @ W2）的区别：
 /// - 用 SiLU(x) ⊙ gate 替代 GELU（表达力更强）
 /// - 多一个 W_gate 矩阵（门控分支）
 /// - hidden_dim 通常设为 (2/3) * 4d（保持参数量相近）
@@ -582,14 +583,7 @@ impl SwiGLUMLP {
         self.w_down.forward(&hidden)
     }
 
-    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
-        let mut ps = self.w_gate.named_parameters(&format!("{prefix}.w_gate"));
-        ps.extend(self.w_up.named_parameters(&format!("{prefix}.w_up")));
-        ps.extend(self.w_down.named_parameters(&format!("{prefix}.w_down")));
-        ps
-    }
-
-    /// 三个投影 + 各自的参数名前缀。名字与 [`SwiGLUMLP::named_parameters`] 严格一致
+    /// 三个投影 + 各自的参数名前缀。[`MLPEnum::named_parameters`] 由它派生，名字因此严格一致
     /// （量化要按同一套名字去取校准统计，名字对不上就会静默退回 RTN）。
     pub fn named_linears(&self, prefix: &str) -> Vec<(String, &Linear)> {
         vec![
@@ -617,7 +611,7 @@ impl Module for SwiGLUMLP {
     }
 }
 
-/// 统一的 MLP 层枚举：支持 GPT-2 风格 GELU MLP 和 LLaMA 风格 SwiGLU MLP
+/// 统一的 MLP 层枚举：支持经典风格 GELU MLP 和 LLaMA 风格 SwiGLU MLP
 pub enum MLPEnum {
     GELU {
         linear1: Linear,
@@ -658,7 +652,7 @@ impl MLPEnum {
     ///
     /// `named_parameters` 由它派生，名字因此**只有一处定义**：量化要按同一套名字
     /// 去取校准统计（[`crate::quant::CalibStats`]），名字对不上不会报错，
-    /// 只会让 GPTQ / AWQ 静默退回 RTN，属于最难查的那类偏差。
+    /// 只会让 Hessian 量化 / AWQ 静默退回 RTN，属于最难查的那类偏差。
     pub fn named_linears(&self, prefix: &str) -> Vec<(String, &Linear)> {
         match self {
             MLPEnum::GELU { linear1, linear2 } => vec![
@@ -680,7 +674,7 @@ impl MLPEnum {
     }
 
     /// GELU 分支的 `(W₁, b₁, W₂, b₂)`；SwiGLU 分支返回 None
-    /// （GPU 常驻显存路径目前只实现了 GPT-2 风格的 GELU MLP）
+    /// （GPU 常驻显存路径目前只实现了经典风格的 GELU MLP）
     ///
     /// 同 [`NormLayer::norm_params`]：调用点只在 gpu feature 下，不带时是"死代码"，别删。
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
@@ -712,7 +706,7 @@ impl MLPEnum {
     }
 
     /// 给本 MLP 的各投影挂上适配器
-    /// （是否该挂由调用方按 `targets.mlp` 决定，见 [`crate::model::GPT::apply_lora`]）
+    /// （是否该挂由调用方按 `targets.mlp` 决定，见 [`crate::model::Transformer::apply_lora`]）
     pub fn apply_lora(&mut self, lora: &crate::config::LoRAConfig, rng: &mut Rng) {
         for lin in self.linears_mut() {
             lin.attach_lora(lora.rank, lora.alpha, rng);
@@ -766,7 +760,7 @@ impl Module for MLPEnum {
 /// ```
 ///
 /// - `W` ∈ R^{in×out}：原始权重，冻结后 requires_grad = false，全程不动
-///   （冻结动作在 [`crate::model::GPT::apply_lora`] 里统一做）
+///   （冻结动作在 [`crate::model::Transformer::apply_lora`] 里统一做）
 /// - `a` ∈ R^{r×in}：下投影，`N(0, 1/√r)` 初始化
 /// - `b` ∈ R^{out×r}：上投影，**全零**初始化
 /// - `r ≪ min(in, out)`：秩（通常 4-64），`α` 是缩放因子
@@ -781,7 +775,7 @@ impl Module for MLPEnum {
 /// 该结构体**不持有**主干权重：增量与主干是两条独立支路，在 [`Linear::forward`] 里相加。
 /// 推理时可以把 `ΔW` 预先进主干（`W' = W + (α/r)·B·A`，见 [`Linear::merge_lora`]），
 /// 此后零额外开销；但那是**不可逆**的——合并后存档再也分不出主干与适配层，
-/// 也就无法再链式续训（见 [`crate::model::GPT::resume_lora`]）。
+/// 也就无法再链式续训（见 [`crate::model::Transformer::resume_lora`]）。
 /// 训练与"想保留适配层"的推理都走两条支路，代价只是每层多两次小矩阵乘。
 pub struct LoraAdapter {
     /// 低秩下投影 [rank, in]
@@ -876,7 +870,7 @@ impl Module for Embedding {
 
 // ---------- 激活函数（第 5 课） ----------
 
-/// GELU：GPT 系列的默认激活，用 tanh 近似，比 ReLU 更平滑
+/// GELU：现代 LLM的默认激活，用 tanh 近似，比 ReLU 更平滑
 pub fn gelu(x: &Tensor) -> Tensor {
     x.gelu()
 }
@@ -891,7 +885,7 @@ mod tests {
     use super::*;
     use crate::module::{Module, zero_grad_all};
     use crate::optim::{AdamW, Optimizer};
-    use crate::quant::{AWQ_ALPHA, GptqOpts, HessianKind, QuantOpts};
+    use crate::quant::{AWQ_ALPHA, HessOpts, HessianKind, QuantOpts};
 
     /// 手工搭一个可控的 Linear：W = [[1,2],[3,4]]、b = 0（in = out = 2）
     fn hand_linear() -> Linear {
@@ -915,7 +909,7 @@ mod tests {
         }
     }
 
-    /// 冻结整个线性层（等价于 [`crate::model::GPT::apply_lora`] 对全部主干参数做的事：
+    /// 冻结整个线性层（等价于 [`crate::model::Transformer::apply_lora`] 对全部主干参数做的事：
     /// 把共享的 requires_grad 标志置 false）
     fn freeze(lin: &Linear) {
         lin.weight.set_requires_grad(false);
@@ -1047,7 +1041,7 @@ mod tests {
         let xd: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.37).sin()).collect();
         // 用 3D 输入顺带验证：展平后算、输出仍是 3D，钩子拿到的是 [B·T, in]
         let x3 = Tensor::from_vec(xd.clone(), vec![1, m, k]);
-        let cap = Rc::new(RefCell::new(Tensor::from_vec(vec![0.0], vec![1])));
+        let cap = Shared::new(Tensor::from_vec(vec![0.0], vec![1]));
         lin.capture = Some(cap.clone());
 
         let before = crate::tensor::no_grad(|| lin.forward(&x3).data());
@@ -1230,11 +1224,11 @@ mod tests {
         }
     }
 
-    /// 校准统计必须**真的被用上**：给一个强相关的全矩阵 Hessian，GPTQ 的码值应当
+    /// 校准统计必须**真的被用上**：给一个强相关的全矩阵 Hessian，Hessian 量化的码值应当
     /// 与 RTN 不同；同一个 Hessian 退化成对角模式时，码值又必须与 RTN 逐位一致
     /// （对角 `H⁻¹` ⇒ 跨通道补偿系数恒为 0）。这一正一反把"统计没被静默忽略"钉死。
     #[test]
-    fn gptq_layer_really_consumes_the_calibration_hessian() {
+    fn hess_layer_really_consumes_the_calibration_hessian() {
         let mut rng = Rng::new(404);
         let (k, n) = (24, 20);
         let base = Linear::new(k, n, &mut rng);
@@ -1267,8 +1261,8 @@ mod tests {
         let quantized_with = |rng: &mut Rng, stats: Option<&LayerCalib>, method: QuantMethod| {
             let mut lin = Linear::new(k, n, rng);
             lin.weight.set_data(w.clone());
-            let opts = if method == QuantMethod::Gptq {
-                QuantOpts { gptq: GptqOpts::default(), ..Default::default() }
+            let opts = if method == QuantMethod::Hess {
+                QuantOpts { hess: HessOpts::default(), ..Default::default() }
             } else {
                 QuantOpts::default()
             };
@@ -1287,7 +1281,7 @@ mod tests {
                 act_abs_mean: Some(diag.clone()),
                 n_tokens: tokens,
             }),
-            QuantMethod::Gptq,
+            QuantMethod::Hess,
         );
         let diagonal = quantized_with(
             &mut rng,
@@ -1296,18 +1290,18 @@ mod tests {
                 act_abs_mean: None,
                 n_tokens: tokens,
             }),
-            QuantMethod::Gptq,
+            QuantMethod::Hess,
         );
 
         assert_eq!(
             diagonal, rtn_code,
-            "对角 Hessian 下 GPTQ 在数学上退化成 RTN，必须逐位一致"
+            "对角 Hessian 下 Hessian 量化在数学上退化成 RTN，必须逐位一致"
         );
-        assert_ne!(full, rtn_code, "全矩阵 Hessian 没被用上：GPTQ 的码值与 RTN 一字不差");
+        assert_ne!(full, rtn_code, "全矩阵 Hessian 没被用上：Hessian 量化的码值与 RTN 一字不差");
 
         // 该层没有校准统计时也必须能跑（退回 RTN），而不是报错
         assert_eq!(
-            quantized_with(&mut rng, None, QuantMethod::Gptq),
+            quantized_with(&mut rng, None, QuantMethod::Hess),
             rtn_code,
             "缺统计时应逐位退回 RTN，而不是拒绝量化"
         );

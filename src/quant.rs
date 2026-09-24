@@ -4,7 +4,7 @@
 //! 再额外存一个（或一组）缩放因子用于还原。本模块提供**对称量化**的公共底座，
 //! 供两处使用：
 //!
-//! 1. **权重 / 激活量化**（第 33 课后面的 GPTQ、AWQ、量化推理）——把 `Linear` 的
+//! 1. **权重 / 激活量化**（第 33 课后面的 Hessian 量化、AWQ、量化推理）——把 `Linear` 的
 //!    权重从 f32 压到 int8 / int4，显存占用降到 1/4 或 1/8；
 //! 2. **KV cache 量化**（KIVI，见 [`crate::attention::KVCache`]）——长上下文推理时
 //!    KV cache 才是显存大头，把它压到 int8 / int4 才能继续加长上下文。
@@ -20,7 +20,7 @@
 //!
 //! 量化误差的上界是半个步长 `s / (2·qmax)`：int8 时约为 `|x|max / 254`，
 //! int4 时约为 `|x|max / 14`——**比特数每少 1，误差翻倍**，这就是 int4 必须配合
-//! 分组（每组一个 scale）的原因，也是 GPTQ / AWQ 这些"聪明的量化"存在的意义：
+//! 分组（每组一个 scale）的原因，也是 Hessian 量化 / AWQ 这些"聪明的量化"存在的意义：
 //! 同样的位宽下把误差压得更低。
 //!
 //! ## 为什么按"组"而不是整张矩阵一个 scale
@@ -33,7 +33,7 @@
 //! ## 本模块的边界
 //!
 //! 这里只放**数据结构与逐元素映射**：整数码的位打包、逐通道 / 逐行量化、
-//! 增删行（KV cache 需要）、误差统计。上层算法（GPTQ 的 Hessian 误差补偿、
+//! 增删行（KV cache 需要）、误差统计。上层算法（Hessian 量化的 Hessian 误差补偿、
 //! AWQ 的激活感知缩放）与量化推理内核在后面的小节里，与这里共用同一套容器。
 
 use serde::{Deserialize, Serialize};
@@ -482,7 +482,7 @@ pub fn quant_error(x: &[f32], xq: &[f32]) -> QuantError {
     }
 }
 
-// ==================== 量化算法：RTN / GPTQ / AWQ（第 33 课） ====================
+// ==================== 量化算法：RTN / Hessian 量化 / AWQ（第 33 课） ====================
 //
 // 三种算法解的是**同一个优化问题**，差别只在"用多少信息去挑格点"：
 //
@@ -494,7 +494,7 @@ pub fn quant_error(x: &[f32], xq: &[f32]) -> QuantError {
 // 而不是权重矩阵上的逐元素误差。三个算法的区别就落在这个目标函数的处理方式上：
 //
 // - [`QMethod::Rtn`]：假装 H = I（每个权重同等重要），逐元素取最近的格点。
-// - [`QMethod::Gptq`]：把 H 真的算出来（前向一批校准数据得到 `XᵀX`），逐列量化时
+// - [`QMethod::Hess`]：把 H 真的算出来（前向一批校准数据得到 `XᵀX`），逐列量化时
 //   用 `H⁻¹` 把当前列的误差按**相关性**折算成对后续未量化列的修正量，
 //   于是后面的列可以"提前补偿"前面列的误差。
 // - [`QMethod::Awq`]：不动误差传播，改**坐标**——按激活幅度把输入通道缩放一下，
@@ -509,8 +509,8 @@ pub fn quant_error(x: &[f32], xq: &[f32]) -> QuantError {
 pub enum QuantMethod {
     /// Round-To-Nearest：逐列独立四舍五入，等价于 [`QMatrix::quantize`]
     Rtn,
-    /// GPTQ：用输入的二阶统计 `H = XᵀX` 做逐列误差补偿
-    Gptq,
+    /// Hessian 量化：用输入的二阶统计 `H = XᵀX` 做逐列误差补偿
+    Hess,
     /// AWQ：按激活幅度对输入通道做感知缩放后再量化
     Awq,
 }
@@ -520,7 +520,7 @@ impl QuantMethod {
     pub fn name(self) -> &'static str {
         match self {
             QuantMethod::Rtn => "rtn",
-            QuantMethod::Gptq => "gptq",
+            QuantMethod::Hess => "hess",
             QuantMethod::Awq => "awq",
         }
     }
@@ -529,7 +529,7 @@ impl QuantMethod {
     pub fn describe(self) -> &'static str {
         match self {
             QuantMethod::Rtn => "逐列独立四舍五入，列与列之间不共享任何信息（无需校准数据）",
-            QuantMethod::Gptq => "用 XᵀX 的逆把每个输入通道的量化误差按相关性分摊给后面未量化的通道，逐通道最小化加权误差",
+            QuantMethod::Hess => "用 XᵀX 的逆把每个输入通道的量化误差按相关性分摊给后面未量化的通道，逐通道最小化加权误差",
             QuantMethod::Awq => "按激活幅度缩放输入通道（组内几何均值归一），让重要通道落到更细的量化格点上",
         }
     }
@@ -538,23 +538,23 @@ impl QuantMethod {
     pub fn needs_calib(self) -> bool {
         match self {
             QuantMethod::Rtn => false,
-            QuantMethod::Gptq | QuantMethod::Awq => true,
+            QuantMethod::Hess | QuantMethod::Awq => true,
         }
     }
 }
 
-/// GPTQ 的选项。
+/// Hessian 量化的选项。
 ///
 /// 三个字段各管一件事，且都不是"可调着玩"的超参——它们对应算法里三个**必须显式做选择**
 /// 的工程点：
 /// - `act_order`（激活重要性重排序）：按 `diag(H)` 降序处理输入通道。`diag(H) = E[x²]`
 ///   就是该通道的激活能量，能量大的通道先量化、于是能享受到后面所有通道的误差补偿；
 ///   关掉它就是论文里的"naive 顺序"。默认开。
-/// - `damp`：Cholesky 之前的阻尼系数，见 [`GPTQ_DAMP`]。
+/// - `damp`：Cholesky 之前的阻尼系数，见 [`HESS_DAMP`]。
 /// - `block`：误差补偿的批处理粒度（处理多少个输入通道后，把累积的补偿量一次性作用到
-///   剩余通道上），见 [`gptq_quantize`] 的"分块"一节。0 表示不分块。
+///   剩余通道上），见 [`hess_quantize`] 的"分块"一节。0 表示不分块。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GptqOpts {
+pub struct HessOpts {
     /// 是否按 `diag(H)` 降序重排输入通道（act-order / activation ordering）
     pub act_order: bool,
     /// `H += damp · (trace(H)/n) · I` 的阻尼系数；`0` = 不加阻尼
@@ -563,17 +563,17 @@ pub struct GptqOpts {
     pub block: usize,
 }
 
-impl Default for GptqOpts {
+impl Default for HessOpts {
     fn default() -> Self {
-        GptqOpts {
+        HessOpts {
             act_order: true,
-            damp: GPTQ_DAMP,
-            block: GPTQ_BLOCK,
+            damp: HESS_DAMP,
+            block: HESS_BLOCK,
         }
     }
 }
 
-impl GptqOpts {
+impl HessOpts {
     /// 日志用的一句话摘要
     pub fn describe(&self) -> String {
         format!(
@@ -592,16 +592,16 @@ impl GptqOpts {
 /// 统一的量化选项：一次调用把"分组方向 + 各算法的参数"都带全。
 ///
 /// 为什么要一个统一结构而不是给每个算法一个函数：模型级入口
-/// （[`crate::model::GPT::quantize_weights`]）只有一条路径，它必须能把用户选的
-/// **任意**算法连同该算法的参数一起传下去。分开写会让调用点出现"gptq 参数在
+/// （[`crate::model::Transformer::quantize_weights`]）只有一条路径，它必须能把用户选的
+/// **任意**算法连同该算法的参数一起传下去。分开写会让调用点出现"hess 参数在
 /// awq 时无意义"的分支，而分支里漏掉一个字段不会报错、只会静默用默认值。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QuantOpts {
     /// 分组方向：[`QAxis::Col`] = 每个输出通道一个 scale（per-channel 权重量化，默认），
     /// [`QAxis::Row`] = 每个输入通道一个 scale。
     pub axis: QAxis,
-    /// GPTQ 的选项（其余算法忽略）
-    pub gptq: GptqOpts,
+    /// Hessian 量化的选项（其余算法忽略）
+    pub hess: HessOpts,
     /// AWQ 的缩放指数 α：`Some(α)` 用给定值；`None` = 在 [`awq_alpha_grid`] 上
     /// 按权重+激活的代理误差搜索最优 α（逐层独立搜索）。
     pub awq_alpha: Option<f32>,
@@ -611,7 +611,7 @@ impl Default for QuantOpts {
     fn default() -> Self {
         QuantOpts {
             axis: QAxis::Col,
-            gptq: GptqOpts::default(),
+            hess: HessOpts::default(),
             awq_alpha: None,
         }
     }
@@ -620,16 +620,18 @@ impl Default for QuantOpts {
 /// 校准选项。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalibOpts {
-    /// 校准集最多喂多少 token（统计量按 token 累加，越多越准）
+    /// 校准集最多喂多少 token（统计量按 token 累加，越多越准）。
+    /// 4096 是该量化论文常用的校准规模（原文 128 条 × 2048 token 量级）：
+    /// 512 时 Hessian 的通道协方差估计噪声明显，补偿质量打折
     pub max_tokens: usize,
     /// 一次前向喂多长（会被 `block_size` 截断）
     pub max_seq: usize,
     /// **存全矩阵 Hessian 的最大输入维度**：`in_features` 超过它时只累加对角。
     ///
     /// 取舍：全矩阵是 `[in, in]` 的 f32，内存 `4·in²` 字节/层（in = 1024 时 4 MB、
-    /// 4096 时 64 MB），换来的是**通道之间的相关性**——GPTQ 的误差补偿完全依赖它；
+    /// 4096 时 64 MB），换来的是**通道之间的相关性**——Hessian 量化的误差补偿完全依赖它；
     /// 对角模式只存 `in` 个数（内存 O(in)），但 `H⁻¹` 退化成对角阵，
-    /// 补偿量恒为 0，GPTQ 随之退化为 RTN。所以这个阈值是"显存"与"精度"之间
+    /// 补偿量恒为 0，Hessian 量化随之退化为 RTN。所以这个阈值是"显存"与"精度"之间
     /// 唯一的一个旋钮：能放进内存就存全矩阵。
     pub full_hessian_max_dim: usize,
 }
@@ -637,7 +639,7 @@ pub struct CalibOpts {
 impl Default for CalibOpts {
     fn default() -> Self {
         CalibOpts {
-            max_tokens: 512,
+            max_tokens: 4096,
             max_seq: 128,
             full_hessian_max_dim: CALIB_FULL_HESSIAN_MAX_DIM,
         }
@@ -651,20 +653,20 @@ impl Default for CalibOpts {
 /// 再大（4096 起）就该上对角模式了。
 pub const CALIB_FULL_HESSIAN_MAX_DIM: usize = 1024;
 
-/// GPTQ 默认的分块大小（输入通道数）。
+/// Hessian 量化默认的分块大小（输入通道数）。
 ///
 /// 官方实现用的是 128：分块只影响"补偿量的批处理粒度"（每 128 个通道把累积的补偿
 /// 一次性结算给剩余通道，矩阵乘更接近 BLAS-3 的形状），**不改变数学结果**——
-/// 见 [`gptq_quantize`] 的证明与 `gptq_block_size_does_not_change_result` 测试。
-pub const GPTQ_BLOCK: usize = 128;
+/// 见 [`hess_quantize`] 的证明与 `hess_block_size_does_not_change_result` 测试。
+pub const HESS_BLOCK: usize = 128;
 
-/// GPTQ 的默认阻尼系数：`H += damp · (trace(H)/n) · I`。
+/// Hessian 量化的默认阻尼系数：`H += damp · (trace(H)/n) · I`。
 ///
 /// 校准集只有几百个 token，而 `H` 是 `[cols, cols]`——`cols` 大时 `H` 会接近奇异
 /// （某些通道的激活几乎线性相关），此时 `H⁻¹` 的元素会爆掉，误差补偿的量级会大到
 /// 把未量化的列推飞。按"对角均值的 1%"做阻尼相当于给每个通道加一点点独立噪声，
-/// 把 `H` 的最小特征值抬离 0，代价是补偿精度略降。1% 是 GPTQ 实现里的通行取值。
-pub const GPTQ_DAMP: f32 = 0.01;
+/// 把 `H` 的最小特征值抬离 0，代价是补偿精度略降。1% 是 Hessian 量化实现里的通行取值。
+pub const HESS_DAMP: f32 = 0.01;
 
 /// AWQ 的默认激活缩放指数 α：`s_j = (mean|x_j|)^α`。
 ///
@@ -680,7 +682,7 @@ pub const AWQ_GROUP_SIZE: usize = 128;
 
 /// Cholesky 分解：对行优先 `n×n` 对称矩阵 `A` 求下三角 `L`，使 `A = L·Lᵀ`。
 ///
-/// GPTQ 需要 `H⁻¹`，而直接求逆不做分解的话既慢又容易在接近奇异时失去精度；
+/// Hessian 量化需要 `H⁻¹`，而直接求逆不做分解的话既慢又容易在接近奇异时失去精度；
 /// 走 `H = L·Lᵀ` 后：正定性检查天然落在对角元素上（`d ≤ 0` 立刻返回 `None`，
 /// 不会算出 `NaN` 污染整张矩阵），求逆则退化成两次三角回代（[`cholesky_inverse_upper`]）。
 ///
@@ -760,13 +762,13 @@ pub fn cholesky_inverse_upper(l: &[f32], n: usize) -> Vec<f32> {
 /// 三步串成一件调用方真正想要的事。非正定（含 NaN/Inf）返回 `None`，由调用方决定怎么降级。
 ///
 /// 为什么要把"加阻尼"并进这个函数，而不是留给调用方自己改对角线：
-/// 阻尼值只有在看到 `H` 的量级之后才定得下来（GPTQ 用的是相对量 `damp · trace(H)/n`，
-/// 见 [`GPTQ_DAMP`]），于是"非正定就换一个更大的 damp 重试"这个循环，在调用点变成一行；
+/// 阻尼值只有在看到 `H` 的量级之后才定得下来（Hessian 量化用的是相对量 `damp · trace(H)/n`，
+/// 见 [`HESS_DAMP`]），于是"非正定就换一个更大的 damp 重试"这个循环，在调用点变成一行；
 /// 更重要的是，**阻尼必须紧挨着分解**——中间隔开一步就很容易写出"加了阻尼却把没加阻尼的矩阵
 /// 拿去分解"这种不报错的错。
 ///
 /// `damp` 是加到对角线上的**绝对**量（`H[i][i] += damp`）。这里不替调用方折算相对口径，
-/// 因为"按 trace/n 折算"是 GPTQ 的策略而非求逆的一部分（[`gptq_quantize`] 就是这么做的）；
+/// 因为"按 trace/n 折算"是 Hessian 量化的策略而非求逆的一部分（[`hess_quantize`] 就是这么做的）；
 /// 只想要"给个绝对兜底值"的调用方（例如已经算好 `H⁻¹`、要拿它连量化多层权重）
 /// 不该被迫接受另一套口径。`damp` 非有限时按"不加"处理：NaN 阻尼没有任何意义，
 /// 交回 Cholesky 依原始 `H` 判定，总好过算出一整张 NaN 矩阵。
@@ -779,19 +781,19 @@ pub fn cholesky_inverse(h: &[f32], n: usize, damp: f32) -> Option<Vec<f32>> {
         }
     }
     // 非正定在这里变成 `None`（而不是 NaN 逆矩阵）：调用方加大 damp 重来，或退回 RTN，
-    // 两条路都不会 panic（见 [`gptq_quantize_with_hinv`] 的退化路径）
+    // 两条路都不会 panic（见 [`hess_quantize_with_hinv`] 的退化路径）
     let l = cholesky(&damped, n)?;
     Some(cholesky_inverse_upper(&l, n))
 }
 
 /// 逐层校准统计：Hessian（`H = XᵀX`）与激活幅度的累加和。
 ///
-/// GPTQ 与 AWQ 吃的是**同一批**校准数据（把校准文本喂进前向，逐层截住该层的输入激活 `x`），
-/// 但需要的统计不同：GPTQ 要 `H = Σ_t x_t x_tᵀ`（`[n, n]`，含**输入通道之间**的相关性，
+/// Hessian 量化与 AWQ 吃的是**同一批**校准数据（把校准文本喂进前向，逐层截住该层的输入激活 `x`），
+/// 但需要的统计不同：Hessian 量化要 `H = Σ_t x_t x_tᵀ`（`[n, n]`，含**输入通道之间**的相关性，
 /// 补偿系数全部来自它），AWQ 要 `mean|x_i|`（`[n]`，通道重要性的唯一依据）。
 /// 把两者放进同一个累加器，是因为它们天然由同一遍采集产生：分两遍跑会把校准前向的成本翻倍，
 /// 而两遍之间只要有半点不一致（采样长度改了、窗口换了），拿到的就是两份互不匹配的统计——
-/// 那种偏差不报任何错，只会让 GPTQ 的补偿方向悄悄偏掉。
+/// 那种偏差不报任何错，只会让 Hessian 量化的补偿方向悄悄偏掉。
 ///
 /// 存的是**累加和**而不是均值：均值要等数据采完才能算（阻尼、归一化都依赖总量），
 /// 而分批采集（[`Self::observe`]）与并行采集（各线程各采一份再 [`Self::merge`]）
@@ -908,9 +910,9 @@ impl Calibration {
 ///
 /// 校准采集时按 [`CalibOpts::full_hessian_max_dim`] 决定用哪种：
 /// - [`HessianKind::Full`]：`[n, n]` 的完整 `H`，含**通道之间的相关性**——
-///   GPTQ 的误差补偿系数 `H⁻¹[i, k]`（i ≠ k）全部来自它；
+///   Hessian 量化的误差补偿系数 `H⁻¹[i, k]`（i ≠ k）全部来自它；
 /// - [`HessianKind::Diagonal`]：只存 `diag(H)`。此时 `H⁻¹` 也是对角阵，
-///   跨通道补偿系数恒为 0，GPTQ 在数学上退化成 RTN（顺序重排也失效——
+///   跨通道补偿系数恒为 0，Hessian 量化在数学上退化成 RTN（顺序重排也失效——
 ///   对角 H 下加权误差是可分的）。它存在的唯一理由是内存：O(n) 而不是 O(n²)。
 ///   AWQ 不受影响（它只用 `diag(H) = E[x²]` 这一路信息）。
 #[derive(Clone, Debug, PartialEq)]
@@ -986,7 +988,7 @@ fn order_by_importance(diag: &[f32], act_order: bool) -> Vec<usize> {
 /// 按 `perm` 行/列同步重排对称矩阵：`Hp[i][j] = H[perm[i]][perm[j]]`。
 ///
 /// H 与权重行必须用**同一个** `perm`，否则补偿系数会配到别的通道上——
-/// 这种错不会报错，只会让 GPTQ 的效果退化（甚至变差），是最难查的一类偏差。
+/// 这种错不会报错，只会让 Hessian 量化的效果退化（甚至变差），是最难查的一类偏差。
 fn permute_sym(h: &[f32], n: usize, perm: &[usize]) -> Vec<f32> {
     let mut out = vec![0.0f32; n * n];
     for i in 0..n {
@@ -997,19 +999,19 @@ fn permute_sym(h: &[f32], n: usize, perm: &[usize]) -> Vec<f32> {
     out
 }
 
-/// GPTQ 量化：在 `H = E[xᵀx]` 的加权误差意义下逐个输入通道挑格点，并把当前误差补偿给后续通道。
+/// Hessian 量化量化：在 `H = E[xᵀx]` 的加权误差意义下逐个输入通道挑格点，并把当前误差补偿给后续通道。
 ///
 /// ## 参数与形状
 ///
 /// - `w`：行优先 `[rows, cols]` 的权重。本项目的 [`crate::layers::Linear`] 存的是
 ///   `[in_features, out_features]`，所以 `rows` = **输入维度**、`cols` = **输出通道**。
 /// - `hessian`：**输入维度**上的 `H = E[xᵀx]`（把校准集喂进前向、逐 token 累加 `x⊗x`
-///   得到，见 [`crate::model::GPT::calibrate`]）。必须落在输入维度上：被量化的单元是
+///   得到，见 [`crate::model::Transformer::calibrate`]）。必须落在输入维度上：被量化的单元是
 ///   "某一个输入通道在全部输出通道上的权重"（矩阵一整行），而 `H⁻¹` 描述的是**输入通道
 ///   之间**的相关性，两者同维，补偿系数才有意义。
-/// - `opts`：见 [`GptqOpts`]（act-order / damp / block）。
+/// - `opts`：见 [`HessOpts`]（act-order / damp / block）。
 ///
-/// ## 算法（GPTQ 论文 Algorithm 1）
+/// ## 算法（该量化论文 Algorithm 1）
 ///
 /// ```text
 /// Ŵ = W
@@ -1049,16 +1051,16 @@ fn permute_sym(h: &[f32], n: usize, perm: &[usize]) -> Vec<f32> {
 ///   [`QAxis::Col`] 分组时列 scale 跨行共享，必须**冻结**（取原始权重逐列最大值）：
 ///   若每行都重算它，前面行的补偿会连带改掉后面行的 scale，补偿量就失去了意义；
 ///   冻结之后每行里各元素的步长与 RTN 完全一致，补偿的收益才可归因于算法本身。
-pub fn gptq_quantize(
+pub fn hess_quantize(
     w: &[f32],
     rows: usize,
     cols: usize,
     bits: QBits,
     axis: QAxis,
     hessian: &HessianKind,
-    opts: &GptqOpts,
+    opts: &HessOpts,
 ) -> QMatrix {
-    assert_eq!(w.len(), rows * cols, "GPTQ 输入长度与形状不符");
+    assert_eq!(w.len(), rows * cols, "Hessian 量化输入长度与形状不符");
     assert_eq!(
         hessian.dim(),
         rows,
@@ -1091,19 +1093,19 @@ pub fn gptq_quantize(
         }
     };
     let block = if opts.block == 0 { rows } else { opts.block.min(rows) };
-    gptq_apply(w, rows, cols, bits, axis, &perm, hinv.as_deref(), block)
+    hess_apply(w, rows, cols, bits, axis, &perm, hinv.as_deref(), block)
 }
 
-/// GPTQ 的主体：按 `perm` 给定的顺序逐行（输入通道）量化，并把每行的量化误差按 `H⁻¹`
+/// Hessian 量化的主体：按 `perm` 给定的顺序逐行（输入通道）量化，并把每行的量化误差按 `H⁻¹`
 /// 补偿给**尚未量化**的行。`perm` / `hinv` / `block` 由调用方决定，
-/// 于是"从 Hessian 出发"（[`gptq_quantize`]）与"从现成的 `H⁻¹` 出发"
-/// （[`gptq_quantize_with_hinv`]）这两条入口共用同一份补偿逻辑——
+/// 于是"从 Hessian 出发"（[`hess_quantize`]）与"从现成的 `H⁻¹` 出发"
+/// （[`hess_quantize_with_hinv`]）这两条入口共用同一份补偿逻辑——
 /// 误差补偿的公式只该有一处实现，否则两个入口的数值行为会悄悄分叉。
 ///
 /// `hinv` 为 `None` 表示"不做补偿"：每一行都按它进入时的取值直接量化，
-/// 结果与 [`QMatrix::quantize`] 逐位相同（降级路径，见 [`gptq_quantize_with_hinv`]）。
+/// 结果与 [`QMatrix::quantize`] 逐位相同（降级路径，见 [`hess_quantize_with_hinv`]）。
 /// 长度断言只加在这里：两个公开入口都已经保证 `rows ≥ 1`，且 `perm` 由本模块内部产生。
-fn gptq_apply(
+fn hess_apply(
     w: &[f32],
     rows: usize,
     cols: usize,
@@ -1113,7 +1115,7 @@ fn gptq_apply(
     hinv: Option<&[f32]>,
     block: usize,
 ) -> QMatrix {
-    assert_eq!(w.len(), rows * cols, "GPTQ 输入长度与形状不符");
+    assert_eq!(w.len(), rows * cols, "Hessian 量化输入长度与形状不符");
     assert_eq!(perm.len(), rows, "置换的长度必须等于输入通道数");
     if let Some(inv) = hinv {
         assert_eq!(inv.len(), rows * rows, "H⁻¹ 必须落在输入维度上，形状 [rows, rows]");
@@ -1212,16 +1214,16 @@ fn gptq_apply(
     QMatrix::quantize_with_scales(&back, rows, cols, bits, axis, &scales)
 }
 
-/// 用**已经算好的** `H⁻¹` 做 GPTQ：`h_inv` 是输入维度上的 `[rows, rows]` 逆矩阵（行优先）。
+/// 用**已经算好的** `H⁻¹` 做 Hessian 量化：`h_inv` 是输入维度上的 `[rows, rows]` 逆矩阵（行优先）。
 ///
-/// 与 [`gptq_quantize`] 的分工：后者从 [`HessianKind`] 出发，把"阻尼、act-order、分块"
+/// 与 [`hess_quantize`] 的分工：后者从 [`HessianKind`] 出发，把"阻尼、act-order、分块"
 /// 三件策略一起包办；这里把**求逆这一步交给调用方**——它可能已经拿着 `H⁻¹`
 /// （例如来自 [`cholesky_inverse`]，或据 [`Calibration::mean_hessian`] 自己加了别的正则），
 /// 也可能要用同一份逆矩阵连量化多层权重，那就没必要再求一次逆（求逆是 `O(rows³)` 的，
 /// 而"同一层 Hessian"在跨 rank / 跨分组方向对比时会被反复用到）。
 ///
 /// 因此本函数**不做** act-order（严格按原始输入通道顺序）、**不分块**，也**不再加阻尼**
-/// ——阻尼是求逆之前的事，见 [`cholesky_inverse`]。要这些策略就用 [`gptq_quantize`]。
+/// ——阻尼是求逆之前的事，见 [`cholesky_inverse`]。要这些策略就用 [`hess_quantize`]。
 ///
 /// 方向约定（与全模块一致，写死在一处以免误配）：`w` 是 `[rows, cols]` 行优先，
 /// 本项目的 [`crate::layers::Linear`] 存 `[in_features, out_features]`，于是
@@ -1232,8 +1234,8 @@ fn gptq_apply(
 /// 退化路径（刻意的，不是失败）：`h_inv` 为空、或长度不等于 `rows·rows` 时不做任何补偿，
 /// 结果与 [`QMatrix::quantize`] **逐位相同**。量化是部署前的最后一步，
 /// "校准没采到 / 维度对不上"在这里 panic 会把整条流水线卡死；把判断写成返回值语义
-/// （空 = 不补偿）而不是断言，调用方也就多了一条"先试 GPTQ，不行就 RTN"的现成退路。
-pub fn gptq_quantize_with_hinv(
+/// （空 = 不补偿）而不是断言，调用方也就多了一条"先试 Hessian 量化，不行就 RTN"的现成退路。
+pub fn hess_quantize_with_hinv(
     w: &[f32],
     rows: usize,
     cols: usize,
@@ -1241,7 +1243,7 @@ pub fn gptq_quantize_with_hinv(
     axis: QAxis,
     h_inv: &[f32],
 ) -> QMatrix {
-    assert_eq!(w.len(), rows * cols, "GPTQ 输入长度与形状不符");
+    assert_eq!(w.len(), rows * cols, "Hessian 量化输入长度与形状不符");
     if rows == 0 || cols == 0 {
         return QMatrix::quantize(w, rows, cols, bits, axis);
     }
@@ -1249,7 +1251,7 @@ pub fn gptq_quantize_with_hinv(
     let hinv = (h_inv.len() == rows * rows).then_some(h_inv);
     // 恒等置换 + 不分块：低层入口不做策略，只把补偿算准
     let perm: Vec<usize> = (0..rows).collect();
-    gptq_apply(w, rows, cols, bits, axis, &perm, hinv, rows)
+    hess_apply(w, rows, cols, bits, axis, &perm, hinv, rows)
 }
 
 /// AWQ 的逐输入通道缩放系数：`s_j = (mean|x_j|)^α`，再按 `group_size` 分组归一到组内**几何均值 = 1**。
@@ -1504,7 +1506,7 @@ pub struct QuantWeight {
     /// 权重的量化表示，形状与原权重一致（`[in_features, out_features]`）
     pub q: QMatrix,
     /// AWQ 的输入缩放：`Some(s)` 时前向必须先把输入逐通道除以 `s`（见 [`awq_unfold_input`]）。
-    /// RTN / GPTQ 不需要它（`None`）。
+    /// RTN / Hessian 量化不需要它（`None`）。
     pub input_scale: Option<Vec<f32>>,
     /// 产生这份表示所用的算法。checkpoint 头部靠它记录"这个档当初是怎么量化的"，
     /// 加载端才能按同样参数重放（见 [`crate::checkpoint::requantize_after_load`]）。
@@ -1512,7 +1514,7 @@ pub struct QuantWeight {
 }
 
 impl QuantWeight {
-    /// RTN / GPTQ 的量化表示（无输入缩放）
+    /// RTN / Hessian 量化的量化表示（无输入缩放）
     pub fn new(q: QMatrix, method: QuantMethod) -> Self {
         QuantWeight {
             q,
@@ -1536,14 +1538,14 @@ impl QuantWeight {
     }
 }
 
-/// 单层的校准统计：GPTQ 要 `H = E[xᵀx]`，AWQ 要 `mean|x|`
+/// 单层的校准统计：Hessian 量化要 `H = E[xᵀx]`，AWQ 要 `mean|x|`
 #[derive(Clone, Debug, Default)]
 pub struct LayerCalib {
     /// 输入维度上的 `H = E[xᵀx]`；`None` = 这一层没采到。
     /// 是全矩阵还是对角由 [`CalibOpts::full_hessian_max_dim`] 决定（见 [`HessianKind`]）。
     pub hessian: Option<HessianKind>,
     /// 每个输入通道的 `mean|x|`（长度 = `in_features`）；`None` = 这一层没采到。
-    /// 它是 AWQ 的唯一输入，也是 GPTQ act-order 的备用依据（`diag(H)` 与之同源）。
+    /// 它是 AWQ 的唯一输入，也是 Hessian 量化 act-order 的备用依据（`diag(H)` 与之同源）。
     pub act_abs_mean: Option<Vec<f32>>,
     /// 参与统计的 token 数。Hessian 与均值都是在这些 token 上累加出来的：
     /// token 太少时 `H` 估计得不准（采样噪声会被 `H⁻¹` 放大），
@@ -1551,7 +1553,7 @@ pub struct LayerCalib {
     pub n_tokens: usize,
 }
 
-/// 整模型的校准统计：key 就是 [`crate::model::GPT::named_parameters`] 的名字去掉
+/// 整模型的校准统计：key 就是 [`crate::model::Transformer::named_parameters`] 的名字去掉
 /// 末尾 `.weight` 之后的**参数名前缀**（如 `blocks.0.attn.c_q`）。
 ///
 /// 用名字而不是层下标做 key，是为了让"遍历顺序"与 checkpoint / 日志里出现的名字一致：
@@ -1646,6 +1648,11 @@ pub struct QuantSummary {
     pub layers: Vec<QuantReport>,
     /// 被跳过的层数（例如已挂 LoRA 适配器的层：量化会让适配器增量被静默丢弃）
     pub skipped: usize,
+    /// 请求的算法没有真正生效、实际退回 RTN 的层数
+    /// （Hessian 量化缺统计 / 对角 Hessian、AWQ 缺激活均值都会退化）。
+    /// 逐层报告里 method 已如实记为 Rtn，这里汇总成一个数字，
+    /// 让"宣称 Hessian 量化实际一堆层是 RTN"在摘要里一眼可见，不再静默
+    pub degraded: usize,
 }
 
 impl QuantSummary {
@@ -1688,6 +1695,13 @@ impl QuantSummary {
         }
         if self.skipped > 0 {
             s.push_str(&format!("，跳过 {} 层", self.skipped));
+        }
+        if self.degraded > 0 {
+            s.push_str(&format!(
+                "，警告：{} 层未吃到 {} 补偿、实际按 RTN 建（缺校准统计或 Hessian 只存了对角）",
+                self.degraded,
+                self.method.name()
+            ));
         }
         s.push('）');
         s
@@ -1919,7 +1933,7 @@ mod tests {
         assert!(q4.byte_len() < q8.byte_len());
     }
 
-    // ---------- 第 33 课：GPTQ / AWQ 的数值测试 ----------
+    // ---------- 第 33 课：Hessian 量化 / AWQ 的数值测试 ----------
 
     /// 造一个条件数可控的正定矩阵 `A = M·Mᵀ + n·I` 与它的行优先表示
     fn random_spd(n: usize, seed: u64) -> Vec<f32> {
@@ -1953,7 +1967,7 @@ mod tests {
         out
     }
 
-    /// GPTQ 的加权误差 `tr((W-Ŵ)ᵀ H (W-Ŵ)) = Σ_b e_bᵀ H e_b`。
+    /// Hessian 量化的加权误差 `tr((W-Ŵ)ᵀ H (W-Ŵ)) = Σ_b e_bᵀ H e_b`。
     ///
     /// `err` 行优先 `[rows, cols]`（`rows` = 输入维度），`e_b` 是它的第 `b` 列
     /// ——也就是第 b 个输出通道上的误差向量（长度 = rows）；`h` 是 `[rows, rows]`。
@@ -1971,13 +1985,13 @@ mod tests {
 
     /// 造一批**通道之间强相关**的输入 `[tokens, rows]`，同时返回 `H = Σ_t x_t x_tᵀ`。
     ///
-    /// 为什么不用独立同分布的高斯输入：GPTQ 的全部收益来自 `H` 的**非对角能量**。
+    /// 为什么不用独立同分布的高斯输入：Hessian 量化的全部收益来自 `H` 的**非对角能量**。
     /// iid 输入下 `H ≈ tokens·I`（非对角只剩 O(√tokens) 的采样噪声），补偿系数
-    /// `H⁻¹[i,k]`（i ≠ k）几乎为 0，GPTQ 相对 RTN 的降幅只剩百分之几——那时
-    /// "GPTQ 更好"的断言实际上测的是噪声。真实 Transformer 的激活高度冗余
+    /// `H⁻¹[i,k]`（i ≠ k）几乎为 0，Hessian 量化相对 RTN 的降幅只剩百分之几——那时
+    /// "Hessian 量化更好"的断言实际上测的是噪声。真实 Transformer 的激活高度冗余
     /// （相邻通道强相关），这里用一阶自回归 `x_j = ρ·x_{j-1} + √(1-ρ²)·z_j`
     /// 造出 `H ≈ tokens·Toeplitz(ρ^{|i-j|})` 这种强非对角结构，
-    /// 才是 GPTQ 真正被设计来处理的情形。
+    /// 才是 Hessian 量化真正被设计来处理的情形。
     fn correlated_inputs(tokens: usize, rows: usize, rho: f32, seed: u64) -> (Vec<f32>, Vec<f32>) {
         let mut rng = Rng::new(seed);
         let s = (1.0 - rho * rho).sqrt();
@@ -2001,7 +2015,7 @@ mod tests {
     }
 
     /// Cholesky 的两个恒等式：`L·Lᵀ = A` 与 `A·A⁻¹ = I`。
-    /// 这两步是 GPTQ 的全部数学依赖，任一处偏差都会被 `H⁻¹` 放大到补偿量上。
+    /// 这两步是 Hessian 量化的全部数学依赖，任一处偏差都会被 `H⁻¹` 放大到补偿量上。
     #[test]
     fn cholesky_inverse_is_correct() {
         let n = 6;
@@ -2061,15 +2075,15 @@ mod tests {
         assert!(cholesky(&vec![0.0f32; n * n], n).is_none(), "零矩阵是奇异的");
     }
 
-    /// GPTQ 的全部意义所在：同样的位宽、同一份权重、同一个 `H` 下，
+    /// Hessian 量化的全部意义所在：同样的位宽、同一份权重、同一个 `H` 下，
     /// **加权误差**必须显著小于 RTN（这里给的是 20% 的硬门限）。
     ///
     /// 加权误差才是真正决定模型质量的量（它等于"用 Ŵ 替代 W 之后每层输出的均方误差"），
-    /// 权重矩阵上的逐元素误差不是——GPTQ 完全可能在逐元素口径上不比 RTN 好，
+    /// 权重矩阵上的逐元素误差不是——Hessian 量化完全可能在逐元素口径上不比 RTN 好，
     /// 却把输出误差降掉一大半。所以门限只压在加权口径上，
     /// 逐元素只检查"有限、没有把某列推出浮点范围"。
     #[test]
-    fn gptq_beats_rtn_on_weighted_error() {
+    fn hess_beats_rtn_on_weighted_error() {
         let (rows, cols, tokens) = (32, 32, 256);
         let mut rng = Rng::new(7);
         let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
@@ -2077,7 +2091,7 @@ mod tests {
         let hess = HessianKind::Full(h.clone());
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
-            let gptq = gptq_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &GptqOpts::default());
+            let hess = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &HessOpts::default());
             let err = |q: &QMatrix| {
                 let d = q.dequantize();
                 let e: Vec<f32> = w.iter().zip(&d).map(|(a, b)| a - b).collect();
@@ -2085,19 +2099,19 @@ mod tests {
             };
             // 开方后就是"每个输出通道上的加权 rmse"口径的相对误差，跨位宽/跨规模可比
             let rel_rtn = err(&rtn).sqrt();
-            let rel_gptq = err(&gptq).sqrt();
+            let rel_hess = err(&hess).sqrt();
             println!(
-                "[{}] 加权相对误差 RTN = {rel_rtn:.6}，GPTQ = {rel_gptq:.6}（降幅 {:.1}%）",
+                "[{}] 加权相对误差 RTN = {rel_rtn:.6}，Hessian 量化 = {rel_hess:.6}（降幅 {:.1}%）",
                 bits.name(),
-                (1.0 - rel_gptq / rel_rtn) * 100.0
+                (1.0 - rel_hess / rel_rtn) * 100.0
             );
             assert!(
-                rel_gptq < rel_rtn * 0.8,
-                "[{}] GPTQ 的加权误差应至少再降 20%：{rel_gptq} vs RTN {rel_rtn}",
+                rel_hess < rel_rtn * 0.8,
+                "[{}] Hessian 量化的加权误差应至少再降 20%：{rel_hess} vs RTN {rel_rtn}",
                 bits.name()
             );
             // 逐元素误差同样要有限（补偿不能把某列推出浮点范围）
-            assert!(gptq.dequantize().iter().all(|v| v.is_finite()));
+            assert!(hess.dequantize().iter().all(|v| v.is_finite()));
         }
     }
 
@@ -2105,16 +2119,16 @@ mod tests {
     /// 量化是部署前的最后一步，这里挂掉会让整条流水线卡死。
     /// 对角模式同样退化成 RTN——`H⁻¹` 是对角阵时跨通道补偿系数恒为 0。
     #[test]
-    fn gptq_falls_back_to_rtn_on_singular_hessian() {
+    fn hess_falls_back_to_rtn_on_singular_hessian() {
         let (rows, cols) = (8, 8);
         let w = ramp(rows * cols);
-        let opts = GptqOpts::default();
+        let opts = HessOpts::default();
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
 
             // 全零 Hessian：trace = 0，加阻尼也救不回正定性
             let zero_h = HessianKind::Full(vec![0.0f32; rows * rows]);
-            let q1 = gptq_quantize(&w, rows, cols, bits, QAxis::Col, &zero_h, &opts);
+            let q1 = hess_quantize(&w, rows, cols, bits, QAxis::Col, &zero_h, &opts);
             assert_eq!(q1.dequantize(), rtn.dequantize(), "H 全零时必须逐位退回 RTN");
 
             // 对角含 NaN：Cholesky 的 `d > 0` 判断天然挡住 NaN
@@ -2122,7 +2136,7 @@ mod tests {
             for i in 0..rows {
                 nan_h[i * rows + i] = f32::NAN;
             }
-            let q2 = gptq_quantize(
+            let q2 = hess_quantize(
                 &w,
                 rows,
                 cols,
@@ -2138,7 +2152,7 @@ mod tests {
             let neg_h: Vec<f32> = (0..rows * rows)
                 .map(|i| if i / rows == i % rows { -1.0 } else { 0.0 })
                 .collect();
-            let q3 = gptq_quantize(
+            let q3 = hess_quantize(
                 &w,
                 rows,
                 cols,
@@ -2151,7 +2165,7 @@ mod tests {
 
             // 对角模式：`H⁻¹` 也是对角阵 ⇒ 跨通道补偿系数恒为 0 ⇒ 与 RTN 逐位相同
             let diag: Vec<f32> = (0..rows).map(|i| 1.0 + i as f32 * 0.1).collect();
-            let q4 = gptq_quantize(
+            let q4 = hess_quantize(
                 &w,
                 rows,
                 cols,
@@ -2163,7 +2177,7 @@ mod tests {
             assert_eq!(
                 q4.dequantize(),
                 rtn.dequantize(),
-                "只存对角时 GPTQ 在数学上就退化成 RTN，必须逐位一致"
+                "只存对角时 Hessian 量化在数学上就退化成 RTN，必须逐位一致"
             );
         }
     }
@@ -2171,7 +2185,7 @@ mod tests {
     /// 阻尼的意义：把**奇异** `H` 的 Cholesky 从"失败"救成"成功"，
     /// 从而让误差补偿路径真正跑起来（而不是静默退回 RTN）。
     #[test]
-    fn gptq_damp_rescues_singular_hessian() {
+    fn hess_damp_rescues_singular_hessian() {
         let n = 8;
         // 只有左上 2×2 有能量的奇异 H（其余行列全 0）：第 3 个主元恰好是 0，
         // 不做阻尼时 Cholesky 必然在第 3 步返回 None。
@@ -2183,7 +2197,7 @@ mod tests {
         assert!(cholesky(&h, n).is_none(), "奇异 H 不该分解出实的下三角因子");
 
         // 按 trace/n 的比例加阻尼后，最小特征值被抬离 0，分解必定成功
-        let damp = GPTQ_DAMP * (2.0 + 2.0) / n as f32;
+        let damp = HESS_DAMP * (2.0 + 2.0) / n as f32;
         let mut damped = h.clone();
         for i in 0..n {
             damped[i * n + i] += damp;
@@ -2196,20 +2210,20 @@ mod tests {
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
             // damp = 0：分解失败 ⇒ 不做补偿 ⇒ 与 RTN 逐位相同
-            let no_damp = gptq_quantize(
+            let no_damp = hess_quantize(
                 &w,
                 rows,
                 cols,
                 bits,
                 QAxis::Col,
                 &hess,
-                &GptqOpts { damp: 0.0, ..Default::default() },
+                &HessOpts { damp: 0.0, ..Default::default() },
             );
             assert_eq!(no_damp.dequantize(), rtn.dequantize(), "Cholesky 失败时必须退回 RTN");
 
             // damp > 0：分解成功 ⇒ 补偿路径真的跑起来，结果依然有限且结构合法
             let with_damp =
-                gptq_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &GptqOpts::default());
+                hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &HessOpts::default());
             assert!(with_damp.dequantize().iter().all(|v| v.is_finite()));
             assert_eq!(with_damp.axis(), QAxis::Col);
             assert_eq!((with_damp.rows(), with_damp.cols()), (rows, cols));
@@ -2219,9 +2233,9 @@ mod tests {
     }
 
     /// act-order 的两个开关都必须跑通且误差有限；更强的一条：无论开不开，
-    /// GPTQ 的加权误差都要优于 RTN（重排序只影响"谁先被量化"，不影响补偿本身成立）。
+    /// Hessian 量化的加权误差都要优于 RTN（重排序只影响"谁先被量化"，不影响补偿本身成立）。
     #[test]
-    fn gptq_act_order_runs_both_ways() {
+    fn hess_act_order_runs_both_ways() {
         let (rows, cols, tokens) = (24, 20, 192);
         let mut rng = Rng::new(101);
         let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
@@ -2251,8 +2265,8 @@ mod tests {
             let rel_rtn = err(&rtn);
             let mut results = Vec::new();
             for act_order in [false, true] {
-                let opts = GptqOpts { act_order, ..Default::default() };
-                let q = gptq_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &opts);
+                let opts = HessOpts { act_order, ..Default::default() };
+                let q = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &opts);
                 assert!(q.dequantize().iter().all(|v| v.is_finite()), "act_order={act_order} 产出了非有限值");
                 assert_eq!(q.axis(), QAxis::Col);
                 assert_eq!((q.rows(), q.cols()), (rows, cols));
@@ -2265,7 +2279,7 @@ mod tests {
                 );
                 assert!(
                     r < rel_rtn,
-                    "[{}] act_order={act_order} 时 GPTQ 仍应优于 RTN：{r} vs {rel_rtn}",
+                    "[{}] act_order={act_order} 时 Hessian 量化仍应优于 RTN：{r} vs {rel_rtn}",
                     bits.name()
                 );
                 results.push((act_order, r));
@@ -2285,7 +2299,7 @@ mod tests {
     /// 结算给块外通道，数学上与不分块的顺序版等价。浮点累加顺序不同，个别落在
     /// 格点边界上的元素可能相差一个码，所以这里断言"误差量级一致"而不是逐位相同。
     #[test]
-    fn gptq_block_size_does_not_change_result() {
+    fn hess_block_size_does_not_change_result() {
         let (rows, cols, tokens) = (16, 24, 160);
         let mut rng = Rng::new(202);
         let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
@@ -2301,18 +2315,18 @@ mod tests {
             let rel_rtn = err(&rtn);
             let mut base: Option<f32> = None;
             for block in [0usize, 1, 4, 16] {
-                let opts = GptqOpts { block, ..Default::default() };
-                let q = gptq_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &opts);
+                let opts = HessOpts { block, ..Default::default() };
+                let q = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &opts);
                 assert!(q.dequantize().iter().all(|v| v.is_finite()), "block={block} 产出了非有限值");
                 assert_eq!(q.byte_len(), rtn.byte_len(), "分块不改变表示口径");
                 let r = err(&q);
                 println!("[{}] block={block:>3} 加权相对误差 {r:.6}", bits.name());
-                // 这里的门限故意比 `gptq_beats_rtn_on_weighted_error` 松：本测试的对象是
+                // 这里的门限故意比 `hess_beats_rtn_on_weighted_error` 松：本测试的对象是
                 // **分块不变性**，而这组 `(rows, cols, ρ)` 是按"非对角能量够大"随手取的，
                 // 收益本就只有一成多。严格的 0.8 倍门限由那个专门构造的用例来钉。
                 assert!(
                     r < rel_rtn * 0.9,
-                    "[{}] block={block} 时 GPTQ 也必须优于 RTN：{r} vs {rel_rtn}",
+                    "[{}] block={block} 时 Hessian 量化也必须优于 RTN：{r} vs {rel_rtn}",
                     bits.name()
                 );
                 match base {
@@ -2426,17 +2440,17 @@ mod tests {
         }
     }
 
-    /// GPTQ 产出的 `QMatrix` 与 RTN 版**表示完全同构**：形状、分组方向、每列一个 scale、
+    /// Hessian 量化产出的 `QMatrix` 与 RTN 版**表示完全同构**：形状、分组方向、每列一个 scale、
     /// 字节口径都一致，且反量化值本身落在格点上（再量化一次不变）。
-    /// 这是"GPTQ 只是换了每列的取值，不引入新的数据结构"的直接证据。
+    /// 这是"Hessian 量化只是换了每列的取值，不引入新的数据结构"的直接证据。
     #[test]
-    fn gptq_partial_bits_roundtrip() {
+    fn hess_partial_bits_roundtrip() {
         let (rows, cols) = (16, 12);
         let w = ramp(rows * cols);
         let h = random_spd(rows, 31); // 用良态正定矩阵当 Hessian（H 在输入维度上），确保走的是补偿分支
         let hess = HessianKind::Full(h);
         for bits in [QBits::Int8, QBits::Int4] {
-            let q = gptq_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &GptqOpts::default());
+            let q = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &HessOpts::default());
             assert_eq!(q.axis(), QAxis::Col);
             assert_eq!((q.rows(), q.cols()), (rows, cols));
             assert_eq!(q.scales().len(), cols, "逐列分组：每个输出通道一个 scale");
@@ -2541,7 +2555,7 @@ mod tests {
         );
     }
 
-    // ---------- 第 33 课：校准累加器 / 现成 H⁻¹ 的 GPTQ / 按输出误差搜索的 AWQ ----------
+    // ---------- 第 33 课：校准累加器 / 现成 H⁻¹ 的 Hessian 量化 / 按输出误差搜索的 AWQ ----------
 
     /// 朴素高斯-约当消元求逆（带列主元），给 `cholesky_inverse` 当**独立**对照。
     /// 为什么要另写一份：只有一条"完全不同的路径"给出同一个矩阵，才能说明
@@ -2654,33 +2668,33 @@ mod tests {
     }
 
     /// 用真的 [`Calibration::observe`] 采 Hessian、[`cholesky_inverse`] 求逆，再用
-    /// [`gptq_quantize_with_hinv`] 量化：**Hessian 加权**误差必须严格小于 RTN。
+    /// [`hess_quantize_with_hinv`] 量化：**Hessian 加权**误差必须严格小于 RTN。
     ///
     /// 为什么口径必须是 `tr((W − Ŵ)ᵀ H (W − Ŵ))`（= `‖X·W − X·Ŵ‖²` 的期望）而不是朴素 MSE：
-    /// GPTQ 优化的目标就是它，算法会**有意**把误差从重要通道挪到不重要的通道上，
+    /// Hessian 量化优化的目标就是它，算法会**有意**把误差从重要通道挪到不重要的通道上，
     /// 于是逐元素 MSE 口径下完全可能不比 RTN 好——这是算法定义决定的，不是实现问题。
     ///
     /// 为什么连"只取 `H` 的对角"都不够：补偿系数 `H⁻¹[j,k]` 里的**非对角项**才是补偿的方向，
     /// 而对角口径看不见它们。实测（本测试的 `println` 里有对角口径的数字）相关性强时
-    /// 对角口径下 GPTQ 反而比 RTN 差一成多，而同一批次的全 `H` 口径下它好 30%~45%：
+    /// 对角口径下 Hessian 量化反而比 RTN 差一成多，而同一批次的全 `H` 口径下它好 30%~45%：
     /// 补偿沿着"通道相关方向"搬动误差，代价落在对角项上、收益落在交叉项上。
     /// 所以判据必须是与算法同一个二次型，不能是它的对角近似。
     #[test]
-    fn test_gptq_beats_rtn_on_hessian_weighted_error() {
+    fn test_hess_beats_rtn_on_hessian_weighted_error() {
         let (rows, cols, tokens) = (24, 16, 256);
         // 多组随机种子：单组权重上"更小"可能只是运气，要看到方向性
         for seed in 0..4u64 {
             let mut rng = Rng::new(9000 + seed);
             let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
-            // 通道强相关的激活：GPTQ 的全部收益来自 H 的非对角能量（iid 输入下 H ≈ tokens·I）
+            // 通道强相关的激活：Hessian 量化的全部收益来自 H 的非对角能量（iid 输入下 H ≈ tokens·I）
             let (x, _h) = correlated_inputs(tokens, rows, 0.85, 300 + seed);
             let mut cal = Calibration::zeros(rows);
             cal.observe(&x, tokens);
             assert_eq!(cal.n_tokens(), tokens);
             let h = cal.mean_hessian();
-            // 阻尼按 GPTQ 的通行口径取"对角均值（= trace/n）的 1%"，H 接近奇异时也能求逆
+            // 阻尼按 Hessian 量化的通行口径取"对角均值（= trace/n）的 1%"，H 接近奇异时也能求逆
             let trace = (0..rows).map(|i| h[i * rows + i]).sum::<f32>();
-            let hinv = cholesky_inverse(&h, rows, GPTQ_DAMP * trace / rows as f32)
+            let hinv = cholesky_inverse(&h, rows, HESS_DAMP * trace / rows as f32)
                 .expect("阻尼后 H 必为正定");
             // 返回 (全 H 加权误差, 只取对角的加权误差)
             let errs = |q: &QMatrix| {
@@ -2693,10 +2707,10 @@ mod tests {
             };
             for bits in [QBits::Int8, QBits::Int4] {
                 let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
-                let gptq = gptq_quantize_with_hinv(&w, rows, cols, bits, QAxis::Col, &hinv);
-                let (a, b) = (errs(&gptq), errs(&rtn));
+                let hess = hess_quantize_with_hinv(&w, rows, cols, bits, QAxis::Col, &hinv);
+                let (a, b) = (errs(&hess), errs(&rtn));
                 println!(
-                    "[{}] seed {seed} 全 H 加权 GPTQ {:.6} < RTN {:.6}（降 {:.1}%；对角口径 {:.6} vs {:.6}）",
+                    "[{}] seed {seed} 全 H 加权 Hessian 量化 {:.6} < RTN {:.6}（降 {:.1}%；对角口径 {:.6} vs {:.6}）",
                     bits.name(),
                     a.0,
                     b.0,
@@ -2706,21 +2720,21 @@ mod tests {
                 );
                 assert!(
                     a.0 < b.0,
-                    "[{}] seed {seed}：GPTQ 必须严格优于 RTN，实得 {:.6} vs {:.6}",
+                    "[{}] seed {seed}：Hessian 量化必须严格优于 RTN，实得 {:.6} vs {:.6}",
                     bits.name(),
                     a.0,
                     b.0
                 );
-                assert!(gptq.dequantize().iter().all(|v| v.is_finite()));
+                assert!(hess.dequantize().iter().all(|v| v.is_finite()));
             }
         }
     }
 
     /// 校准数据的**输出误差**口径：同一批输入分别过原层与量化层，`‖X·W − X·Ŵ‖²` 必须
-    /// GPTQ < RTN。与上一条相比这里不做任何"加权"包装——它就是部署后真正会看到的偏差；
+    /// Hessian 量化 < RTN。与上一条相比这里不做任何"加权"包装——它就是部署后真正会看到的偏差；
     /// 顺带用分开两次 `observe` 采统计，验证累加器与"一次喂完"等价。
     #[test]
-    fn test_gptq_reduces_output_error_on_calibration_data() {
+    fn test_hess_reduces_output_error_on_calibration_data() {
         let (rows, cols, tokens) = (20, 12, 192);
         let mut rng = Rng::new(5150);
         let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
@@ -2740,14 +2754,14 @@ mod tests {
         }
         let trace = (0..rows).map(|i| h_mean[i * rows + i]).sum::<f32>();
         let hinv =
-            cholesky_inverse(&h_mean, rows, GPTQ_DAMP * trace / rows as f32).expect("阻尼后必为正定");
+            cholesky_inverse(&h_mean, rows, HESS_DAMP * trace / rows as f32).expect("阻尼后必为正定");
         let sq = |wq: &[f32]| output_error_sq(&x, &w, wq, tokens, rows, cols);
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
-            let gptq = gptq_quantize_with_hinv(&w, rows, cols, bits, QAxis::Col, &hinv);
-            let (a, b) = (sq(&gptq.dequantize()), sq(&rtn.dequantize()));
-            println!("[{}] 校准数据输出平方误差 GPTQ {a:.6} < RTN {b:.6}", bits.name());
-            assert!(a < b, "[{}] GPTQ 必须把输出误差压得更低：{a} vs {b}", bits.name());
+            let hess = hess_quantize_with_hinv(&w, rows, cols, bits, QAxis::Col, &hinv);
+            let (a, b) = (sq(&hess.dequantize()), sq(&rtn.dequantize()));
+            println!("[{}] 校准数据输出平方误差 Hessian 量化 {a:.6} < RTN {b:.6}", bits.name());
+            assert!(a < b, "[{}] Hessian 量化必须把输出误差压得更低：{a} vs {b}", bits.name());
         }
     }
 
@@ -2915,19 +2929,19 @@ mod tests {
     /// 这条路径对应"校准没采到 / 维度对不上"——量化是部署前最后一步，
     /// 在这里 panic 会把整条流水线卡死，所以判断写成"空 = 不补偿"的语义。
     #[test]
-    fn test_gptq_falls_back_to_rtn_without_hessian() {
+    fn test_hess_falls_back_to_rtn_without_hessian() {
         let (rows, cols) = (12, 9);
         let w = ramp(rows * cols);
         for bits in [QBits::Int8, QBits::Int4] {
             for axis in [QAxis::Row, QAxis::Col] {
                 let rtn = QMatrix::quantize(&w, rows, cols, bits, axis);
-                let q = gptq_quantize_with_hinv(&w, rows, cols, bits, axis, &[]);
+                let q = hess_quantize_with_hinv(&w, rows, cols, bits, axis, &[]);
                 assert_eq!(q.bytes(), rtn.bytes(), "空 h_inv 必须逐位退回 RTN");
                 assert_eq!(q.scales(), rtn.scales());
                 assert_eq!((q.rows(), q.cols(), q.axis()), (rows, cols, axis));
                 // 维度对不上（给了 [cols, cols] 而不是 [rows, rows]）同样降级，而不是 panic
                 let wrong = vec![1.0f32; cols * cols];
-                let q2 = gptq_quantize_with_hinv(&w, rows, cols, bits, axis, &wrong);
+                let q2 = hess_quantize_with_hinv(&w, rows, cols, bits, axis, &wrong);
                 assert_eq!(q2.bytes(), rtn.bytes(), "维度不符时同样退回 RTN");
             }
         }

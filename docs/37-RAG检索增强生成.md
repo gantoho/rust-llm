@@ -2,7 +2,7 @@
 
 > **本课已落地为可运行代码**：`src/rag.rs`（9 个单测）+ `rag` 子命令——分块（字符域切分 + 句读对齐 +
 > 可配重叠）、三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）、余弦检索与 MMR 多样化重排、提示组装。
-> 与已有代码的衔接：生成阶段复用 `src/sample.rs` 的 `generate`；稠密向量由 `GPT::forward_hidden`
+> 与已有代码的衔接：生成阶段复用 `src/sample.rs` 的 `generate`；稠密向量由 `Transformer::forward_hidden`
 > 做均值池化得到，余弦相似度在 L2 归一化后用点积计算。
 
 ---
@@ -224,7 +224,7 @@ CLI 入口是 [`rag`](../README.md#12-quant--distributed--align--rag--speculativ
 | `Embedder` trait | `rag.rs` | 向量化器接口：`dim()` + `embed(text) → Vec<f32>` |
 | `TfIdf` | `rag.rs` | TF-IDF 向量化器：`fit` 统计文档频率，`embed` 生成稀疏向量 |
 | `HashingEmbedder` | `rag.rs` | 特征哈希向量化器：FNV-1a 哈希映射到固定维度，无词表、无未登录词问题，符号哈希缓解冲突偏置 |
-| `ModelEmbedder` | `rag.rs` | 模型稠密向量化器：GPT 隐状态均值池化 + 归一化，三者中唯一"懂语义"的检索器 |
+| `ModelEmbedder` | `rag.rs` | 模型稠密向量化器：Transformer 隐状态均值池化 + 归一化，三者中唯一"懂语义"的检索器 |
 | `ScoredChunk` | `rag.rs` | 一条检索结果：`index` + `chunk` + 余弦相似度 `score` |
 | `Retriever` | `rag.rs` | 向量检索器：持有嵌入器 + 块向量，提供 `build`/`from_text`/`from_corpus_dir`/`search`（暴力 top-k）/`search_mmr`（MMR 去冗余重排） |
 | `PromptOpts` / `RagPrompt` | `rag.rs` | 提示组装参数与结果：字符预算 `max_context_chars` + 系统约束指令 + 来源标注 |

@@ -11,8 +11,7 @@ use crate::module::Module;
 use crate::quant::{QAxis, QBits, QMatrix};
 use crate::rng::Rng;
 use crate::rope::RopeSpec;
-use crate::tensor::Tensor;
-use std::rc::Rc;
+use crate::tensor::{Buffer, Shared, Tensor};
 
 /// KV 缓存的配置（第 25 课滑动窗口 + 第 33 课量化 + Attention Sink）
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,14 +38,17 @@ pub struct KvCacheOpts {
 /// 两者对外只暴露"读成 `Vec<f32>` / 追加若干行 / 丢掉最前面若干行"，
 /// 于是窗口与 Attention Sink 的裁剪逻辑不必关心底层是哪种表示。
 enum KvBlock {
-    F32(Vec<f32>),
+    /// f32 数据挂在 `Shared<..>`（`Arc<Mutex<..>>` 薄封装）上：[`KVCache::k`] / [`KVCache::v`]
+    /// 直接共享这个句柄构造零拷贝视图（见那两个方法的文档），历史数据不再每步克隆。
+    /// 缓冲本体是 [`Buffer::F32`]（KV 缓存恒为 f32 存储，量化走 `Quant` 变体）。
+    F32(Shared<Buffer>),
     Quant(QMatrix),
 }
 
 impl KvBlock {
     fn new(bits: Option<QBits>, axis: QAxis) -> Self {
         match bits {
-            None => KvBlock::F32(Vec::new()),
+            None => KvBlock::F32(Shared::new(Buffer::F32(Vec::new()))),
             // 列数要等第一次 append 才知道，这里先占位（rows=0 的合法空矩阵）
             Some(b) => KvBlock::Quant(QMatrix::zeros(0, 0, b, axis)),
         }
@@ -55,7 +57,7 @@ impl KvBlock {
     /// 还原成 `[rows, d]` 的 f32 行优先数据
     fn to_vec(&self, d: usize) -> Vec<f32> {
         match self {
-            KvBlock::F32(v) => v.clone(),
+            KvBlock::F32(v) => v.decode().to_vec(),
             KvBlock::Quant(q) => {
                 debug_assert_eq!(q.cols(), d);
                 q.dequantize()
@@ -66,7 +68,10 @@ impl KvBlock {
     /// 追加 `rows` 行（每行 `d` 个数）
     fn push(&mut self, x: &[f32], rows: usize, d: usize) {
         match self {
-            KvBlock::F32(v) => v.extend_from_slice(x),
+            KvBlock::F32(v) => match &mut *v.borrow_mut() {
+                Buffer::F32(buf) => buf.extend_from_slice(x),
+                Buffer::Bf16(_) => unreachable!("KV 缓存 f32 路径不会中途变 bf16"),
+            },
             KvBlock::Quant(q) => {
                 if q.rows() == 0 && q.cols() == 0 {
                     // 第一批数据：用它的数值统计出分组 scale
@@ -84,9 +89,12 @@ impl KvBlock {
             return;
         }
         match self {
-            KvBlock::F32(v) => {
-                v.drain(..n * d);
-            }
+            KvBlock::F32(v) => match &mut *v.borrow_mut() {
+                Buffer::F32(buf) => {
+                    buf.drain(..n * d);
+                }
+                Buffer::Bf16(_) => unreachable!("KV 缓存 f32 路径不会中途变 bf16"),
+            },
             KvBlock::Quant(q) => q.drop_front_rows(n),
         }
     }
@@ -94,7 +102,7 @@ impl KvBlock {
     /// 当前占用的字节数（用于打印量化收益）
     fn byte_len(&self) -> usize {
         match self {
-            KvBlock::F32(v) => v.len() * 4,
+            KvBlock::F32(v) => v.borrow().len() * 4,
             KvBlock::Quant(q) => q.byte_len(),
         }
     }
@@ -169,16 +177,17 @@ impl KVCache {
 
     /// 深拷贝一份（Beam Search 的每条候选路径都要有自己独立的缓存）。
     ///
-    /// 不能靠 `#[derive(Clone)]`：缓存内部是 `Rc<RefCell<..>>`，派生的 clone 会共享
+    /// 不能靠 `#[derive(Clone)]`：缓存内部是 `Shared<..>`，派生的 clone 会共享
     /// 同一份数据，一条路径的 append 会污染其它路径。这里逐字节复制。
     pub fn fork(&self) -> Self {
         KVCache {
+            // F32：取出内容后逐字节复制——若共享句柄，一条路径的 append 会污染其它路径
             k: match &self.k {
-                KvBlock::F32(v) => KvBlock::F32(v.clone()),
+                KvBlock::F32(v) => KvBlock::F32(Shared::new(v.borrow().clone())),
                 KvBlock::Quant(q) => KvBlock::Quant(q.clone()),
             },
             v: match &self.v {
-                KvBlock::F32(v) => KvBlock::F32(v.clone()),
+                KvBlock::F32(v) => KvBlock::F32(Shared::new(v.borrow().clone())),
                 KvBlock::Quant(q) => KvBlock::Quant(q.clone()),
             },
             len: self.len,
@@ -258,13 +267,27 @@ impl KVCache {
         }
     }
 
-    /// 返回完整缓存张量 [1, T, D]（注意力打分需要读全量历史，这里克隆一次）
+    /// 返回完整缓存张量 [1, T, D]。
+    ///
+    /// **f32 路径零拷贝**：直接共享缓存底层的 `Shared` 句柄（张量是只读叶子：
+    /// req = false、不挂 backward），解码每步省掉整段历史 O(T·D) 的克隆。
+    /// 缓存的变更（append / rollback / 窗口裁剪）只发生在两次前向之间，
+    /// 不会与正在读它的注意力前向重叠。
+    ///
+    /// 量化路径仍需反量化出 f32——「量化布局直接打分」要动 flash 内核、
+    /// 反向重算与 GPU 常驻路径三处，推迟到 strides 视图重构批（批次 10）。
     pub fn k(&self) -> Tensor {
-        Tensor::from_vec(self.k.to_vec(self.d), vec![1, self.len, self.d])
+        match &self.k {
+            KvBlock::F32(v) => Tensor::shared(v.clone(), vec![1, self.len, self.d]),
+            KvBlock::Quant(_) => Tensor::from_vec(self.k.to_vec(self.d), vec![1, self.len, self.d]),
+        }
     }
 
     pub fn v(&self) -> Tensor {
-        Tensor::from_vec(self.v.to_vec(self.d), vec![1, self.len, self.d])
+        match &self.v {
+            KvBlock::F32(v) => Tensor::shared(v.clone(), vec![1, self.len, self.d]),
+            KvBlock::Quant(_) => Tensor::from_vec(self.v.to_vec(self.d), vec![1, self.len, self.d]),
+        }
     }
 
     /// 回滚最近追加的 `n` 个位置（推测解码用：草稿 token 被拒后必须从缓存里撤掉，
@@ -296,7 +319,15 @@ impl KvBlock {
         }
         match self {
             KvBlock::F32(v) => {
-                v.truncate(v.len() - n * d);
+                // 单次借用同一把锁（Mutex 不可重入）：先借出来再取长度与截断
+                let mut g = v.borrow_mut();
+                match &mut *g {
+                    Buffer::F32(buf) => {
+                        let len = buf.len();
+                        buf.truncate(len - n * d);
+                    }
+                    Buffer::Bf16(_) => unreachable!("KV 缓存 f32 路径不会中途变 bf16"),
+                }
             }
             KvBlock::Quant(q) => q.drop_back_rows(n),
         }
@@ -319,7 +350,7 @@ impl KvBlock {
         kept.extend_from_slice(&all[..offset * d]);
         kept.extend_from_slice(&all[(offset + n) * d..]);
         match self {
-            KvBlock::F32(v) => *v = kept,
+            KvBlock::F32(v) => *v.borrow_mut() = Buffer::F32(kept),
             KvBlock::Quant(q) => {
                 let bits = q.bits();
                 let axis = q.axis();
@@ -359,7 +390,6 @@ pub struct MultiHeadAttention {
     pub c_proj: Linear,
     pub n_head: usize,
     pub n_kv_head: usize,
-    n_rep: usize, // n_head / n_kv_head
     /// RoPE 的频率参数（底数 + 长度外推方式）。**结构的一部分**：训练与推理、
     /// checkpoint 加载与续训必须一致，否则同一段文本会被旋转到不同角度。
     pub rope: RopeSpec,
@@ -384,20 +414,20 @@ impl MultiHeadAttention {
             c_proj: Linear::new(n_embd, n_embd, rng),
             n_head,
             n_kv_head: n_kv,
-            n_rep: n_head / n_kv,
             rope,
         }
     }
 
     /// 前向
     /// - x: [B, T, D]
-    /// - mask: [T, T_total] 因果掩码（-inf 的位置不能看）
+    /// - mask: 可选的 `[T, T_total]` 后缀因果掩码；CPU 分块核在核内屏蔽不需要它，
+    ///   传 `None` 即可；只有 GPU 常驻 / probe 录制路径会消费真实掩码 buffer
     /// - kv_cache: Some(缓存) 时走推理模式（只算新 token）
     /// - base: RoPE 的绝对位置基准（训练时 = 0，KV cache 推理时 = 缓存已见位置总数）
     pub fn forward(
         &self,
         x: &Tensor,
-        mask: &Tensor,
+        mask: Option<&Tensor>,
         kv_cache: Option<&mut KVCache>,
         base: usize,
     ) -> Tensor {
@@ -434,7 +464,8 @@ impl MultiHeadAttention {
         };
         let t_total = k.shape()[1];
 
-        // 4. 拆头 + GQA repeat
+        // 4. 拆头（GQA 不再物化 repeat_kv：flash_attention 的 CPU 分块核按 Q 头
+        //    核内索引共享 KV 头，GPU 路径在 `Tensor::flash_attention` 内核外展开）
         let q = q
             .reshape(vec![b, t, self.n_head, head_dim])
             .permute(&[0, 2, 1, 3])
@@ -449,16 +480,8 @@ impl MultiHeadAttention {
             .permute(&[0, 2, 1, 3])
             .reshape(vec![b * self.n_kv_head, t_total, head_dim]);
 
-        // GQA：如果 n_kv_head < n_head，把 K/V 的每个头重复 n_rep 次
-        let (k, v) = if self.n_rep > 1 {
-            (repeat_kv(&k, self.n_rep), repeat_kv(&v, self.n_rep))
-        } else {
-            (k, v)
-        };
-
-        // 5-7. Flash Attention 融合算子：Q'·Kᵀ → softmax(+mask) → ·V 全走矩阵乘内核
-        //      （2026-09-16 重写，见 `Tensor::flash_attention`：数学等价，但不再做分块在线 softmax）
-        //      `block_size` 参数已失效；显存仍是 O(T²)（保留 P 供反向用）
+        // 5-7. Flash Attention 融合算子：CPU 走分块在线 softmax（不物化掩码、不落地 P，
+        //      `block_size` 真实生效）；GPU 常驻/probe 路径才消费 mask（见 `Tensor::flash_attention`）
         let out = Tensor::flash_attention(&q, &k, &v, mask, 32);
 
         // 8. 合并头回 [B, T, D]
@@ -478,7 +501,7 @@ impl MultiHeadAttention {
     /// 调整，是 LoRA 论文与社区实践里性价比最高的一组。输出投影 `c_proj` 只做一次线性汇总，
     /// 加适配器收益最小而参数与 Q 一样多，所以默认关闭（`--lora-targets` 可打开）。
     ///
-    /// 主干冻结不在这里做，由 [`crate::model::GPT::apply_lora`] 统一处理。
+    /// 主干冻结不在这里做，由 [`crate::model::Transformer::apply_lora`] 统一处理。
     pub fn apply_lora(&mut self, lora: &crate::config::LoRAConfig, rng: &mut Rng) {
         let t = lora.targets;
         for (on, lin) in [
@@ -572,64 +595,11 @@ impl Module for MultiHeadAttention {
     }
 }
 
-/// GQA 辅助函数：把 KV 头重复 n_rep 次。
-///
-/// 输入 x: [B*n_kv_head, T, head_dim]
-/// 输出:   [B*n_head, T, head_dim]
-///
-/// 例如 n_kv_head=2, n_rep=4 时：
-/// [head0, head1] -> [head0, head0, head0, head0, head1, head1, head1, head1]
-///
-/// 反向：将 n_rep 个重复副本的梯度求和回原始 KV 头。
-fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
-    if n_rep == 1 {
-        return x.clone();
-    }
-    let shape = x.shape();
-    assert_eq!(shape.len(), 3, "repeat_kv 输入必须为 3D");
-    let (batch_kv, t, head_dim) = (shape[0], shape[1], shape[2]);
-    let batch = batch_kv * n_rep;
-    let xd = x.data.borrow();
-    let mut out = vec![0.0f32; batch * t * head_dim];
-    for b in 0..batch_kv {
-        let src = &xd[b * t * head_dim..(b + 1) * t * head_dim];
-        for r in 0..n_rep {
-            let dst_start = (b * n_rep + r) * t * head_dim;
-            out[dst_start..dst_start + t * head_dim].copy_from_slice(src);
-        }
-    }
-    drop(xd);
-
-    let mut result = Tensor::new(out, vec![batch, t, head_dim], x.req());
-    if x.req() {
-        let rg = result.grad.clone();
-        let sg = x.grad.clone();
-        let n_rep2 = n_rep;
-        let elems = t * head_dim;
-        result.parents = Rc::new(vec![x.clone()]);
-        result.backward = Some(Rc::new(move || {
-            let g = rg.borrow();
-            let mut sgm = sg.borrow_mut();
-            // 反向：将 n_rep 个副本的梯度求和回原始头
-            for b in 0..batch_kv {
-                let dst_base = b * elems;
-                for r in 0..n_rep2 {
-                    let src_base = (b * n_rep2 + r) * elems;
-                    for i in 0..elems {
-                        sgm[dst_base + i] += g[src_base + i];
-                    }
-                }
-            }
-        }));
-    }
-    result
-}
-
-/// GQA 辅助函数（权重空间版）：把 K/V 投影的**参数**按 [`repeat_kv`] 的同一套头顺序展开。
+/// GQA 辅助函数（权重空间版）：把 K/V 投影的**参数**按 [`crate::tensor::repeat_flat`] 的同一套头顺序展开。
 ///
 /// `src` 是 `[rows, n_kv_head * head_dim]` 的行主序数据（权重取 `rows = d`，
 /// 偏置取 `rows = 1`），返回 `[rows, n_head * head_dim]`：
-/// 输出第 `hh` 个头直接复制自源头 `hh / n_rep` —— 与 `repeat_kv` 把
+/// 输出第 `hh` 个头直接复制自源头 `hh / n_rep` —— 与 [`crate::tensor::repeat_flat`] 把
 /// `[head0, head1]` 变成 `[head0, head0, head0, head0, head1, …]` 完全一致。
 ///
 /// 存在的理由：GPU 常驻显存路径的「按头重排」内核只认 `n_head` 个头，
@@ -659,7 +629,7 @@ pub(crate) fn expand_kv_head(src: &[f32], rows: usize, n_kv: usize, hd: usize, n
 /// [`expand_kv_head`] 的反向：把展开空间里的参数梯度折回原始 `n_kv` 个头。
 ///
 /// 同一源头的 `n_rep` 个副本各自攒到一份梯度，折回时按列相加 ——
-/// 对应 `repeat_kv` 反向「把 n_rep 个副本的梯度求和回原始头」。
+/// 对应 `crate::tensor::fold_repeat_grad` 反向「把 n_rep 个副本的梯度求和回原始头」。
 /// 数学上与「先求和再乘」是同一个结果：展开空间里 `dWk[:, hh] = xnᵀ·dk_pre'[:, hh]`，
 /// 按 `hh / n_rep` 分组相加后正是 `xnᵀ·(Σ_r dk_pre'[:, …])`，也就是未展开时的 `dWk`。
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
@@ -904,7 +874,7 @@ mod tests {
         }
     }
 
-    /// GQA 的**权重空间展开**必须与张量空间的 [`repeat_kv`] 同序，且折回是展开的共轭。
+    /// GQA 的**权重空间展开**必须与张量空间的 [`crate::tensor::repeat_flat`] 同序，且折回是展开的共轭。
     /// 这两条就是「参数空间做头复制」能替代「张量空间头复制」的全部依据：
     /// 同序保证前向算的是同一个函数，共轭保证反向梯度折回后与未展开时逐位一致
     /// （`⟨expand(a), g⟩ == ⟨a, fold(g)⟩` 即「先求和再乘」= 「分别乘再求和」）。
@@ -918,10 +888,10 @@ mod tests {
         let exp = expand_kv_head(&src, rows, n_kv, hd, n_rep);
         assert_eq!(exp.len(), rows * n_head * hd);
 
-        // 1) 头顺序：`repeat_kv` 吃 `[B*n_kv, T, hd]`（令 B=1、T=rows），
+        // 1) 头顺序：`repeat_flat` 吃 `[B*n_kv, T, hd]` 展平数据（令 B=1、T=rows），
         //    把第 b 个 KV 头复制成 n_rep 份；展开结果的第 hh 个头应取自源头的 `hh / n_rep`。
-        //    两者的数据布局不同（源是「行内多头连续」，repeat_kv 是「头在外、行长在内」），
-        //    这里把源转置成 repeat_kv 认的布局再比。
+        //    两者的数据布局不同（源是「行内多头连续」，repeat_flat 是「头在外、行长在内」），
+        //    这里把源转置成 repeat_flat 认的布局再比。
         let mut kv_in = vec![0.0f32; n_kv * rows * hd];
         for r in 0..rows {
             for kv in 0..n_kv {
@@ -930,13 +900,13 @@ mod tests {
                 }
             }
         }
-        let rep = repeat_kv(&Tensor::from_vec(kv_in, vec![n_kv, rows, hd]), n_rep);
-        assert_eq!(rep.shape(), &[n_head, rows, hd]);
+        let rep = crate::tensor::repeat_flat(&kv_in, n_kv, n_rep);
+        assert_eq!(rep.len(), n_head * rows * hd);
         for hh in 0..n_head {
             for r in 0..rows {
                 for j in 0..hd {
                     let got = exp[r * n_head * hd + hh * hd + j];
-                    let want = rep.data()[(hh * rows + r) * hd + j];
+                    let want = rep[(hh * rows + r) * hd + j];
                     assert!(
                         (got - want).abs() < 1e-6,
                         "第 {hh} 个头第 {r} 行第 {j} 列不一致：{got} vs {want}"

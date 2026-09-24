@@ -193,7 +193,7 @@ $$
 
 ### RLAIF（RL from AI Feedback）
 
-用 AI 代替人类标注偏好数据（如用 GPT-4 判断哪个回答更好），大幅降低标注成本。
+用 AI 代替人类标注偏好数据（如用商用大模型判断哪个回答更好），大幅降低标注成本。
 
 ### GRPO（Group Relative Policy Optimization，DeepSeek）
 
@@ -221,7 +221,7 @@ CLI 入口是 [`align`](../README.md#12-quant--distributed--align--rag--speculat
 
 | 组件 | 位置 | 说明 |
 |------|------|------|
-| `RewardModel` | `align.rs` | 奖励模型：GPT 主干 + 标量头（`Linear`），给一条回答打分（无界实数，仅相对大小有意义）。实现 `Module` trait 聚合 backbone 和 head 的参数 |
+| `RewardModel` | `align.rs` | 奖励模型：Transformer 主干 + 标量头（`Linear`），给一条回答打分（无界实数，仅相对大小有意义）。实现 `Module` trait 聚合 backbone 和 head 的参数 |
 | `MaskedSequence` | `align.rs` | 带掩码的 token 序列：`ids` + `mask[i]`（是否计入对数概率）。提供 `full()`（整条参与）和 `answer_only()`（仅回答部分参与）两种构造方式 |
 | `PreferencePair` | `align.rs` | 一对偏好样本：同一 prompt 下的 `chosen`（优选）和 `rejected`（劣选）两个 `MaskedSequence` |
 | `bradley_terry_loss` | `align.rs` | Bradley-Terry 成对损失：`-log σ(r_chosen - r_rejected)`，形式等价于 `softplus(-delta)`，手写梯度注入 |

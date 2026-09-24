@@ -1,6 +1,6 @@
 //! 数据加载（第 14 课）
 //!
-//! 训练 GPT 的自监督方式：给模型一段文本，让它预测"下一个 token"。
+//! 训练 Transformer 的自监督方式：给模型一段文本，让它预测"下一个 token"。
 //! 不需要人工标注——文本本身就是标签（这就是"自监督学习"）。
 //!
 //! 支持：
@@ -51,6 +51,16 @@ pub fn load_texts(paths: &str) -> Vec<String> {
         files.extend(resolve_files(p));
     }
     files.iter().map(|f| read_one(f)).collect()
+}
+
+/// 加载单个路径项（文件 / 目录 / 通配符）展开出的**每个文件一份文本**，保留文件边界。
+///
+/// 与 [`load_text`]（把所有文件 `join("\n")` 成一份，喂分词器训练）不同：这里给
+/// [`DataLoader::from_documents`] 用——每个文档单独包 `[BOS] … [EOS]` 后打包成一条
+/// 语料流，文档边界被特殊 token 显式标出，模型不会把"上一份文档结尾"和
+/// "下一份文档开头"当成连续上下文。
+pub fn load_documents(path: &str) -> Vec<String> {
+    resolve_files(path).iter().map(|f| read_one(f)).collect()
 }
 
 fn read_one(path: &str) -> String {
@@ -178,17 +188,49 @@ impl DataLoader {
         block_size: usize,
         batch_size: usize,
     ) -> Self {
-        let mut tokens = encode_document(tokenizer, train_text);
+        let tokens = encode_document(tokenizer, train_text);
+        let val_tokens = val_text.map(|v| encode_document(tokenizer, v));
+        Self::from_encoded(tokens, val_tokens, block_size, batch_size)
+    }
+
+    /// 从多份文档构造加载器（**样本 packing**）：每个文档各自包 `[BOS] … [EOS]` 后
+    /// 依次拼进同一条 token 流——短文档不再各自为政，边界由特殊 token 显式标出。
+    /// - `val_doc = Some(..)`：使用独立的验证文档；
+    /// - `val_doc = None`：与 [`from_texts`] 相同，自动从末尾切约 10% 作验证集。
+    pub fn from_documents(
+        docs: &[String],
+        val_doc: Option<&str>,
+        tokenizer: &Tokenizer,
+        block_size: usize,
+        batch_size: usize,
+    ) -> Self {
+        assert!(!docs.is_empty(), "训练文档列表为空，无语料可加载");
+        let mut tokens = Vec::new();
+        for doc in docs {
+            tokens.extend(encode_document(tokenizer, doc));
+        }
+        let val_tokens = val_doc.map(|v| encode_document(tokenizer, v));
+        Self::from_encoded(tokens, val_tokens, block_size, batch_size)
+    }
+
+    /// [`from_texts`](Self::from_texts) / [`from_documents`](Self::from_documents) 共用的
+    /// 训练/验证切分逻辑：入参是已经编码好的训练流与可选验证流。
+    fn from_encoded(
+        mut tokens: Vec<usize>,
+        val_tokens: Option<Vec<usize>>,
+        block_size: usize,
+        batch_size: usize,
+    ) -> Self {
         assert!(
             tokens.len() > block_size,
             "训练语料太短，无法切出完整序列（{} <= {}，必须严格大于 block_size）",
             tokens.len(),
             block_size
         );
-        let val_start = match val_text {
+        let val_start = match val_tokens {
             Some(v) => {
                 let split = tokens.len();
-                tokens.extend(encode_document(tokenizer, v));
+                tokens.extend(v);
                 assert!(
                     tokens.len() - split > block_size,
                     "验证文本太短，无法切出完整序列（{} token，需要 > {}）",
@@ -250,10 +292,9 @@ impl DataLoader {
 
 /// 训练 / 评估的批次来源。
 ///
-/// 预训练与 SFT 的采样方式不同：前者每个位置都是预测目标，后者只有回答段是。
-/// 把这点差异收在一个 trait 后面，`train::train_gpt` 那段训练循环就能原样复用，
-/// 不必为 SFT 再抄一遍（早停、断点续训、指标记录这些逻辑抄第二份必然会走样）。
-pub trait BatchSource {
+/// 预取线程（见 `train::train_transformer`）要把 `&dyn BatchSource` 持有到工作线程里，
+/// 所以要求 `Sync`——两个内置实现只含 `Vec`，天然满足。
+pub trait BatchSource: Sync {
     fn block_size(&self) -> usize;
     fn batch_size(&self) -> usize;
     fn num_tokens(&self) -> usize;
@@ -870,5 +911,49 @@ mod tests {
         assert!(mask.is_some());
         // 三个窗口都只能从 val_start 起，右端恰好用满验证区
         assert_eq!(&x[..block_size], &loader.tokens[val_start..val_start + block_size]);
+    }
+
+    #[test]
+    fn from_documents_packs_docs_with_boundaries() {
+        // packing：每份文档单独包 [BOS]…[EOS] 后拼进同一条流，边界由特殊 token 标出
+        let tok = Tokenizer::char("abcdefghijklmnopqrstuvwxyz \n");
+        let docs = vec![
+            "hello world".to_string(),
+            "foo bar baz".to_string(),
+            "packing short docs saves windows".to_string(),
+        ];
+        let block = 8;
+        let loader = DataLoader::from_documents(&docs, None, &tok, block, 2);
+
+        let bos = tok.bos_id();
+        let eos = tok.eos_id();
+        let expected: usize = docs
+            .iter()
+            .map(|d| bos.map_or(0, |_| 1) + tok.encode(d).len() + eos.map_or(0, |_| 1))
+            .sum();
+        assert_eq!(loader.tokens.len(), expected, "token 流应是各文档打包后的总长");
+        // 每份文档的边界处必须是 EOS→BOS（若分词器有特殊 token）
+        if let (Some(b), Some(e)) = (bos, eos) {
+            let mut pos = 0usize;
+            for d in &docs {
+                let len = 1 + tok.encode(d).len() + 1;
+                assert_eq!(loader.tokens[pos], b, "文档应以 BOS 开头");
+                assert_eq!(loader.tokens[pos + len - 1], e, "文档应以 EOS 结尾");
+                pos += len;
+            }
+        }
+
+        // 单文档退化情形必须与 from_texts 完全一致（采样序列同 rng 同种子逐位相同）
+        // CORPUS 含大写字母，须用它自己的字符集建分词器（词表外字符 encode 会 panic）
+        let tok2 = Tokenizer::char(CORPUS);
+        let one = vec![CORPUS.to_string()];
+        let a = DataLoader::from_documents(&one, None, &tok2, block, 2);
+        let b = DataLoader::from_texts(CORPUS, None, &tok2, block, 2);
+        assert_eq!(a.tokens, b.tokens);
+        assert_eq!(a.val_start, b.val_start);
+        let (xa, ya, _) = a.sample_batch(&mut Rng::new(7));
+        let (xb, yb, _) = b.sample_batch(&mut Rng::new(7));
+        assert_eq!(xa, xb);
+        assert_eq!(ya, yb);
     }
 }

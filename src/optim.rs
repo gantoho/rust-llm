@@ -5,6 +5,7 @@
 //! - AdamW（第 17 课）：自适应学习率 + 动量 + 权重衰减，现代 LLM 标配
 
 use crate::tensor::Tensor;
+use rayon::prelude::*;
 
 /// 优化器统一接口（第 17 课）
 ///
@@ -47,15 +48,21 @@ impl Optimizer for SGD {
     /// 冻结参数（`requires_grad = false`，LoRA 的主干）直接跳过：它们的梯度槽可能被
     /// GPU 常驻显存路径注入了非零值，不跳过就会被"顺手更新"，冻结就名存实亡了。
     fn step(&mut self) {
+        let lr = self.lr;
+        // 参数间串行、参数内按元素并行——
+        // 大参数（embedding、输出头）占更新量的绝大头
         for p in &self.params {
             if !p.requires_grad() {
                 continue;
             }
             let g = p.grad.borrow();
-            let mut d = p.data.borrow_mut();
-            for j in 0..d.len() {
-                d[j] -= self.lr * g[j];
-            }
+            // decode_mut：bf16 参数按 f32 视图就地更新，退出作用域时统一 encode 回 u16
+            //（master weights 语义——更新在 f32 精度下进行，存储仍是 bf16）
+            let mut d = p.decode_mut();
+            let g_ref: &[f32] = &g;
+            d.par_iter_mut()
+                .zip(g_ref.par_iter())
+                .for_each(|(dv, &gv)| *dv -= lr * gv);
         }
     }
 }
@@ -92,7 +99,7 @@ impl AdamW {
     }
 
     /// 可自定义 beta1 / beta2 的构造器（小 batch 或特殊场景需要调优时使用）
-    pub fn new_with_betas(
+    fn new_with_betas(
         lr: f32,
         params: Vec<Tensor>,
         weight_decay: f32,
@@ -154,19 +161,25 @@ impl Optimizer for AdamW {
                 continue; // 冻结参数：不更新、也不做权重衰减（见结构体注释）
             }
             let g = self.params[i].grad.borrow();
-            let mut d = self.params[i].data.borrow_mut();
+            // decode_mut：bf16 参数按 f32 视图就地更新，退出作用域时统一 encode 回 u16
+            let mut d = self.params[i].decode_mut();
+            let g_ref: &[f32] = &g;
             let mi = &mut self.m[i];
             let vi = &mut self.v[i];
-            for j in 0..d.len() {
-                let gv = g[j];
-                mi[j] = beta1 * mi[j] + (1.0 - beta1) * gv;
-                vi[j] = beta2 * vi[j] + (1.0 - beta2) * gv * gv;
-                let m_hat = mi[j] / bc1;
-                let v_hat = vi[j] / bc2;
-                let step = lr * m_hat / (v_hat.sqrt() + eps);
-                let decay = lr * wd * d[j];
-                d[j] = d[j] - step - decay;
-            }
+            // 参数内按元素并行；单元素内的运算顺序与串行版一致，数值不变
+            mi.par_iter_mut()
+                .zip(vi.par_iter_mut())
+                .zip(d.par_iter_mut())
+                .zip(g_ref.par_iter())
+                .for_each(|(((mv, vv), dv), &gv)| {
+                    *mv = beta1 * *mv + (1.0 - beta1) * gv;
+                    *vv = beta2 * *vv + (1.0 - beta2) * gv * gv;
+                    let m_hat = *mv / bc1;
+                    let v_hat = *vv / bc2;
+                    let step = lr * m_hat / (v_hat.sqrt() + eps);
+                    let decay = lr * wd * *dv;
+                    *dv = *dv - step - decay;
+                });
         }
     }
 }
