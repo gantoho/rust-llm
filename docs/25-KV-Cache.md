@@ -21,7 +21,7 @@
 
 生成是**逐 token**的：每产生一个新 token，都要把它拼到上下文末尾，再前向一次，从输出的 logits 里采样下一个 token。
 
-全量模式（第 16 课 `generate` 的 `use_kv_cache=false` 分支）每步都把**整个上下文**重新喂给模型：
+全量模式（`--no-kv-cache`，即 `KvOpts::enable = false` 的分支）每步都把**整个上下文**重新喂给模型：
 
 ```
 第 1 步：输入 [t0]               → 前向 1 个位置
@@ -264,7 +264,7 @@ for _ in 0..b {
 let block_size = model.cfg.block_size;
 let mut ids = tokenizer.encode(prompt);
 if ids.is_empty() { ids.push(0); }                             // 空 prompt 兜底
-let mut cache = use_kv_cache.then(|| model.new_kv_cache());    // 只有用 cache 才分配
+let mut cache = kv.build(model);                               // 只有用 cache 才分配（KvOpts::enable = false 时是 None）
 
 for _ in 0..max_new {
     // 只保留最近的 block_size 个 token（两种模式都必须遵守的上下文上限）
@@ -273,10 +273,9 @@ for _ in 0..max_new {
 
     // 推理不需要反向：no_grad 下不挂计算图、不分配梯度缓冲
     let logits = crate::tensor::no_grad(|| {
-        if use_kv_cache {
+        if let Some(c) = cache.as_mut() {
             // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
             // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-            let c = cache.as_mut().unwrap();
             if c[0].seq_len() == 0 {
                 model.forward(ctx, 1, ctx.len(), Some(c), false)
             } else {
@@ -312,7 +311,7 @@ for _ in 0..max_new {
 | 上下文处理 | 每步 `ids.len().saturating_sub(block_size)` 截断，窗口滑到最近 32 个 | 缓存在 `append` 里自己丢最旧行（第 8 节），每步 +1 行 |
 | 停止条件 | 生成满 `max_new` 个 | 生成满 `max_new` 个（缓存容量不再是上限） |
 | 每次前向的位置数 | 32（封顶后固定） | 首次 prompt 长度，之后恒为 1 |
-| 生成 80 个新 token 的累计前向位置数 | 441 + 32×59 = 2329（前 21 步按 11..31 递增） | 11 + 80 = 91 |
+| 生成 80 个新 token 的累计前向位置数 | 441 + 32×59 = 2329（前 21 步按 11..31 递增） | 11 + 79 = 90 |
 
 用流程图看 demo 的生成 1 / 生成 2（prompt = "Once upon a"，11 个 token，max_new=80，block_size=32）：
 
@@ -390,7 +389,7 @@ println!(
 | ... | ... | ... | ... | ... |
 | 第 22 步 | 最新 1 个 | 32 | 32 | 第 22 个 |
 | 第 23 步 | 最新 1 个 | **32**（丢掉全局位置 0） | **33** | 第 23 个 |
-| 第 80 步 | 最新 1 个 | 32 | 80 | 第 80 个 |
+| 第 80 步 | 最新 1 个 | 32 | 90 | 第 80 个 |
 
 两个计数器必须分开，原因在 RoPE：**缓存里存的是已旋转的 K**，每条 K 都带着它产生时的绝对位置。如果为了"把窗口下标重新编号成 0..32"而改动位置基准，就得把缓存里每一行重新旋转一遍——那是每步 O(T) 的额外工作，正好把缓存省下的计算量又还回去。让绝对位置一路递增、缓存行原地不动，是唯一自洽的做法；而 RoPE 打分只依赖**相对距离**，同一 query 与同一 key 之间的相对距离在两种编号下完全一致，所以递增编号不会改变任何分数。
 
@@ -420,8 +419,8 @@ println!(
 > 核心内容已全部实现，这里是进阶拓展。
 
 1. **在窗口内验证"完全相等"**：demo 的窗口内自检已经是 `a == b` 的严格比较，把它换成 `assert_eq!`、再把 prompt 与 `max_new` 调到刚好占满窗口（11 + 21 = 32），确认仍然相等——边界值最容易暴露 off-by-one。
-2. **打印两个计数器**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("seq_len = {}, seen = {}", cache.seq_len(), cache.positions_seen());`，跑 demo 的生成 2，观察一个在第 23 步停住、另一个继续涨到 80。
-3. **关掉滑动窗口看后果**：把 `Transformer::new_kv_cache` 里的 `window` 改成 `0`（不丢弃），重新跑 demo 的生成 2——缓存长度会一路上涨到 91，模型被迫在 RoPE 外推区（训练只见过 `0..32`）做注意力，生成质量会明显劣化。这是"窗口不是可选项"最直观的证据。
+2. **打印两个计数器**：在 `MultiHeadAttention::forward` 的 `cache.append` 之后加一行 `println!("seq_len = {}, seen = {}", cache.seq_len(), cache.positions_seen());`，跑 demo 的生成 2，观察 `seq_len` 到第 22 步封顶在 32 之后不再增长，而 `positions_seen` 一路涨到 90（11 个 prompt token + 79 次增量前向）。
+3. **关掉滑动窗口看后果**：把 `Transformer::new_kv_cache` 里的 `window` 改成 `0`（不丢弃），重新跑 demo 的生成 2——缓存长度会一路上涨到 90，模型被迫在 RoPE 外推区（训练只见过 `0..32`）做注意力，生成质量会明显劣化。这是"窗口不是可选项"最直观的证据。
 4. **对比计算量**：对 `block_size=32`、prompt 11、`max_new=80`，按第 6 节的表分别估算两种模式累计前向的位置数，再和 demo 里两种模式的实测耗时比一比。
 5. **（进阶）Attention Sink 与量化的叠加**：sink 已实现在 `KvCacheOpts::sink`（CLI `--kv-sink`），
    缓存量化已实现在 `--kv-bits`。把两个开关一起打开跑长文本生成，对比"只开 sink""只量化""都开"

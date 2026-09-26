@@ -211,7 +211,48 @@ pub fn sample_from_probs(ids: &[usize], probs: &[f32], rng: &mut Rng) -> usize {
     ids.last().copied().unwrap_or(0)
 }
 
-/// 生成文本
+/// 这一轮生成是怎么停下来的
+///
+/// 三个结束条件（见 [`generate_with_reason`]）各对应一个变体。它存在的意义：
+/// 「模型一个字都没说」与「程序根本没跑」在终端上都表现为一行空白，只有把收尾原因
+/// 记下来，空白输出才可解释（聊天模式把原因写进日志，见 `cmd_chat`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// 采到 EOS：模型自己学出来的结束符号
+    Eos,
+    /// 命中 [`SampleOpts::stop`] 里的停止标记（模板标记兜底）
+    StopMark(&'static str),
+    /// 到达 `max_new` 上限，不是提前收尾
+    MaxNew,
+}
+
+/// 生成结果：全文、本轮新生成的部分、收尾原因
+#[derive(Clone, Debug)]
+pub struct GenOutput {
+    /// 完整文本（prompt + 新生成部分），与 [`generate`] 的返回值一致
+    pub text: String,
+    /// 本轮新生成的部分：已丢掉特殊 token、已按停止标记截断、**不含** prompt
+    pub generated: String,
+    /// 收尾原因
+    pub reason: StopReason,
+}
+
+/// 生成文本，只取全文（prompt + 新生成部分）。
+///
+/// 需要区分"这一轮生成了什么、为什么停下"时用 [`generate_with_reason`]。
+pub fn generate(
+    model: &Transformer,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_new: usize,
+    opts: &SampleOpts,
+    kv: KvOpts,
+    rng: &mut Rng,
+) -> String {
+    generate_with_reason(model, tokenizer, prompt, max_new, opts, kv, rng).text
+}
+
+/// 生成文本，并给出收尾原因与本轮新生成的部分。
 ///
 /// - prompt: 起始文本
 /// - max_new: 最多生成多少个新 token
@@ -222,7 +263,11 @@ pub fn sample_from_probs(ids: &[usize], probs: &[f32], rng: &mut Rng) -> usize {
 /// 1. 采到 EOS token（分词器带特殊 token 时；这是模型真正学过的结束符号）
 /// 2. `opts.stop` 里的字符串出现（模板停止标记，给没学 EOS 的老权重兜底）
 /// 3. 生成到 `max_new` 个 token
-pub fn generate(
+///
+/// [`GenOutput::generated`] 单独给出生成段，调用方不必再用 `prompt.len()` 去切全文：
+/// 那个字节偏移在"生成段为空"时会把整段切成空串，于是"模型没说话"与"程序出错"
+/// 长得一模一样。偏移本身还与"`decode` 丢掉特殊 token"这一实现细节耦合。
+pub fn generate_with_reason(
     model: &Transformer,
     tokenizer: &Tokenizer,
     prompt: &str,
@@ -230,7 +275,7 @@ pub fn generate(
     opts: &SampleOpts,
     kv: KvOpts,
     rng: &mut Rng,
-) -> String {
+) -> GenOutput {
     let block_size = model.cfg.block_size;
     // prompt 前面补 BOS：训练时每篇文档都以 BOS 开头（见 `data::encode_document`），
     // 推理从 BOS 起头才与训练分布一致。老分词器没有 BOS，行为不变。
@@ -242,6 +287,11 @@ pub fn generate(
     if ids.is_empty() {
         ids.push(0); // 空 prompt 且无 BOS：先喂一个 token，避免 0 长度上下文导致下标下溢
     }
+    // 生成段的起点：这之前的 token 全是「BOS + prompt」。`decode` 会在特殊 token（BOS）
+    // 处断开，所以前后两段分别 decode 再拼起来与整体 decode 结果一致，而调用方拿到的
+    // `generated` 就是纯粹的"本轮生成"，不必再按 `prompt.len()` 的字节偏移去切全文。
+    let n_prompt = ids.len();
+    let prompt_text = tokenizer.decode(&ids[..n_prompt]);
     let mut cache = kv.build(model);
     let eos = tokenizer.eos_id();
     // 字节级 BPE 的 UTF-8 约束：词表里有"半个汉字"，采样前要把它们排除（char 分词器返回 None）
@@ -297,7 +347,12 @@ pub fn generate(
         // 采到 EOS 就收：这是模型自己学出来的结束符号（训练时每段序列末尾都带它），
         // 比"等某个字符组合出现"可靠得多。EOS 本身不进结果。
         if eos == Some(next) {
-            return tokenizer.decode(&ids[..ids.len() - 1]);
+            let generated = tokenizer.decode(&ids[n_prompt..ids.len() - 1]);
+            return GenOutput {
+                text: format!("{prompt_text}{generated}"),
+                generated,
+                reason: StopReason::Eos,
+            };
         }
 
         // 命中停止标记就收：SFT 模板下模型答完会自己吐「。。」，
@@ -306,18 +361,32 @@ pub fn generate(
         //
         // 只在**新生成的部分**里查找：prompt 自己就含「用户：」（模板的一部分），
         // 对整个字符串搜索会立刻在 prompt 里命中，结果返回空白。
-        // 每步解码一次整串：长度上限就是 block_size，这点开销远小于一次前向。
+        // 每步解码一次生成段：长度上限就是 block_size，这点开销远小于一次前向。
         if !opts.stop.is_empty() {
-            let text = tokenizer.decode(&ids);
-            if let Some(generated) = text.get(prompt.len()..) {
-                if let Some(rel) = opts.stop.iter().filter_map(|s| generated.find(s)).min() {
-                    return text[..prompt.len() + rel].trim_end().to_string();
-                }
+            let raw = tokenizer.decode(&ids[n_prompt..]);
+            if let Some((rel, mark)) = opts
+                .stop
+                .iter()
+                .filter_map(|s| raw.find(s).map(|i| (i, *s)))
+                .min_by_key(|(i, _)| *i)
+            {
+                // `rel` 来自 `find`，一定落在字符边界上
+                let generated = raw[..rel].trim_end().to_string();
+                return GenOutput {
+                    text: format!("{prompt_text}{generated}"),
+                    generated,
+                    reason: StopReason::StopMark(mark),
+                };
             }
         }
     }
 
-    tokenizer.decode(&ids)
+    let generated = tokenizer.decode(&ids[n_prompt..]);
+    GenOutput {
+        text: format!("{prompt_text}{generated}"),
+        generated,
+        reason: StopReason::MaxNew,
+    }
 }
 
 /// Beam Search 生成：维护 `beam_size` 个候选序列，每步扩展后保留 top-k。
@@ -609,6 +678,30 @@ mod tests {
             cached.chars().count(),
             "滑动窗口下 cache 模式不应再提前结束：\nfull   = {full}\ncached = {cached}"
         );
+    }
+
+    /// `generate_with_reason` 要把「生成段」单独交出来，并把收尾原因说清楚：
+    /// 聊天模式下生成段为空就是终端上的一行空白，只有 `reason` 能解释它。
+    #[test]
+    fn test_generate_with_reason_separates_generated_text_and_reports_stop() {
+        let (model, tokenizer) = tiny_setup();
+        // prompt 里就含停止标记 "qz"：若搜索落到 prompt 上，开场就会命中并返回空回答
+        let prompt = "qzthe";
+        let mut o = opts();
+        o.stop = &["qz"];
+        let mut rng = Rng::new(99);
+        // 生成 1 个 token：生成段只有一个字符，拼不出两字符的停止标记，断言是确定的
+        let out = generate_with_reason(&model, &tokenizer, prompt, 1, &o, KvOpts::off(), &mut rng);
+        assert_ne!(out.reason, StopReason::StopMark("qz"), "停止标记只在生成段里查找");
+        assert_eq!(out.text, format!("{prompt}{}", out.generated), "全文 = prompt + 生成段");
+
+        // 停止标记落在生成段第 0 位（空标记的 find 恒为 0）：生成段为空、全文退回 prompt
+        o.stop = &[""];
+        let mut rng = Rng::new(99);
+        let out = generate_with_reason(&model, &tokenizer, prompt, 8, &o, KvOpts::off(), &mut rng);
+        assert_eq!(out.reason, StopReason::StopMark(""));
+        assert_eq!(out.generated, "", "生成段为空");
+        assert_eq!(out.text, prompt, "生成段为空时全文就是 prompt（旧写法在这里会切出空串）");
     }
 
     /// 重复惩罚要把"最近出现过"的 token 压下去。

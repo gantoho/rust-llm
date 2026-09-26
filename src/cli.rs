@@ -221,7 +221,9 @@ pub enum Cmd {
         /// SFT 语料路径（逗号分隔，可含 `*` 通配）；缺省用 config 里的 train.sft_file
         #[arg(long)]
         sft_file: Option<String>,
-        /// 微调步数（缺省用 config 里的 train.steps）
+        /// 微调步数；缺省按 SFT 语料大小推导（= config 的 train.steps 与「400 epoch」取小，
+        /// 评估间隔同步改成每 20 epoch 一次，见 `sft_schedule`）。
+        /// 显式给出就完全按这个数跑，不做任何收敛。
         #[arg(long)]
         steps: Option<usize>,
         /// 峰值学习率（缺省用 config 里 train.max_lr 的 1/10；SFT 要比预训练小一个量级才不冲掉已有能力）

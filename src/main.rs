@@ -61,7 +61,7 @@ use optim::{AdamW, Optimizer, SGD};
 use quant::{CalibOpts, HessOpts, QBits, QuantMethod, QuantOpts};
 use rng::Rng;
 use rope::RopeScaling;
-use sample::{KvOpts, SampleOpts, generate, probs_from_logits, sample_from_probs};
+use sample::{KvOpts, SampleOpts, StopReason, generate, generate_with_reason, probs_from_logits, sample_from_probs};
 use tensor::Tensor;
 use tokenizer::{BPETokenizer, CharTokenizer, Tokenizer};
 
@@ -1066,19 +1066,38 @@ fn trim_sft_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> Stri
     String::new()
 }
 
-/// SFT 模板下的停止标记：模型答完会自己吐 `。。`；
-/// 万一没学会收尾，它就会顺着模板编下一轮提问，所以 `用户：` 也是停止标记。
+/// SFT 模板下的停止标记（兜底用）。
+///
+/// 当前分词器带特殊 token，训练时每段对话的收尾符号是**可训练的 EOS**
+/// （见 `data::build_sft_stream` 的 `Some(id)` 分支），所以正常收尾靠 EOS 触发。
+/// 这里两个文本标记是保险：
+/// - `用户：` 防它顺着模板接着编下一轮提问（"回答后面跟提问"在训练语料里到处都是）；
+/// - `。。` 只对**老分词器**（没有 EOS、退回文本标记 [`SFT_END`]）训出来的权重有意义，
+///   当前 SFT 语料里 `。。` 从未出现过，实际不会命中。
 const SFT_STOP: &[&str] = &[SFT_END, SFT_USER];
 
-/// 把 `i` 向前收敛到最近的字符边界（`String` 按字节切片时用，避免切出非法 UTF-8）
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
+/// 把收尾原因说成一句人话。生成段为空时终端上只有一行空白，
+/// 不写清楚"模型没说话"还是"程序没跑"，用户无从判断（见 [`StopReason`]）。
+fn describe_stop(reason: StopReason) -> String {
+    match reason {
+        StopReason::Eos => "模型采到 EOS，自己收了尾".to_string(),
+        StopReason::StopMark(mark) => format!("模型开口就是停止标记「{mark}」，没答就转下一轮"),
+        StopReason::MaxNew => "生成到 --max-new 上限，内容全为空白".to_string(),
     }
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
+}
+
+/// 收尾原因的短标签，**每一轮**都写进运行日志。
+///
+/// 与 [`describe_stop`] 分开写：那句长话是给"空输出"解释用的，
+/// "开口就是停止标记「用户：」，没答就转下一轮"套在一段有内容的回答上是错的。
+/// 只记空输出的那几轮时，非空回答究竟是采到 EOS 还是命中停止标记停下的就查不到——
+/// 而这两种收尾写进历史的方式并不相同（见 `cmd_chat` 的历史更新）。
+fn stop_label(reason: StopReason) -> String {
+    match reason {
+        StopReason::Eos => "采到 EOS".to_string(),
+        StopReason::StopMark(mark) => format!("命中停止标记「{mark}」"),
+        StopReason::MaxNew => "跑满 --max-new 被截断".to_string(),
     }
-    i
 }
 
 /// 交互式对话模式
@@ -1281,25 +1300,50 @@ fn cmd_chat(
 
         // 每轮都重建缓存：上一轮的缓存对不上本轮重新裁剪过的 prompt，
         // 沿用会让模型看到"已被丢弃的历史"（见 `generate` 里的 KV 复用说明）。
-        let out = generate(&model, &tokenizer, &prompt, max_new, &opts, kv, &mut rng);
+        let out = generate_with_reason(&model, &tokenizer, &prompt, max_new, &opts, kv, &mut rng);
 
-        // 只打印新生成的部分（去掉 prompt 前缀）
-        let start = floor_char_boundary(&out, prompt.len());
-        let response = out[start..].trim();
-        logln!("{response}");
-        runlog::append(&format!("[第 {turn} 轮] 输出：{response}"));
+        // 生成段由 `generate_with_reason` 直接给出，不必再按 `prompt.len()` 的字节偏移去切全文
+        let response = out.generated.trim();
+        // 收尾原因**每轮**都记：只记空输出的那几轮，非空回答"是采到 EOS 还是被停止标记截住"
+        // 就查不到，只能靠猜；而两者的差别会体现在下一轮的上下文里。
+        let why = stop_label(out.reason);
+        if response.is_empty() {
+            // 空白必须可解释：模型一个字都没说，与"程序根本没跑"在终端上是同一行空白
+            logln!("[本轮无输出] {}", describe_stop(out.reason));
+            runlog::append(&format!("[第 {turn} 轮] 输出：（空）{why}"));
+        } else {
+            logln!("{response}");
+            runlog::append(&format!("[第 {turn} 轮] 输出：{response}（收尾：{why}）"));
+        }
 
         // 更新历史：历史 = 旧历史 + 本轮问答（不含 system，它单独拼接）。
         // 不要重复拼 `input`：prompt 里已含本轮输入，那会让每轮输入在窗口里占两份。
         // 长度控制交给下一轮开头的裁剪（按真实 token 数、SFT 模式下按轮）。
         context_history = history;
-        if !context_history.is_empty() {
-            context_history.push('\n');
-        }
         if use_sft {
-            // 写成模板形态，下一轮就能被 `trim_sft_history` 按轮切开
-            context_history.push_str(&format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n{response}"));
+            // 空回答整轮不写回：历史里一旦出现「助手：\n\n用户：」（助手什么都没说），
+            // 就成了训练语料里根本没有的 in-context 示范——模型会跟着一起沉默，
+            // 于是从某一轮起连续输出空白。裁剪按轮切，跳过整轮只影响"还能记住几轮"。
+            //
+            // 被 `--max-new` 硬截断的回答同样不写回。训练语料里助手回合都是短句，
+            // 后面紧跟「用户：」或 EOS；而截断的回答是一段没有收尾的半截话
+            // （实测末尾停在「…公司业」）。把这种"说了 200 个 token 还不收尾"的状态
+            // 喂回去，下一轮模型第一步就采到 EOS，此后每轮全空——见 `[本轮无输出]`。
+            let truncated = out.reason == StopReason::MaxNew;
+            if !response.is_empty() && truncated {
+                logln!("[info] 本轮回答被 --max-new={max_new} 截断（未收尾），不计入对话历史");
+            }
+            if !response.is_empty() && !truncated {
+                if !context_history.is_empty() {
+                    context_history.push('\n');
+                }
+                // 写成模板形态，下一轮就能被 `trim_sft_history` 按轮切开
+                context_history.push_str(&format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n{response}"));
+            }
         } else {
+            if !context_history.is_empty() {
+                context_history.push('\n');
+            }
             context_history.push_str(input);
             if !response.is_empty() {
                 context_history.push('\n');
@@ -1309,6 +1353,41 @@ fn cmd_chat(
     }
     runlog::append(&format!("\n对话结束：共 {} 轮", turn));
     runlog::finish();
+}
+
+/// SFT 的步数上限与评估间隔：按 **SFT 语料自己的 epoch** 推导，不沿用预训练那套数。
+///
+/// 配置里的 `steps`（4000）和 `eval_every`（200）是配 471.9 万字的预训练语料定的。
+/// SFT 语料常常只有一两万字，`steps_per_epoch` 只有几步，于是那两个数会同时出问题：
+///
+/// - `steps = 4000` 等于几千个 epoch。本例 SFT 语料 1.4 万字（一个 epoch ≈ 3 步），
+///   实测 2600 步时 train 2.68 / val 7.77，而 val 早在 600 步就见底了——多出来的步数
+///   全是过拟合；
+/// - `eval_every` 按"步数的 1/10"收到 200 步，两次评估之间隔了约 80 个 epoch，
+///   val 曲线上只有十几个点，"刚开始像样"的那一步很可能整个被跨过去（`best.ckpt`
+///   就落在这么粗的网格上）。
+///
+/// 所以这里改按 epoch 算：**每 20 个 epoch 评估一次**，步数上限 **400 个 epoch**
+/// （早停的 patience 10 次评估 ≈ 200 个 epoch，会先到，上限只是兜底）。
+/// `--steps` 显式给了就完全听它的，不做任何收敛。
+fn sft_schedule(
+    steps_per_epoch: usize,
+    cfg_steps: usize,
+    cfg_eval_every: usize,
+    steps_given: bool,
+) -> (usize, usize) {
+    /// 两次评估之间隔多少个 epoch
+    const EVAL_EVERY_EPOCHS: usize = 20;
+    /// 步数上限相当于多少个 epoch
+    const MAX_EPOCHS: usize = 400;
+
+    let eval_every = cfg_eval_every.min(steps_per_epoch * EVAL_EVERY_EPOCHS).max(1);
+    let steps = if steps_given {
+        cfg_steps
+    } else {
+        cfg_steps.min(steps_per_epoch * MAX_EPOCHS).max(1)
+    };
+    (steps, eval_every)
 }
 
 /// 监督微调（SFT）：用「提问→回答」语料教只会续写的预训练模型"回答"。
@@ -1331,6 +1410,7 @@ fn cmd_sft(
     // 学习率**不**默认沿用预训练量级：SFT 是在已收敛的权重上继续训，
     // 用预训练的步长会把预训练攒下的语言能力一起冲掉（实测几百步就退化成乱码）。
     // 未显式指定时取配置里 max_lr 的 1/10，并把实际取值记进日志。
+    let steps_given = steps.is_some();
     if let Some(s) = steps {
         cfg.train.steps = s;
     }
@@ -1343,12 +1423,8 @@ fn cmd_sft(
     };
     cfg.train.max_lr = max_lr;
     cfg.train.min_lr = max_lr * 0.1;
-    // 预热太长会让 SFT 大部分步数都耗在爬坡上
-    cfg.train.warmup_steps = cfg.train.warmup_steps.min(cfg.train.steps / 10).max(1);
-    // 评估间隔按步数收窄：配置里那是给预训练（上万步）的值，直接用在几百步的 SFT 上，
-    // 会把整段训练压成"只在最后评估一次"——best.ckpt 退化成 final.ckpt，
-    // 连续不改善才触发的早停也永远等不到第二次评估。收到约 1/10 就有十条曲线可看。
-    cfg.train.eval_every = cfg.train.eval_every.min(cfg.train.steps / 10).max(1);
+    // 步数上限 / 预热 / 评估间隔都得看 SFT 语料**实际有多大**，而语料要等权重和分词器
+    // 都加载完才能编码，所以这三项挪到下面 `SftLoader` 建好之后再算（见 `sft_schedule`）。
 
     let sft_paths = sft_file
         .map(str::to_string)
@@ -1368,9 +1444,6 @@ fn cmd_sft(
     };
     cfg.train.log_file = Some(format!("{out_dir}/sft.csv"));
 
-    runlog::json(&format!("完整配置（{config_path} + CLI 覆盖后）"), &cfg);
-    let tcfg = &cfg.train;
-
     // SFT 是"带 loss mask 的"训练，GPU 的常驻输出头路径不吃逐位置权重，整段会回落到
     // 逐算子路径。实测这条回落路径比纯 CPU 还慢（MX150：392 tok/s vs CPU 780 tok/s），
     // 长跑还会崩。用户多半是照着预训练的命令加 `--features gpu` 过来的，所以要说清楚。
@@ -1380,10 +1453,51 @@ fn cmd_sft(
          实测比纯 CPU 更慢。建议改用不带 `--features gpu` 的构建跑 SFT。"
     );
 
-    let (model, tokenizer, ckpt) = load_model_and_tokenizer(pretrained_path, tcfg, tcfg.seed, None);
+    // 先加载权重与语料：步数 / 评估间隔要按"SFT 语料究竟有多大"推导，而语料有多大
+    // 得先编码出来。这几行只借用 `&cfg.train` 读一下，用完立刻还回去，下面才能继续改它。
+    let (model, tokenizer, ckpt) = {
+        let t = &cfg.train;
+        load_model_and_tokenizer(pretrained_path, t, t.seed, None)
+    };
     // 语料可能散在多处，用逗号分隔（支持目录与 `*` 通配）。
     // 按文件加载而不是拼成一份：说话人角色是文件级属性，拼接会让后面文件的角色弄反。
     let sft_texts = load_texts(&sft_paths);
+    let loader = SftLoader::from_texts(
+        &sft_texts,
+        &tokenizer,
+        ckpt.model.block_size,
+        cfg.train.batch_size,
+    );
+
+    // 一个 epoch = 把整个 SFT 语料过一遍要多少步
+    let steps_per_epoch = loader
+        .num_tokens()
+        .div_ceil(cfg.train.batch_size * ckpt.model.block_size)
+        .max(1);
+    let (steps, eval_every) = sft_schedule(
+        steps_per_epoch,
+        cfg.train.steps,
+        cfg.train.eval_every,
+        steps_given,
+    );
+    if steps != cfg.train.steps || eval_every != cfg.train.eval_every {
+        logln!(
+            "[info] SFT 语料 {} token，1 epoch ≈ {steps_per_epoch} 步：\
+             步数上限 {} → {steps}、评估间隔 {} → {eval_every} 步（≈{} epoch）\
+             ——配置里那两个数是配预训练语料的",
+            loader.num_tokens(),
+            cfg.train.steps,
+            cfg.train.eval_every,
+            eval_every / steps_per_epoch,
+        );
+    }
+    cfg.train.steps = steps;
+    cfg.train.eval_every = eval_every;
+    // 预热太长会让 SFT 大部分步数都耗在爬坡上
+    cfg.train.warmup_steps = cfg.train.warmup_steps.min(cfg.train.steps / 10).max(1);
+
+    runlog::json(&format!("完整配置（{config_path} + CLI 覆盖后）"), &cfg);
+    let tcfg = &cfg.train;
 
     runlog::fields(
         "本次运行参数",
@@ -1405,12 +1519,6 @@ fn cmd_sft(
     );
 
     let mut rng = Rng::new(tcfg.seed);
-    let loader = SftLoader::from_texts(
-        &sft_texts,
-        &tokenizer,
-        ckpt.model.block_size,
-        tcfg.batch_size,
-    );
     logln!(
         "SFT 语料：{} 段对话，打包 {} token | 监督位置（回答段）占 {:.1}%",
         loader.num_conversations(),
@@ -1750,7 +1858,7 @@ fn cmd_bench(steps: usize, gen_tokens: usize) {
 
     let prompt = "Once upon a time";
     let prompt_len = tokenizer.encode(prompt).len();
-    // KV cache 模式下上下文总长达到 block_size 就会停，这里取不超过该上限
+    // 生成长度限制在 block_size 内：滑动窗口下缓存已不会提前停，这里只是控制测量规模
     let kv_new = gen_tokens.min(gcfg.block_size.saturating_sub(prompt_len + 1));
     let kv_secs = bench_generate(&model, &tokenizer, prompt, kv_new, KvOpts::on(0, None), 5);
     println!(
