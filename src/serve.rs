@@ -1,0 +1,2091 @@
+//! HTTP API 服务：把模型包装成 OpenAI 兼容的接口。
+//!
+//! 提供的端点：
+//! - `POST /v1/chat/completions` —— 对话补全，`stream=true` 时走 SSE 流式
+//! - `POST /v1/embeddings` —— 文本向量化（最后一层 hidden 按行均值池化）
+//! - `GET  /v1/models` —— 只有一个模型的模型列表
+//! - `GET  /health` —— 存活探针
+//! - `GET  /v1/status` —— 队列/计数/模型信息（诊断用，不鉴权）
+//! - `GET  /openapi.json` / `/openapi.yaml` —— 本服务的 OpenAPI 规范（不鉴权）
+//!
+//! 并发模型：主线程 accept，每个请求 `spawn` 一个线程；模型是**单份**的，
+//! 所有生成请求共用一把 `Mutex`（`with_core`），因此实际生成是串行排队的，
+//! `/v1/status` 里的 `queued` 就是这条队列的长度。
+//!
+//! 之所以选"单模型 + 互斥"而不是多副本：单机 CPU 推理时多副本只会互相抢核心，
+//! 排队反而让延迟曲线平稳；要真并发得开多进程（另起端口）或上 GPU。
+
+use std::collections::HashMap;
+use std::io::{self, Cursor, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+use crate::data::{SFT_ASSISTANT, SFT_USER};
+use crate::model::Transformer;
+use crate::prompt;
+use crate::rng::Rng;
+use crate::sample::{Generator, KvOpts, SampleOpts, StopReason};
+use crate::tokenizer::Tokenizer;
+
+/// 请求体上限：本项目的 prompt 预算也就上下文窗口那么大，2 MB 绰绰有余
+const MAX_BODY: usize = 2 * 1024 * 1024;
+/// 单次请求最多带多少条消息（防止有人拿一万个 message 把内存撑爆）
+const MAX_MESSAGES: usize = 200;
+/// 单次请求最多带几个 `stop` 字符串
+const MAX_STOPS: usize = 4;
+/// 单个 `stop` 字符串的最大字节数（防止拿它当内存缓冲用）
+const MAX_STOP_LEN: usize = 64;
+/// 停止标记切片池上限：每种**组合**泄漏一份 `&'static [&'static str]`
+const MAX_STOP_SLICES: usize = 256;
+/// 不同的停止标记字符串上限：每个字符串只泄漏一次，按出现过的种类封顶
+const MAX_STOP_STRINGS: usize = 1024;
+/// `/v1/embeddings` 单批最多多少条输入
+const MAX_EMBED_BATCH: usize = 32;
+
+// ==================== 服务状态 ====================
+
+/// 服务的静态配置（启动时定死，请求不可改）
+pub struct ServeCfg {
+    pub host: String,
+    pub port: u16,
+    /// `Some` = 要求 `Authorization: Bearer <key>`；`None` = 不鉴权
+    pub api_key: Option<String>,
+    /// 是否回 CORS 头（浏览器页面直连调试用）
+    pub cors: bool,
+    /// 服务级 system prompt（请求里的 system 会**接在它后面**）
+    pub system: String,
+    /// 用 SFT 对话模板还是裸续写（同 `chat --prompt-format`）
+    pub use_sft: bool,
+    /// `max_tokens` 缺省时用的生成上限
+    pub max_new: usize,
+    /// 不带 `seed` 字段时的随机种子
+    pub seed: u64,
+    pub kv: KvOpts,
+    /// 回给客户端的模型名（OpenAI 客户端会校验它）
+    pub model_name: String,
+    /// 采样默认值（请求里的同名字段可逐个覆盖）
+    pub sample: SampleOpts,
+    /// 上下文窗口（用于限制 `max_tokens` 与 embedding 输入长度）
+    pub block_size: usize,
+}
+
+/// 独占的模型核心：一次只有一个线程能碰到它
+struct Core {
+    model: Transformer,
+    tokenizer: Tokenizer,
+    /// 不带 `seed` 的请求共用它（同服务实例下连续请求的随机性来源）
+    rng: Rng,
+}
+
+/// 计数器，全部是原子量：任何线程都能在不碰 `Core` 的情况下读写
+#[derive(Default)]
+struct Stats {
+    /// 已进队但还没拿到锁的请求数
+    queued: AtomicUsize,
+    /// 正在跑生成/编码的请求数
+    running: AtomicUsize,
+    chat: AtomicUsize,
+    stream: AtomicUsize,
+    embeddings: AtomicUsize,
+    errors: AtomicUsize,
+}
+
+/// 服务的全部运行时状态，`Arc` 共享给每个请求线程
+struct State {
+    cfg: ServeCfg,
+    core: Mutex<Core>,
+    stats: Stats,
+    /// `time.time()`，回给客户端当 `created` 字段
+    created: u64,
+    /// 进程启动时刻（算 uptime）
+    started: Instant,
+}
+
+/// 当前 Unix 时间戳（秒）
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ==================== 停止标记驻留（interner） ====================
+
+/// 全局字符串/切片驻留表。
+///
+/// `SampleOpts.stop` 是 `&'static [&'static str]`（为了保持 `Copy`，见该字段文档），
+/// 但 HTTP 请求里的 `stop` 是**运行时才知道的字符串**。两者要兼容，只能把它"钉"成静态：
+/// 字符串 `Box::leak` 成 `&'static str`，切片 `Box::leak` 成 `&'static [&'static str]`。
+///
+/// 泄漏是有界的：字符串按**去重后的种类**封顶 [`MAX_STOP_STRINGS`]，
+/// 切片按**去重后的组合**封顶 [`MAX_STOP_SLICES`]——同一组 stop 反复请求只泄漏一份。
+#[derive(Default)]
+struct Interner {
+    strings: HashMap<String, &'static str>,
+    slices: Vec<&'static [&'static str]>,
+    combo: HashMap<Vec<String>, &'static [&'static str]>,
+}
+
+static INTERN: LazyLock<Mutex<Interner>> = LazyLock::new(|| Mutex::new(Interner::default()));
+
+/// 把一组运行时 stop 字符串换成静态切片（`SampleOpts::stop` 需要的类型）。
+fn intern_stops(items: &[String]) -> Result<&'static [&'static str], ApiError> {
+    if items.len() > MAX_STOPS {
+        return Err(bad(format!("stop 最多 {MAX_STOPS} 个字符串")));
+    }
+    for s in items {
+        if s.is_empty() {
+            return Err(bad("stop 里的字符串不能为空"));
+        }
+        if s.len() > MAX_STOP_LEN {
+            return Err(bad(format!("单个 stop 最长 {MAX_STOP_LEN} 字节")));
+        }
+    }
+    if items.is_empty() {
+        return Ok(&[]);
+    }
+    let mut intern = INTERN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = intern.combo.get(items) {
+        return Ok(*hit);
+    }
+    if intern.slices.len() >= MAX_STOP_SLICES {
+        return Err(bad(format!("本次进程见过的不同 stop 组合已达上限 {MAX_STOP_SLICES}")));
+    }
+    let mut ptrs = Vec::with_capacity(items.len());
+    for s in items {
+        if intern.strings.len() >= MAX_STOP_STRINGS && !intern.strings.contains_key(s) {
+            return Err(bad(format!("本次进程见过的不同 stop 字符串已达上限 {MAX_STOP_STRINGS}")));
+        }
+        // get 返回 `&&'static str`（哈希表存的是引用），闭包返回 `&'static str`，
+        // 两边类型对不上，只能 match 分开出（不能靠 unwrap_or_else 合流）
+        let p: &'static str = match intern.strings.get(s) {
+            Some(p) => p,
+            None => {
+                let p: &'static str = Box::leak(s.clone().into_boxed_str());
+                intern.strings.insert(s.clone(), p);
+                p
+            }
+        };
+        ptrs.push(p);
+    }
+    let slice: &'static [&'static str] = Box::leak(ptrs.into_boxed_slice());
+    intern.slices.push(slice);
+    intern.combo.insert(items.to_vec(), slice);
+    Ok(slice)
+}
+
+// ==================== 错误 ====================
+
+/// OpenAI 风格的错误：`status` 决定 HTTP 码，`kind` 是 `error.type`
+#[derive(Debug)]
+struct ApiError {
+    status: u16,
+    kind: &'static str,
+    message: String,
+}
+
+fn bad(message: impl Into<String>) -> ApiError {
+    ApiError { status: 400, kind: "invalid_request_error", message: message.into() }
+}
+
+fn server_err(message: impl Into<String>) -> ApiError {
+    ApiError { status: 500, kind: "server_error", message: message.into() }
+}
+
+impl ApiError {
+    fn to_value(&self) -> Value {
+        json!({
+            "error": {
+                "message": self.message,
+                "type": self.kind,
+                "code": self.status,
+            }
+        })
+    }
+}
+
+// ==================== 拿到模型 ====================
+
+/// 拿一把 `Core` 锁并跑 `f`，顺带维护排队/运行计数、把 panic 转成 500。
+///
+/// 三件事必须在这里做，否则各调用点会各漏一个：
+/// - **排队计数**：进锁前 +1、拿到锁后 -1，`/v1/status` 才能看见"有多少人在等"；
+/// - **panic 隔离**：字符分词器遇到词表外的字符会直接 panic（见 `tokenizer.rs`），
+///   HTTP 线程上炸了会让整个进程退；转成 500 客户端才知道是输入的问题；
+/// - **锁中毒**：上面那条 panic 发生时 Mutex 会被标记中毒，下一个人得能把锁打开
+///   （`into_inner`），否则服务从此不可用。
+fn with_core<R>(state: &Arc<State>, f: impl FnOnce(&mut Core) -> R) -> Result<R, ApiError> {
+    state.stats.queued.fetch_add(1, Ordering::SeqCst);
+    let mut core = state.core.lock().unwrap_or_else(|e| e.into_inner());
+    state.stats.queued.fetch_sub(1, Ordering::SeqCst);
+    state.stats.running.fetch_add(1, Ordering::SeqCst);
+    let guard = RunGuard(&state.stats);
+    let res = catch_unwind(AssertUnwindSafe(|| f(&mut core)));
+    drop(guard);
+    res.map_err(|_| {
+        server_err("生成过程发生 panic：输入可能含分词器词表外的字符（如 emoji 或生僻字）")
+    })
+}
+
+/// 退出作用域时把 `running` 减回去（panic 路径也不能漏）
+struct RunGuard<'a>(&'a Stats);
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// ==================== HTTP 小工具 ====================
+
+/// 取请求头（大小写不敏感）。
+///
+/// 不能用 `HeaderField::equiv`——它要求 `&'static str`，请求头名是运行时的值。
+fn header_value(req: &Request, name: &str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// 造一个静态常量响应头（`Header::from_bytes` 对 ASCII 字面量恒成功）
+fn header(name: &'static str, value: &'static str) -> Header {
+    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("静态响应头恒为合法 ASCII")
+}
+
+/// 开了 `--cors` 就补上跨域头
+fn with_cors<R: Read>(state: &Arc<State>, resp: Response<R>) -> Response<R> {
+    if !state.cfg.cors {
+        return resp;
+    }
+    resp.with_header(header("Access-Control-Allow-Origin", "*"))
+        .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
+        .with_header(header("Access-Control-Allow-Headers", "Content-Type, Authorization"))
+        .with_header(header("Access-Control-Max-Age", "600"))
+}
+
+/// 发一个 JSON 响应，返回状态码（供请求日志记录）。
+///
+/// 必须自己写 `Content-Type: application/json`：`Response::from_string` 恒回 `text/plain`。
+/// `data_length=Some(len)` 让 tiny_http 走 `Content-Length` 而不是 chunked。
+fn reply_json(req: Request, state: &Arc<State>, status: u16, body: &Value) -> u16 {
+    let bytes = serde_json::to_vec(body).unwrap_or_else(|e| {
+        format!(r#"{{"error":{{"message":"响应序列化失败：{e}","type":"server_error"}}}}"#).into_bytes()
+    });
+    let len = bytes.len();
+    let resp = Response::new(
+        StatusCode(status),
+        vec![header("Content-Type", "application/json; charset=utf-8")],
+        Cursor::new(bytes),
+        Some(len),
+        None,
+    );
+    let _ = req.respond(with_cors(state, resp));
+    status
+}
+
+/// 发一个任意文本类型的响应（`/openapi.yaml` 用），返回状态码。
+///
+/// 与 [`reply_json`] 的差别只在 `Content-Type`；同样给 `Content-Length`。
+fn reply_text(
+    req: Request,
+    state: &Arc<State>,
+    status: u16,
+    mime: &'static str,
+    body: String,
+) -> u16 {
+    let bytes = body.into_bytes();
+    let len = bytes.len();
+    let resp = Response::new(
+        StatusCode(status),
+        vec![header("Content-Type", mime)],
+        Cursor::new(bytes),
+        Some(len),
+        None,
+    );
+    let _ = req.respond(with_cors(state, resp));
+    status
+}
+
+/// 发一个错误响应；顺带把 `errors` 计数 +1（诊断"客户端在踩哪类坑"）
+fn reply_err(req: Request, state: &Arc<State>, err: ApiError) -> u16 {
+    state.stats.errors.fetch_add(1, Ordering::SeqCst);
+    let status = err.status;
+    reply_json(req, state, status, &err.to_value())
+}
+
+/// 读完整个请求体（限长 + UTF-8 校验）
+fn read_body(req: &mut Request) -> Result<String, ApiError> {
+    if let Some(n) = req.body_length()
+        && n > MAX_BODY
+    {
+        return Err(too_large());
+    }
+    let mut buf = String::new();
+    let n = req
+        .as_reader()
+        .take(MAX_BODY as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|e| bad(format!("读取请求体失败（非 UTF-8 或连接中断）：{e}")))?;
+    if n > MAX_BODY {
+        return Err(too_large());
+    }
+    Ok(buf)
+}
+
+fn too_large() -> ApiError {
+    ApiError { status: 413, kind: "invalid_request_error", message: format!("请求体超过 {MAX_BODY} 字节") }
+}
+
+/// 校验 `Authorization: Bearer <key>`
+fn check_auth(req: &Request, state: &Arc<State>) -> Result<(), ApiError> {
+    let Some(expected) = state.cfg.api_key.as_deref() else {
+        return Ok(());
+    };
+    let raw = header_value(req, "authorization").unwrap_or_default();
+    let raw = raw.trim();
+    let token = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("bearer ") {
+        raw[7..].trim()
+    } else {
+        ""
+    };
+    if token == expected {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: 401,
+            kind: "authentication_error",
+            message: "缺少或错误的 API key（请带 `Authorization: Bearer <key>`）".into(),
+        })
+    }
+}
+
+// ==================== 路由 ====================
+
+/// 单个请求的入口：分发到具体处理器，返回 HTTP 状态码
+fn route(mut req: Request, state: &Arc<State>) -> u16 {
+    // 预检请求：浏览器跨域前先问一句"允许我带 Authorization 吗"
+    if matches!(req.method(), Method::Options) {
+        let resp = with_cors(state, Response::empty(StatusCode(204)));
+        let _ = req.respond(resp);
+        return 204;
+    }
+    // 只看路径，忽略查询串
+    let path = req.url().split('?').next().unwrap_or("/").to_string();
+    let is_get = matches!(req.method(), Method::Get);
+    let is_post = matches!(req.method(), Method::Post);
+
+    match path.as_str() {
+        "/health" if is_get => reply_json(
+            req,
+            state,
+            200,
+            &json!({ "status": "ok", "model": state.cfg.model_name }),
+        ),
+        "/v1/models" if is_get => {
+            // OpenAI 的 /v1/models 是要鉴权的：它会暴露服务上有哪些模型
+            if let Err(e) = check_auth(&req, state) {
+                return reply_err(req, state, e);
+            }
+            reply_json(
+                req,
+                state,
+                200,
+                &json!({
+                    "object": "list",
+                    "data": [{
+                        "id": state.cfg.model_name,
+                        "object": "model",
+                        "created": state.created,
+                        "owned_by": "local",
+                    }],
+                }),
+            )
+        }
+        "/v1/status" if is_get => {
+            let s = &state.stats;
+            reply_json(
+                req,
+                state,
+                200,
+                &json!({
+                    "status": "ok",
+                    "uptime_seconds": state.started.elapsed().as_secs(),
+                    "queue": {
+                        "queued": s.queued.load(Ordering::SeqCst),
+                        "running": s.running.load(Ordering::SeqCst),
+                    },
+                    "requests": {
+                        "chat": s.chat.load(Ordering::SeqCst),
+                        "stream": s.stream.load(Ordering::SeqCst),
+                        "embeddings": s.embeddings.load(Ordering::SeqCst),
+                        "errors": s.errors.load(Ordering::SeqCst),
+                    },
+                    "model": {
+                        "name": state.cfg.model_name,
+                        "block_size": state.cfg.block_size,
+                        "max_new": state.cfg.max_new,
+                        "prompt_format": if state.cfg.use_sft { "sft" } else { "raw" },
+                    },
+                }),
+            )
+        }
+        // OpenAPI 规范：给 Swagger UI / Postman / Apifox 直接导入，
+        // 与实际路由同源生成，改了路由这里不会过期，因此不鉴权。
+        "/openapi.json" if is_get => reply_text(
+            req,
+            state,
+            200,
+            "application/json; charset=utf-8",
+            // 规范是给人读、给 Postman/Apifox 导入的，缩进输出便于阅读与 git diff
+            serde_json::to_string_pretty(&openapi_spec(&state.cfg))
+                .unwrap_or_else(|_| "{}".into()),
+        ),
+        "/openapi.yaml" if is_get => reply_text(
+            req,
+            state,
+            200,
+            "text/yaml; charset=utf-8",
+            json_to_yaml(&openapi_spec(&state.cfg)),
+        ),
+        "/v1/chat/completions" if is_post => {
+            if let Err(e) = check_auth(&req, state) {
+                return reply_err(req, state, e);
+            }
+            let body = match read_body(&mut req) {
+                Ok(b) => b,
+                Err(e) => return reply_err(req, state, e),
+            };
+            let job = match parse_chat(&body, &state.cfg) {
+                Ok(j) => j,
+                Err(e) => return reply_err(req, state, e),
+            };
+            state.stats.chat.fetch_add(1, Ordering::SeqCst);
+            if job.stream {
+                state.stats.stream.fetch_add(1, Ordering::SeqCst);
+                return stream_reply(req, state, job);
+            }
+            match run_chat(state, job) {
+                Ok(v) => reply_json(req, state, 200, &v),
+                Err(e) => reply_err(req, state, e),
+            }
+        }
+        "/v1/embeddings" if is_post => {
+            if let Err(e) = check_auth(&req, state) {
+                return reply_err(req, state, e);
+            }
+            let body = match read_body(&mut req) {
+                Ok(b) => b,
+                Err(e) => return reply_err(req, state, e),
+            };
+            match run_embeddings(state, &body) {
+                Ok(v) => {
+                    state.stats.embeddings.fetch_add(1, Ordering::SeqCst);
+                    reply_json(req, state, 200, &v)
+                }
+                Err(e) => reply_err(req, state, e),
+            }
+        }
+        _ if is_get || is_post => reply_err(
+            req,
+            state,
+            ApiError { status: 404, kind: "not_found", message: format!("未知路径 {path}") },
+        ),
+        _ => {
+            // 先取方法名再移动 `req`：参数从左到右求值，写在 reply_err 实参里会"先 move 后借用"
+            let method = req.method().as_str().to_string();
+            reply_err(
+                req,
+                state,
+                ApiError {
+                    status: 405,
+                    kind: "invalid_request_error",
+                    message: format!("不支持的方法 {method}（可用：GET / POST / OPTIONS）"),
+                },
+            )
+        }
+    }
+}
+
+/// 一个请求 = 一个线程：这里只负责"记日志 + 分发"
+fn handle(req: Request, state: Arc<State>) {
+    let started = Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.url().split('?').next().unwrap_or("/").to_string();
+    let status = route(req, &state);
+    logln!(
+        "[serve] {method} {path} → {status}（{:.0}ms）",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
+// ==================== OpenAPI 规范 ====================
+
+/// 生成本服务的 OpenAPI 3.1 规范。
+///
+/// 与路由**同源**：这里写的路径、字段约束逐条对应 `route()` 与 `parse_chat()` 的实现，
+/// 改动任一侧都要同步另一侧，`openapi_spec_covers_every_route` 测试会盯着关键项。
+///
+/// 只依赖 `&ServeCfg`（不依赖 `State`），是为了能在没有模型的单测里直接构造。
+fn openapi_spec(cfg: &ServeCfg) -> Value {
+    let base = format!("http://{}:{}", cfg.host, cfg.port);
+    let health = json!({
+        "tags": ["health"],
+        "summary": "存活探针",
+        "description": "不鉴权。进程活着就回 200，给网关/负载均衡当探针用。",
+        "security": [],
+        "responses": {
+            "200": {
+                "description": "服务正常",
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+            }
+        }
+    });
+    let status = json!({
+        "tags": ["health"],
+        "summary": "队列与计数（诊断用）",
+        "description": "不鉴权。看当前排队/运行中的请求数、各类请求累计计数与模型配置。",
+        "security": [],
+        "responses": {
+            "200": {
+                "description": "当前状态",
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } }
+            }
+        }
+    });
+    let models = json!({
+        "tags": ["models"],
+        "summary": "模型列表",
+        "description": "OpenAI 风格的模型列表。本服务只加载一个 checkpoint，所以 data 恒为一条。",
+        "responses": {
+            "200": {
+                "description": "模型列表",
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelList" } } }
+            },
+            "401": { "$ref": "#/components/responses/Unauthorized" },
+            "405": { "$ref": "#/components/responses/MethodNotAllowed" }
+        }
+    });
+    let openapi_json = json!({
+        "tags": ["health"],
+        "summary": "OpenAPI 规范（JSON）",
+        "description": "不鉴权。本文件自身，可直接喂给 Swagger UI / Postman / Apifox。",
+        "security": [],
+        "responses": {
+            "200": {
+                "description": "OpenAPI 3.1 文档",
+                "content": { "application/json": { "schema": { "type": "object" } } }
+            }
+        }
+    });
+    let openapi_yaml = json!({
+        "tags": ["health"],
+        "summary": "OpenAPI 规范（YAML）",
+        "description": "不鉴权。与 /openapi.json 同源，只是序列化格式不同。",
+        "security": [],
+        "responses": {
+            "200": {
+                "description": "OpenAPI 3.1 文档",
+                "content": { "text/yaml": { "schema": { "type": "object" } } }
+            }
+        }
+    });
+    let chat = json!({
+        "tags": ["chat"],
+        "summary": "对话补全（可流式）",
+        "description": concat!(
+            "本服务的核心端点。\n",
+            "`stream=false`（缺省）回一个完整的 chat.completion 对象；\n",
+            "`stream=true` 回 SSE（`text/event-stream`），帧顺序为：",
+            "role 帧 → content 增量帧… → finish_reason 帧 → usage 帧 → `data: [DONE]`。\n",
+            "单份模型互斥排队，多个并发请求会依次执行；客户端断开连接会立即中止本次生成。\n",
+            "未在 schema 中声明的字段一律忽略（OpenAI 客户端带的 `user`、`logit_bias` 等不会报错），",
+            "声明了的字段严格校验。"
+        ),
+        "requestBody": {
+            "required": true,
+            "content": {
+                "application/json": { "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" } }
+            }
+        },
+        "responses": {
+            "200": {
+                "description": "补全结果（非流式为 JSON，流式为 SSE 事件流）",
+                "content": {
+                    "application/json": {
+                        "schema": { "$ref": "#/components/schemas/ChatCompletionResponse" }
+                    },
+                    "text/event-stream": {
+                        "schema": {
+                            "type": "string",
+                            "description": "每帧形如 `data: {…}\\n\\n`，最后一帧是 `data: [DONE]`；\
+                                           增量帧的结构见 ChatCompletionChunk。"
+                        }
+                    }
+                }
+            },
+            "400": { "$ref": "#/components/responses/BadRequest" },
+            "401": { "$ref": "#/components/responses/Unauthorized" },
+            "405": { "$ref": "#/components/responses/MethodNotAllowed" },
+            "500": { "$ref": "#/components/responses/ServerError" }
+        }
+    });
+    let embeddings = json!({
+        "tags": ["embeddings"],
+        "summary": "文本向量化",
+        "description": format!(
+            "取模型最后一层 hidden states 按 token 均值池化成一个向量。\n\
+             `input` 可以是字符串、token id，或它们的数组（一批最多 {MAX_EMBED_BATCH} 条）；\
+             超长输入只保留窗口内的尾部。"
+        ),
+        "requestBody": {
+            "required": true,
+            "content": {
+                "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingRequest" } }
+            }
+        },
+        "responses": {
+            "200": {
+                "description": "向量列表",
+                "content": {
+                    "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingResponse" } }
+                }
+            },
+            "400": { "$ref": "#/components/responses/BadRequest" },
+            "401": { "$ref": "#/components/responses/Unauthorized" },
+            "405": { "$ref": "#/components/responses/MethodNotAllowed" },
+            "500": { "$ref": "#/components/responses/ServerError" }
+        }
+    });
+
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "llm-from-scratch 本地模型 API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": concat!(
+                "把本项目训练/微调出的单个 checkpoint 包装成 OpenAI 兼容接口。\n",
+                "特性：SSE 流式输出、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志、/v1/status 队列诊断。"
+            ),
+            "license": { "name": "MIT" }
+        },
+        "servers": [{ "url": base, "description": "启动时监听的地址（见 --host / --port）" }],
+        "tags": [
+            { "name": "chat", "description": "对话补全" },
+            { "name": "embeddings", "description": "向量化" },
+            { "name": "models", "description": "模型信息" },
+            { "name": "health", "description": "探针与自描述（不鉴权）" }
+        ],
+        // 全局默认要鉴权；health/status/openapi 各自用 "security": [] 关掉
+        "security": [{ "bearerAuth": [] }],
+        "paths": {
+            "/health": { "get": health },
+            "/v1/status": { "get": status },
+            "/v1/models": { "get": models },
+            "/openapi.json": { "get": openapi_json },
+            "/openapi.yaml": { "get": openapi_yaml },
+            "/v1/chat/completions": { "post": chat },
+            "/v1/embeddings": { "post": embeddings }
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。"
+                }
+            },
+            "responses": {
+                "BadRequest": {
+                    "description": "请求有误（字段缺失、类型错、超限等），`error.type` 为 invalid_request_error",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+                },
+                "Unauthorized": {
+                    "description": "缺少或错误的 Authorization 头，`error.type` 为 authentication_error",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+                },
+                "MethodNotAllowed": {
+                    "description": "该路径不支持此 HTTP 方法",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+                },
+                "ServerError": {
+                    "description": "生成/编码过程出错，`error.type` 为 server_error。\
+                                    注意：SSE 已经开始下发后只能在流内发一个 error 帧，拿不到本响应。",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+                }
+            },
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": {
+                        "error": {
+                            "type": "object",
+                            "required": ["message", "type", "code"],
+                            "properties": {
+                                "message": { "type": "string", "description": "给开发者看的中文错误说明" },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["invalid_request_error", "authentication_error", "not_found", "server_error"]
+                                },
+                                "code": { "type": "integer", "description": "与 HTTP 状态码相同" }
+                            }
+                        }
+                    }
+                },
+                "Health": {
+                    "type": "object",
+                    "required": ["status", "model"],
+                    "properties": {
+                        "status": { "type": "string", "const": "ok" },
+                        "model": { "type": "string", "description": "checkpoint 文件名" }
+                    }
+                },
+                "Status": {
+                    "type": "object",
+                    "required": ["status", "queue", "requests", "model"],
+                    "properties": {
+                        "status": { "type": "string", "const": "ok" },
+                        "uptime_seconds": { "type": "integer" },
+                        "queue": {
+                            "type": "object",
+                            "description": "queued = 已进队还没拿到模型锁；running = 正在生成/编码",
+                            "properties": {
+                                "queued": { "type": "integer" },
+                                "running": { "type": "integer" }
+                            }
+                        },
+                        "requests": {
+                            "type": "object",
+                            "properties": {
+                                "chat": { "type": "integer", "description": "非流式请求数" },
+                                "stream": { "type": "integer", "description": "流式请求数" },
+                                "embeddings": { "type": "integer" },
+                                "errors": { "type": "integer" }
+                            }
+                        },
+                        "model": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "block_size": { "type": "integer" },
+                                "max_new": { "type": "integer" },
+                                "prompt_format": { "type": "string", "enum": ["sft", "raw"] }
+                            }
+                        }
+                    }
+                },
+                "ModelList": {
+                    "type": "object",
+                    "required": ["object", "data"],
+                    "properties": {
+                        "object": { "type": "string", "const": "list" },
+                        "data": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "object", "created", "owned_by"],
+                                "properties": {
+                                    "id": { "type": "string", "description": "checkpoint 文件名" },
+                                    "object": { "type": "string", "const": "model" },
+                                    "created": { "type": "integer" },
+                                    "owned_by": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "ChatMessage": {
+                    "type": "object",
+                    "required": ["role", "content"],
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["system", "developer", "user", "assistant"],
+                            "description": "system/developer 汇成人设，最后一条必须是 user"
+                        },
+                        "content": { "type": "string" }
+                    }
+                },
+                "ChatCompletionRequest": {
+                    "type": "object",
+                    "required": ["messages"],
+                    "additionalProperties": true,
+                    "description": "认识的字段严格校验，不认识的忽略",
+                    "properties": {
+                        "model": {
+                            "type": "string",
+                            "description": "可选；服务端固定用启动时加载的 checkpoint，该字段被忽略"
+                        },
+                        "messages": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": MAX_MESSAGES,
+                            "items": { "$ref": "#/components/schemas/ChatMessage" }
+                        },
+                        "temperature": {
+                            "type": "number", "minimum": 0, "maximum": 5,
+                            "description": "缺省用服务级 --temperature"
+                        },
+                        "top_k": { "type": "integer", "minimum": 0, "maximum": 10_000, "description": "0 = 不限制" },
+                        "top_p": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+                        "repetition_penalty": { "type": "number", "minimum": 0.1, "maximum": 10 },
+                        "repetition_window": { "type": "integer", "minimum": 0, "maximum": 100_000 },
+                        "stop": {
+                            "description": "缺省用服务级停止标记（SFT 模板标记）",
+                            "oneOf": [
+                                { "type": "string", "minLength": 1, "maxLength": MAX_STOP_LEN },
+                                {
+                                    "type": "array",
+                                    "minItems": 1, "maxItems": MAX_STOPS,
+                                    "items": { "type": "string", "minLength": 1, "maxLength": MAX_STOP_LEN }
+                                }
+                            ]
+                        },
+                        "max_tokens": {
+                            "type": "integer", "minimum": 1,
+                            "description": "缺省用服务级 --max-new；超过 block_size 会被钳到窗口内"
+                        },
+                        "seed": { "type": "integer", "minimum": 0, "description": "不给则用服务级 --seed" },
+                        "stream": { "type": "boolean", "default": false },
+                        "n": { "type": "integer", "const": 1, "description": "本服务一次只生成一个回答" }
+                    }
+                },
+                "ChatCompletionResponse": {
+                    "type": "object",
+                    "required": ["id", "object", "created", "model", "choices", "usage"],
+                    "properties": {
+                        "id": { "type": "string", "examples": ["chatcmpl-1"] },
+                        "object": { "type": "string", "const": "chat.completion" },
+                        "created": { "type": "integer" },
+                        "model": { "type": "string" },
+                        "choices": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": { "type": "integer", "const": 0 },
+                                    "message": {
+                                        "type": "object",
+                                        "properties": {
+                                            "role": { "type": "string", "const": "assistant" },
+                                            "content": { "type": "string" }
+                                        }
+                                    },
+                                    "finish_reason": { "type": "string", "enum": ["stop", "length"] },
+                                    "logprobs": { "type": "null" }
+                                }
+                            }
+                        },
+                        "usage": { "$ref": "#/components/schemas/Usage" }
+                    }
+                },
+                "ChatCompletionChunk": {
+                    "type": "object",
+                    "description": "SSE 每一帧 data: 后面的 JSON（usage 帧的 choices 是空数组）",
+                    "required": ["id", "object", "created", "model", "choices"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "object": { "type": "string", "const": "chat.completion.chunk" },
+                        "created": { "type": "integer" },
+                        "model": { "type": "string" },
+                        "choices": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": { "type": "integer", "const": 0 },
+                                    "delta": {
+                                        "type": "object",
+                                        "description": "首帧只有 role+空 content，其后是增量 content",
+                                        "properties": {
+                                            "role": { "type": "string" },
+                                            "content": { "type": "string" }
+                                        }
+                                    },
+                                    "finish_reason": { "type": ["string", "null"], "enum": ["stop", "length", null] }
+                                }
+                            }
+                        },
+                        "usage": { "$ref": "#/components/schemas/Usage" }
+                    }
+                },
+                "Usage": {
+                    "type": "object",
+                    "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+                    "properties": {
+                        "prompt_tokens": { "type": "integer" },
+                        "completion_tokens": { "type": "integer" },
+                        "total_tokens": { "type": "integer" }
+                    }
+                },
+                "EmbeddingRequest": {
+                    "type": "object",
+                    "required": ["input"],
+                    "additionalProperties": true,
+                    "properties": {
+                        "input": {
+                            "description": "字符串、token id，或它们的数组（一批最多 32 条）",
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "integer", "minimum": 0 },
+                                {
+                                    "type": "array",
+                                    "minItems": 1, "maxItems": MAX_EMBED_BATCH,
+                                    "items": { "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 0 } ] }
+                                }
+                            ]
+                        },
+                        "model": { "type": "string", "description": "可选，被忽略（向量来自已加载的 checkpoint）" }
+                    }
+                },
+                "EmbeddingResponse": {
+                    "type": "object",
+                    "required": ["object", "data", "model", "usage"],
+                    "properties": {
+                        "object": { "type": "string", "const": "list" },
+                        "data": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "object": { "type": "string", "const": "embedding" },
+                                    "index": { "type": "integer" },
+                                    "embedding": { "type": "array", "items": { "type": "number" } }
+                                }
+                            }
+                        },
+                        "model": { "type": "string" },
+                        "usage": {
+                            "type": "object",
+                            "properties": {
+                                "prompt_tokens": { "type": "integer" },
+                                "total_tokens": { "type": "integer" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// 把 `serde_json::Value` 序列化成 YAML 文档。
+///
+/// 不引入 yaml 库：本服务的规范文档只用到 JSON 的四种结构（对象/数组/标量/空值），
+/// 按 YAML 的块序列（block sequence）+ 块映射（block mapping）写出来即可。
+/// 字符串一律按最保守的规则决定裸写还是双引号，避免把 `yes`、`1.1.1` 之类
+/// 写成裸标量后被 YAML 解析回 bool / 数字。
+fn json_to_yaml(v: &Value) -> String {
+    let mut out = String::new();
+    emit_yaml(v, 0, &mut out);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// 启动时把规范写进 `dir`（`openapi/openapi.json` + `openapi/openapi.yaml`）。
+///
+/// 内容与端点完全同源（都出自 [`openapi_spec`]）：仓库里的静态文件每次
+/// `serve` 启动都会刷新，手删了下次启动也会自动回来。
+/// 写盘失败只打一行警告，不影响服务本身。
+fn dump_openapi_files(dir: &str, cfg: &ServeCfg) {
+    let spec = openapi_spec(cfg);
+    let files = [
+        (
+            format!("{dir}/openapi.json"),
+            serde_json::to_string_pretty(&spec).unwrap_or_else(|_| "{}".into()),
+        ),
+        (format!("{dir}/openapi.yaml"), json_to_yaml(&spec)),
+    ];
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        logln!("[serve] 创建 {dir}/ 失败（不影响服务）：{e}");
+        return;
+    }
+    for (path, body) in files {
+        match std::fs::write(&path, body) {
+            Ok(()) => logln!("[serve] 已写入 {path}（接口规范静态版，与端点同源）"),
+            Err(e) => logln!("[serve] 写 {path} 失败（不影响服务）：{e}"),
+        }
+    }
+}
+
+/// 缩进 `indent` 个空格后写入一个非空对象/数组（标量由调用方内联处理）
+fn emit_yaml(v: &Value, indent: usize, out: &mut String) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map {
+                let pad = " ".repeat(indent);
+                match yaml_inline(val) {
+                    Some(s) => out.push_str(&format!("{pad}{}: {s}\n", yaml_key(k))),
+                    None => {
+                        out.push_str(&format!("{pad}{}:\n", yaml_key(k)));
+                        emit_yaml(val, indent + 2, out);
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let pad = " ".repeat(indent);
+                match yaml_inline(item) {
+                    Some(s) => out.push_str(&format!("{pad}- {s}\n")),
+                    None => {
+                        // 先按 indent+2 渲染，再把首行的缩进换成 "- "：
+                        // 两者宽度相同（2 个空格 = "- "），后续行缩进天然对齐。
+                        // 首行 head_len 字节本来就全是空格，只需改前 2 个字节。
+                        let start = out.len();
+                        emit_yaml(item, indent + 2, out);
+                        // 把第 indent..indent+2 这两个空格换成 "- "，
+                        // 前面的缩进原样保留
+                        out.replace_range(start + indent..start + indent + 2, "- ");
+                    }
+                }
+            }
+        }
+        // 顶层就是标量（OpenAPI 文档不会这样，但通用工具就该能处理）
+        other => out.push_str(&yaml_inline(other).unwrap_or_else(|| "null".into())),
+    }
+}
+
+/// 能写成一行的值：标量、空数组、空对象
+fn yaml_inline(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => yaml_str(s),
+        Value::Array(a) if a.is_empty() => "[]".into(),
+        Value::Object(o) if o.is_empty() => "{}".into(),
+        _ => return None,
+    })
+}
+
+/// 字符串加引号：控制字符走 JSON 转义（YAML 双引号支持同样的转义）
+fn yaml_str(s: &str) -> String {
+    let plain_ok = !s.is_empty()
+        && s == s.trim()
+        && !s.contains(':')
+        && !s.contains('#')
+        && !s.contains('\n')
+        && !s.contains('\t')
+        && !s.starts_with(['-', '?', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`'])
+        // 数字长相的一律引号：`1.1.1`、`0x1F`、`01` 在某些 YAML 版本里会被当成数/布尔
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && !s.eq_ignore_ascii_case("true")
+        && !s.eq_ignore_ascii_case("false")
+        && !s.eq_ignore_ascii_case("null")
+        && !s.eq_ignore_ascii_case("yes")
+        && !s.eq_ignore_ascii_case("no")
+        && !s.eq_ignore_ascii_case("on")
+        && !s.eq_ignore_ascii_case("off")
+        && s.parse::<f64>().is_err();
+    if plain_ok { s.to_string() } else { serde_json::to_string(s).unwrap_or_else(|_| "null".into()) }
+}
+
+/// 对象键：同样按裸写/引号规则判断（键也可能被解析成数字）
+fn yaml_key(k: &str) -> String {
+    let plain_ok = !k.is_empty()
+        && !k.contains(':')
+        && !k.contains('#')
+        && k.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        && k.parse::<f64>().is_err();
+    if plain_ok { k.to_string() } else { serde_json::to_string(k).unwrap_or_else(|_| "null".into()) }
+}
+
+
+
+/// 一次已校验过的对话请求
+struct ChatJob {
+    /// OpenAI 风格的补全 id：`chatcmpl-<序号>`
+    id: String,
+    /// 请求里的 system/developer 消息（还没和服务级 system 合并）
+    system: String,
+    /// 中间消息拼成的历史（不含 system、不含末条 user）
+    history: String,
+    /// 末条 user 消息
+    input: String,
+    max_tokens: usize,
+    sample: SampleOpts,
+    /// 请求指定的种子；`None` = 用服务级 `--seed`
+    seed: Option<u64>,
+    stream: bool,
+}
+
+/// 单调递增的补全 id 序号（`chatcmpl-1`、`chatcmpl-2`…）
+static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 解析并校验 `POST /v1/chat/completions` 的请求体。
+///
+/// 校验刻意严格：错误信息里要指出**哪个字段**错在哪，否则调用方只能看到 400 干瞪眼。
+/// 未知字段一律忽略——OpenAI 的客户端（temperature 之外还会带 `user`、`logit_bias` 等）
+/// 才能直连本服务。
+fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| bad(format!("请求体不是合法 JSON：{e}")))?;
+    let obj = v.as_object().ok_or_else(|| bad("请求体必须是 JSON 对象"))?;
+
+    // ---- messages ----
+    let msgs_val = obj.get("messages").ok_or_else(|| bad("缺少 messages 字段"))?;
+    let arr = msgs_val.as_array().ok_or_else(|| bad("messages 必须是数组"))?;
+    if arr.is_empty() {
+        return Err(bad("messages 不能为空"));
+    }
+    if arr.len() > MAX_MESSAGES {
+        return Err(bad(format!("messages 最多 {MAX_MESSAGES} 条，收到 {} 条", arr.len())));
+    }
+    let mut msgs: Vec<(String, String)> = Vec::with_capacity(arr.len());
+    for m in arr {
+        let m = m.as_object().ok_or_else(|| bad("messages 的元素必须是对象"))?;
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("message 缺少 role 字段"))?;
+        if !matches!(role, "system" | "developer" | "user" | "assistant") {
+            return Err(bad(format!(
+                "不支持的 role「{role}」（只支持 system / developer / user / assistant）"
+            )));
+        }
+        let content = m
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad(format!("{role} 消息的 content 必须是字符串")))?;
+        msgs.push((role.to_string(), content.to_string()));
+    }
+    // 末条必须是 user：prompt 模板要靠它拼"轮到模型说话"的位置（见 prompt::assemble）
+    if msgs.last().map(|(r, _)| r.as_str()) != Some("user") {
+        return Err(bad("messages 的最后一条必须是 role=user"));
+    }
+
+    let (system, history, input) = split_messages(&msgs, cfg.use_sft);
+
+    // ---- 采样参数（逐个覆盖服务级默认值）----
+    let mut sample = cfg.sample;
+
+    if let Some(v) = obj.get("temperature") {
+        let t = v.as_f64().ok_or_else(|| bad("temperature 必须是数字"))? as f32;
+        if !t.is_finite() || !(0.0..=5.0).contains(&t) {
+            return Err(bad("temperature 取值范围是 [0, 5]"));
+        }
+        sample.temperature = t;
+    }
+    if let Some(v) = obj.get("top_k") {
+        let k = v.as_u64().ok_or_else(|| bad("top_k 必须是非负整数"))?;
+        if k > 10_000 {
+            return Err(bad("top_k 最大 10000（0 = 不限制）"));
+        }
+        sample.top_k = k as usize;
+    }
+    if let Some(v) = obj.get("top_p") {
+        let p = v.as_f64().ok_or_else(|| bad("top_p 必须是数字"))?;
+        if !(0.0 < p && p <= 1.0) {
+            return Err(bad("top_p 取值范围是 (0, 1]"));
+        }
+        sample.top_p = p as f32;
+    }
+    if let Some(v) = obj.get("repetition_penalty") {
+        let r = v.as_f64().ok_or_else(|| bad("repetition_penalty 必须是数字"))?;
+        if !(0.1..=10.0).contains(&r) {
+            return Err(bad("repetition_penalty 取值范围是 [0.1, 10]"));
+        }
+        sample.repetition_penalty = r as f32;
+    }
+    if let Some(v) = obj.get("repetition_window") {
+        let w = v.as_u64().ok_or_else(|| bad("repetition_window 必须是非负整数"))?;
+        if w > 100_000 {
+            return Err(bad("repetition_window 最大 100000"));
+        }
+        sample.repetition_window = w as usize;
+    }
+
+    // ---- stop：可能来自请求，走驻留表换成 &'static ----
+    sample.stop = match obj.get("stop") {
+        None | Some(Value::Null) => cfg.sample.stop,
+        Some(Value::String(s)) => intern_stops(std::slice::from_ref(s))?,
+        Some(Value::Array(a)) => {
+            let mut items = Vec::with_capacity(a.len());
+            for x in a {
+                items.push(
+                    x.as_str()
+                        .ok_or_else(|| bad("stop 数组的元素必须是字符串"))?
+                        .to_string(),
+                );
+            }
+            intern_stops(&items)?
+        }
+        Some(_) => return Err(bad("stop 必须是字符串或字符串数组")),
+    };
+
+    // ---- 其余标量 ----
+    let max_tokens = match obj.get("max_tokens") {
+        None => cfg.max_new,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| bad("max_tokens 必须是正整数"))?;
+            if n == 0 {
+                return Err(bad("max_tokens 必须大于 0"));
+            }
+            // 钳到上下文窗口内：prompt 侧还会再减掉它算预算（见 run_chat）
+            (n as usize).min(cfg.block_size.max(1))
+        }
+    };
+    let seed = match obj.get("seed") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or_else(|| bad("seed 必须是非负整数"))?),
+    };
+    let stream = match obj.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad("stream 必须是布尔值"))?,
+    };
+    if let Some(v) = obj.get("n")
+        && v.as_u64() != Some(1)
+    {
+        return Err(bad("本服务只支持 n=1（一次生成一个回答）"));
+    }
+
+    Ok(ChatJob {
+        id: format!("chatcmpl-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed)),
+        system,
+        history,
+        input,
+        max_tokens,
+        sample,
+        seed,
+        stream,
+    })
+}
+
+/// 把消息列表拆成「system」「历史」「本轮输入」三段。
+///
+/// - `system` / `developer` 消息无论出现在哪都汇进 system（最后用换行连接）；
+/// - 末条 `user` 是本轮输入，其余按 `use_sft` 套角色模板；
+/// - SFT 模板下历史长这样：`用户：\nq1\n助手：\na1`（与 `prompt::assemble` 的 tail 同形，
+///   拼完整条 prompt 时首尾能自然接上）。
+fn split_messages(msgs: &[(String, String)], use_sft: bool) -> (String, String, String) {
+    let (last_role, last_content) = msgs.last().expect("调用方已保证非空");
+    debug_assert_eq!(last_role, "user");
+
+    let mut systems: Vec<&str> = Vec::new();
+    let mut history = String::new();
+    // 末条 user 之前的都算历史
+    for (role, content) in &msgs[..msgs.len() - 1] {
+        match role.as_str() {
+            "system" | "developer" => systems.push(content),
+            "user" => {
+                if !history.is_empty() {
+                    history.push('\n');
+                }
+                if use_sft {
+                    history.push_str(&format!("{SFT_USER}\n{content}\n{SFT_ASSISTANT}"));
+                } else {
+                    history.push_str(content);
+                }
+            }
+            _ => {
+                // assistant（校验阶段已挡掉其它 role）
+                if !history.is_empty() {
+                    history.push('\n');
+                }
+                history.push_str(content);
+            }
+        }
+    }
+    (systems.join("\n"), history, last_content.clone())
+}
+
+/// 合并服务级 system 与请求里的 system：**服务级在前**（它相当于"全局人设"，
+/// 请求级 system 更像是本轮的临时指令，放后面优先级更高）。
+fn merge_system(base: &str, extra: &str) -> String {
+    let b = base.trim();
+    let e = extra.trim();
+    match (b.is_empty(), e.is_empty()) {
+        (true, _) => e.to_string(),
+        (_, true) => b.to_string(),
+        _ => format!("{b}\n{e}"),
+    }
+}
+
+/// 收尾原因 → OpenAI 的 `finish_reason`
+fn finish_of(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Eos | StopReason::StopMark(_) => "stop",
+        StopReason::MaxNew => "length",
+    }
+}
+
+// ==================== chat/completions：非流式 ====================
+
+fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
+    let system = merge_system(&state.cfg.system, &job.system);
+    let max_tokens = job.max_tokens;
+    // 给生成预留 max_new，剩下的才是输入预算（见 prompt::assemble 的分配顺序）
+    let prompt_budget = state.cfg.block_size.saturating_sub(max_tokens);
+    let use_sft = state.cfg.use_sft;
+    let kv = state.cfg.kv;
+    let mut owned_rng = job.seed.map(Rng::new);
+
+    let (text, n_prompt, n_gen, reason, trimmed) = with_core(state, |core| {
+        // 拆开字段借用：`Generator` 同时要 `&Transformer` / `&Tokenizer` 和 `&mut Rng`，
+        // 直接借 `core` 会因为"一个可变 + 两个共享"打架
+        let Core { model, tokenizer, rng: shared_rng } = core;
+        let a = prompt::assemble(tokenizer, &system, &job.history, &job.input, use_sft, prompt_budget);
+        let rng = match owned_rng.as_mut() {
+            Some(r) => r,
+            None => shared_rng,
+        };
+        let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
+        let n_prompt = g.prompt_tokens();
+        g.run();
+        let n_gen = g.generated_tokens();
+        let out = g.into_output();
+        (out.generated, n_prompt, n_gen, out.reason, a.trimmed)
+    })?;
+
+    if let Some((before, after)) = trimmed {
+        logln!(
+            "[serve] 历史超出输入预算：{before} → {after} token（预算 {prompt_budget}）"
+        );
+    }
+
+    Ok(json!({
+        "id": job.id,
+        "object": "chat.completion",
+        "created": state.created,
+        "model": state.cfg.model_name,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": finish_of(reason),
+            "logprobs": null,
+        }],
+        "usage": {
+            "prompt_tokens": n_prompt,
+            "completion_tokens": n_gen,
+            "total_tokens": n_prompt + n_gen,
+        },
+    }))
+}
+
+// ==================== chat/completions：SSE 流式 ====================
+
+/// 一个 SSE 帧
+fn sse(text: &str) -> Vec<u8> {
+    format!("data: {text}\n\n").into_bytes()
+}
+
+/// 造一个 `chat.completion.chunk`
+fn delta_chunk(state: &Arc<State>, id: &str, delta: Value, finish: Option<&str>) -> String {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": state.cfg.model_name,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish.map(Value::from).unwrap_or(Value::Null),
+            "logprobs": null,
+        }],
+    })
+    .to_string()
+}
+
+/// usage 单独发一帧（choices 为空数组）——这是 OpenAI 的实际做法
+fn usage_chunk(state: &Arc<State>, id: &str, n_prompt: usize, n_gen: usize) -> String {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": state.cfg.model_name,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": n_prompt,
+            "completion_tokens": n_gen,
+            "total_tokens": n_prompt + n_gen,
+        },
+    })
+    .to_string()
+}
+
+/// 流式回复的结果（闭包把信息带回外层，由外层发 finish/usage/DONE）
+struct StreamOutcome {
+    n_prompt: usize,
+    n_gen: usize,
+    reason: StopReason,
+    trimmed: Option<(usize, usize)>,
+    /// 客户端断开了，别再发任何东西
+    aborted: bool,
+}
+
+fn stream_reply(req: Request, state: &Arc<State>, job: ChatJob) -> u16 {
+    // 有界通道 = 背压：生成线程最多领先客户端 16 帧，
+    // 客户端读得慢时生成会自己慢下来，而不是把内存堆爆。
+    let (tx, rx) = sync_channel::<Vec<u8>>(16);
+    let st = Arc::clone(state);
+    thread::spawn(move || stream_generate(st, tx, job));
+
+    let resp = Response::new(
+        StatusCode(200),
+        vec![
+            header("Content-Type", "text/event-stream; charset=utf-8"),
+            header("Cache-Control", "no-cache"),
+        ],
+        SsePipe { rx, buf: Vec::new(), pos: 0 },
+        None, // 无长度 → HTTP/1.1 走 chunked，边生成边发
+        None,
+    );
+    // 这里会阻塞到整条流写完（或客户端断开）
+    let _ = req.respond(with_cors(state, resp));
+    200
+}
+
+/// 生成线程：把 SSE 帧一帧帧塞进 channel，`tx` 一断（客户端断开）就收手
+fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
+    let id = job.id.clone();
+    // 第一帧先声明角色：OpenAI 客户端靠它拿到 assistant 角色
+    if tx
+        .send(sse(&delta_chunk(&state, &id, json!({ "role": "assistant", "content": "" }), None)))
+        .is_err()
+    {
+        return;
+    }
+
+    let system = merge_system(&state.cfg.system, &job.system);
+    let prompt_budget = state.cfg.block_size.saturating_sub(job.max_tokens);
+    let max_tokens = job.max_tokens;
+    let use_sft = state.cfg.use_sft;
+    let kv = state.cfg.kv;
+    let mut owned_rng = job.seed.map(Rng::new);
+
+    let res = with_core(&state, |core| {
+        let Core { model, tokenizer, rng: shared_rng } = core;
+        let a = prompt::assemble(tokenizer, &system, &job.history, &job.input, use_sft, prompt_budget);
+        let trimmed = a.trimmed;
+        let rng = match owned_rng.as_mut() {
+            Some(r) => r,
+            None => shared_rng,
+        };
+        let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
+        let n_prompt = g.prompt_tokens();
+
+        while g.step() {
+            // send 失败 = 接收端（响应流）已 drop = 客户端断开：
+            // 立刻停生成，别在一个没人听的请求上烧 CPU
+            if let Some(delta) = g.next_text()
+                && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": delta }), None))).is_err()
+            {
+                return StreamOutcome {
+                    n_prompt,
+                    n_gen: g.generated_tokens(),
+                    reason: StopReason::MaxNew,
+                    trimmed,
+                    aborted: true,
+                };
+            }
+        }
+        // 收尾后把被 hold-back 的尾巴一次发干净（结果已定，不会再变）
+        let tail = g.flush();
+        let n_gen = g.generated_tokens();
+        let out = g.into_output();
+        let aborted = !tail.is_empty()
+            && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": tail }), None))).is_err();
+        StreamOutcome { n_prompt, n_gen, reason: out.reason, trimmed, aborted }
+    });
+
+    let outcome = match res {
+        Ok(o) => o,
+        Err(e) => {
+            // 生成中途出错：发一个 OpenAI 风格的 error 事件，客户端才知道不是正常结束
+            let _ = tx.send(sse(&e.to_value().to_string()));
+            let _ = tx.send(b"data: [DONE]\n\n".to_vec());
+            return;
+        }
+    };
+    if outcome.aborted {
+        logln!("[serve] 客户端提前断开，生成已中止（{} token）", outcome.n_gen);
+        return;
+    }
+    if let Some((before, after)) = outcome.trimmed {
+        logln!("[serve] 历史超出输入预算：{before} → {after} token（预算 {prompt_budget}）");
+    }
+    let fr = finish_of(outcome.reason);
+    let _ = tx.send(sse(&delta_chunk(&state, &id, json!({}), Some(fr))));
+    let _ = tx.send(sse(&usage_chunk(&state, &id, outcome.n_prompt, outcome.n_gen)));
+    let _ = tx.send(b"data: [DONE]\n\n".to_vec());
+    logln!(
+        "[serve] 流式完成 {}：{} token（{}）",
+        id, outcome.n_gen, crate::stop_label(outcome.reason)
+    );
+}
+
+/// 把 channel 里的 SSE 帧转成 tiny_http 能边发边读的响应体。
+///
+/// `Read` 的语义决定了一切：读到 `Ok(0)` 就是 EOF，所以 channel 关闭时直接返回 0，
+/// 响应自然收尾（chunked 流以 `0\r\n\r\n` 结束）。
+struct SsePipe {
+    rx: Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for SsePipe {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.pos < self.buf.len() {
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.rx.recv() {
+                Ok(b) => {
+                    self.buf = b;
+                    self.pos = 0;
+                }
+                // 发送端全部 drop：流结束
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+// ==================== embeddings ====================
+
+/// 一条待编码的输入
+enum EmbedIn {
+    Text(String),
+    Ids(Vec<usize>),
+}
+
+fn run_embeddings(state: &Arc<State>, body: &str) -> Result<Value, ApiError> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| bad(format!("请求体不是合法 JSON：{e}")))?;
+    let obj = v.as_object().ok_or_else(|| bad("请求体必须是 JSON 对象"))?;
+    let input = obj.get("input").ok_or_else(|| bad("缺少 input 字段"))?;
+
+    let items: Vec<EmbedIn> = match input {
+        Value::String(s) => vec![EmbedIn::Text(s.clone())],
+        Value::Number(_) => vec![EmbedIn::Ids(vec![as_usize(input)?])],
+        Value::Array(a) => {
+            if a.is_empty() {
+                return Err(bad("input 数组不能为空"));
+            }
+            if a.len() > MAX_EMBED_BATCH {
+                return Err(bad(format!("input 数组最多 {MAX_EMBED_BATCH} 条")));
+            }
+            let mut out = Vec::with_capacity(a.len());
+            for x in a {
+                out.push(match x {
+                    Value::String(s) => EmbedIn::Text(s.clone()),
+                    Value::Number(_) => EmbedIn::Ids(vec![as_usize(x)?]),
+                    _ => return Err(bad("input 数组的元素只能是字符串或 token id")),
+                });
+            }
+            out
+        }
+        _ => return Err(bad("input 必须是字符串、token id，或它们的数组")),
+    };
+
+    let block_size = state.cfg.block_size;
+    let (rows, prompt_tokens) = with_core(state, |core| {
+        let Core { model, tokenizer, .. } = core;
+        let vocab = model.cfg.vocab_size;
+        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(items.len());
+        let mut prompt_tokens = 0usize;
+        for item in &items {
+            let mut ids = match item {
+                EmbedIn::Text(s) => {
+                    let mut v = match tokenizer.bos_id() {
+                        Some(bos) => vec![bos],
+                        None => Vec::new(),
+                    };
+                    v.extend(tokenizer.encode(s));
+                    v
+                }
+                EmbedIn::Ids(v) => v.clone(),
+            };
+            // 越界的 token id 会直接下标越界 panic，这里先挡成 400
+            if let Some(bad_id) = ids.iter().find(|&&x| x >= vocab) {
+                return Err(bad(format!("token id {bad_id} 超出词表大小 {vocab}")));
+            }
+            if ids.is_empty() {
+                ids.push(0); // 空输入：给一个位置，避免 0 长度前向
+            }
+            if ids.len() > block_size {
+                // 与生成一样只看窗口内的内容（超长的头部本来也会被滑出）
+                ids = ids[ids.len() - block_size..].to_vec();
+            }
+            prompt_tokens += ids.len();
+            let hidden = crate::tensor::no_grad(|| model.forward_hidden(&ids, 1, ids.len(), false));
+            rows.push(mean_pool(&hidden));
+        }
+        Ok((rows, prompt_tokens))
+    })??;
+
+    let data: Vec<Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| json!({ "object": "embedding", "index": i, "embedding": r }))
+        .collect();
+
+    Ok(json!({
+        "object": "list",
+        "data": data,
+        "model": state.cfg.model_name,
+        "usage": { "prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens },
+    }))
+}
+
+fn as_usize(v: &Value) -> Result<usize, ApiError> {
+    v.as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| bad("token id 必须是非负整数"))
+}
+
+/// 按 token 维度对 hidden states 做**均值池化**，得到一个向量。
+///
+/// `forward_hidden` 回的是 `[B*T, H]`（`B=1`），所以"按行平均"就是把整条序列
+/// 平均成一个长度 `H` 的向量——与常见句向量模型的 pooling 一致。
+/// 非有限值（上游数值溢出）一律置 0：`null` 混进 embedding 数组会让客户端直接报错。
+fn mean_pool(hidden: &crate::tensor::Tensor) -> Vec<f64> {
+    let shape = hidden.shape();
+    let h = *shape.last().unwrap_or(&1);
+    if h == 0 {
+        return Vec::new();
+    }
+    let data = hidden.data();
+    let rows = data.len() / h;
+    let mut acc = vec![0f64; h];
+    for r in 0..rows {
+        for (i, x) in data[r * h..(r + 1) * h].iter().enumerate() {
+            acc[i] += *x as f64;
+        }
+    }
+    let denom = rows.max(1) as f64;
+    for x in &mut acc {
+        *x /= denom;
+        if !x.is_finite() {
+            *x = 0.0;
+        }
+    }
+    acc
+}
+
+// ==================== 服务入口 ====================
+
+/// 启动 HTTP 服务并永不返回。
+pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer) -> ! {
+    let addr = format!("{}:{}", cfg.host, cfg.port);
+    let seed = cfg.seed;
+    let model_name = cfg.model_name.clone();
+    let block_size = cfg.block_size;
+    let api_on = cfg.api_key.is_some();
+    let cors_on = cfg.cors;
+
+    let state = Arc::new(State {
+        cfg,
+        core: Mutex::new(Core { model, tokenizer, rng: Rng::new(seed) }),
+        stats: Stats::default(),
+        created: now_unix(),
+        started: Instant::now(),
+    });
+
+    let server = Server::http(&addr).unwrap_or_else(|e| panic!("监听 {addr} 失败：{e}"));
+
+    logln!("[serve] 已监听 http://{addr}");
+    logln!("[serve] 模型 {model_name}（上下文窗口 {block_size}）");
+    // 接口规范静态版：与端点同一份数据，启动即写（删了也会自动重建）
+    dump_openapi_files("openapi", &state.cfg);
+    logln!(
+        "[serve] 鉴权{}，CORS{}",
+        if api_on { "开" } else { "关（任何人都能调）" },
+        if cors_on { "开" } else { "关" }
+    );
+    logln!("[serve] 端点：");
+    logln!("[serve]   POST /v1/chat/completions  （stream=true 走 SSE）");
+    logln!("[serve]   POST /v1/embeddings");
+    logln!("[serve]   GET  /v1/models");
+    logln!("[serve]   GET  /health");
+    logln!("[serve]   GET  /v1/status");
+    logln!("[serve]   GET  /openapi.json  /openapi.yaml  （接口规范，可导入 Postman/Apifox）");
+    logln!("[serve] Ctrl-C 停止");
+
+    // 每个请求一个线程；真正的生成在 `with_core` 里排队
+    for req in server.incoming_requests() {
+        let st = Arc::clone(&state);
+        thread::spawn(move || handle(req, st));
+    }
+    unreachable!("tiny_http::Server::incoming_requests 是无限迭代器，不会返回")
+}
+
+// ==================== 测试 ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(use_sft: bool) -> ServeCfg {
+        // 与 cmd_serve 同源：SFT 模板下默认带模板停止标记（请求可用 stop 逐次覆盖）
+        let mut sample = SampleOpts::default();
+        if use_sft {
+            sample.stop = prompt::SFT_STOP;
+        }
+        ServeCfg {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            api_key: None,
+            cors: false,
+            system: String::new(),
+            use_sft,
+            max_new: 200,
+            seed: 42,
+            kv: KvOpts::off(),
+            model_name: "test-model".into(),
+            sample,
+            block_size: 512,
+        }
+    }
+
+    fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(r, c)| (r.to_string(), c.to_string())).collect()
+    }
+
+    #[test]
+    fn split_sft_history_shape() {
+        let m = msgs(&[
+            ("system", "你是助手"),
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+        ]);
+        let (system, history, input) = split_messages(&m, true);
+        assert_eq!(system, "你是助手");
+        assert_eq!(history, format!("{SFT_USER}\nq1\n{SFT_ASSISTANT}\na1"));
+        assert_eq!(input, "q2");
+    }
+
+    #[test]
+    fn split_raw_history_shape() {
+        let m = msgs(&[("user", "q1"), ("assistant", "a1"), ("user", "q2")]);
+        let (system, history, input) = split_messages(&m, false);
+        assert_eq!(system, "");
+        assert_eq!(history, "q1\na1");
+        assert_eq!(input, "q2");
+    }
+
+    #[test]
+    fn split_sft_two_rounds_join_with_newline() {
+        let m = msgs(&[
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+            ("assistant", "a2"),
+            ("user", "q3"),
+        ]);
+        let (_, history, input) = split_messages(&m, true);
+        assert_eq!(
+            history,
+            format!("{SFT_USER}\nq1\n{SFT_ASSISTANT}\na1\n{SFT_USER}\nq2\n{SFT_ASSISTANT}\na2")
+        );
+        assert_eq!(input, "q3");
+    }
+
+    #[test]
+    fn split_merges_multiple_system_messages() {
+        let m = msgs(&[
+            ("system", "s1"),
+            ("developer", "s2"),
+            ("user", "q"),
+        ]);
+        let (system, history, input) = split_messages(&m, true);
+        assert_eq!(system, "s1\ns2");
+        assert_eq!(history, "");
+        assert_eq!(input, "q");
+    }
+
+    #[test]
+    fn merge_system_service_level_comes_first() {
+        assert_eq!(merge_system("全局人设", "本轮指令"), "全局人设\n本轮指令");
+        assert_eq!(merge_system("", "本轮指令"), "本轮指令");
+        assert_eq!(merge_system("全局人设", ""), "全局人设");
+        assert_eq!(merge_system("  ", "  "), "");
+    }
+
+    #[test]
+    fn parse_chat_rejects_bad_requests() {
+        let c = cfg(true);
+        // 非 JSON
+        assert!(parse_chat("不是 JSON", &c).is_err());
+        // 缺 messages
+        assert!(parse_chat("{}", &c).is_err());
+        // 空 messages
+        assert!(parse_chat(r#"{"messages":[]}"#, &c).is_err());
+        // 末条不是 user
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"a"}]}"#, &c).is_err());
+        // 未知 role
+        assert!(parse_chat(r#"{"messages":[{"role":"tool","content":"x"},{"role":"user","content":"q"}]}"#, &c).is_err());
+        // content 不是字符串
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":[{"type":"text","text":"q"}]}]}"#, &c).is_err());
+        // n != 1
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"n":2}"#, &c).is_err());
+        // max_tokens = 0
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"max_tokens":0}"#, &c).is_err());
+        // 越界 temperature
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"temperature":9}"#, &c).is_err());
+        // 越界 top_p
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"top_p":0}"#, &c).is_err());
+        // 非法 stop 元素
+        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"stop":[1]}"#, &c).is_err());
+    }
+
+    #[test]
+    fn parse_chat_applies_defaults_and_overrides() {
+        let c = cfg(true);
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"你好"}]}"#, &c).unwrap();
+        assert_eq!(job.input, "你好");
+        assert_eq!(job.max_tokens, 200);
+        assert!(!job.stream);
+        assert!(job.seed.is_none());
+        assert_eq!(job.sample.temperature, 0.8);
+        // SFT 下自动带模板停止标记
+        assert_eq!(job.sample.stop, prompt::SFT_STOP);
+
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"你好"}],"max_tokens":64,
+                "temperature":0.1,"top_p":0.5,"stream":true,"seed":7,
+                "stop":"STOP","model":"ignored"}"#,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(job.max_tokens, 64);
+        assert_eq!(job.sample.temperature, 0.1);
+        assert_eq!(job.sample.top_p, 0.5);
+        assert!(job.stream);
+        assert_eq!(job.seed, Some(7));
+        assert_eq!(job.sample.stop, &["STOP"]);
+        assert!(job.id.starts_with("chatcmpl-"));
+    }
+
+    #[test]
+    fn stop_interner_dedups_identical_slices() {
+        let a = vec!["结束".to_string()];
+        let b = vec!["结束".to_string()];
+        let pa = intern_stops(&a).unwrap();
+        let pb = intern_stops(&b).unwrap();
+        assert!(std::ptr::eq(pa, pb), "同一组 stop 必须复用同一份静态切片");
+
+        let c = vec!["结束".to_string(), "STOP".to_string()];
+        let pc = intern_stops(&c).unwrap();
+        assert!(!std::ptr::eq(pa, pc));
+        assert_eq!(pc, &["结束", "STOP"]);
+
+        assert!(intern_stops(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_interner_rejects_oversized_input() {
+        assert!(intern_stops(&[String::new()]).is_err());
+        assert!(intern_stops(&[ "x".repeat(MAX_STOP_LEN + 1) ]).is_err());
+        let many: Vec<String> = (0..MAX_STOPS + 1).map(|i| format!("s{i}")).collect();
+        assert!(intern_stops(&many).is_err());
+    }
+
+    #[test]
+    fn sse_pipe_reads_frames_then_hits_eof() {
+        let (tx, rx) = sync_channel::<Vec<u8>>(4);
+        let mut pipe = SsePipe { rx, buf: Vec::new(), pos: 0 };
+
+        tx.send(b"hello".to_vec()).unwrap();
+        tx.send(b"world".to_vec()).unwrap();
+        drop(tx); // 发送端关闭 → 读完缓冲后返回 0
+
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 3];
+        loop {
+            let n = pipe.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(out, b"helloworld");
+    }
+
+    #[test]
+    fn finish_reason_mapping() {
+        assert_eq!(finish_of(StopReason::Eos), "stop");
+        assert_eq!(finish_of(StopReason::StopMark("用户：")), "stop");
+        assert_eq!(finish_of(StopReason::MaxNew), "length");
+    }
+
+    #[test]
+    fn mean_pool_averages_rows() {
+        // 2 行 × 3 列 → 每列取平均
+        let t = crate::tensor::Tensor::from_vec(vec![1.0, 2.0, 3.0, 3.0, 6.0, 9.0], vec![2, 3]);
+        assert_eq!(mean_pool(&t), vec![2.0, 4.0, 6.0]);
+    }
+
+    /// 收集文档里所有 `$ref`（形如 `#/components/schemas/X`）
+    fn collect_refs(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, x) in map {
+                    if k == "$ref" {
+                        if let Some(s) = x.as_str() {
+                            out.push(s.to_string());
+                        }
+                    } else {
+                        collect_refs(x, out);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|x| collect_refs(x, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn openapi_spec_covers_every_route() {
+        let spec = openapi_spec(&cfg(true));
+        assert_eq!(spec["openapi"], "3.1.0");
+        let paths = spec["paths"].as_object().expect("paths 必须是对象");
+        for p in [
+            "/health",
+            "/v1/status",
+            "/v1/models",
+            "/openapi.json",
+            "/openapi.yaml",
+            "/v1/chat/completions",
+            "/v1/embeddings",
+        ] {
+            assert!(paths.contains_key(p), "规范里缺了 {p}");
+        }
+        // 全局默认要鉴权；不鉴权的端点必须显式清空，否则导入工具会强制要求带 key
+        for p in ["/health", "/v1/status", "/openapi.json", "/openapi.yaml"] {
+            assert_eq!(spec["paths"][p]["get"]["security"], json!([]), "{p} 应不鉴权");
+        }
+        // 鉴权端点不写 security → 沿用全局 bearerAuth
+        assert!(spec["paths"]["/v1/chat/completions"]["post"]["security"].is_null());
+        assert_eq!(spec["components"]["securitySchemes"]["bearerAuth"]["scheme"], "bearer");
+    }
+
+    #[test]
+    fn openapi_spec_constraints_match_parse_chat() {
+        let spec = openapi_spec(&cfg(true));
+        let req = &spec["components"]["schemas"]["ChatCompletionRequest"];
+        assert_eq!(req["required"][0], "messages");
+        let props = &req["properties"];
+        // 这些上限必须和 parse_chat 的逐字段校验一字不差，否则文档会骗人
+        assert_eq!(props["messages"]["maxItems"].as_u64(), Some(MAX_MESSAGES as u64));
+        assert_eq!(props["stop"]["oneOf"][1]["maxItems"].as_u64(), Some(MAX_STOPS as u64));
+        assert_eq!(props["stop"]["oneOf"][1]["items"]["maxLength"].as_u64(), Some(MAX_STOP_LEN as u64));
+        assert_eq!(props["temperature"]["maximum"].as_f64(), Some(5.0));
+        assert_eq!(props["top_k"]["maximum"].as_u64(), Some(10_000));
+        assert_eq!(props["repetition_penalty"]["minimum"].as_f64(), Some(0.1));
+        assert_eq!(props["repetition_window"]["maximum"].as_u64(), Some(100_000));
+        assert_eq!(props["n"]["const"], json!(1));
+        let emb = &spec["components"]["schemas"]["EmbeddingRequest"]["properties"]["input"];
+        assert_eq!(emb["oneOf"][2]["maxItems"].as_u64(), Some(MAX_EMBED_BATCH as u64));
+    }
+
+    #[test]
+    fn openapi_spec_every_ref_resolves() {
+        let spec = openapi_spec(&cfg(true));
+        let mut refs = Vec::new();
+        collect_refs(&spec, &mut refs);
+        assert!(!refs.is_empty(), "应该至少有一个 $ref");
+        for r in &refs {
+            let mut cur = &spec;
+            for seg in r.trim_start_matches("#/").split('/') {
+                cur = cur
+                    .get(seg)
+                    .unwrap_or_else(|| panic!("$ref {r} 指向不存在的节点 `{seg}`"));
+            }
+        }
+    }
+
+    #[test]
+    fn dump_openapi_files_writes_both_formats() {
+        // 写进临时目录，避免污染仓库；内容必须与端点返回的字节逐字一致
+        let dir = std::env::temp_dir().join(format!("llm_oss_openapi_{}", std::process::id()));
+        let dir = dir.to_string_lossy().into_owned();
+        dump_openapi_files(&dir, &cfg(false));
+
+        let spec = openapi_spec(&cfg(false));
+        let json_txt = std::fs::read_to_string(format!("{dir}/openapi.json")).unwrap();
+        let yaml_txt = std::fs::read_to_string(format!("{dir}/openapi.yaml")).unwrap();
+        assert_eq!(json_txt, serde_json::to_string_pretty(&spec).unwrap());
+        assert_eq!(yaml_txt, json_to_yaml(&spec));
+
+        // 落盘的 JSON 能解析回来，且仍是覆盖全部路由的完整规范
+        let parsed: Value = serde_json::from_str(&json_txt).unwrap();
+        assert_eq!(parsed["paths"].as_object().unwrap().len(), 7);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_to_yaml_renders_nested_structures() {
+        let v = json!({
+            "n": 3,
+            "pi": 0.25,
+            "ok": true,
+            "none": null,
+            "s": "带冒号: 的值",
+            "list": [1, "two", {"k": "v"}, [3, 4]],
+            "empty_arr": [],
+            "empty_obj": {},
+            "nl": "a\nb",
+            "ver": "1.1.1"
+        });
+        // serde_json 的 Map 是 BTreeMap，键按字典序输出
+        let want = concat!(
+            "empty_arr: []\n",
+            "empty_obj: {}\n",
+            "list:\n",
+            "  - 1\n",
+            "  - two\n",
+            "  - k: v\n",
+            "  - - 3\n",
+            "    - 4\n",
+            "n: 3\n",
+            "nl: \"a\\nb\"\n",
+            "none: null\n",
+            "ok: true\n",
+            "pi: 0.25\n",
+            "s: \"带冒号: 的值\"\n",
+            "ver: \"1.1.1\"\n",
+        );
+        assert_eq!(json_to_yaml(&v), want);
+    }
+
+    #[test]
+    fn yaml_quoting_never_leaks_ambiguous_scalars() {
+        // 会被 YAML 解析成 bool / null 的写法一律上引号
+        for s in ["true", "NULL", "Yes", "off"] {
+            assert_eq!(yaml_str(s), format!("\"{s}\""), "{s} 必须引号");
+        }
+        // 看着像数字但不是数的（版本号之类）也上引号
+        for s in ["1.1.1", "0x1F", "2026-09-27"] {
+            assert_eq!(yaml_str(s), format!("\"{s}\""), "{s} 必须引号");
+        }
+        // 普通文本保持裸写，便于阅读
+        assert_eq!(yaml_str("hello world"), "hello world");
+        assert_eq!(yaml_str(""), "\"\"");
+        // 含 # 与 : 的必须引号，否则会被当成注释/键值分隔
+        assert_eq!(yaml_str("a # b"), "\"a # b\"");
+        // 路径既没有 : 也没有 #，裸写即可
+        assert_eq!(yaml_str("/v1/models"), "/v1/models");
+    }
+}

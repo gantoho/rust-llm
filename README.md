@@ -2,8 +2,8 @@
 
 > **深度学习算法全部纯手写**：不使用任何深度学习框架（如 tch-rs / candle / burn），
 > 从零手写张量、自动微分、神经网络层、Transformer 架构。
-> 仅引入少量**工具库**（serde_json 做配置/序列化、clap 做命令行、windows-sys 修控制台编码、
-> rayon 做 CPU 并行、可选的 wgpu 做 GPU 计算后端），它们都不参与任何算法实现。
+> 仅引入少量**工具库**（serde_json 做配置/序列化、clap 做命令行、tiny_http 起 HTTP 服务、
+> windows-sys 修控制台编码、rayon 做 CPU 并行、可选的 wgpu 做 GPU 计算后端），它们都不参与任何算法实现。
 >
 > 每个实现步骤都配套一篇中文教程文档（见 `docs/`），边写代码边学原理。
 
@@ -14,8 +14,8 @@
 本项目是一个从零实现的 **Transformer 大语言模型**项目，目标是让你理解大语言模型（LLM）的底层原理：
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
-- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、39 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善。
-- **工程化完整**：CLI 子命令（train / eval / generate / chat / sft / finetune / preset / demo / bench / scaling）、
+- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、40 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善并部署成 API 服务。
+- **工程化完整**：CLI 子命令（train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
@@ -25,13 +25,13 @@
 - **LoRA 已接入**：`finetune` 子命令会冻结预训练主干、只训练低秩适配层（缺省挂 Q/K/V，`--lora-targets` 可扩到 O 与 MLP）
   （本项目实测可训练参数 **24,576 / 1,866,496 = 1.32%**），支持**链式续训**（`--resume-lora`，接着训旧适配层）
   与**推理合并**（`--merge-lora`，把增量就地并进主干），存档头部记录 LoRA 形态，加载后可直接对话，
-  见 [§6](#6-finetune--lora-微调) 与第 29 课。
+  见 [§7](#7-finetune--lora-微调) 与第 29 课。
 - **混合精度训练（AMP）已接入训练循环**：`train.amp` 打开后，loss 先乘上动态 `scale` 再反向，
   参数更新前检查梯度是否溢出（含 Inf/NaN 就丢弃本步、不更新参数，`scale` 自动减半）、并把梯度
   反缩放回真实尺度再做裁剪（保证裁剪阈值仍然作用在真实梯度上），见第 26 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
-### 包含的功能（对应 39 课）
+### 包含的功能（对应 40 课）
 
 | 模块 | 文件 | 内容 |
 |------|------|------|
@@ -56,7 +56,8 @@
 | 分布式 | `src/distributed.rs` | 环形 allreduce（reduce-scatter + all-gather）、数据并行、ZeRO-1/2（状态分片）、张量并行 MLP 与 QKV 列切分、GPipe / 1F1B 流水线、3D 并行规划（`DistConfig`） |
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式，**头部记录 LoRA 形态（旧档兼容）** |
-| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** |
+| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** |
+| API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
@@ -73,11 +74,12 @@
 | RAG 检索增强生成 | `docs/37-RAG检索增强生成.md` | 文档分块、向量嵌入、相似度检索、重排序、HyDE、Self-RAG（**已落地代码**：`src/rag.rs` + `rag` 子命令） |
 | 分布式训练 | `docs/38-分布式训练.md` | 数据并行、ZeRO、张量并行、流水线并行、3D 并行、通信原语（**已落地代码**：`src/distributed.rs` + `distributed` 子命令） |
 
-### 工程化完善教程（第 39 课，代码+文档）
+### 工程化与部署教程（第 39~40 课，代码+文档）
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
 | 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
+| 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)） |
 
 ## 快速开始
 
@@ -105,6 +107,12 @@ cargo run --release -- train --config config/config_medium.json
 #  交互式对话（训练后直接对话，无需语料）
 # ═══════════════════════════════════════════
 cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt
+
+# ═══════════════════════════════════════════
+#  部署成 API（OpenAI 兼容，流式 + 鉴权）
+# ═══════════════════════════════════════════
+cargo run --release -- serve --ckpt checkpoints/zh-sft/best.ckpt --api-key sk-test
+# 之后任何 OpenAI 兼容客户端把 base_url 指到 http://127.0.0.1:8080 即可调用
 
 # ═══════════════════════════════════════════
 #  监督微调（把只会续写的预训练模型教会"应答"）
@@ -558,7 +566,7 @@ cargo run --release -- chat [参数]
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，对话时自动加载。
 
-**`--prompt-format`**：默认 `sft`，prompt 会被拼成训练时的模板形态（`用户：` / `助手：`，见 [§5](#5-sft--监督微调把续写变成应答)），
+**`--prompt-format`**：默认 `sft`，prompt 会被拼成训练时的模板形态（`用户：` / `助手：`，见 [§6](#6-sft--监督微调把续写变成应答)），
 生成在三种情况下停下：**采到 EOS**（正常收尾，SFT 训练时每段回答都以它结尾）、**命中文本停止标记**
 （`用户：` / `。。`，防它顺着模板接着编下一轮提问）、**跑满 `--max-new` 被截断**。这样它接的是
 "该我回答了"的位置，而不是把提问当成小说开头往下续。
@@ -591,7 +599,113 @@ cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt --temperature 1.0 --
 
 ---
 
-### 5. `sft` —— 监督微调：把"续写"变成"应答"
+### 5. `serve` —— 部署成 OpenAI 兼容的 API 服务
+
+```bash
+cargo run --release -- serve [参数]
+```
+
+把 checkpoint 包装成常驻 HTTP 服务，接口形状与主流大模型厂商一致
+（`POST /v1/chat/completions` + SSE 流式），任何 OpenAI 兼容客户端把
+`base_url` 指过来即可调用。加载链路与 `chat` 完全一致（配置 → 分词器 →
+checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept 循环。
+详细原理见 [`docs/40-把模型部署成API服务.md`](docs/40-把模型部署成API服务.md)。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config <路径>` | string | `config/config.json` | 配置文件路径 |
+| `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
+| `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径 |
+| `--host <地址>` | string | `127.0.0.1` | 监听地址（只本机访问；对外开放用 `0.0.0.0`） |
+| `--port <端口>` | int | `8080` | 监听端口 |
+| `--api-key <密钥>` | string | 无（不鉴权） | 给出后所有请求必须带 `Authorization: Bearer <key>` |
+| `--cors` | flag | 关 | 允许跨域（回 `Access-Control-Allow-Origin: *`），浏览器页面直连调试用 |
+| `--system <文本>` | string | `""` | 服务级系统提示（请求 messages 里的 system 接在它后面） |
+| `--temperature` / `--top-k` / `--top-p` | — | `0.8` / `40` / `0.9` | 采样默认值，请求里的同名字段可逐个覆盖 |
+| `--repetition-penalty` / `--repetition-window` | — | `1.1` / `64` | 重复惩罚及其回看窗口 |
+| `--max-new <数量>` | int | `200` | 生成上限（请求 `max_tokens` 缺省时用它） |
+| `--kv-bits <位宽>` / `--kv-sink <N>` | string/int | `none` / `0` | KV cache 量化与 Attention Sink |
+| `--seed <种子>` | int | `42` | 请求不带 `seed` 时的随机种子 |
+| `--prompt-format <模板>` | string | `sft` | 同 `chat`：`sft` / `raw` |
+| `--merge-lora` | flag | 关 | 推理前把 LoRA 增量并进主干权重 |
+
+**端点**：
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| POST | `/v1/chat/completions` | 是 | 对话补全；`stream: true` 走 SSE 流式 |
+| POST | `/v1/embeddings` | 是 | 文本向量化（最后一层 hidden 均值池化） |
+| GET | `/v1/models` | 是 | 模型列表（id = checkpoint 文件名） |
+| GET | `/health` | 否 | 存活探针 |
+| GET | `/v1/status` | 否 | 队列长度 / 请求计数 / 模型元信息 |
+| GET | `/openapi.json` | 否 | OpenAPI 3.1 接口规范（JSON），可导入 Postman / Apifox / Swagger UI |
+| GET | `/openapi.yaml` | 否 | 同上，YAML 格式；`serve` 启动时自动写出静态版 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml) |
+| OPTIONS | 任意 | 否 | CORS 预检（仅 `--cors` 时带跨域头） |
+
+**流式输出**：`"stream": true` 时按 OpenAI 的 SSE 格式逐 token 下发——首帧声明
+`role: assistant`，中间帧是 `delta.content` 增量，末尾依次发 `finish_reason`
+帧、`usage` 帧和 `data: [DONE]`。多字节字符与停止标记前缀会被 hold-back 到
+确定安全才发，所以流式与非流式输出逐字一致。
+
+**客户端断开即中止**：客户端关掉连接后服务端立刻停止生成（不再对空连接烧
+CPU），日志打印 `客户端提前断开，生成已中止（N token）`。
+
+**并发模型**：每请求一个线程处理 HTTP，但模型只有一份、生成串行排队
+（`/v1/status` 的 `queue.queued` 就是队列长度）——单机 CPU 推理时并行只会互相
+抢核心，排队反而让延迟曲线平稳。
+
+**限制**：请求体 ≤ 2 MB、`messages` ≤ 200 条且末条必须是 `user`、`n` 只接受 1、
+`stop` ≤ 4 个且每个 ≤ 64 字节、embeddings 单批 ≤ 32 条；不认识的字段一律忽略
+（OpenAI SDK 才能直连），认识的字段严格校验并指明错在哪。
+
+**示例**：
+
+```bash
+# ── 启动服务（推荐 release + 显式 key）──
+cargo run --release -- serve --ckpt checkpoints/zh-sft/best.ckpt \
+  --host 127.0.0.1 --port 8080 --api-key sk-test
+
+# ── 非流式调用（注意：PowerShell 下 JSON 走文件，避免引号被吞）──
+$json = '{"model":"best","messages":[{"role":"user","content":"你好"}]}'
+[IO.File]::WriteAllText("$env:TEMP\req.json", $json, [Text.UTF8Encoding]::new($false))
+curl.exe -s http://127.0.0.1:8080/v1/chat/completions `
+  -H "Authorization: Bearer sk-test" -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\req.json"
+
+# ── 流式调用（-N 关闭 curl 缓冲，边生成边打印）──
+$json = '{"model":"best","stream":true,"messages":[{"role":"user","content":"写一首诗"}]}'
+[IO.File]::WriteAllText("$env:TEMP\req.json", $json, [Text.UTF8Encoding]::new($false))
+curl.exe -s -N http://127.0.0.1:8080/v1/chat/completions `
+  -H "Authorization: Bearer sk-test" -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\req.json"
+
+# ── 文本向量化 ──
+$json = '{"input":"你好"}'
+[IO.File]::WriteAllText("$env:TEMP\emb.json", $json, [Text.UTF8Encoding]::new($false))
+curl.exe -s http://127.0.0.1:8080/v1/embeddings `
+  -H "Authorization: Bearer sk-test" -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\emb.json"
+
+# ── 健康检查与状态（不需鉴权）──
+curl.exe -s http://127.0.0.1:8080/health
+curl.exe -s http://127.0.0.1:8080/v1/status
+
+# ── 接口规范（不需鉴权；serve 启动时也会自动写出 openapi/ 目录）──
+#    下面两条是手动刷新，与启动自动写出的内容逐字一致
+curl.exe -s -o openapi\openapi.json http://127.0.0.1:8080/openapi.json
+curl.exe -s -o openapi\openapi.yaml http://127.0.0.1:8080/openapi.yaml
+```
+
+**踩坑：PowerShell 里 `curl -d "{\"a\":1}"` 的引号会被吞掉**，服务端收到的
+是不合法 JSON（报错形如 `key must be a string at line 1 column 2`）。可靠做法
+是把 JSON 写进临时文件再用 `--data-binary "@file"` 发（见上例）。
+
+**安全提示**：`--api-key` 走的是明文 HTTP，跨机器调用请前置 nginx/caddy 终结
+TLS；`--cors` 的 `*` 意味着任何网页都能调，别在生产开。
+
+---
+
+### 6. `sft` —— 监督微调：把"续写"变成"应答"
 
 ```bash
 cargo run --release -- sft [参数]
@@ -733,7 +847,7 @@ cargo run --release -- chat --ckpt checkpoints/zh-sft/final.ckpt --tokenizer che
 
 ---
 
-### 6. `finetune` —— LoRA 微调
+### 7. `finetune` —— LoRA 微调
 
 ```bash
 cargo run --release -- finetune [参数]
@@ -838,7 +952,7 @@ step    54 | lr 0.000006 | loss 6.2499 | val 6.5596 (ppl 706.0) *
 
 ---
 
-### 7. `preset` —— 生成预设配置
+### 8. `preset` —— 生成预设配置
 
 ```bash
 cargo run --release -- preset [参数]
@@ -884,7 +998,7 @@ cargo run --release -- train --config config/config_medium.json
 
 ---
 
-### 8. `demo` —— 端到端演示
+### 9. `demo` —— 端到端演示
 
 ```bash
 cargo run --release -- demo
@@ -918,7 +1032,7 @@ cargo run -- demo
 
 ---
 
-### 9. `bench` —— 性能基准
+### 10. `bench` —— 性能基准
 
 ```bash
 cargo run --release -- bench [参数]
@@ -977,7 +1091,7 @@ cargo run --release -- bench --steps 30
 
 ---
 
-### 10. `scaling` —— Scaling Laws 实验（预算规划 + 实测幂律拟合）
+### 11. `scaling` —— Scaling Laws 实验（预算规划 + 实测幂律拟合）
 
 ```bash
 cargo run --release -- scaling [参数]
@@ -1028,7 +1142,7 @@ cargo run --release -- scaling --budget 1e23 --gpu-tflops 989 --n-gpu 1024 --mfu
 
 ---
 
-### 11. `moe` —— MoE 稀疏专家实验（第 32 课）
+### 12. `moe` —— MoE 稀疏专家实验（第 32 课）
 
 ```bash
 cargo run --release -- moe [参数]
@@ -1093,7 +1207,7 @@ cargo run --release -- moe [参数]
 
 ---
 
-### 12. `quant` / `distributed` / `align` / `rag` / `speculative` —— 第 33~38 课实验
+### 13. `quant` / `distributed` / `align` / `rag` / `speculative` —— 第 33~38 课实验
 
 第 33~38 课各带一个子命令，把该课的算法跑成**带断言自检**的实验：输出的是实测数字与结论，
 参数配得不合法（如 `--gamma` 相对 `--block-size` 过大）会当场 panic，而不是给出一份看起来正常的结果。
@@ -1119,7 +1233,7 @@ cargo run --release -- speculative [参数]  # 第 34/35 课：推测解码 + �
 
 ---
 
-### 13. `cargo test` —— 单元测试
+### 14. `cargo test` —— 单元测试
 
 ```bash
 # ── 运行全部测试 ──
@@ -1148,9 +1262,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **210 个单元测试**（零外部依赖；全量约 11 分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **235 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 220 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 245 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1229,6 +1343,18 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `test_sparse_stats_matches_real_layer` | 参数/激活量公式与真实建层逐位一致（GELU 与 SwiGLU 两种专家）；4 专家取 2 ⇒ 激活约一半、省约一半 FLOPs |
 | `test_aux_loss_gradient_balances_routing` | 只优化 `L_aux` 能把偏斜的负载推平（不均衡度下降）——这是"加不加辅助损失"对照实验的机理 |
 | `test_moe_layer_trains` | 端到端：MoE 层 + 输出头在簇状合成任务上真的能学起来（专家可分工） |
+| `split_sft_history_shape` / `split_raw_history_shape` | `serve` 历史拼接：SFT 模板形态与裸续写形态的三段（system / 历史 / 最后一问） |
+| `split_sft_two_rounds_join_with_newline` / `split_merges_multiple_system_messages` / `merge_system_service_level_comes_first` | 多轮历史换行拼接、多条 system 合并、服务级 system 排在会话级之前 |
+| `parse_chat_rejects_bad_requests` / `parse_chat_applies_defaults_and_overrides` | `chat/completions` 入参：空 messages / 超长 / 末条非 user / 非法 role 报 400；采样参数逐字段覆盖默认值 |
+| `stop_interner_dedups_identical_slices` / `stop_interner_rejects_oversized_input` | stop 字符串驻留表：重复项去重共享、组合数与长度超限拒绝 |
+| `sse_pipe_reads_frames_then_hits_eof` | SSE 管道：按帧吐字节、channel 关闭后返回 0（EOF，触发干净收尾） |
+| `finish_reason_mapping` / `mean_pool_averages_rows` | `StopReason` → OpenAI `finish_reason` 映射；embeddings 的均值池化逐行正确 |
+| `openapi_spec_covers_every_route` | `/openapi.json` 的 `paths` 与真实路由表**一一对应**（新增端点忘写规范会当场失败） |
+| `openapi_spec_constraints_match_parse_chat` | 规范里声明的 `max_tokens` / `max_embeddings` / messages 条数上限与 `parse_chat` 实际校验值一致（防文档漂移） |
+| `openapi_spec_every_ref_resolves` | 全文每个 `$ref`（`#/components/schemas/...`）都能解析到已声明的 schema |
+| `json_to_yaml_renders_nested_structures` | 手写 JSON→YAML：块映射 / 块序列 / 复杂数组项的 `- ` 前缀缩进正确 |
+| `yaml_quoting_never_leaks_ambiguous_scalars` | YAML 引号安全：`1.1.1` / `on` / 含 `:` `#` 等会被误解析的标量一律加引号 |
+| `dump_openapi_files_writes_both_formats` | `serve` 启动自动写出的 `openapi/{json,yaml}` 与端点字节逐字一致 |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
 
@@ -1253,7 +1379,7 @@ cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
 
 ---
 
-### 14. GPU 加速（可选 feature）
+### 15. GPU 加速（可选 feature）
 
 默认构建**不启用 GPU**，保持依赖轻量。通过 `--features gpu` 开启 wgpu 计算着色器加速：
 
@@ -1454,7 +1580,7 @@ SwiGLU 就足以让整条路径放弃）。
 | `out_dir` | string | `"checkpoints"` | 权重输出目录：checkpoint（latest / best / final）与 `tokenizer.json` 都写在这里。目录不存在时自动创建 |
 | `accum_steps` | int | `1` | 梯度累积步数。有效 batch = `batch_size × accum_steps` |
 | `tokenizer_file` | string/null | `null` | 分词器文件路径。`null` = 从语料训练并自动保存；指定路径 = 直接加载 |
-| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0, "targets": { "q": true, "k": true, "v": true, "o": false, "mlp": false } }`。**只被 `finetune` 子命令读取**（`sft` 忽略它），`--lora-rank` / `--lora-alpha` / `--lora-targets` 优先于它（CLI 没传才看这里）；`train` 子命令不注入适配层，读到它只会打印一行提示。`targets` 字段可省（回落 `q,k,v`，兼容旧档）。详见 [§6](#6-finetune--lora-微调) 与第 29 课 |
+| `lora` | object/null | `null` | LoRA 配置 `{ "rank": 16, "alpha": 16.0, "targets": { "q": true, "k": true, "v": true, "o": false, "mlp": false } }`。**只被 `finetune` 子命令读取**（`sft` 忽略它），`--lora-rank` / `--lora-alpha` / `--lora-targets` 优先于它（CLI 没传才看这里）；`train` 子命令不注入适配层，读到它只会打印一行提示。`targets` 字段可省（回落 `q,k,v`，兼容旧档）。详见 [§7](#7-finetune--lora-微调) 与第 29 课 |
 | `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = **每个评估点**（每 `eval_every` 步 + 最后一步）写一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`。无验证集时 `val_loss` / `ppl` 两列留空。**每次训练覆盖该文件**，不是追加 |
 | `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
 | `sft_file` | string/null | `null` | 对话语料路径，逗号分隔，每项可以是文件、目录或含 `*` 的路径。**被 `sft` 与 `finetune` 两个子命令读取**（LoRA 微调与全参 SFT 共用同一份语料，效果才可对比）；`--sft-file` 优先于它。两处命令行都未指定且这里也是 `null` 时直接报错 |
@@ -1562,14 +1688,14 @@ llm_from_scratch/
 │   ├── zh/             #   本仓库已训好的中文权重：latest/best/final.ckpt + tokenizer.json + train.csv
 │   ├── zh-sft/         #   `sft` 的默认输出（{out_dir}-sft），不会覆盖上面的预训练权重
 │   └── ...             #   其他实验目录，如 checkpoints/perf、checkpoints/probe_b2
-├── logs/               # 日志目录（自动创建）：运行日志（每次 train/eval/generate/chat/sft/finetune 各一份）
+├── logs/               # 日志目录（自动创建）：运行日志（每次 train/eval/generate/chat/serve/sft/finetune 各一份）
 │                       #      与训练指标 CSV（由 train.log_file 指定，本项目配的是 checkpoints/zh/train.csv）
 ├── data/               # 语料：alice.txt（公版《爱丽丝梦游仙境》）
 │                       #      corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
 │                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）
 │                       #      corpus_perf/（性能测试用节选）、sft/（SFT 问答语料 zh_qa.txt）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / chat / sft / finetune / preset / demo / bench / scaling / moe
+│   ├── main.rs         # CLI 入口：train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling / moe
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）
 │   ├── runlog.rs       # 运行日志：每次训练 / 推理自动写 logs/{操作}_{时间戳}.log（命令行 + 完整配置 + 过程输出）
@@ -1589,9 +1715,13 @@ llm_from_scratch/
 │   ├── data.rs         # 数据集 + SFT 对话解析与 loss 掩码（第 14 课）
 │   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）
 │   ├── sample.rs       # 推理与采样（第 15、30 课）
+│   ├── serve.rs        # OpenAI 兼容 API 服务：路由/鉴权/SSE 流式/排队（第 40 课）
 │   ├── scaling.rs      # Scaling Laws：幂律拟合、算力/参数口径、Chinchilla 最优配比、实测扫描（第 31 课）
 │   └── moe.rs          # MoE 稀疏专家：Top-K 路由、两种门控口径、稀疏前向、辅助损失、容量因子（第 32 课）
-└── docs/               # 39 课教程文档（00-学习计划 + 01~39 各课）
+├── openapi/           # OpenAPI 接口规范静态版（serve 启动时自动写出，与端点同源，删了会重建）
+│   ├── openapi.json   #   OpenAPI 3.1，JSON（缩进输出），可导入 Postman / Apifox / Swagger UI
+│   └── openapi.yaml   #   同一份规范的 YAML 格式
+└── docs/               # 40 课教程文档（00-学习计划 + 01~40 各课）
 ```
 
 ### 产物目录约定（自动创建，无需手动 mkdir）
@@ -1601,7 +1731,7 @@ llm_from_scratch/
 | 配置文件 | `config/config.json` | `--config` / `--output` | 所有子命令的配置默认路径；`preset --output` 写同类路径 |
 | 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json`；`sft` 另写 `{out_dir}-sft`，`finetune` 写回 `{out_dir}` |
 | 训练指标日志 | `logs/train.csv` | `train.log_file` | CSV：`step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
-| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `eval` / `generate` / `chat` / `sft` / `finetune` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出 |
+| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出（`serve` 是常驻进程，日志在启动时落一份，之后每个请求的访问日志追加到 stdout） |
 
 实现方式：`src/config.rs` 提供 `ensure_parent_dir()` / `ensure_dir()`，并在**每个写盘出口**调用——
 `Config::save()`（配置）、`checkpoint::save()`（权重）、`Tokenizer::save()`（分词器）、`MetricsLogger::new()`（指标 CSV）、
@@ -1635,8 +1765,8 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **210 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `210 passed; 0 failed`，耗时约 11 分钟；
-  GPU 用例需 `--features gpu`，另计）（详见 [§13 `cargo test`](#13-cargo-test--单元测试)）
+- **235 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `235 passed; 0 failed`，release 全量约 43 秒；
+  GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
   `cholesky_inverse` / `Calibration` / `awq_best_alpha`、`distributed.rs` 的 `World::barrier` / `broadcast` / `qkv_head_columns`、
@@ -1743,7 +1873,7 @@ cargo run --release -- bench --steps 30
 | 推理（全量前向） | ~43 tok/s | ~165 tok/s | **约 3.9×** |
 
 **正确性**：当时 69 个单元测试全部通过；同一 seed 下 loss 与优化前完全一致；`demo` 端到端正常。
-（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§9 `bench`](#9-bench--性能基准) 与 [§14 GPU 章节](#14-gpu-加速可选-feature)。）
+（该组数据是优化当时的同机 A/B，绝对值有 ±20% 噪声；当前可复现的对照点见 [§10 `bench`](#10-bench--性能基准) 与 [§15 GPU 章节](#15-gpu-加速可选-feature)。）
 
 ### 还能压的地方
 

@@ -5,6 +5,7 @@
 //! - `cargo run --release -- eval     --config config/config.json [--ckpt checkpoints/latest.ckpt]`
 //! - `cargo run --release -- generate --config config/config.json [--ckpt ...] --prompt "Once" --max-new 100`
 //! - `cargo run --release -- chat     --config config/config.json [--ckpt ...] [--system "..."]`
+//! - `cargo run --release -- serve    --config config/config.json [--ckpt ...] [--host 127.0.0.1 --port 8080]`
 //! - `cargo run --release -- sft      --config config/config.json --pretrained ckpt [--sft-file "..."]`
 //! - `cargo run --release -- finetune --config config/config.json --pretrained ckpt [--lora-rank 16]`
 //! - `cargo run --release -- preset   [--name small] [--output config/config.json]`
@@ -14,6 +15,9 @@
 //!
 //! 每次训练 / 推理都会自动在 `logs/` 下生成一份运行日志（文件名含操作名与毫秒级时间），
 //! 内容包含完整命令行、完整配置与全部过程输出，见 [`runlog`]。
+
+// serve 里的 OpenAPI 规范是一整个巨大的 `json!{...}`，宏展开层数超过默认上限
+#![recursion_limit = "512"]
 
 // `runlog` 里的 `logln!` 宏要覆盖后面所有模块，必须最先声明并带 #[macro_use]
 #[macro_use]
@@ -35,12 +39,14 @@ mod model;
 mod moe;
 mod module;
 mod optim;
+mod prompt;
 mod quant;
 mod rag;
 mod rng;
 mod rope;
 mod sample;
 mod scaling;
+mod serve;
 mod speculative;
 mod tensor;
 mod tokenizer;
@@ -222,6 +228,51 @@ fn main() {
             ckpt.as_deref(),
             tokenizer.as_deref(),
             merge_lora,
+            &system,
+            SampleOpts {
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                repetition_window,
+                stop: &[],
+            },
+            max_new,
+            KvOpts::on(kv_sink, kv_bits_from_name(&kv_bits)),
+            seed,
+            &prompt_format,
+            rope,
+        ),
+        Cmd::Serve {
+            config,
+            ckpt,
+            tokenizer,
+            merge_lora,
+            host,
+            port,
+            api_key,
+            cors,
+            system,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            repetition_window,
+            max_new,
+            kv_bits,
+            kv_sink,
+            seed,
+            prompt_format,
+            rope,
+        } => cmd_serve(
+            &config,
+            ckpt.as_deref(),
+            tokenizer.as_deref(),
+            merge_lora,
+            &host,
+            port,
+            api_key,
+            cors,
             &system,
             SampleOpts {
                 temperature,
@@ -1030,52 +1081,6 @@ fn describe_kv(kv: &KvOpts) -> String {
     format!("开（{bits}，Attention Sink {})", kv.sink)
 }
 
-/// 把对话历史裁剪到不超过 `budget` 个 token：从最老的一行开始丢，保留最近的内容。
-///
-/// 必须真的调 `encode` 来数 token —— 按"字节数 / 字符数"估算的偏差很大：
-/// 中英文、BPE 合并数都不同，同样长度的文本 token 数能差一倍以上。
-fn trim_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
-    if history.is_empty() || tokenizer.encode(history).len() <= budget {
-        return history.to_string();
-    }
-    // 行粒度足够细：每轮对话都会写入多行
-    let lines: Vec<&str> = history.split('\n').collect();
-    for start in 1..lines.len() {
-        let candidate = lines[start..].join("\n");
-        if tokenizer.encode(&candidate).len() <= budget {
-            return candidate;
-        }
-    }
-    String::new()
-}
-
-/// SFT 模板下的历史裁剪：以 `SFT_USER` 为切点按**轮**丢，而不是按行。
-///
-/// 按行丢会把某轮拦腰截断（历史里一行只是回答中的一句），留下半截上下文。
-/// 每轮都以 `SFT_USER` 开头，从它的位置切就天然对齐到轮边界。
-fn trim_sft_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
-    if history.is_empty() || tokenizer.encode(history).len() <= budget {
-        return history.to_string();
-    }
-    for (pos, _) in history.match_indices(SFT_USER) {
-        let candidate = &history[pos..];
-        if tokenizer.encode(candidate).len() <= budget {
-            return candidate.to_string();
-        }
-    }
-    String::new()
-}
-
-/// SFT 模板下的停止标记（兜底用）。
-///
-/// 当前分词器带特殊 token，训练时每段对话的收尾符号是**可训练的 EOS**
-/// （见 `data::build_sft_stream` 的 `Some(id)` 分支），所以正常收尾靠 EOS 触发。
-/// 这里两个文本标记是保险：
-/// - `用户：` 防它顺着模板接着编下一轮提问（"回答后面跟提问"在训练语料里到处都是）；
-/// - `。。` 只对**老分词器**（没有 EOS、退回文本标记 [`SFT_END`]）训出来的权重有意义，
-///   当前 SFT 语料里 `。。` 从未出现过，实际不会命中。
-const SFT_STOP: &[&str] = &[SFT_END, SFT_USER];
-
 /// 把收尾原因说成一句人话。生成段为空时终端上只有一行空白，
 /// 不写清楚"模型没说话"还是"程序没跑"，用户无从判断（见 [`StopReason`]）。
 fn describe_stop(reason: StopReason) -> String {
@@ -1098,6 +1103,123 @@ fn stop_label(reason: StopReason) -> String {
         StopReason::StopMark(mark) => format!("命中停止标记「{mark}」"),
         StopReason::MaxNew => "跑满 --max-new 被截断".to_string(),
     }
+}
+
+/// 把模型部署成 OpenAI 兼容的 HTTP API（`serve` 子命令）
+///
+/// 加载链路与 [`cmd_chat`] 完全一致（配置 → 分词器 → checkpoint → LoRA → RoPE），
+/// 区别只在最后一步：不进 REPL，而是把模型与默认采样参数打包成 [`serve::ServeCfg`]，
+/// 交给 `serve::run` 起 HTTP 服务——服务进程常驻，所以这里的 `runlog::finish()`
+/// 由进程退出（Ctrl-C）时触发，而不是像 chat 那样每轮结束就收尾。
+#[allow(clippy::too_many_arguments)]
+fn cmd_serve(
+    config_path: &str,
+    ckpt_path: Option<&str>,
+    tokenizer_path: Option<&str>,
+    merge_lora: bool,
+    host: &str,
+    port: u16,
+    api_key: Option<String>,
+    cors: bool,
+    system: &str,
+    mut opts: SampleOpts,
+    max_new: usize,
+    kv: KvOpts,
+    seed: u64,
+    prompt_format: &str,
+    rope_opt: RopeArgs,
+) {
+    let log_path = runlog::start("serve");
+    println!("运行日志：{log_path}");
+    let cfg = Config::load(config_path);
+    runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
+    let tcfg = &cfg.train;
+    let use_sft = prompt_format == "sft";
+    if use_sft {
+        opts.stop = prompt::SFT_STOP;
+    }
+    let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
+    let (mut model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
+    maybe_merge_lora(&mut model, merge_lora);
+    // 长度外推必须在下面读 `model.cfg.block_size` **之前**生效（同 cmd_chat）。
+    let rope_note = apply_rope_override(&mut model, &rope_opt);
+    let block_size = model.cfg.block_size;
+    if max_new >= block_size {
+        logln!(
+            "[warn] --max-new {max_new} ≥ 上下文窗口 {block_size}，prompt 会被挤到没有空间，建议调小"
+        );
+    }
+    // OpenAI 客户端会拿请求里的 `model` 和 `/v1/models` 的 id 对账，
+    // 这里用 checkpoint 文件名当模型名，多个 checkpoint 服务并存时不会撞名。
+    let model_name = std::path::Path::new(&*ckpt_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "model".to_string());
+    let addr = format!("{host}:{port}");
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("配置文件", config_path.to_string()),
+            ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
+            (
+                "分词器文件",
+                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+            ),
+            ("模型结构", format!("{:?}", ckpt.model)),
+            ("模型名（回给客户端）", model_name.clone()),
+            ("系统提示", if system.is_empty() { "无".to_string() } else { system.to_string() }),
+            ("prompt 模板", prompt_format.to_string()),
+            ("每轮最大新 token", max_new.to_string()),
+            ("上下文窗口", block_size.to_string()),
+            ("seed", seed.to_string()),
+            ("temperature", opts.temperature.to_string()),
+            ("top_k", opts.top_k.to_string()),
+            ("top_p", opts.top_p.to_string()),
+            (
+                "重复惩罚",
+                format!("{}（回看窗口 {}）", opts.repetition_penalty, opts.repetition_window),
+            ),
+            ("KV cache", describe_kv(&kv)),
+            (
+                "RoPE / 上下文",
+                rope_note.clone().unwrap_or_else(|| {
+                    format!("沿用 checkpoint：窗口 {block_size}，base = {}", model.cfg.rope_base)
+                }),
+            ),
+            ("监听地址", format!("http://{addr}")),
+            (
+                "鉴权",
+                if api_key.is_some() {
+                    "开启（请求需带 Authorization: Bearer <key>）".to_string()
+                } else {
+                    "关闭（局域网内任何人可调用）".to_string()
+                },
+            ),
+            ("CORS", if cors { "开（浏览器页面可直连）" } else { "关" }.to_string()),
+        ],
+    );
+    if let Some(note) = &rope_note {
+        logln!("[rope] {note}");
+    }
+    serve::run(
+        serve::ServeCfg {
+            host: host.to_string(),
+            port,
+            api_key,
+            cors,
+            system: system.to_string(),
+            use_sft,
+            max_new,
+            seed,
+            kv,
+            model_name,
+            sample: opts,
+            block_size,
+        },
+        model,
+        tokenizer,
+    );
 }
 
 /// 交互式对话模式
@@ -1125,7 +1247,7 @@ fn cmd_chat(
     let use_sft = prompt_format == "sft";
     let mut opts = opts;
     if use_sft {
-        opts.stop = SFT_STOP;
+        opts.stop = prompt::SFT_STOP;
     }
     let ckpt_path = resolve_ckpt(ckpt_path, &tcfg.out_dir);
     let (mut model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
@@ -1233,29 +1355,12 @@ fn cmd_chat(
         }
         turn += 1;
 
-        // 构造 prompt：system + 历史 + 本轮。
-        // system 固定在序列最前面并独立于裁剪，历史按 **token** 裁剪（不是字节/字符），
-        // 并给本轮生成留够 max_new 个 token。
-        //
-        // 本轮追加到 prompt 末尾的内容：raw 模式就是输入本身；
-        // SFT 模式下要补上角色标记，并且**停在「助手：」这一行之后**——
-        // 这正是训练时"轮到模型说话"的位置，模型才会接着写回答，而不是继续续写前文。
-        let tail = if use_sft {
-            format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n")
-        } else {
-            input.to_string()
-        };
-        let n_tail = tokenizer.encode(&tail).len();
-        // 历史预算 = 输入预算 - system（含其后 '\n'）- 本轮追加内容 - 历史与它之间的 '\n'
-        let history_budget = prompt_budget.saturating_sub(n_system_prefix + n_tail + 1);
-        let history = if use_sft {
-            trim_sft_history(&tokenizer, &context_history, history_budget)
-        } else {
-            trim_history(&tokenizer, &context_history, history_budget)
-        };
-        if history.len() < context_history.len() {
-            let n_before = tokenizer.encode(&context_history).len();
-            let n_after = tokenizer.encode(&history).len();
+        // 构造 prompt：system + 历史 + 本轮。预算分配（system 永保 → 生成预留 → 历史）
+        // 与 SFT/raw 两种模板都在 `prompt` 模块里，HTTP serve 走同一套代码。
+        let assembled = prompt::assemble(&tokenizer, system, &context_history, input, use_sft, prompt_budget);
+        let history = assembled.history;
+        if let Some((n_before, n_after)) = assembled.trimmed {
+            let history_budget = assembled.history_budget;
             let dropped = n_before.saturating_sub(n_after);
             trim_count += 1;
             dropped_tokens_total += dropped;
@@ -1278,16 +1383,7 @@ fn cmd_chat(
             }
         }
 
-        let mut prompt = String::new();
-        if !system.is_empty() {
-            prompt.push_str(system);
-            prompt.push('\n');
-        }
-        if !history.is_empty() {
-            prompt.push_str(&history);
-            prompt.push('\n');
-        }
-        prompt.push_str(&tail);
+        let prompt = assembled.prompt;
         runlog::append(&format!("\n[第 {turn} 轮] 输入：{input}"));
 
         let n_prompt = tokenizer.encode(&prompt).len();

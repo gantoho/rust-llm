@@ -210,6 +210,68 @@ pub enum Cmd {
         #[command(flatten)]
         rope: RopeArgs,
     },
+    /// 把模型部署成 OpenAI 兼容的 HTTP API（`/v1/chat/completions`，支持 SSE 流式输出）
+    Serve {
+        /// 配置文件路径
+        #[arg(long, default_value = crate::config::DEFAULT_CONFIG_PATH)]
+        config: String,
+        /// checkpoint 文件（缺省用 out_dir/latest.ckpt）
+        #[arg(long)]
+        ckpt: Option<String>,
+        /// 分词器文件路径（缺省自动从 out_dir/tokenizer.json 加载）
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// 推理前把 LoRA 增量合并进主干权重
+        #[arg(long)]
+        merge_lora: bool,
+        /// 监听地址（127.0.0.1 只本机可访问；对外开放用 0.0.0.0）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 监听端口
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// API key：给出后所有请求必须带 `Authorization: Bearer <key>`（不给 = 不鉴权）
+        #[arg(long)]
+        api_key: Option<String>,
+        /// 允许跨域（CORS）：开启后返回 `Access-Control-Allow-Origin: *`，供浏览器页面直连调试
+        #[arg(long)]
+        cors: bool,
+        /// 系统提示词（服务级 system，客户端 messages 里的 system 消息也可覆盖）
+        #[arg(long, default_value = "")]
+        system: String,
+        /// 采样温度
+        #[arg(long, default_value_t = 0.8)]
+        temperature: f32,
+        /// top-k 采样
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// top-p 采样
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+        /// 重复惩罚系数：>1 压低最近出现过的 token（1.0 = 关闭）
+        #[arg(long, default_value_t = 1.1)]
+        repetition_penalty: f32,
+        /// 重复惩罚的回看窗口：只看最近 N 个 token（0 = 关闭）
+        #[arg(long, default_value_t = 64)]
+        repetition_window: usize,
+        /// 单次生成的最大 token 数（`max_tokens` 缺省时用它）
+        #[arg(long, default_value_t = 200)]
+        max_new: usize,
+        /// KV cache 的量化位宽：none = f32；int8 / int4 = KIVI 式压缩
+        #[arg(long, value_parser = ["none", "int8", "int4"], default_value = "none")]
+        kv_bits: String,
+        /// Attention Sink：缓存超窗丢弃时永久保留最前面的 N 个位置（StreamingLLM）
+        #[arg(long, default_value_t = 0)]
+        kv_sink: usize,
+        /// 随机种子（temperature=0 时无影响；>0 时同种子可复现）
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// prompt 模板：`sft` / `raw`，含义同 `chat` 子命令
+        #[arg(long, value_parser = ["sft", "raw"], default_value = "sft")]
+        prompt_format: String,
+        #[command(flatten)]
+        rope: RopeArgs,
+    },
     /// 监督微调（SFT）：用「提问→回答」语料把只会续写的预训练模型教会应答
     Sft {
         /// 配置文件路径

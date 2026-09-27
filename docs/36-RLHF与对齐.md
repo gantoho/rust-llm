@@ -215,7 +215,7 @@ $$
 ## 本项目的实际实现
 
 上面的原理已全部落地为可运行代码。核心文件是 [`src/align.rs`](../src/align.rs)（20 个单测），
-CLI 入口是 [`align`](../README.md#12-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令。
+CLI 入口是 [`align`](../README.md#13-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令。
 
 ### 代码结构
 

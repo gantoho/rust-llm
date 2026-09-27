@@ -252,6 +252,304 @@ pub fn generate(
     generate_with_reason(model, tokenizer, prompt, max_new, opts, kv, rng).text
 }
 
+/// 生成状态机：把生成循环拆成可单步推进的结构，供**流式输出**（HTTP SSE）使用。
+///
+/// 非流式路径 [`generate_with_reason`] 就是 `new + run + into_output` 的封装，
+/// 两者执行完全相同的前向/采样序列，同种子下结果逐字节一致。
+///
+/// 流式用法：循环 `step()`，每步之后用 [`Generator::next_text`] 取"可安全发出"的增量，
+/// 收尾后（`step()` 返回 `false`）用 [`Generator::flush`] 补发尾巴，最后 [`Generator::into_output`] 拿结果。
+///
+/// 流式不能把 `decode` 出来的字节直接全发出去——有两处会被后续"追回"：
+/// 1. 命中停止标记时最终结果是 `raw[..rel].trim_end()`，尾部空白与标记本身都不出现，
+///    先发出去就收不回来；
+/// 2. 停止标记可能**横跨两次采样**（这次 decode 出「用户」，下次补上「：」），
+///    已发出的字节必须保证不超过标记的起始位置。
+///
+/// 因此 [`Generator::next_text`] 按 [`safe_len`] 扣掉"尾部空白 + 停止标记的真前缀"再发，
+/// 被扣住的部分在收尾时由 [`Generator::flush`] 随最终结果一次性补齐（此刻结果已定，不再变动）。
+pub struct Generator<'m, 'r> {
+    model: &'m Transformer,
+    tokenizer: &'m Tokenizer,
+    opts: SampleOpts,
+    eos: Option<usize>,
+    /// 字节级 BPE 的 UTF-8 约束词表（char 分词器为 `None`）
+    vocab_bytes: Option<&'m [Vec<u8>]>,
+    /// BOS + prompt + 已生成的 token
+    ids: Vec<usize>,
+    /// 生成段的起点：这之前的 token 全是「BOS + prompt」
+    n_prompt: usize,
+    prompt_text: String,
+    cache: Option<Vec<KVCache>>,
+    rng: &'r mut Rng,
+    masked: Vec<f32>,
+    /// 还能生成多少个新 token（到 0 即以 [`StopReason::MaxNew`] 收尾）
+    remaining: usize,
+    /// 已通过 [`Generator::next_text`] 发出的字节数（生成段内偏移）
+    emitted: usize,
+    /// 收尾原因；`Some` 表示已收尾
+    reason: Option<StopReason>,
+    /// 收尾时定稿的生成段（收尾前为空，[`Generator::into_output`] 兜底补算）
+    generated: String,
+}
+
+impl<'m, 'r> Generator<'m, 'r> {
+    /// 建立生成状态：编码 prompt（前补 BOS）、建 KV 缓存、准备采样状态。
+    ///
+    /// 参数与 [`generate_with_reason`] 一致。
+    pub fn new(
+        model: &'m Transformer,
+        tokenizer: &'m Tokenizer,
+        prompt: &str,
+        max_new: usize,
+        opts: &SampleOpts,
+        kv: KvOpts,
+        rng: &'r mut Rng,
+    ) -> Self {
+        // prompt 前面补 BOS：训练时每篇文档都以 BOS 开头（见 `data::encode_document`），
+        // 推理从 BOS 起头才与训练分布一致。老分词器没有 BOS，行为不变。
+        let mut ids = match tokenizer.bos_id() {
+            Some(bos) => vec![bos],
+            None => Vec::new(),
+        };
+        ids.extend(tokenizer.encode(prompt));
+        if ids.is_empty() {
+            ids.push(0); // 空 prompt 且无 BOS：先喂一个 token，避免 0 长度上下文导致下标下溢
+        }
+        // 生成段的起点：这之前的 token 全是「BOS + prompt」。`decode` 会在特殊 token（BOS）
+        // 处断开，所以前后两段分别 decode 再拼起来与整体 decode 结果一致，而调用方拿到的
+        // `generated` 就是纯粹的"本轮生成"，不必再按 `prompt.len()` 的字节偏移去切全文。
+        let n_prompt = ids.len();
+        let prompt_text = tokenizer.decode(&ids[..n_prompt]);
+        Generator {
+            model,
+            tokenizer,
+            opts: *opts,
+            eos: tokenizer.eos_id(),
+            vocab_bytes: tokenizer.vocab_bytes(),
+            ids,
+            n_prompt,
+            prompt_text,
+            cache: kv.build(model),
+            rng,
+            masked: Vec::new(),
+            remaining: max_new,
+            emitted: 0,
+            reason: None,
+            generated: String::new(),
+        }
+    }
+
+    /// 推进一步：一次前向 + 一次采样。
+    ///
+    /// 返回 `true` = 还在生成中（可接着调 [`Generator::next_text`] 取增量）；
+    /// 返回 `false` = 已收尾（原因见内部 `reason`，最终结果用 [`Generator::into_output`] 取）。
+    /// 已收尾后再调用恒返回 `false`。
+    pub fn step(&mut self) -> bool {
+        if self.reason.is_some() {
+            return false;
+        }
+        // 上限用尽：与原循环跑满 `0..max_new` 后的出口一致（生成段不 trim，原样交出）
+        if self.remaining == 0 {
+            self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..]);
+            self.reason = Some(StopReason::MaxNew);
+            return false;
+        }
+        self.remaining -= 1;
+        let block_size = self.model.cfg.block_size;
+
+        // 只保留最近的 block_size 个 token（两种模式都必须遵守的上下文上限）
+        let start = self.ids.len().saturating_sub(block_size);
+        let ctx = &self.ids[start..];
+
+        // 推理不需要反向：no_grad 下不挂计算图、不分配梯度缓冲
+        // （把 cache 提成局部变量：闭包按字段精确捕获，避免与下面的 `self.ids` 打架）
+        let model = self.model;
+        let cache = self.cache.as_mut();
+        let logits = crate::tensor::no_grad(|| {
+            if let Some(c) = cache {
+                // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
+                // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
+                if c[0].seq_len() == 0 {
+                    model.forward(ctx, 1, ctx.len(), Some(c), false)
+                } else {
+                    model.forward(&self.ids[self.ids.len() - 1..], 1, 1, Some(c), false)
+                }
+            } else {
+                // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
+                model.forward(ctx, 1, ctx.len(), None, false)
+            }
+        });
+
+        // 取最后一个位置的 logits
+        let v = model.cfg.vocab_size;
+        let n = logits.numel();
+        let last_row = &logits.data()[n - v..];
+        // 只允许"接上后仍是合法 UTF-8 前缀"的 token，否则会拼出半个字符
+        let row: &[f32] = match self.vocab_bytes {
+            Some(vocab) => {
+                let pending = pending_tail(vocab, &self.ids);
+                self.masked.clear();
+                self.masked.extend_from_slice(last_row);
+                mask_illegal_utf8(&mut self.masked, vocab, &pending);
+                &self.masked
+            }
+            None => last_row,
+        };
+        // 重复惩罚的回看窗口：只看最近 N 个 token（含 prompt），更早的不再计入。
+        // 窗口过大时高频 token 会被持续压低，可能影响语句的连贯性。
+        let recent = if self.opts.repetition_window == 0 {
+            &[][..]
+        } else {
+            let start = self.ids.len().saturating_sub(self.opts.repetition_window);
+            &self.ids[start..]
+        };
+        let next = sample_token(row, &self.opts, recent, self.rng);
+        self.ids.push(next);
+
+        // 采到 EOS 就收：这是模型自己学出来的结束符号（训练时每段序列末尾都带它），
+        // 比"等某个字符组合出现"可靠得多。EOS 本身不进结果（`decode` 跳过特殊 token）。
+        if self.eos == Some(next) {
+            self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..self.ids.len() - 1]);
+            self.reason = Some(StopReason::Eos);
+            return false;
+        }
+
+        // 命中停止标记就收：SFT 模板下模型答完会自己吐「。。」，
+        // 不截断的话它会顺着模板继续编下一轮提问（"回答后面跟提问"在训练语料里到处都是）。
+        // 这一条是给**没学过 EOS 的老权重**兜底的路径。
+        //
+        // 只在**新生成的部分**里查找：prompt 自己就含「用户：」（模板的一部分），
+        // 对整个字符串搜索会立刻在 prompt 里命中，结果返回空白。
+        // 每步解码一次生成段：长度上限就是 block_size，这点开销远小于一次前向。
+        if !self.opts.stop.is_empty() {
+            let raw = self.tokenizer.decode(&self.ids[self.n_prompt..]);
+            if let Some((rel, mark)) = self
+                .opts
+                .stop
+                .iter()
+                .filter_map(|s| raw.find(s).map(|i| (i, *s)))
+                .min_by_key(|(i, _)| *i)
+            {
+                // `rel` 来自 `find`，一定落在字符边界上
+                self.generated = raw[..rel].trim_end().to_string();
+                self.reason = Some(StopReason::StopMark(mark));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 取一段**可以安全发给客户端**的增量（上次发出之后的新内容）。
+    ///
+    /// 返回 `None` = 这一步还没有可发的字节（例如尾部正卡着半个停止标记）。
+    /// 已收尾后恒返回 `None`，尾巴请用 [`Generator::flush`] 补。
+    pub fn next_text(&mut self) -> Option<String> {
+        if self.reason.is_some() {
+            return None;
+        }
+        let raw = self.tokenizer.decode(&self.ids[self.n_prompt..]);
+        let n = safe_len(&raw, self.opts.stop);
+        // 安全长度按构造不会倒退，但守住这道闸：宁可这步不发，也绝不回吐已发字节
+        if n <= self.emitted {
+            return None;
+        }
+        let delta = raw[self.emitted..n].to_string();
+        self.emitted = n;
+        Some(delta)
+    }
+
+    /// 收尾后补发剩余尾巴（最终结果里还没发出的部分）。
+    ///
+    /// 必须在 `step()` 返回 `false` **之后**调用；收尾前调用返回空串。
+    pub fn flush(&mut self) -> String {
+        if self.reason.is_none() {
+            return String::new();
+        }
+        let g = &self.generated;
+        let mut start = self.emitted.min(g.len());
+        while start > 0 && !g.is_char_boundary(start) {
+            start -= 1; // 兜底：decode 产物按字节切出的偏移必须落在字符边界
+        }
+        let tail = g[start..].to_string();
+        self.emitted = g.len();
+        tail
+    }
+
+    /// 一直推进到收尾（非流式用法）。
+    pub fn run(&mut self) {
+        while self.step() {}
+    }
+
+    /// 已采样出的新 token 数（含刚收尾时补上的那个 EOS/停止标记）。
+    ///
+    /// 服务端要把它当 `usage.completion_tokens` 回给客户端，
+    /// 这里的计数与 `prompt_tokens` 同源（都是 `ids` 的长度差），两者相加即总长。
+    pub fn generated_tokens(&self) -> usize {
+        self.ids.len().saturating_sub(self.n_prompt)
+    }
+
+    /// 输入侧 token 数（BOS + prompt），生成前生成后都不变。
+    ///
+    /// 服务端把它当 `usage.prompt_tokens` 回给客户端。
+    pub fn prompt_tokens(&self) -> usize {
+        self.n_prompt
+    }
+
+    /// 消费状态机，取出最终结果（[`GenOutput`]）。
+    pub fn into_output(self) -> GenOutput {
+        let Generator {
+            tokenizer,
+            ids,
+            n_prompt,
+            prompt_text,
+            reason,
+            generated,
+            ..
+        } = self;
+        // 未收尾就取结果（调用方没跑完）：按当前已生成的 token 算，原因记 MaxNew
+        let (reason, generated) = match reason {
+            Some(r) => (r, generated),
+            None => (StopReason::MaxNew, tokenizer.decode(&ids[n_prompt..])),
+        };
+        GenOutput {
+            text: format!("{prompt_text}{generated}"),
+            generated,
+            reason,
+        }
+    }
+}
+
+/// 流式安全发出的字节长度：见 [`Generator`] 的文档。返回值落在 UTF-8 字符边界上。
+///
+/// - `stops` 为空：直接全发（此路径的收尾结果从不 trim，也没有标记可截断）；
+/// - 否则扣两样：① 尾部可能成为某标记**开头**的片段（标记可横跨两次采样），
+///   ② 扣完之后的尾部空白（命中标记时最终结果要 `trim_end`，空白会消失）。
+///
+/// 关键不变式：`safe_len ≤ 标记起始位置`。完整标记在 `step()` 里就已检出并收尾，
+/// 所以这里只会遇到"真前缀"；而任何未来才补全的标记，其起始位置之前的部分
+/// 必然是当前 `raw` 的尾部真前缀（生成是**只追加**的），于是被 ① 扣住——
+/// 因此已发出的字节永远不会越过最终的 `rel`，`flush` 的尾巴永不为空差。
+fn safe_len(raw: &str, stops: &[&str]) -> usize {
+    if stops.is_empty() {
+        return raw.len();
+    }
+    let mut cut = raw.len();
+    for mark in stops {
+        // 只看真前缀（1..len）：完整标记意味着 step() 已收尾，走不到这里
+        for k in 1..mark.len() {
+            if !mark.is_char_boundary(k) {
+                continue;
+            }
+            if raw.len() >= k && raw.ends_with(&mark[..k]) {
+                cut = (raw.len() - k).min(cut);
+            }
+        }
+    }
+    // ② 标记起始位置之前的空白同样会被最终的 trim_end 掉，跟在前缀后面一起扣
+    raw[..cut].trim_end().len()
+}
+
 /// 生成文本，并给出收尾原因与本轮新生成的部分。
 ///
 /// - prompt: 起始文本
@@ -267,6 +565,9 @@ pub fn generate(
 /// [`GenOutput::generated`] 单独给出生成段，调用方不必再用 `prompt.len()` 去切全文：
 /// 那个字节偏移在"生成段为空"时会把整段切成空串，于是"模型没说话"与"程序出错"
 /// 长得一模一样。偏移本身还与"`decode` 丢掉特殊 token"这一实现细节耦合。
+///
+/// 本函数是 [`Generator`]（状态机）的非流式封装：同种子下与手动
+/// `new + run + into_output` 逐字节一致。需要边生成边输出（HTTP SSE）时直接用 [`Generator`]。
 pub fn generate_with_reason(
     model: &Transformer,
     tokenizer: &Tokenizer,
@@ -276,117 +577,9 @@ pub fn generate_with_reason(
     kv: KvOpts,
     rng: &mut Rng,
 ) -> GenOutput {
-    let block_size = model.cfg.block_size;
-    // prompt 前面补 BOS：训练时每篇文档都以 BOS 开头（见 `data::encode_document`），
-    // 推理从 BOS 起头才与训练分布一致。老分词器没有 BOS，行为不变。
-    let mut ids = match tokenizer.bos_id() {
-        Some(bos) => vec![bos],
-        None => Vec::new(),
-    };
-    ids.extend(tokenizer.encode(prompt));
-    if ids.is_empty() {
-        ids.push(0); // 空 prompt 且无 BOS：先喂一个 token，避免 0 长度上下文导致下标下溢
-    }
-    // 生成段的起点：这之前的 token 全是「BOS + prompt」。`decode` 会在特殊 token（BOS）
-    // 处断开，所以前后两段分别 decode 再拼起来与整体 decode 结果一致，而调用方拿到的
-    // `generated` 就是纯粹的"本轮生成"，不必再按 `prompt.len()` 的字节偏移去切全文。
-    let n_prompt = ids.len();
-    let prompt_text = tokenizer.decode(&ids[..n_prompt]);
-    let mut cache = kv.build(model);
-    let eos = tokenizer.eos_id();
-    // 字节级 BPE 的 UTF-8 约束：词表里有"半个汉字"，采样前要把它们排除（char 分词器返回 None）
-    let vocab_bytes = tokenizer.vocab_bytes();
-    let mut masked: Vec<f32> = Vec::new();
-
-    for _ in 0..max_new {
-        // 只保留最近的 block_size 个 token（两种模式都必须遵守的上下文上限）
-        let start = ids.len().saturating_sub(block_size);
-        let ctx = &ids[start..];
-
-        // 推理不需要反向：no_grad 下不挂计算图、不分配梯度缓冲
-        let logits = crate::tensor::no_grad(|| {
-            if let Some(c) = cache.as_mut() {
-                // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
-                // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-                if c[0].seq_len() == 0 {
-                    model.forward(ctx, 1, ctx.len(), Some(c), false)
-                } else {
-                    model.forward(&ids[ids.len() - 1..], 1, 1, Some(c), false)
-                }
-            } else {
-                // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-                model.forward(ctx, 1, ctx.len(), None, false)
-            }
-        });
-
-        // 取最后一个位置的 logits
-        let v = model.cfg.vocab_size;
-        let n = logits.numel();
-        let last_row = &logits.data()[n - v..];
-        // 只允许"接上后仍是合法 UTF-8 前缀"的 token，否则会拼出半个字符
-        let row: &[f32] = match vocab_bytes {
-            Some(vocab) => {
-                masked.clear();
-                masked.extend_from_slice(last_row);
-                mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, &ids));
-                &masked
-            }
-            None => last_row,
-        };
-        // 重复惩罚的回看窗口：只看最近 N 个 token（含 prompt），更早的不再计入。
-        // 窗口过大时高频 token 会被持续压低，可能影响语句的连贯性。
-        let recent = if opts.repetition_window == 0 {
-            &[][..]
-        } else {
-            let start = ids.len().saturating_sub(opts.repetition_window);
-            &ids[start..]
-        };
-        let next = sample_token(row, opts, recent, rng);
-        ids.push(next);
-
-        // 采到 EOS 就收：这是模型自己学出来的结束符号（训练时每段序列末尾都带它），
-        // 比"等某个字符组合出现"可靠得多。EOS 本身不进结果。
-        if eos == Some(next) {
-            let generated = tokenizer.decode(&ids[n_prompt..ids.len() - 1]);
-            return GenOutput {
-                text: format!("{prompt_text}{generated}"),
-                generated,
-                reason: StopReason::Eos,
-            };
-        }
-
-        // 命中停止标记就收：SFT 模板下模型答完会自己吐「。。」，
-        // 不截断的话它会顺着模板继续编下一轮提问（"回答后面跟提问"在训练语料里到处都是）。
-        // 这一条是给**没学过 EOS 的老权重**兜底的路径。
-        //
-        // 只在**新生成的部分**里查找：prompt 自己就含「用户：」（模板的一部分），
-        // 对整个字符串搜索会立刻在 prompt 里命中，结果返回空白。
-        // 每步解码一次生成段：长度上限就是 block_size，这点开销远小于一次前向。
-        if !opts.stop.is_empty() {
-            let raw = tokenizer.decode(&ids[n_prompt..]);
-            if let Some((rel, mark)) = opts
-                .stop
-                .iter()
-                .filter_map(|s| raw.find(s).map(|i| (i, *s)))
-                .min_by_key(|(i, _)| *i)
-            {
-                // `rel` 来自 `find`，一定落在字符边界上
-                let generated = raw[..rel].trim_end().to_string();
-                return GenOutput {
-                    text: format!("{prompt_text}{generated}"),
-                    generated,
-                    reason: StopReason::StopMark(mark),
-                };
-            }
-        }
-    }
-
-    let generated = tokenizer.decode(&ids[n_prompt..]);
-    GenOutput {
-        text: format!("{prompt_text}{generated}"),
-        generated,
-        reason: StopReason::MaxNew,
-    }
+    let mut machine = Generator::new(model, tokenizer, prompt, max_new, opts, kv, rng);
+    machine.run();
+    machine.into_output()
 }
 
 /// Beam Search 生成：维护 `beam_size` 个候选序列，每步扩展后保留 top-k。
@@ -678,6 +871,61 @@ mod tests {
             cached.chars().count(),
             "滑动窗口下 cache 模式不应再提前结束：\nfull   = {full}\ncached = {cached}"
         );
+    }
+
+    /// 流式（`step + next_text + flush`）与非流式（`generate_with_reason`）同种子下
+    /// 必须逐字节一致：HTTP SSE "边聊边出的字"与非流式"一次性返回的字"是同一段，
+    /// 客户端无论用哪种方式拿到的最终文本都相同（覆盖 EOS / 停止标记 / 上限三种收尾）。
+    #[test]
+    fn test_streaming_equals_non_streaming() {
+        let (model, tokenizer) = tiny_setup();
+        fn run_case(
+            model: &Transformer,
+            tokenizer: &Tokenizer,
+            prompt: &str,
+            max_new: usize,
+            stop: &'static [&'static str],
+        ) {
+            let mut o = opts();
+            o.stop = stop;
+
+            let mut rng_plain = Rng::new(77);
+            let plain = generate_with_reason(model, tokenizer, prompt, max_new, &o, KvOpts::off(), &mut rng_plain);
+
+            let mut rng_s = Rng::new(77);
+            let mut g = Generator::new(model, tokenizer, prompt, max_new, &o, KvOpts::off(), &mut rng_s);
+            let mut stream = String::new();
+            while g.step() {
+                if let Some(t) = g.next_text() {
+                    stream.push_str(&t);
+                }
+            }
+            stream.push_str(&g.flush());
+            let out = g.into_output();
+
+            let tag = format!("prompt={prompt:?} max_new={max_new} stop={stop:?}");
+            assert_eq!(stream, out.generated, "流式拼接必须等于最终生成段（{tag}）");
+            assert_eq!(out.generated, plain.generated, "同种子下流式与非流式生成段一致（{tag}）");
+            assert_eq!(out.reason, plain.reason, "收尾原因一致（{tag}）");
+            assert_eq!(out.text, plain.text, "全文一致（{tag}）");
+        }
+
+        run_case(&model, &tokenizer, "the", 40, &[]); // 走 EOS 或上限
+        run_case(&model, &tokenizer, "the", 40, &["brown"]); // 走停止标记
+        run_case(&model, &tokenizer, "the", 40, &["qz"]); // 标记可能整段都不出现
+        run_case(&model, &tokenizer, "the", 0, &[]); // 上限为 0：立即 MaxNew
+    }
+
+    /// 流式安全发出的扣留规则：尾部空白与停止标记的真前缀都不能先发出去。
+    #[test]
+    fn test_safe_len_holds_back_stop_prefix_and_trailing_space() {
+        assert_eq!(safe_len("abc", &[]), 3, "无停止标记时全发（收尾结果不 trim）");
+        assert_eq!(safe_len("abc ", &["用户："]), 3, "尾部空白要扣：命中标记时最终结果要 trim_end");
+        assert_eq!(safe_len("abc用", &["用户："]), 3, "标记的真前缀要扣：标记可能横跨两次采样");
+        assert_eq!(safe_len("abc用户", &["用户："]), 3, "多字节前缀整段扣住");
+        assert_eq!(safe_len("abc 用户", &["用户："]), 3, "前缀之前的空白也会被最终的 trim_end 掉");
+        assert_eq!(safe_len("abc用 ", &["用户："]), 6, "空格已隔开前缀，标记拼不上，只扣尾部空白");
+        assert_eq!(safe_len("abc", &["xyz"]), 3, "没有前缀命中就不扣");
     }
 
     /// `generate_with_reason` 要把「生成段」单独交出来，并把收尾原因说清楚：

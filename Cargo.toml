@@ -15,6 +15,8 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 # 数据并行：把训练热路径里的逐元素/逐行 CPU 算子分摊到多核，避免 CPU 单线程成为瓶颈
 rayon = "1"
+# `serve` 子命令的 HTTP 服务：同步阻塞模型（一个连接一个线程），API 面小、零异步运行时
+tiny_http = "0.12"
 # 可选：GPU 加速（wgpu 计算着色器，支持 NVIDIA / Intel 核显，Windows 走 DX12/Vulkan）
 wgpu = { version = "30", optional = true }
 # wgpu 的异步初始化需要事件循环，pollster 提供最简单的同步阻塞工具（零依赖）
