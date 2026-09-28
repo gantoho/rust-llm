@@ -559,7 +559,7 @@
     },
     "securitySchemes": {
       "bearerAuth": {
-        "description": "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。",
+        "description": "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。\n导入 Postman/Apifox 后，只需在 collection 的 Authorization → Bearer Token 里填一次 `--api-key` 的值，无需逐请求设置。",
         "scheme": "bearer",
         "type": "http"
       }
@@ -647,6 +647,22 @@
         "requestBody": {
           "content": {
             "application/json": {
+              "example": {
+                "max_tokens": 64,
+                "messages": [
+                  {
+                    "content": "你是一个简洁的中文助手。",
+                    "role": "system"
+                  },
+                  {
+                    "content": "用一句话介绍 Transformer。",
+                    "role": "user"
+                  }
+                ],
+                "model": "latest",
+                "stream": false,
+                "temperature": 0.7
+              },
               "schema": {
                 "$ref": "#/components/schemas/ChatCompletionRequest"
               }
@@ -696,6 +712,10 @@
         "requestBody": {
           "content": {
             "application/json": {
+              "example": {
+                "input": "用一句话介绍 Transformer。",
+                "model": "latest"
+              },
               "schema": {
                 "$ref": "#/components/schemas/EmbeddingRequest"
               }

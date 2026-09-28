@@ -612,7 +612,21 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
         "requestBody": {
             "required": true,
             "content": {
-                "application/json": { "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" } }
+                "application/json": {
+                    "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" },
+                    // 导入 Postman/Apifox 时直接拿它当请求体：让工具按 schema
+                    // 自己编示例会撞 400（编出 n≠1、或 messages 以 assistant 结尾）
+                    "example": {
+                        "model": "latest",
+                        "messages": [
+                            { "role": "system", "content": "你是一个简洁的中文助手。" },
+                            { "role": "user", "content": "用一句话介绍 Transformer。" }
+                        ],
+                        "max_tokens": 64,
+                        "temperature": 0.7,
+                        "stream": false
+                    }
+                }
             }
         },
         "responses": {
@@ -648,7 +662,10 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
         "requestBody": {
             "required": true,
             "content": {
-                "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingRequest" } }
+                "application/json": {
+                    "schema": { "$ref": "#/components/schemas/EmbeddingRequest" },
+                    "example": { "model": "latest", "input": "用一句话介绍 Transformer。" }
+                }
             }
         },
         "responses": {
@@ -699,7 +716,11 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                 "bearerAuth": {
                     "type": "http",
                     "scheme": "bearer",
-                    "description": "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。"
+                    "description": concat!(
+                        "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。\n",
+                        "导入 Postman/Apifox 后，只需在 collection 的 Authorization → ",
+                        "Bearer Token 里填一次 `--api-key` 的值，无需逐请求设置。"
+                    )
                 }
             },
             "responses": {
@@ -2013,6 +2034,35 @@ mod tests {
                     .unwrap_or_else(|| panic!("$ref {r} 指向不存在的节点 `{seg}`"));
             }
         }
+    }
+
+    #[test]
+    fn openapi_examples_pass_real_parsers() {
+        // 导入 Postman/Apifox 后，工具直接把 example 当请求体发送；
+        // 它必须能过真实的入参校验，否则一点 Send 就是 400（编出 n≠1、
+        // 或 messages 以 assistant 结尾这类“看着合法”的坏例子）
+        let spec = openapi_spec(&cfg(false));
+        let chat_ex = &spec["paths"]["/v1/chat/completions"]["post"]["requestBody"]
+            ["content"]["application/json"]["example"];
+        assert!(!chat_ex.is_null(), "chat 缺 example，导入工具只能自己瞎编");
+        let job = parse_chat(&chat_ex.to_string(), &cfg(false))
+            .unwrap_or_else(|e| panic!("chat example 过不了 parse_chat：{}", e.message));
+        assert_eq!(job.input, "用一句话介绍 Transformer。");
+
+        let emb_ex = &spec["paths"]["/v1/embeddings"]["post"]["requestBody"]
+            ["content"]["application/json"]["example"];
+        assert!(!emb_ex.is_null(), "embeddings 缺 example");
+        // input 只接受 string / number / string[]（run_embeddings 逐项解析）
+        let input = &emb_ex["input"];
+        assert!(
+            input.is_string()
+                || input.is_number()
+                || (input
+                    .as_array()
+                    .map(|a| a.iter().all(|v| v.is_string()))
+                    .unwrap_or(false)),
+            "embeddings example 的 input 类型不合法：{input}"
+        );
     }
 
     #[test]

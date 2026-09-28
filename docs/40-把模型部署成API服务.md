@@ -396,6 +396,19 @@ curl -s http://127.0.0.1:8080/openapi.yaml   # 同一份，YAML
 schema 做请求校验（JSON 端点按 `to_string_pretty` 缩进输出，方便人读和看
 git diff）。
 
+**导入即可直接调用**（不用手改示例、不用逐请求配鉴权）：
+
+- `chat` / `embeddings` 的 `requestBody` 在 media type 层带了**能跑通的
+  `example`**——Postman 会直接拿它当请求体。若不给 `example`，导入工具会按
+  schema 自己编，编出 `n≠1` 或以 assistant 结尾的 messages，一点 Send 就是
+  「本服务只支持 n=1」「messages 的最后一条必须是 role=user」两个 400。
+  单测 `openapi_examples_pass_real_parsers` 把 example 塞回真实 `parse_chat`
+  验一遍，漂移会当场失败。
+- 鉴权是**规范里写不了密钥值的**（安全），但已在 `bearerAuth.description`
+  里写清做法：导入后在 collection 的 Authorization → Bearer Token 填一次
+  `--api-key` 的值即可，子请求全部继承，无需逐请求设置；没给 `--api-key`
+  则服务不鉴权。
+
 同一份规范还会在 **`serve` 启动时自动写进 `openapi/` 目录**
 （`dump_openapi_files`，与端点出自同一个 `openapi_spec`，逐字一致）：
 
@@ -475,7 +488,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 ---
 
-## 10. 单元测试（18 个）
+## 10. 单元测试（19 个）
 
 `src/serve.rs` 底部的 `#[cfg(test)] mod tests`，不启端口、纯函数级：
 
@@ -498,6 +511,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 | `json_to_yaml_renders_nested_structures` | YAML 序列化：嵌套对象/数组、空容器、换行与引号 |
 | `yaml_quoting_never_leaks_ambiguous_scalars` | `true`/`1.1.1`/`2026-09-27` 一律引号，普通文本裸写 |
 | `dump_openapi_files_writes_both_formats` | 启动自动写出的 `openapi/{json,yaml}` 与端点字节逐字一致，JSON 可解析回 7 条路由 |
+| `openapi_examples_pass_real_parsers` | requestBody 的 `example` 能过真实 `parse_chat` / input 类型校验——导入 Postman 点 Send 直接 200 |
 
 端到端（鉴权、CORS、SSE、断开中止）靠 §9 的 curl 实测覆盖——HTTP 层的正确性
 用真 socket 验证比 mock 更可信。
@@ -508,7 +522,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 **当前已具备**：流式/非流式、鉴权、CORS、embeddings、请求日志、队列状态、
 OpenAPI 规范（运行时端点 + `serve` 启动自动写出 `openapi/{openapi.json,openapi.yaml}`）、
-断开可中断、OpenAI 兼容错误体、资源上限、235 个测试全绿。
+断开可中断、OpenAI 兼容错误体、资源上限、236 个测试全绿。
 
 **上生产前还要补的**（本课未做，刻意不半成品实现）：
 

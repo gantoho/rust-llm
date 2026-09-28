@@ -642,6 +642,11 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 | GET | `/openapi.yaml` | 否 | 同上，YAML 格式；`serve` 启动时自动写出静态版 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml) |
 | OPTIONS | 任意 | 否 | CORS 预检（仅 `--cors` 时带跨域头） |
 
+**导入即用**：规范里 `chat` / `embeddings` 的请求体自带能直接跑通的
+`example`（不会撞 `n≠1`、末条非 `user` 这类 400），导入 Postman / Apifox
+点 Send 就返回 200；鉴权只需在 collection 的 Authorization → Bearer Token
+填一次 `--api-key` 的值，无需逐请求设置（没给 `--api-key` 则不需要鉴权）。
+
 **流式输出**：`"stream": true` 时按 OpenAI 的 SSE 格式逐 token 下发——首帧声明
 `role: assistant`，中间帧是 `delta.content` 增量，末尾依次发 `finish_reason`
 帧、`usage` 帧和 `data: [DONE]`。多字节字符与停止标记前缀会被 hold-back 到
@@ -1262,9 +1267,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **235 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **236 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 245 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 246 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1355,6 +1360,7 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `json_to_yaml_renders_nested_structures` | 手写 JSON→YAML：块映射 / 块序列 / 复杂数组项的 `- ` 前缀缩进正确 |
 | `yaml_quoting_never_leaks_ambiguous_scalars` | YAML 引号安全：`1.1.1` / `on` / 含 `:` `#` 等会被误解析的标量一律加引号 |
 | `dump_openapi_files_writes_both_formats` | `serve` 启动自动写出的 `openapi/{json,yaml}` 与端点字节逐字一致 |
+| `openapi_examples_pass_real_parsers` | 规范里 requestBody 的 `example` 能过真实 `parse_chat` / input 类型校验——导入 Postman 点 Send 直接 200（防「示例一发就 400」漂移） |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
 
@@ -1765,7 +1771,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **235 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `235 passed; 0 failed`，release 全量约 43 秒；
+- **236 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `236 passed; 0 failed`，release 全量约 43 秒；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
