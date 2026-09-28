@@ -15,3 +15,5 @@
 
 # 临时目录
 /.temp/
+/web/node_modules
+/web/dist

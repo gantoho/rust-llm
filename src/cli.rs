@@ -236,6 +236,12 @@ pub enum Cmd {
         /// 允许跨域（CORS）：开启后返回 `Access-Control-Allow-Origin: *`，供浏览器页面直连调试
         #[arg(long)]
         cors: bool,
+        /// 不启动 web/ 前端测试页（默认随 API 一起拉起 vite dev server）
+        #[arg(long)]
+        no_web: bool,
+        /// 前端测试页端口（vite dev server）
+        #[arg(long, default_value_t = 5173)]
+        web_port: u16,
         /// 系统提示词（服务级 system，客户端 messages 里的 system 消息也可覆盖）
         #[arg(long, default_value = "")]
         system: String,

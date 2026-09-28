@@ -428,6 +428,45 @@ YAML 是手写的极简序列化器（`json_to_yaml`，不引 yaml 库）：块�
 
 ---
 
+### 7.8 前端测试页（`web/`，随 serve 一起启动）
+
+`serve` 默认在进入常驻循环前顺带拉起 [`web/`](../web/) 目录下的 **vite dev
+server**（React + TypeScript），浏览器打开 `http://localhost:5173` 就是一个
+可视化接口调试台：
+
+| 页签 | 覆盖端点 | 能干什么 |
+|------|---------|---------|
+| 对话 | `POST /v1/chat/completions` | 流式开关、模型下拉、temperature/top_k/top_p/max_tokens 调参、气泡对话、meta（耗时/finish_reason/usage）、原始 JSON、等价 cURL |
+| 向量化 | `POST /v1/embeddings` | 多行文本按行批量向量化，显示维度、前 8 维、usage、完整 JSON |
+| 状态 | `/health`、`/v1/status`、`/v1/models` | 三卡片并行探活 + 刷新，附 openapi.yaml 下载链接 |
+
+**为什么不需要 `--cors`**：页面请求打的是 vite dev server 自己的源，
+vite 把 `/v1`、`/health`、`/openapi.*` **代理转发**到 `http://127.0.0.1:${API_PORT}`
+——浏览器视角是同源，CORS 根本不参与；转发目标端口由 Rust 侧通过环境变量
+`API_PORT` 传入（vite.config.ts 读取），`--web-port` 传 dev server 端口
+（`WEB_PORT`，默认 5173，`strictPort` 占用即报错不静默换端口）。
+
+**启动编排**（`serve::spawn_web_frontend`）：
+
+- 定位 `web/`：先找工作目录（部署时 web/ 与二进制并排放），找不到再退回
+  编译时的仓库目录（开发时从子目录 `cargo run`）；
+- 用 `node web/node_modules/vite/bin/vite.js` 直接拉起——绕开 Windows 上
+  `npm` 实际是 `npm.cmd`、`std::process::Command` 找不到的问题；
+- 找不到工程或没装依赖（`node_modules/vite` 不存在）只打一行警告就返回，
+  **绝不影响 API 启动**；缺依赖时提示 `cd web && npm install`；
+- 子进程交给独立线程 `wait()` 收割（不留僵尸进程），与 API 共享控制台，
+  Ctrl-C 时两边一起停。
+
+**开关**：`--no-web` 只起 API；`--web-port <端口>` 换页面端口。
+生产部署（systemd/nginx，见 §11）务必加 `--no-web`——dev server 只服务开发调试。
+
+```bash
+cargo run --release -- serve --ckpt checkpoints/zh-sft/best.ckpt --api-key sk-test
+#   [serve] 前端测试页已启动：http://localhost:5173（代理 API → 127.0.0.1:8080）
+```
+
+---
+
 ## 8. 错误处理：OpenAI 形状 + 中文原因
 
 ```json
@@ -522,6 +561,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 **当前已具备**：流式/非流式、鉴权、CORS、embeddings、请求日志、队列状态、
 OpenAPI 规范（运行时端点 + `serve` 启动自动写出 `openapi/{openapi.json,openapi.yaml}`）、
+前端测试页（`web/` 随 serve 启动，§7.8，生产加 `--no-web`）、
 断开可中断、OpenAI 兼容错误体、资源上限、236 个测试全绿。
 
 **上生产前还要补的**（本课未做，刻意不半成品实现）：

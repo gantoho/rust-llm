@@ -252,6 +252,8 @@ fn main() {
             port,
             api_key,
             cors,
+            no_web,
+            web_port,
             system,
             temperature,
             top_k,
@@ -273,6 +275,8 @@ fn main() {
             port,
             api_key,
             cors,
+            no_web,
+            web_port,
             &system,
             SampleOpts {
                 temperature,
@@ -1121,6 +1125,8 @@ fn cmd_serve(
     port: u16,
     api_key: Option<String>,
     cors: bool,
+    no_web: bool,
+    web_port: u16,
     system: &str,
     mut opts: SampleOpts,
     max_new: usize,
@@ -1197,10 +1203,22 @@ fn cmd_serve(
                 },
             ),
             ("CORS", if cors { "开（浏览器页面可直连）" } else { "关" }.to_string()),
+            (
+                "前端测试页",
+                if no_web {
+                    "不启动（--no-web）".to_string()
+                } else {
+                    format!("http://localhost:{web_port}（随 API 一起启动）")
+                },
+            ),
         ],
     );
     if let Some(note) = &rope_note {
         logln!("[rope] {note}");
+    }
+    // 前端测试页：在进入常驻的 serve 循环之前拉起，失败只警告不影响 API
+    if !no_web {
+        serve::spawn_web_frontend(port, web_port);
     }
     serve::run(
         serve::ServeCfg {

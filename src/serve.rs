@@ -1703,6 +1703,67 @@ fn mean_pool(hidden: &crate::tensor::Tensor) -> Vec<f64> {
     acc
 }
 
+// ==================== 前端测试页 ====================
+
+/// 随 API 一起拉起 `web/` 前端测试页（vite dev server 子进程）。
+///
+/// - 定位 `web/`：优先**当前工作目录**（部署时 web/ 与二进制并排放），
+///   找不到再退回编译时的仓库目录（开发时从子目录 `cargo run`）；
+/// - 找不到工程或没装依赖时只警告就返回，绝不影响 API 启动；
+/// - 通过 `API_PORT` 环境变量把 API 端口传给 vite 代理，页面经**同源转发**
+///   调接口，因此不需要开 `--cors`；
+/// - 子进程交给独立线程收割（避免僵尸进程），共享控制台收到 Ctrl-C 时
+///   vite 也会一并收到，两个服务同时停止。
+pub fn spawn_web_frontend(api_port: u16, web_port: u16) {
+    // 候选目录：cwd/web（部署形态）→ CARGO_MANIFEST_DIR/web（开发形态）
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("web"));
+    }
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web"));
+
+    let Some(web_dir) = candidates.into_iter().find(|p| p.join("package.json").is_file()) else {
+        logln!("[serve] 未找到 web/ 前端工程，跳过测试页（用 --no-web 可去掉本提示）");
+        return;
+    };
+    // 直接用 node 拉 vite 的 bin，避开 Windows 上 npm 是 npm.cmd 而 Command 找不到的问题
+    let vite_bin = web_dir.join("node_modules").join("vite").join("bin").join("vite.js");
+    if !vite_bin.is_file() {
+        logln!(
+            "[serve] web/ 依赖未安装，跳过测试页：cd {} && npm install",
+            web_dir.display()
+        );
+        return;
+    }
+
+    let child = std::process::Command::new("node")
+        .arg(&vite_bin)
+        .current_dir(&web_dir)
+        // vite.config.ts 读这两个环境变量：代理目标端口 + dev server 端口
+        .env("API_PORT", api_port.to_string())
+        .env("WEB_PORT", web_port.to_string())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn();
+
+    match child {
+        Ok(mut child) => {
+            logln!("[serve] 前端测试页已启动：http://localhost:{web_port}（代理 API → 127.0.0.1:{api_port}）");
+            thread::spawn(move || {
+                // 收割子进程；异常退出时打一行日志（如端口被占）
+                if let Ok(status) = child.wait()
+                    && !status.success()
+                {
+                    logln!("[serve] 前端测试页退出（{status}），可手动 cd web && npm run dev 重启");
+                }
+            });
+        }
+        Err(e) => {
+            logln!("[serve] 前端测试页启动失败：{e}（可手动 cd web && npm run dev）");
+        }
+    }
+}
+
 // ==================== 服务入口 ====================
 
 /// 启动 HTTP 服务并永不返回。

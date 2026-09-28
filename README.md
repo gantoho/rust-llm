@@ -79,11 +79,13 @@
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
 | 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
-| 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)） |
+| 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)）、`web/` 前端测试页随 serve 启动 |
 
 ## 快速开始
 
 需要 **Rust 2024 edition** 工具链（Rust 1.85+，建议使用最新的 stable）。
+另需 **Node 18+** 才能使用 `serve` 的前端测试页（没有 Node 或未装 `web/`
+依赖也不影响 API 本身，`serve` 只会打一行提示）。
 
 ```bash
 # ═══════════════════════════════════════════
@@ -113,6 +115,8 @@ cargo run --release -- chat --ckpt checkpoints/zh/best.ckpt
 # ═══════════════════════════════════════════
 cargo run --release -- serve --ckpt checkpoints/zh-sft/best.ckpt --api-key sk-test
 # 之后任何 OpenAI 兼容客户端把 base_url 指到 http://127.0.0.1:8080 即可调用
+# 前端测试页随服务一起启动：浏览器打开 http://localhost:5173 可视化调接口
+# （首次使用先 cd web && npm install；只起 API 用 --no-web）
 
 # ═══════════════════════════════════════════
 #  监督微调（把只会续写的预训练模型教会"应答"）
@@ -620,6 +624,8 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 | `--port <端口>` | int | `8080` | 监听端口 |
 | `--api-key <密钥>` | string | 无（不鉴权） | 给出后所有请求必须带 `Authorization: Bearer <key>` |
 | `--cors` | flag | 关 | 允许跨域（回 `Access-Control-Allow-Origin: *`），浏览器页面直连调试用 |
+| `--no-web` | flag | 关 | 不启动 [`web/`](web/) 前端测试页（默认随 API 一起拉起 vite dev server） |
+| `--web-port <端口>` | int | `5173` | 前端测试页端口（vite dev server） |
 | `--system <文本>` | string | `""` | 服务级系统提示（请求 messages 里的 system 接在它后面） |
 | `--temperature` / `--top-k` / `--top-p` | — | `0.8` / `40` / `0.9` | 采样默认值，请求里的同名字段可逐个覆盖 |
 | `--repetition-penalty` / `--repetition-window` | — | `1.1` / `64` | 重复惩罚及其回看窗口 |
@@ -646,6 +652,14 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 `example`（不会撞 `n≠1`、末条非 `user` 这类 400），导入 Postman / Apifox
 点 Send 就返回 200；鉴权只需在 collection 的 Authorization → Bearer Token
 填一次 `--api-key` 的值，无需逐请求设置（没给 `--api-key` 则不需要鉴权）。
+
+**前端测试页**：`serve` 启动时会顺带拉起 [`web/`](web/) 目录下的 vite dev
+server（React + TS），浏览器打开 `http://localhost:5173` 即可可视化调接口——
+三个页签分别对应流式/非流式对话（带采样参数、原始 JSON、等价 cURL）、
+embeddings 向量化、health/status/models 状态总览。页面请求经 vite 代理
+**同源转发**到 API 端口，因此不需要开 `--cors`。首次使用先装依赖
+`cd web && npm install`；只起 API 不起页面用 `--no-web`，换端口用
+`--web-port`。生产部署（systemd/nginx）务必加 `--no-web`，前端只服务开发调试。
 
 **流式输出**：`"stream": true` 时按 OpenAI 的 SSE 格式逐 token 下发——首帧声明
 `role: assistant`，中间帧是 `delta.content` 增量，末尾依次发 `finish_reason`
@@ -1727,6 +1741,9 @@ llm_from_scratch/
 ├── openapi/           # OpenAPI 接口规范静态版（serve 启动时自动写出，与端点同源，删了会重建）
 │   ├── openapi.json   #   OpenAPI 3.1，JSON（缩进输出），可导入 Postman / Apifox / Swagger UI
 │   └── openapi.yaml   #   同一份规范的 YAML 格式
+├── web/               # 前端测试页（vite + React + TS，serve 默认随 API 一起启动，--no-web 关闭）
+│   ├── vite.config.ts #   dev server 代理 /v1、/health、/openapi.* → API 端口（同源转发，免 --cors）
+│   └── src/           #   App.tsx（三个页签：流式对话 / embeddings / 状态总览）+ api.ts（SSE 客户端）
 └── docs/               # 40 课教程文档（00-学习计划 + 01~40 各课）
 ```
 
