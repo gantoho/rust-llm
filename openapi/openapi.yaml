@@ -375,6 +375,11 @@ components:
           type: integer
         prompt_tokens:
           type: integer
+        tokens_per_second:
+          description: 服务端实测的纯解码段生成速率（tok/s，不含 prefill，也不受网络/缓冲影响）；生成 token 数不足 2 时为 null
+          type:
+            - number
+            - "null"
         total_tokens:
           type: integer
       required:
@@ -384,7 +389,7 @@ components:
       type: object
   securitySchemes:
     bearerAuth:
-      description: "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。\n导入 Postman/Apifox 后，只需在 collection 的 Authorization → Bearer Token 里填一次 `--api-key` 的值，无需逐请求设置。"
+      description: "所有业务端点都要带 `Authorization: Bearer <key>`：key 取启动时的 `--api-key`，没给则启动时自动生成随机 key 并打印在控制台启动日志里（`/health`、`/v1/status`、`/openapi.*` 不鉴权）。\n导入 Postman/Apifox 后，只需在 collection 的 Authorization → Bearer Token 里填一次 key，无需逐请求设置。"
       scheme: bearer
       type: http
 info:

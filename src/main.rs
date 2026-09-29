@@ -1137,6 +1137,12 @@ fn cmd_serve(
 ) {
     let log_path = runlog::start("serve");
     println!("运行日志：{log_path}");
+    // 没给 `--api-key` 就现场生成一个：API 始终有鉴权，随机 key 由启动日志回显，
+    // 否则默认「谁都能调」在把端口暴露出去时等于裸奔
+    let (api_key, auto_key) = match api_key {
+        Some(k) => (Some(k), false),
+        None => (Some(serve::random_api_key()), true),
+    };
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
@@ -1196,11 +1202,14 @@ fn cmd_serve(
             ("监听地址", format!("http://{addr}")),
             (
                 "鉴权",
-                if api_key.is_some() {
-                    "开启（请求需带 Authorization: Bearer <key>）".to_string()
-                } else {
-                    "关闭（局域网内任何人可调用）".to_string()
-                },
+                format!(
+                    "开启（请求需带 Authorization: Bearer <key>）{}",
+                    if auto_key {
+                        "；未提供 --api-key，已生成随机 key（见控制台 [serve] 鉴权行）"
+                    } else {
+                        ""
+                    }
+                ),
             ),
             ("CORS", if cors { "开（浏览器页面可直连）" } else { "关" }.to_string()),
             (
@@ -1217,8 +1226,9 @@ fn cmd_serve(
         logln!("[rope] {note}");
     }
     // 前端测试页：在进入常驻的 serve 循环之前拉起，失败只警告不影响 API
+    // （key 一并注入，页面打开即自动填好——随机 key 用户没法预知）
     if !no_web {
-        serve::spawn_web_frontend(port, web_port);
+        serve::spawn_web_frontend(port, web_port, api_key.as_deref());
     }
     serve::run(
         serve::ServeCfg {

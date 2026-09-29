@@ -134,6 +134,12 @@ pub fn json<T: serde::Serialize>(title: &str, value: &T) {
     append(&text);
 }
 
+/// 当前本地时间（`2026-09-19 14:30:12.345`），供正文里需要标注时间戳的地方使用
+/// （如 `serve` 的问答记录：运行头部只有一个「开始时间」，跑久了就对不上号）
+pub fn now() -> String {
+    fmt_time(local_now())
+}
+
 /// 写入尾部（结束时间与总耗时）并关闭日志文件
 ///
 /// 总耗时 = 命令开始执行的时刻 → 此刻（见 [`mark_start`]）。

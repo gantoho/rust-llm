@@ -230,7 +230,8 @@ pub enum Cmd {
         /// 监听端口
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// API key：给出后所有请求必须带 `Authorization: Bearer <key>`（不给 = 不鉴权）
+        /// API key：给出则用它鉴权；不给则启动时自动生成随机 key（打印在启动日志里）。
+        /// 除 /health、/v1/status、/openapi.* 外，请求都要带 `Authorization: Bearer <key>`
         #[arg(long)]
         api_key: Option<String>,
         /// 允许跨域（CORS）：开启后返回 `Access-Control-Allow-Origin: *`，供浏览器页面直连调试

@@ -31,6 +31,7 @@ use crate::data::{SFT_ASSISTANT, SFT_USER};
 use crate::model::Transformer;
 use crate::prompt;
 use crate::rng::Rng;
+use crate::runlog;
 use crate::sample::{Generator, KvOpts, SampleOpts, StopReason};
 use crate::tokenizer::Tokenizer;
 
@@ -342,6 +343,35 @@ fn read_body(req: &mut Request) -> Result<String, ApiError> {
 
 fn too_large() -> ApiError {
     ApiError { status: 413, kind: "invalid_request_error", message: format!("请求体超过 {MAX_BODY} 字节") }
+}
+
+/// 生成一个随机 API key（`sk-` + 32 位十六进制，共 128 bit 熵）
+///
+/// 调用方没给 `--api-key` 时用它兜底——服务**始终**有鉴权，key 打印在启动日志里。
+/// 熵源不引第三方 crate：[`RandomState`] 的种子由标准库从操作系统取
+/// （哈希表防碰撞随机化用的就是它），再混入时间、进程号、轮次做一次哈希；
+/// 两轮各出 64 bit，拼成 128 bit，两次调用撞车的概率可忽略。
+///
+/// [`RandomState`]: std::collections::hash_map::RandomState
+pub fn random_api_key() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let pid = std::process::id() as u64;
+    let mut out = String::with_capacity(3 + 32);
+    out.push_str("sk-");
+    // 每轮新建一个 RandomState（线程局部种子 + 全局计数器，每次调用都不同），
+    // 把时间/进程号/轮次喂进去搅一次；`finish` 是 64 bit → 16 位十六进制
+    for round in [0u64, 1] {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(nanos);
+        h.write_u64(pid);
+        h.write_u64(round);
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
 }
 
 /// 校验 `Authorization: Bearer <key>`
@@ -717,9 +747,11 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                     "type": "http",
                     "scheme": "bearer",
                     "description": concat!(
-                        "启动时给了 `--api-key` 才需要；不给则所有端点都不鉴权。\n",
+                        "所有业务端点都要带 `Authorization: Bearer <key>`：key 取启动时的 `--api-key`，",
+                        "没给则启动时自动生成随机 key 并打印在控制台启动日志里",
+                        "（`/health`、`/v1/status`、`/openapi.*` 不鉴权）。\n",
                         "导入 Postman/Apifox 后，只需在 collection 的 Authorization → ",
-                        "Bearer Token 里填一次 `--api-key` 的值，无需逐请求设置。"
+                        "Bearer Token 里填一次 key，无需逐请求设置。"
                     )
                 }
             },
@@ -944,7 +976,11 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                     "properties": {
                         "prompt_tokens": { "type": "integer" },
                         "completion_tokens": { "type": "integer" },
-                        "total_tokens": { "type": "integer" }
+                        "total_tokens": { "type": "integer" },
+                        "tokens_per_second": {
+                            "type": ["number", "null"],
+                            "description": "服务端实测的纯解码段生成速率（tok/s，不含 prefill，也不受网络/缓冲影响）；生成 token 数不足 2 时为 null"
+                        }
                     }
                 },
                 "EmbeddingRequest": {
@@ -1132,6 +1168,8 @@ struct ChatJob {
     system: String,
     /// 中间消息拼成的历史（不含 system、不含末条 user）
     history: String,
+    /// 历史消息条数（不含 system、不含末条 user）——问答日志只记条数，不重刷全文
+    history_turns: usize,
     /// 末条 user 消息
     input: String,
     max_tokens: usize,
@@ -1186,6 +1224,9 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         return Err(bad("messages 的最后一条必须是 role=user"));
     }
 
+    // 历史条数 = 非 system 消息去掉末条 user（问答日志用，只记条数不记全文）
+    let history_turns =
+        msgs.iter().filter(|(r, _)| !matches!(r.as_str(), "system" | "developer")).count() - 1;
     let (system, history, input) = split_messages(&msgs, cfg.use_sft);
 
     // ---- 采样参数（逐个覆盖服务级默认值）----
@@ -1276,6 +1317,7 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         id: format!("chatcmpl-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed)),
         system,
         history,
+        history_turns,
         input,
         max_tokens,
         sample,
@@ -1342,6 +1384,98 @@ fn finish_of(reason: StopReason) -> &'static str {
     }
 }
 
+// ==================== 问答记录 ====================
+
+/// 一次生成的结果素材（组装问答日志用）
+struct QaOutcome<'a> {
+    /// 合并后的 system（真正进 prompt 的那份）
+    system: &'a str,
+    /// 完整回复文本（可能为空）
+    output: &'a str,
+    /// 收尾原因；`None` = 没跑到正常收尾（如客户端提前断开，见 `note`）
+    reason: Option<StopReason>,
+    /// 输入侧 token 数
+    n_prompt: usize,
+    /// 生成侧 token 数
+    n_gen: usize,
+    /// 纯解码段速率（tok/s），样本不足时为 None
+    rate: Option<f64>,
+    /// 附加说明（如「客户端提前断开」）
+    note: Option<&'a str>,
+}
+
+/// 组装一条问答记录的标题与键值对（纯函数，便于单测）。
+///
+/// 只记**本轮**问答与参数：历史全文由无状态的调用方每次重发，
+/// 原样记下来只会让同一段历史在日志里反复刷屏，因此历史只记条数。
+fn qa_log_block(job: &ChatJob, r: &QaOutcome) -> (String, Vec<(&'static str, String)>) {
+    let mode = if job.stream { "流式" } else { "非流式" };
+    let title = format!("问答 {}（{mode}）", job.id);
+    let history = if job.history_turns == 0 {
+        "0 条（首轮问答）".to_string()
+    } else {
+        format!("{} 条", job.history_turns)
+    };
+    let output = if r.output.is_empty() { "（空）".to_string() } else { r.output.to_string() };
+    let finish = match r.reason {
+        Some(x) => crate::stop_label(x),
+        None => "未正常收尾（见备注）".to_string(),
+    };
+    let seed = match job.seed {
+        Some(s) => s.to_string(),
+        None => "未指定（用服务级）".to_string(),
+    };
+    let rate = match r.rate {
+        Some(v) => format!("{v:.1} tok/s"),
+        None => "样本不足".to_string(),
+    };
+    let mut items: Vec<(&'static str, String)> = vec![
+        (
+            "system",
+            if r.system.is_empty() { "（无）".to_string() } else { r.system.to_string() },
+        ),
+        ("历史", history),
+        ("输入", job.input.clone()),
+        ("输出", output),
+        ("收尾", finish),
+        (
+            "采样参数",
+            format!(
+                "temperature={}, top_k={}, top_p={}, repetition_penalty={}, \
+                 repetition_window={}, stop={:?}, seed={seed}, max_tokens={}",
+                job.sample.temperature,
+                job.sample.top_k,
+                job.sample.top_p,
+                job.sample.repetition_penalty,
+                job.sample.repetition_window,
+                job.sample.stop,
+                job.max_tokens,
+            ),
+        ),
+        (
+            "用量",
+            format!(
+                "prompt {} + completion {} = {} token，{rate}",
+                r.n_prompt,
+                r.n_gen,
+                r.n_prompt + r.n_gen
+            ),
+        ),
+    ];
+    if let Some(note) = r.note {
+        items.push(("备注", note.to_string()));
+    }
+    (title, items)
+}
+
+/// 把一条问答记录写进运行日志（**只写文件**：控制台保持现有的简洁接口行，
+/// 问答正文只落在 `logs/serve_*.log` 里）
+fn log_qa(job: &ChatJob, r: &QaOutcome) {
+    let (title, mut items) = qa_log_block(job, r);
+    items.insert(0, ("时间", runlog::now()));
+    runlog::fields(&title, &items);
+}
+
 // ==================== chat/completions：非流式 ====================
 
 fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
@@ -1353,7 +1487,7 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
     let kv = state.cfg.kv;
     let mut owned_rng = job.seed.map(Rng::new);
 
-    let (text, n_prompt, n_gen, reason, trimmed) = with_core(state, |core| {
+    let produced = with_core(state, |core| {
         // 拆开字段借用：`Generator` 同时要 `&Transformer` / `&Tokenizer` 和 `&mut Rng`，
         // 直接借 `core` 会因为"一个可变 + 两个共享"打架
         let Core { model, tokenizer, rng: shared_rng } = core;
@@ -1364,17 +1498,56 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         };
         let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
         let n_prompt = g.prompt_tokens();
-        g.run();
+        // 与 `g.run()` 等价的手写循环：多拿一个「prefill 结束」的计时点（见 DecodeTimer）
+        let mut timer = DecodeTimer::new();
+        while g.step() {
+            timer.tick();
+        }
         let n_gen = g.generated_tokens();
+        let rate = timer.rate(n_gen);
         let out = g.into_output();
-        (out.generated, n_prompt, n_gen, out.reason, a.trimmed)
-    })?;
+        (out.generated, n_prompt, n_gen, out.reason, a.trimmed, rate)
+    });
+    // 出错也要留一条问答记录：题目在、答案没了，日志里得能查到这条请求的下文
+    let (text, n_prompt, n_gen, reason, trimmed, rate) = match produced {
+        Ok(v) => v,
+        Err(e) => {
+            let note = format!("生成出错：{}", e.message);
+            log_qa(
+                &job,
+                &QaOutcome {
+                    system: &system,
+                    output: "",
+                    reason: None,
+                    n_prompt: 0,
+                    n_gen: 0,
+                    rate: None,
+                    note: Some(&note),
+                },
+            );
+            return Err(e);
+        }
+    };
 
     if let Some((before, after)) = trimmed {
         logln!(
             "[serve] 历史超出输入预算：{before} → {after} token（预算 {prompt_budget}）"
         );
     }
+
+    // 问答正文只写日志文件（控制台仍只有上面那行接口日志）
+    log_qa(
+        &job,
+        &QaOutcome {
+            system: &system,
+            output: &text,
+            reason: Some(reason),
+            n_prompt,
+            n_gen,
+            rate,
+            note: None,
+        },
+    );
 
     Ok(json!({
         "id": job.id,
@@ -1391,6 +1564,8 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
             "prompt_tokens": n_prompt,
             "completion_tokens": n_gen,
             "total_tokens": n_prompt + n_gen,
+            // 纯解码段的生成速率（不含 prefill），样本不足时为 null
+            "tokens_per_second": rate,
         },
     }))
 }
@@ -1420,7 +1595,13 @@ fn delta_chunk(state: &Arc<State>, id: &str, delta: Value, finish: Option<&str>)
 }
 
 /// usage 单独发一帧（choices 为空数组）——这是 OpenAI 的实际做法
-fn usage_chunk(state: &Arc<State>, id: &str, n_prompt: usize, n_gen: usize) -> String {
+fn usage_chunk(
+    state: &Arc<State>,
+    id: &str,
+    n_prompt: usize,
+    n_gen: usize,
+    rate: Option<f64>,
+) -> String {
     json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -1431,9 +1612,37 @@ fn usage_chunk(state: &Arc<State>, id: &str, n_prompt: usize, n_gen: usize) -> S
             "prompt_tokens": n_prompt,
             "completion_tokens": n_gen,
             "total_tokens": n_prompt + n_gen,
+            // 纯解码段的生成速率（不含 prefill），样本不足时为 null
+            "tokens_per_second": rate,
         },
     })
     .to_string()
+}
+
+/// 解码段计时：`Generator::step` 的第一步含 prefill（把整个 prompt 喂进模型），
+/// 从第二步起才是逐 token 解码。首步结束时落表、收尾时算速率，
+/// 这样 tok/s 只反映真实生成速度，不被 prefill 或网络/缓冲耗时污染
+/// （前端本地墙钟测 SSE 到达间隔会被 TCP/代理缓冲骗到，见 web 端展示逻辑）。
+struct DecodeTimer(Option<Instant>);
+
+impl DecodeTimer {
+    fn new() -> Self {
+        Self(None)
+    }
+
+    /// 每次 `step()` 成功返回后调一次；只在第一次（prefill 刚结束）落表
+    fn tick(&mut self) {
+        if self.0.is_none() {
+            self.0 = Some(Instant::now());
+        }
+    }
+
+    /// tok/s = 解码窗口内新生成的 token 数 ÷ 窗口时长。
+    /// 不足 2 个 token 时窗口里只有一个样本，无从算速率，返回 None。
+    fn rate(&self, n_gen: usize) -> Option<f64> {
+        let ms = self.0?.elapsed().as_secs_f64() * 1000.0;
+        (n_gen >= 2 && ms > 0.0).then_some((n_gen - 1) as f64 * 1000.0 / ms)
+    }
 }
 
 /// 流式回复的结果（闭包把信息带回外层，由外层发 finish/usage/DONE）
@@ -1441,9 +1650,13 @@ struct StreamOutcome {
     n_prompt: usize,
     n_gen: usize,
     reason: StopReason,
+    /// 完整回复文本（问答日志用；中断时是已生成的部分）
+    text: String,
     trimmed: Option<(usize, usize)>,
     /// 客户端断开了，别再发任何东西
     aborted: bool,
+    /// 纯解码段速率（tok/s），样本不足时为 None
+    rate: Option<f64>,
 }
 
 fn stream_reply(req: Request, state: &Arc<State>, job: ChatJob) -> u16 {
@@ -1497,28 +1710,35 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
         let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
         let n_prompt = g.prompt_tokens();
 
+        let mut timer = DecodeTimer::new();
         while g.step() {
+            timer.tick();
             // send 失败 = 接收端（响应流）已 drop = 客户端断开：
             // 立刻停生成，别在一个没人听的请求上烧 CPU
             if let Some(delta) = g.next_text()
                 && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": delta }), None))).is_err()
             {
+                let n_gen = g.generated_tokens();
+                let text = g.into_output().generated;
                 return StreamOutcome {
                     n_prompt,
-                    n_gen: g.generated_tokens(),
+                    n_gen,
                     reason: StopReason::MaxNew,
+                    text,
                     trimmed,
                     aborted: true,
+                    rate: timer.rate(n_gen),
                 };
             }
         }
         // 收尾后把被 hold-back 的尾巴一次发干净（结果已定，不会再变）
         let tail = g.flush();
         let n_gen = g.generated_tokens();
+        let rate = timer.rate(n_gen);
         let out = g.into_output();
         let aborted = !tail.is_empty()
             && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": tail }), None))).is_err();
-        StreamOutcome { n_prompt, n_gen, reason: out.reason, trimmed, aborted }
+        StreamOutcome { n_prompt, n_gen, reason: out.reason, text: out.generated, trimmed, aborted, rate }
     });
 
     let outcome = match res {
@@ -1527,11 +1747,38 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
             // 生成中途出错：发一个 OpenAI 风格的 error 事件，客户端才知道不是正常结束
             let _ = tx.send(sse(&e.to_value().to_string()));
             let _ = tx.send(b"data: [DONE]\n\n".to_vec());
+            // 响应头早已按 200 发出，接口行看不出这次失败——问答日志必须留痕
+            let note = format!("生成出错：{}", e.message);
+            log_qa(
+                &job,
+                &QaOutcome {
+                    system: &system,
+                    output: "",
+                    reason: None,
+                    n_prompt: 0,
+                    n_gen: 0,
+                    rate: None,
+                    note: Some(&note),
+                },
+            );
             return;
         }
     };
     if outcome.aborted {
         logln!("[serve] 客户端提前断开，生成已中止（{} token）", outcome.n_gen);
+        // 中断也记一条：只写已生成的部分，收尾原因标为「未正常收尾」
+        log_qa(
+            &job,
+            &QaOutcome {
+                system: &system,
+                output: &outcome.text,
+                reason: None,
+                n_prompt: outcome.n_prompt,
+                n_gen: outcome.n_gen,
+                rate: outcome.rate,
+                note: Some("客户端提前断开，只记到已生成的部分"),
+            },
+        );
         return;
     }
     if let Some((before, after)) = outcome.trimmed {
@@ -1539,11 +1786,30 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     }
     let fr = finish_of(outcome.reason);
     let _ = tx.send(sse(&delta_chunk(&state, &id, json!({}), Some(fr))));
-    let _ = tx.send(sse(&usage_chunk(&state, &id, outcome.n_prompt, outcome.n_gen)));
+    let _ = tx.send(sse(&usage_chunk(
+        &state,
+        &id,
+        outcome.n_prompt,
+        outcome.n_gen,
+        outcome.rate,
+    )));
     let _ = tx.send(b"data: [DONE]\n\n".to_vec());
     logln!(
         "[serve] 流式完成 {}：{} token（{}）",
         id, outcome.n_gen, crate::stop_label(outcome.reason)
+    );
+    // 问答正文只写日志文件（控制台仍只有上面那行接口日志）
+    log_qa(
+        &job,
+        &QaOutcome {
+            system: &system,
+            output: &outcome.text,
+            reason: Some(outcome.reason),
+            n_prompt: outcome.n_prompt,
+            n_gen: outcome.n_gen,
+            rate: outcome.rate,
+            note: None,
+        },
     );
 }
 
@@ -1712,9 +1978,11 @@ fn mean_pool(hidden: &crate::tensor::Tensor) -> Vec<f64> {
 /// - 找不到工程或没装依赖时只警告就返回，绝不影响 API 启动；
 /// - 通过 `API_PORT` 环境变量把 API 端口传给 vite 代理，页面经**同源转发**
 ///   调接口，因此不需要开 `--cors`；
+/// - 通过 `VITE_API_KEY` 把服务的 key 交给页面（`VITE_` 前缀才会进
+///   `import.meta.env`）：key 可能是启动时随机生成的，页面自动填好才免手抄；
 /// - 子进程交给独立线程收割（避免僵尸进程），共享控制台收到 Ctrl-C 时
 ///   vite 也会一并收到，两个服务同时停止。
-pub fn spawn_web_frontend(api_port: u16, web_port: u16) {
+pub fn spawn_web_frontend(api_port: u16, web_port: u16, api_key: Option<&str>) {
     // 候选目录：cwd/web（部署形态）→ CARGO_MANIFEST_DIR/web（开发形态）
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -1736,12 +2004,17 @@ pub fn spawn_web_frontend(api_port: u16, web_port: u16) {
         return;
     }
 
-    let child = std::process::Command::new("node")
-        .arg(&vite_bin)
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(&vite_bin)
         .current_dir(&web_dir)
         // vite.config.ts 读这两个环境变量：代理目标端口 + dev server 端口
         .env("API_PORT", api_port.to_string())
-        .env("WEB_PORT", web_port.to_string())
+        .env("WEB_PORT", web_port.to_string());
+    if let Some(key) = api_key {
+        // 注入鉴权 key：本地测试页与后端同机同源，注入即可用（key 只在本机生效）
+        cmd.env("VITE_API_KEY", key);
+    }
+    let child = cmd
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn();
@@ -1772,7 +2045,8 @@ pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer) -> ! {
     let seed = cfg.seed;
     let model_name = cfg.model_name.clone();
     let block_size = cfg.block_size;
-    let api_on = cfg.api_key.is_some();
+    // 先抄一份 key：下面要打印它，而 cfg 随后会被搬进 Arc<State>
+    let api_key = cfg.api_key.clone();
     let cors_on = cfg.cors;
 
     let state = Arc::new(State {
@@ -1791,7 +2065,11 @@ pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer) -> ! {
     dump_openapi_files("openapi", &state.cfg);
     logln!(
         "[serve] 鉴权{}，CORS{}",
-        if api_on { "开" } else { "关（任何人都能调）" },
+        // key 必须回显：不给 `--api-key` 时它是启动现场生成的，只有这一行能拿到
+        match &api_key {
+            Some(k) => format!("开，API key = {k}（请求带 `Authorization: Bearer <key>`）"),
+            None => "关（任何人都能调）".to_string(),
+        },
         if cors_on { "开" } else { "关" }
     );
     logln!("[serve] 端点：");
@@ -1841,6 +2119,16 @@ mod tests {
 
     fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(r, c)| (r.to_string(), c.to_string())).collect()
+    }
+
+    #[test]
+    fn random_api_key_shape_and_uniqueness() {
+        let k = random_api_key();
+        assert!(k.starts_with("sk-"), "key 必须带 sk- 前缀：{k}");
+        assert_eq!(k.len(), 3 + 32, "sk- + 32 位十六进制：{k}");
+        assert!(k[3..].chars().all(|c| c.is_ascii_hexdigit()), "后缀必须是十六进制：{k}");
+        // 连取两次不能撞车：撞车等于两台/两次服务共用一个 key
+        assert_ne!(k, random_api_key());
     }
 
     #[test]
@@ -1957,6 +2245,114 @@ mod tests {
         assert_eq!(job.seed, Some(7));
         assert_eq!(job.sample.stop, &["STOP"]);
         assert!(job.id.starts_with("chatcmpl-"));
+    }
+
+    #[test]
+    fn parse_chat_counts_history_turns() {
+        let c = cfg(true);
+        // 首轮：没有历史
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c).unwrap();
+        assert_eq!(job.history_turns, 0);
+        // system 不计入历史
+        let job = parse_chat(
+            r#"{"messages":[{"role":"system","content":"s"},{"role":"user","content":"q"}]}"#,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(job.history_turns, 0);
+        // q1 / a1 两条历史 + 本轮输入
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q1"},{"role":"assistant","content":"a1"},
+                {"role":"user","content":"q2"}]}"#,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(job.history_turns, 2);
+        // SFT 模板下历史带模板标记（cfg(true)），但两条内容都得在里面
+        assert!(job.history.contains("q1") && job.history.contains("a1"));
+        // 非 SFT 模板下就是裸拼接
+        let c0 = cfg(false);
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q1"},{"role":"assistant","content":"a1"},
+                {"role":"user","content":"q2"}]}"#,
+            &c0,
+        )
+        .unwrap();
+        assert_eq!(job.history, "q1\na1");
+    }
+
+    /// 问答记录的取值辅助：按键名取值，取不到直接 panic
+    fn field(items: &[(&'static str, String)], k: &str) -> String {
+        items
+            .iter()
+            .find(|(name, _)| *name == k)
+            .unwrap_or_else(|| panic!("问答记录里缺了「{k}」字段"))
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn qa_log_block_records_round_and_params() {
+        let c = cfg(true);
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q1"},{"role":"assistant","content":"a1"},
+                {"role":"user","content":"q2"}],"stream":true,"seed":7}"#,
+            &c,
+        )
+        .unwrap();
+        let (title, items) = qa_log_block(
+            &job,
+            &QaOutcome {
+                system: "你是助手",
+                output: "答案",
+                reason: Some(StopReason::Eos),
+                n_prompt: 10,
+                n_gen: 4,
+                rate: Some(42.5),
+                note: None,
+            },
+        );
+        // 标题带 id 和模式，翻日志时一眼能对上接口行
+        assert_eq!(title, format!("问答 {}（流式）", job.id));
+        assert_eq!(field(&items, "system"), "你是助手");
+        assert_eq!(field(&items, "历史"), "2 条");
+        assert_eq!(field(&items, "输入"), "q2");
+        assert_eq!(field(&items, "输出"), "答案");
+        assert_eq!(field(&items, "收尾"), "采到 EOS");
+        let params = field(&items, "采样参数");
+        for want in ["temperature=0.8", "seed=7", "max_tokens=200", "repetition_penalty="] {
+            assert!(params.contains(want), "采样参数缺 {want}：{params}");
+        }
+        assert_eq!(field(&items, "用量"), "prompt 10 + completion 4 = 14 token，42.5 tok/s");
+        // 正常收尾不该带备注
+        assert!(items.iter().all(|(k, _)| *k != "备注"));
+    }
+
+    #[test]
+    fn qa_log_block_handles_empty_output_and_abort() {
+        let c = cfg(false);
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c).unwrap();
+        let (title, items) = qa_log_block(
+            &job,
+            &QaOutcome {
+                system: "",
+                output: "",
+                reason: None,
+                n_prompt: 3,
+                n_gen: 0,
+                rate: None,
+                note: Some("客户端提前断开，只记到已生成的部分"),
+            },
+        );
+        assert_eq!(title, format!("问答 {}（非流式）", job.id));
+        assert_eq!(field(&items, "system"), "（无）");
+        assert_eq!(field(&items, "历史"), "0 条（首轮问答）");
+        assert_eq!(field(&items, "输出"), "（空）");
+        // 没跑到正常收尾时不许把「跑满 max-new」之类的假原因写进去
+        assert_eq!(field(&items, "收尾"), "未正常收尾（见备注）");
+        assert_eq!(field(&items, "备注"), "客户端提前断开，只记到已生成的部分");
+        assert!(field(&items, "用量").contains("样本不足"));
+        assert!(field(&items, "采样参数").contains("seed=未指定（用服务级）"));
     }
 
     #[test]

@@ -16,7 +16,7 @@
 3. 流式输出（SSE）为什么必须用**状态机**而不是"跑完再返回"？
 4. HTTP 层的 chunked transfer 和 SSE 是什么关系？
 5. 客户端断开连接时，服务端怎么发现自己在对着空气烧 CPU？
-6. 鉴权、CORS、请求日志、队列状态这些"API 周边"各自解决什么问题？
+6. 鉴权、CORS、请求日志与问答记录、队列状态这些"API 周边"各自解决什么问题？
 7. 单机 CPU 推理该用什么并发模型——每请求一线程，还是排队？
 
 ---
@@ -165,9 +165,15 @@ cache，总吞吐不变而单条延迟翻倍；排队反而让延迟曲线平稳
     "finish_reason": "stop",
     "logprobs": null
   }],
-  "usage": { "prompt_tokens": 12, "completion_tokens": 33, "total_tokens": 45 }
+  "usage": { "prompt_tokens": 12, "completion_tokens": 33, "total_tokens": 45,
+             "tokens_per_second": 328.4 }
 }
 ```
+
+`tokens_per_second` 是服务端用 `Instant` 实测的**纯解码段**生成速率（首 token 之后
+逐 token 解码的耗时，不含 prefill，也不受网络/缓冲影响）；生成不足 2 个 token 时
+为 `null`。客户端不要自己拿墙钟算 SSE 到达间隔——TCP/代理缓冲会把多帧合并成一次
+到达，算出来的速率会虚高到离谱。
 
 `finish_reason` 映射：采到 EOS / 命中停止标记 → `"stop"`；跑满 `max_tokens` →
 `"length"`。和 `chat` 一样，MaxNew 截断说明回答没说完——客户端看到 `length`
@@ -233,7 +239,9 @@ data: [DONE]
 
 第一帧先声明角色（OpenAI 客户端靠它拿到 assistant 角色）；usage 单独发一帧
 且 `choices` 为空数组——`stream_options: {"include_usage": true}` 之外也发，
-因为多数轻量客户端不发这个字段却仍然想要 usage。
+因为多数轻量客户端不发这个字段却仍然想要 usage。这帧除了三个 token 计数，还带
+服务端实测的 `tokens_per_second`（纯解码段速率，见 4.2 节），客户端直接展示即可，
+不必自己拿墙钟测 SSE 帧间隔。
 
 ### 5.4 背压：有界 channel
 
@@ -288,8 +296,11 @@ let (tx, rx) = sync_channel::<Vec<u8>>(16);
 if token == expected { Ok(()) } else { 401 authentication_error }
 ```
 
-- 不给 `--api-key` = 不鉴权（本机自用），启动日志明确警告
-  `鉴权关（任何人都能调）`——**默认不鉴权，但必须喊出来**；
+- **给 `--api-key` 用它，不给就现场生成一个**（`serve::random_api_key()`，
+  `sk-` + 32 位十六进制）：服务**始终有鉴权**，随机 key 打在控制台的
+  `[serve] 鉴权开，API key = sk-…` 行与 runlog 里，别人才没法白嫖你的模型；
+- key 随机生成时还会通过 `VITE_API_KEY` 注入前端测试页，页面打开即自动填好
+  （key 每次启动都可能变，让用户手抄不现实）；
 - 比较前 `trim()`，容忍头值两端的空白；
 - 错误体是 OpenAI 形状：`{"error":{"message":"缺少或错误的 API key…","type":"authentication_error"}}`，
   官方 SDK 能直接识别成 `AuthenticationError` 并触发它的重试/报错逻辑。
@@ -310,9 +321,9 @@ OPTIONS → 204 + Access-Control-Allow-Origin: *
 关掉时一个头都不加——`*` 意味着任何网页都能拿你的 key 调你的模型，**生产
 环境不该开**。
 
-### 7.3 请求日志
+### 7.3 请求日志与问答记录
 
-每个请求一行（进 `logs/` 与 runlog）：
+**接口行**每个请求一条（同时进 stdout 与 `logs/serve_*.log`）：
 
 ```
 [serve] GET /v1/models → 401（1ms）
@@ -324,6 +335,32 @@ OPTIONS → 204 + Access-Control-Allow-Origin: *
 
 方法、路径、状态码、耗时四要素齐全；生成类事件单独一行（带 token 数和收尾
 原因），因为"哪个请求慢"和"慢在生成还是慢在排队"是两个问题。
+
+**问答记录**每条到达生成的 chat 请求一个块——只写 `logs/serve_*.log`，
+**控制台保持上面的简洁接口行，不打印问答正文**：
+
+```
+--- 问答 chatcmpl-2（流式） ---
+时间     : 2026-09-30 00:19:48.180
+system   : 你是简明助手
+历史     : 2 条
+输入     : 用一句话介绍勾股定理
+输出     : 我想好。还不客？j我有什么趣！……
+收尾     : 跑满 --max-new 被截断
+采样参数 : temperature=0.8, top_k=40, top_p=0.9, repetition_penalty=1.1, repetition_window=64, stop=["。。", "用户："], seed=7, max_tokens=40
+用量     : prompt 41 + completion 40 = 81 token，112.4 tok/s
+```
+
+设计要点：
+
+- **只记本轮问答 + 参数**：历史全文由无状态的调用方每次重发，原样记下来会让
+  同一段历史在日志里反复刷屏，所以历史只记条数（首轮标 `0 条（首轮问答）`）；
+- 时间戳用 `runlog::now()` 单独标注——运行头部只有一个"开始时间"，常驻进程
+  跑久了对不上号；
+- 收尾原因复用 chat 的标签（`采到 EOS` / `命中停止标记「…」` / `跑满 --max-new 被截断`）；
+- **失败也留痕**：非流式生成出错、流式响应头已按 200 发出后出错、客户端提前
+  断开，都写一条问答记录（后两者收尾标 `未正常收尾（见备注）`，备注说明原因），
+  否则"题目在、答案没了"的请求在日志里查不到下文。
 
 ### 7.4 `/v1/status` 队列状态
 
@@ -406,8 +443,8 @@ git diff）。
   验一遍，漂移会当场失败。
 - 鉴权是**规范里写不了密钥值的**（安全），但已在 `bearerAuth.description`
   里写清做法：导入后在 collection 的 Authorization → Bearer Token 填一次
-  `--api-key` 的值即可，子请求全部继承，无需逐请求设置；没给 `--api-key`
-  则服务不鉴权。
+  key 即可，子请求全部继承，无需逐请求设置；key 取 `--api-key`，没给则
+  是启动时自动生成的随机 key（看控制台启动日志）。
 
 同一份规范还会在 **`serve` 启动时自动写进 `openapi/` 目录**
 （`dump_openapi_files`，与端点出自同一个 `openapi_spec`，逐字一致）：
@@ -454,6 +491,8 @@ vite 把 `/v1`、`/health`、`/openapi.*` **代理转发**到 `http://127.0.0.1:
   `npm` 实际是 `npm.cmd`、`std::process::Command` 找不到的问题；
 - 找不到工程或没装依赖（`node_modules/vite` 不存在）只打一行警告就返回，
   **绝不影响 API 启动**；缺依赖时提示 `cd web && npm install`；
+- 除端口外还注入 `VITE_API_KEY`（`VITE_` 前缀才会进 `import.meta.env`）：
+  鉴权始终开着、key 又可能是随机的，页面自动填好才免得用户手抄；
 - 子进程交给独立线程 `wait()` 收割（不留僵尸进程），与 API 共享控制台，
   Ctrl-C 时两边一起停。
 
@@ -527,7 +566,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 ---
 
-## 10. 单元测试（19 个）
+## 10. 单元测试（23 个）
 
 `src/serve.rs` 底部的 `#[cfg(test)] mod tests`，不启端口、纯函数级：
 
@@ -539,6 +578,9 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 | `merge_system_service_level_comes_first` | 服务级 system 在前 |
 | `parse_chat_rejects_bad_requests` | 各种非法请求的 400 与错误消息 |
 | `parse_chat_applies_defaults_and_overrides` | 默认值套用与逐字段覆盖（含 SFT stop 缺省） |
+| `parse_chat_counts_history_turns` | 历史条数统计：首轮 0、system 不计入、多轮正确计数 |
+| `qa_log_block_records_round_and_params` | 问答记录块：标题/输入/输出/收尾/采样参数/用量逐项齐全 |
+| `qa_log_block_handles_empty_output_and_abort` | 空输出与中止场景：标注"（空）""未正常收尾"与备注 |
 | `stop_interner_dedups_identical_slices` | 驻留表去重 |
 | `stop_interner_rejects_oversized_input` | 驻留表上限生效（不无界泄漏） |
 | `sse_pipe_reads_frames_then_hits_eof` | SsePipe 帧读取 + EOF 语义 |
@@ -559,10 +601,10 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 ## 11. 上线清单与后续方向
 
-**当前已具备**：流式/非流式、鉴权、CORS、embeddings、请求日志、队列状态、
+**当前已具备**：流式/非流式、鉴权、CORS、embeddings、请求日志与完整问答记录、队列状态、
 OpenAPI 规范（运行时端点 + `serve` 启动自动写出 `openapi/{openapi.json,openapi.yaml}`）、
 前端测试页（`web/` 随 serve 启动，§7.8，生产加 `--no-web`）、
-断开可中断、OpenAI 兼容错误体、资源上限、236 个测试全绿。
+断开可中断、OpenAI 兼容错误体、资源上限、240 个测试全绿。
 
 **上生产前还要补的**（本课未做，刻意不半成品实现）：
 

@@ -57,7 +57,7 @@
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式，**头部记录 LoRA 形态（旧档兼容）** |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** |
-| API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 |
+| API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 + 完整问答记录（问答正文只落日志文件） |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
@@ -79,7 +79,7 @@
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
 | 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
-| 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)）、`web/` 前端测试页随 serve 启动 |
+| 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志与完整问答记录、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)）、`web/` 前端测试页随 serve 启动 |
 
 ## 快速开始
 
@@ -622,7 +622,7 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径 |
 | `--host <地址>` | string | `127.0.0.1` | 监听地址（只本机访问；对外开放用 `0.0.0.0`） |
 | `--port <端口>` | int | `8080` | 监听端口 |
-| `--api-key <密钥>` | string | 无（不鉴权） | 给出后所有请求必须带 `Authorization: Bearer <key>` |
+| `--api-key <密钥>` | string | 自动生成随机 key | 给出则用它鉴权；不给则启动时生成随机 key 并打印在启动日志。业务端点都要带 `Authorization: Bearer <key>` |
 | `--cors` | flag | 关 | 允许跨域（回 `Access-Control-Allow-Origin: *`），浏览器页面直连调试用 |
 | `--no-web` | flag | 关 | 不启动 [`web/`](web/) 前端测试页（默认随 API 一起拉起 vite dev server） |
 | `--web-port <端口>` | int | `5173` | 前端测试页端口（vite dev server） |
@@ -651,20 +651,27 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 **导入即用**：规范里 `chat` / `embeddings` 的请求体自带能直接跑通的
 `example`（不会撞 `n≠1`、末条非 `user` 这类 400），导入 Postman / Apifox
 点 Send 就返回 200；鉴权只需在 collection 的 Authorization → Bearer Token
-填一次 `--api-key` 的值，无需逐请求设置（没给 `--api-key` 则不需要鉴权）。
+填一次 key（`--api-key` 的值；没给时看控制台启动日志里的随机 key），
+无需逐请求设置。
 
 **前端测试页**：`serve` 启动时会顺带拉起 [`web/`](web/) 目录下的 vite dev
 server（React + TS），浏览器打开 `http://localhost:5173` 即可可视化调接口——
-三个页签分别对应流式/非流式对话（带采样参数、原始 JSON、等价 cURL）、
+三个页签分别对应流式/非流式对话（带采样参数、原始 JSON、等价 cURL，每条回复
+底部显示耗时 / 停止原因 / token 数 / tok/s——速率为服务端实测值）、
 embeddings 向量化、health/status/models 状态总览。页面请求经 vite 代理
-**同源转发**到 API 端口，因此不需要开 `--cors`。首次使用先装依赖
+**同源转发**到 API 端口，因此不需要开 `--cors`；侧边栏的 API Key 由 serve 用
+`VITE_API_KEY` 自动注入——没给 `--api-key`（随机 key）时页面也开箱可用。
+首次使用先装依赖
 `cd web && npm install`；只起 API 不起页面用 `--no-web`，换端口用
 `--web-port`。生产部署（systemd/nginx）务必加 `--no-web`，前端只服务开发调试。
 
 **流式输出**：`"stream": true` 时按 OpenAI 的 SSE 格式逐 token 下发——首帧声明
 `role: assistant`，中间帧是 `delta.content` 增量，末尾依次发 `finish_reason`
 帧、`usage` 帧和 `data: [DONE]`。多字节字符与停止标记前缀会被 hold-back 到
-确定安全才发，所以流式与非流式输出逐字一致。
+确定安全才发，所以流式与非流式输出逐字一致。`usage` 帧除三个 token 计数外还带
+服务端 `Instant` 实测的 `tokens_per_second`（纯解码段速率，不含 prefill；不足
+2 个 token 为 `null`）——客户端直接用它展示 tok/s，不要拿墙钟测 SSE 帧间隔
+（TCP/代理缓冲会把多帧合并到达，算出来的速率会虚高到离谱）。
 
 **客户端断开即中止**：客户端关掉连接后服务端立刻停止生成（不再对空连接烧
 CPU），日志打印 `客户端提前断开，生成已中止（N token）`。
@@ -680,7 +687,7 @@ CPU），日志打印 `客户端提前断开，生成已中止（N token）`。
 **示例**：
 
 ```bash
-# ── 启动服务（推荐 release + 显式 key）──
+# ── 启动服务（推荐 release + 显式 key；不给 --api-key 会自动生成随机 key 并打印）──
 cargo run --release -- serve --ckpt checkpoints/zh-sft/best.ckpt \
   --host 127.0.0.1 --port 8080 --api-key sk-test
 
@@ -1281,9 +1288,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **236 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **240 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 246 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 250 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1754,7 +1761,7 @@ llm_from_scratch/
 | 配置文件 | `config/config.json` | `--config` / `--output` | 所有子命令的配置默认路径；`preset --output` 写同类路径 |
 | 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json`；`sft` 另写 `{out_dir}-sft`，`finetune` 写回 `{out_dir}` |
 | 训练指标日志 | `logs/train.csv` | `train.log_file` | CSV：`step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
-| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出（`serve` 是常驻进程，日志在启动时落一份，之后每个请求的访问日志追加到 stdout） |
+| 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出（`serve` 是常驻进程，日志在启动时落一份，之后每个请求的接口行与**完整问答记录**——system/历史条数/输入/输出/收尾/采样参数/用量——只追加到日志文件，控制台保持简洁接口行） |
 
 实现方式：`src/config.rs` 提供 `ensure_parent_dir()` / `ensure_dir()`，并在**每个写盘出口**调用——
 `Config::save()`（配置）、`checkpoint::save()`（权重）、`Tokenizer::save()`（分词器）、`MetricsLogger::new()`（指标 CSV）、
@@ -1788,7 +1795,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **236 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `236 passed; 0 failed`，release 全量约 43 秒；
+- **240 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `240 passed; 0 failed`，release 全量约 43 秒；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
