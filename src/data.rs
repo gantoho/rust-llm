@@ -305,6 +305,25 @@ pub trait BatchSource: Sync {
     /// `None` 表示全部位置参与（预训练）。
     fn sample_batch(&self, rng: &mut Rng) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>);
     fn eval_batch(&self, rng: &mut Rng) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>);
+
+    /// 同 [`BatchSource::sample_batch`]，另带像素 `Option<[B, 3·S·S] 首尾相接的 CHW]`。
+    /// 纯文本加载器走默认实现（返回 `None`）；多模态加载器（[`VlmLoader`]）覆写它。
+    fn sample_batch_mm(
+        &self,
+        rng: &mut Rng,
+    ) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>, Option<Vec<f32>>) {
+        let (x, y, mask) = self.sample_batch(rng);
+        (x, y, mask, None)
+    }
+
+    /// 同 [`BatchSource::eval_batch`]，另带像素。
+    fn eval_batch_mm(
+        &self,
+        rng: &mut Rng,
+    ) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>, Option<Vec<f32>>) {
+        let (x, y, mask) = self.eval_batch(rng);
+        (x, y, mask, None)
+    }
 }
 
 impl BatchSource for DataLoader {
@@ -742,6 +761,347 @@ impl BatchSource for SftLoader {
     }
 }
 
+// ==================== VLM（图文指令）语料 ====================
+
+/// VLM 数据加载器：图文指令样本，喂给带视觉塔的模型做训练（见 `train::train_transformer`）。
+///
+/// 语料是 JSONL，每行：
+/// ```json
+/// {"image": "img/0.png", "conversations": [{"role": "human", "content": "图:<|image|> 是什么？"}, {"role": "gpt", "content": "一只猫"}]}
+/// ```
+/// - `role` 取 human/user（提问）与 gpt/assistant（回答），交替出现；
+/// - 提问文本用 `<|image|>` 字面量标出图片位置（分词时展开为 P 个视觉占位符）；
+/// - `image` 路径相对 JSONL 文件所在目录解析，整图预加载进内存（小图数据集）。
+///
+/// 与 [`SftLoader`] 的两点关键区别：
+/// 1. 样本**不打包、不随机滑窗**——每条样本的像素必须与它的文本窗口对齐，
+///    滑窗会把占位符序列切碎（[`crate::model::Transformer::forward_core`] 断言
+///    每个样本恰好 P 个占位符）。整条序列从头取，尾部用 pad 补齐到 `block_size`，
+///    补的位置不计 loss；因果掩码保证 pad 只出现在尾部、不会进入任何监督位置的上下文。
+/// 2. 每批多带一份像素（`[B, 3·S·S]` 首尾相接），交给 `forward_mm` 注入 ViT 特征。
+pub struct VlmLoader {
+    /// 每条样本的 token 序列（`[BOS] … [EOS]`，图片字面量已展开），长度 ≤ block_size+1
+    seqs: Vec<Vec<usize>>,
+    /// 与 `seqs` 等长：第 p 个位置是否为监督目标
+    sups: Vec<Vec<bool>>,
+    /// 与 `seqs` 等长：每条样本的像素 `[3·S·S]`（CHW，[-1,1]）
+    pixels: Vec<Vec<f32>>,
+    /// 图像**生成**序列（占位符段已替换为 VQ 码本 token），由
+    /// [`VlmLoader::attach_generation`] 填充；为空表示本加载器只做理解训练
+    gen_seqs: Vec<Vec<usize>>,
+    /// 与 `gen_seqs` 等长：生成序列的监督掩码
+    gen_sups: Vec<Vec<bool>>,
+    block_size: usize,
+    batch_size: usize,
+    pad_id: usize,
+    /// 验证样本起点（按**样本条数**切分，末尾约 10%）
+    val_start: usize,
+    /// 训练 / 验证区的 token 总数（仅用于日志）
+    train_tokens: usize,
+    val_tokens: usize,
+}
+
+impl VlmLoader {
+    /// 从 JSONL 文件构造加载器。分词器必须已 [`crate::tokenizer::Tokenizer::attach_image_tokens`]。
+    pub fn from_jsonl(
+        path: &str,
+        tokenizer: &Tokenizer,
+        block_size: usize,
+        batch_size: usize,
+        image_size: usize,
+    ) -> Self {
+        let im = tokenizer
+            .image_tokens()
+            .expect("VLM 训练要求分词器已 attach_image_tokens（先调用再构造 VlmLoader）");
+        let pad_id = tokenizer
+            .pad_id()
+            .expect("VLM 训练要求分词器带特殊 token（pad 用于序列对齐填充）");
+        assert!(
+            tokenizer.bos_id().is_some() && tokenizer.eos_id().is_some(),
+            "VLM 训练要求分词器带 BOS/EOS"
+        );
+        assert!(
+            im.count > 0,
+            "attach_image_tokens 的 patch_count 必须大于 0"
+        );
+
+        let text = read_one(path);
+        let base = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new(""));
+        let mut seqs = Vec::new();
+        let mut sups = Vec::new();
+        let mut pixels = Vec::new();
+        for (li, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let tag = format!("{path} 第 {} 行", li + 1);
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{tag} JSON 解析失败: {e}"));
+            let image = v
+                .get("image")
+                .and_then(|t| t.as_str())
+                .unwrap_or_else(|| panic!("{tag} 缺少 string 字段 image"));
+            let turns = v
+                .get("conversations")
+                .and_then(|t| t.as_array())
+                .unwrap_or_else(|| panic!("{tag} 缺少数组字段 conversations"));
+
+            // 角色交替配对成 SftTurns，交给 build_sft_stream 统一渲染模板与掩码
+            let mut conv: SftTurns = Vec::new();
+            let mut pending: Option<String> = None;
+            for t in turns {
+                let role = t.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                let content = t
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_else(|| panic!("{tag} 的 conversations 项缺 string 字段 content"));
+                match role {
+                    "human" | "user" => {
+                        assert!(
+                            pending.is_none(),
+                            "{tag}：连续两条提问，未收到回答"
+                        );
+                        pending = Some(content.to_string());
+                    }
+                    "gpt" | "assistant" => {
+                        let user = pending
+                            .take()
+                            .unwrap_or_else(|| panic!("{tag}：回答（gpt）之前没有提问（human）"));
+                        conv.push((user, content.to_string()));
+                    }
+                    other => panic!("{tag}：未知角色 '{other}'（应为 human/user/gpt/assistant）"),
+                }
+            }
+            assert!(
+                pending.is_none(),
+                "{tag}：最后一条提问没有对应回答"
+            );
+            assert!(!conv.is_empty(), "{tag}：conversations 为空");
+
+            // 图片与占位符一一对应：少了 <|image|> 前向注入无处下手，多了会溢出
+            let n_lit = conv
+                .iter()
+                .map(|(u, _)| u)
+                .map(|u| u.matches(crate::tokenizer::IMAGE_LITERAL).count())
+                .sum::<usize>();
+            assert_eq!(
+                n_lit,
+                1,
+                "{tag}：提问文本里的 {} 出现 {n_lit} 次，每条样本必须恰好 1 次",
+                crate::tokenizer::IMAGE_LITERAL
+            );
+
+            let (tokens, sup) = build_sft_stream(tokenizer, &[conv]);
+            assert!(
+                tokens.len() <= block_size + 1,
+                "{tag}：样本展开后 {L} 个 token，超过 block_size+1（{limit}）——调大 block_size 或精简对话",
+                L = tokens.len(),
+                limit = block_size + 1
+            );
+
+            let img = base.join(image);
+            let px = crate::vision::load_image(img.to_str().expect("image 路径不是合法 UTF-8"), image_size);
+            seqs.push(tokens);
+            sups.push(sup);
+            pixels.push(px);
+        }
+
+        let n = seqs.len();
+        assert!(n >= 2, "VLM 语料至少要有 2 条样本（1 训练 + 1 验证），实际 {n} 条：{path}");
+        // 末尾约 10% 作验证区，至少留 1 条、至少留 1 条训练
+        let val_start = (((n as f64) * 0.9) as usize).clamp(1, n - 1);
+        let train_tokens = seqs[..val_start].iter().map(|s| s.len()).sum();
+        let val_tokens = seqs[val_start..].iter().map(|s| s.len()).sum();
+
+        VlmLoader {
+            seqs,
+            sups,
+            pixels,
+            gen_seqs: Vec::new(),
+            gen_sups: Vec::new(),
+            block_size,
+            batch_size,
+            pad_id,
+            val_start,
+            train_tokens,
+            val_tokens,
+        }
+    }
+
+    pub fn num_samples(&self) -> usize {
+        self.seqs.len()
+    }
+
+    /// 监督位置占总 token 的比例（回答段越长比例越高）。
+    pub fn supervised_ratio(&self) -> f64 {
+        let total: usize = self.sups.iter().map(|s| s.len()).sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let sup: usize = self.sups.iter().map(|s| s.iter().filter(|b| **b).count()).sum();
+        sup as f64 / total as f64
+    }
+
+    /// 在 [lo, hi) 的**样本**里随机选 B 条（有放回），整条从头取、尾部 pad。
+    /// 掩码同 [`window_mask`]：`y[i] = seq[i+1]`，看目标位置的 `sup[i+1]`。
+    fn sample_region(
+        &self,
+        rng: &mut Rng,
+        lo: usize,
+        hi: usize,
+        tag: &str,
+    ) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>, Option<Vec<f32>>) {
+        assert!(hi > lo, "{tag}区没有样本，无法采样");
+        // 批次级二选一（已挂载生成序列时）：整批同构——forward_core 按批次统一收
+        // pixels，理解批（带像素）与生成批（纯 token）不能在同一批里混排。
+        let use_gen =
+            !self.gen_seqs.is_empty() && lo == 0 && hi == self.val_start && rng.choice(2) == 1;
+        let t = self.block_size;
+        let n = self.batch_size * t;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut mask = Vec::with_capacity(n);
+        let mut px = Vec::with_capacity(self.batch_size * self.pixels[0].len());
+        for _ in 0..self.batch_size {
+            let i = lo + rng.choice(hi - lo);
+            let (seq, sup) = if use_gen {
+                (&self.gen_seqs[i], &self.gen_sups[i])
+            } else {
+                (&self.seqs[i], &self.sups[i])
+            };
+            let l = seq.len();
+            // l == 1 时没有可预测的目标；l > block_size+1 在 from_jsonl 已拦截
+            assert!(l >= 2, "{tag}区第 {i} 条样本只有 1 个 token，无法构成 (x, y) 对");
+            for j in 0..t {
+                if j + 1 < l {
+                    x.push(seq[j]);
+                    y.push(seq[j + 1]);
+                    mask.push(sup[j + 1]);
+                } else {
+                    // 尾部填充：pad 只可能出现在这里，任何监督位置都看不到它
+                    x.push(self.pad_id);
+                    y.push(self.pad_id);
+                    mask.push(false);
+                }
+            }
+            if !use_gen {
+                px.extend_from_slice(&self.pixels[i]);
+            }
+        }
+        // 生成批不带像素 → forward_core 走纯 token 路径（占位符已换成码本 token）
+        let px = if use_gen { None } else { Some(px) };
+        (x, y, Some(mask), px)
+    }
+
+    /// 所有样本的像素 `[3·S·S]`（CHW，[-1,1]），供 VQ-VAE 预训练取用。
+    pub fn images(&self) -> &[Vec<f32>] {
+        &self.pixels
+    }
+
+    /// 挂载图像**生成**序列：把每条样本占位符段的 P 个 ph token 替换为该图的
+    /// VQ 码本 token（`start + cb×P + end`），并监督「start→码本→整段收尾」。
+    ///
+    /// 理解批次里 ph 段位于用户提问内、sup 本就为 false，因此
+    /// 「start→ph」（理解）与「start→cb」（生成）两条转移没有监督冲突，
+    /// 模型按上下文决定是看图还是画图。要求分词器挂载了码本（K>0）。
+    pub fn attach_generation(&mut self, vq: &crate::vqvae::Vqvae, tokenizer: &Tokenizer) {
+        let im = tokenizer
+            .image_tokens()
+            .expect("生成序列要求分词器已 attach_image_tokens")
+            .clone();
+        assert!(
+            im.cb_count > 0,
+            "生成序列要求 attach_image_tokens 传入 codebook_size > 0"
+        );
+        self.gen_seqs.clear();
+        self.gen_sups.clear();
+        for i in 0..self.seqs.len() {
+            let codes = vq.encode(&self.pixels[i], 1);
+            assert_eq!(
+                codes.len(),
+                im.count,
+                "VQ 编码得到 {} 个码，与占位符数 {} 不一致",
+                codes.len(),
+                im.count
+            );
+            let mut g = self.seqs[i].clone();
+            let mut s = self.sups[i].clone();
+            let pos = g
+                .iter()
+                .position(|&t| t == im.start)
+                .unwrap_or_else(|| panic!("第 {i} 条样本没有图片 start token"));
+            assert!(
+                g.len() > pos + im.count + 1 && g[pos + im.count + 1] == im.end,
+                "第 {i} 条样本的图片段结构损坏（start 后不是 P 个占位符 + end）"
+            );
+            for j in 0..im.count {
+                g[pos + 1 + j] = im.cb_id(codes[j]);
+            }
+            // 监督「出 start」与「出 P 个码本 + end」：模型要学会起图→出码→收图
+            s[pos] = true;
+            for j in 0..=im.count {
+                s[pos + 1 + j] = true;
+            }
+            self.gen_seqs.push(g);
+            self.gen_sups.push(s);
+        }
+    }
+}
+
+impl BatchSource for VlmLoader {
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    fn num_tokens(&self) -> usize {
+        self.train_tokens + self.val_tokens
+    }
+
+    fn num_train_tokens(&self) -> usize {
+        self.train_tokens
+    }
+
+    fn num_val_tokens(&self) -> usize {
+        self.val_tokens
+    }
+
+    fn has_val(&self) -> bool {
+        self.val_start < self.seqs.len()
+    }
+
+    fn sample_batch(&self, rng: &mut Rng) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>) {
+        let (x, y, mask, _) = self.sample_batch_mm(rng);
+        (x, y, mask)
+    }
+
+    fn eval_batch(&self, rng: &mut Rng) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>) {
+        let (x, y, mask, _) = self.eval_batch_mm(rng);
+        (x, y, mask)
+    }
+
+    fn sample_batch_mm(
+        &self,
+        rng: &mut Rng,
+    ) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>, Option<Vec<f32>>) {
+        self.sample_region(rng, 0, self.val_start, "训练")
+    }
+
+    fn eval_batch_mm(
+        &self,
+        rng: &mut Rng,
+    ) -> (Vec<usize>, Vec<usize>, Option<Vec<bool>>, Option<Vec<f32>>) {
+        assert!(self.has_val(), "没有验证数据，无法采样 eval batch");
+        self.sample_region(rng, self.val_start, self.seqs.len(), "验证")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,5 +1315,168 @@ mod tests {
         let (xb, yb, _) = b.sample_batch(&mut Rng::new(7));
         assert_eq!(xa, xb);
         assert_eq!(ya, yb);
+    }
+
+    /// VLM fixture：`n` 张 8×8 PNG + 同目录 JSONL（`with_literal=false` 时提问里不带图片字面量）。
+    /// 语料要覆盖 SFT 模板与回答的全部字符（词表外字符 encode 会 panic），图片字面量除外。
+    fn vlm_fixture(tag: &str, n: usize, with_literal: bool) -> String {
+        let dir = std::env::temp_dir().join(format!("llm_vlm_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chw = vec![0.25f32; 3 * 8 * 8];
+        for i in 0..n {
+            crate::vision::save_image(&chw, 8, dir.join(format!("img{i}.png")).to_str().unwrap());
+        }
+        let q = if with_literal {
+            format!("看图{}回答", crate::tokenizer::IMAGE_LITERAL)
+        } else {
+            "看图回答".to_string()
+        };
+        let lines: Vec<String> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "image": format!("img{i}.png"),
+                    "conversations": [
+                        {"role": "human", "content": q},
+                        {"role": "gpt", "content": "纯色"},
+                    ],
+                })
+                .to_string()
+            })
+            .collect();
+        let jsonl = dir.join("data.jsonl");
+        std::fs::write(&jsonl, lines.join("\n")).unwrap();
+        jsonl.to_str().unwrap().to_string()
+    }
+
+    fn vlm_tokenizer() -> Tokenizer {
+        let mut tok = Tokenizer::char("用户：助手：\n看图回答纯色");
+        tok.attach_image_tokens(4, 0)
+            .expect("char 分词器默认带 specials，应能挂图片 token");
+        tok
+    }
+
+    /// VLM 批次：整条采样 + 尾部 pad + 像素透传。掩码的 pad 位必须为 false，
+    /// 否则模型会去学"生成 pad"；像素数量必须 = batch·3·S²，否则视觉塔对不上样本。
+    #[test]
+    fn vlm_loader_batches_pad_and_carry_pixels() {
+        let jsonl = vlm_fixture("ok", 3, true);
+        let tok = vlm_tokenizer();
+        let im = tok.image_tokens().unwrap();
+        let block = 64;
+        let loader = VlmLoader::from_jsonl(&jsonl, &tok, block, 2, 8);
+
+        assert_eq!(loader.num_samples(), 3);
+        assert!(loader.has_val(), "3 条样本应按 90/10 切出验证区");
+
+        let mut rng = Rng::new(7);
+        let (x, y, mask, px) = loader.sample_batch_mm(&mut rng);
+        let mask = mask.expect("VLM 必须返回掩码");
+        let px = px.expect("VLM 必须返回像素");
+        assert_eq!(x.len(), 2 * block);
+        assert_eq!(y.len(), 2 * block);
+        assert_eq!(mask.len(), 2 * block);
+        assert_eq!(px.len(), 2 * 3 * 8 * 8, "像素按样本首尾相接");
+        assert!(
+            px.iter().all(|v| (-1.0..=1.0).contains(v)),
+            "像素应归一化到 [-1,1]"
+        );
+        assert!(mask.iter().any(|b| *b), "回答段应带监督位置");
+
+        let pad = tok.pad_id().unwrap();
+        for s in 0..2 {
+            let seg = &x[s * block..(s + 1) * block];
+            assert!(
+                seg.contains(&im.start),
+                "样本 {s} 应含 <|image|> 展开的 start"
+            );
+            for (j, v) in seg.iter().enumerate() {
+                if *v == pad {
+                    assert!(!mask[s * block + j], "pad 位不能带监督");
+                }
+            }
+        }
+
+        // 验证区同样可采样（与训练区互不重叠）
+        let (ex, _, emask, epx) = loader.eval_batch_mm(&mut rng);
+        assert_eq!(ex.len(), 2 * block);
+        assert!(emask.is_some() && epx.is_some());
+
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&jsonl).parent().unwrap());
+    }
+
+    /// 每条样本必须恰好一个 `<|image|>`：0 个则视觉特征无处注入，多于 1 个会溢出占位符计数。
+    #[test]
+    #[should_panic(expected = "每条样本必须恰好 1 次")]
+    fn vlm_loader_requires_exactly_one_image_literal() {
+        let jsonl = vlm_fixture("no_literal", 2, false);
+        let tok = vlm_tokenizer();
+        let _ = VlmLoader::from_jsonl(&jsonl, &tok, 64, 2, 8);
+    }
+
+    /// 生成序列挂载：占位符段换成 VQ 码本 token 并监督整段；
+    /// 训练采样在「理解批（带像素）」与「生成批（纯 token）」之间二选一，整批同构。
+    #[test]
+    fn vlm_attach_generation_swaps_codes_and_mixes_batches() {
+        let jsonl = vlm_fixture("gen", 6, true);
+        let mut tok = Tokenizer::char("用户：助手：\n看图回答纯色");
+        tok.attach_image_tokens(4, 8)
+            .expect("char 分词器默认带 specials，应能挂图片 token");
+        let im = tok.image_tokens().unwrap();
+        let mut loader = VlmLoader::from_jsonl(&jsonl, &tok, 64, 2, 8);
+        let vq_cfg = crate::vqvae::VqConfig {
+            image_size: 8,
+            patch_size: 4, // P = (8/4)² = 4，与 attach 的 4 个占位符一致
+            codebook_size: 8,
+            ..Default::default()
+        };
+        let vq = crate::vqvae::Vqvae::new(vq_cfg, &mut Rng::new(3));
+        loader.attach_generation(&vq, &tok);
+
+        // 每条生成序列：start 后恰 P 个码本 token，再跟 end，整段被监督
+        assert_eq!(loader.gen_seqs.len(), loader.num_samples());
+        for (g, s) in loader.gen_seqs.iter().zip(&loader.gen_sups) {
+            let pos = g.iter().position(|&t| t == im.start).expect("应含 start");
+            assert_eq!(g[pos + im.count + 1], im.end, "start 后 P 个码本 + end");
+            for j in 0..im.count {
+                assert!(
+                    im.cb_index(g[pos + 1 + j]).is_some(),
+                    "第 {j} 个占位符应已替换为码本 token"
+                );
+                assert!(s[pos + 1 + j], "码本 token 应受监督");
+            }
+            assert!(s[pos], "start 应受监督");
+        }
+
+        // 训练采样：两种批次都要出现（固定种子下序列确定），且各带/不带像素
+        let mut rng = Rng::new(5);
+        let (mut seen_understand, mut seen_generate) = (false, false);
+        for _ in 0..24 {
+            let (x, _, mask, px) = loader.sample_batch_mm(&mut rng);
+            assert!(mask.is_some());
+            match px {
+                Some(px) => {
+                    seen_understand = true;
+                    assert_eq!(px.len(), 2 * 3 * 8 * 8, "理解批必须带满像素");
+                    assert!(
+                        x.contains(&im.ph_first),
+                        "理解批保留占位符（由 ViT 特征覆写）"
+                    );
+                }
+                None => {
+                    seen_generate = true;
+                    assert!(
+                        !x.contains(&im.ph_first) && x.iter().any(|&t| im.cb_index(t).is_some()),
+                        "生成批应把占位符换成码本 token"
+                    );
+                }
+            }
+        }
+        assert!(seen_understand && seen_generate, "理解批与生成批都应被采到");
+
+        // 验证区永远走理解通路（生成批次只存在于训练区）
+        let (_, _, _, epx) = loader.eval_batch_mm(&mut rng);
+        assert!(epx.is_some());
+
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&jsonl).parent().unwrap());
     }
 }

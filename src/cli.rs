@@ -118,6 +118,10 @@ pub enum Cmd {
         /// 初始提示词
         #[arg(long, default_value = "")]
         prompt: String,
+        /// 图片理解输入：给定图片路径时先经视觉编码器注入前缀 embedding，
+        /// 模型可围绕该图片生成文字描述
+        #[arg(long)]
+        image: Option<String>,
         /// 生成的最大新 token 数
         #[arg(long, default_value_t = 100)]
         max_new: usize,

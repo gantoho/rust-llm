@@ -14,7 +14,7 @@ use crate::attention::KVCache;
 use crate::model::Transformer;
 use crate::quant::QBits;
 use crate::rng::Rng;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{ImageTokens, Tokenizer};
 
 /// 推理侧 KV cache 的开关与压缩设置（第 25 / 33 课）。
 ///
@@ -291,6 +291,14 @@ pub struct Generator<'m, 'r> {
     reason: Option<StopReason>,
     /// 收尾时定稿的生成段（收尾前为空，[`Generator::into_output`] 兜底补算）
     generated: String,
+    /// 图片 token 区间（分词器未挂载图片区间时为 `None`；K=0 时采样不受约束）
+    image: Option<ImageTokens>,
+    /// 图内状态机：`None` = 图外，`Some(n)` = 图内已采 n 个码本 token（n < P）
+    img_seg: Option<usize>,
+    /// 图片理解的输入像素（CHW、[-1,1]、按 `vision.image_size` 加载）。
+    /// 只在**带 KV cache 的首步（prefill）**与**全量无 cache 模式**下注入——
+    /// 增量步没有新图像（占位符的 K/V 已进缓存），传 None 即可
+    pixels: Option<Vec<f32>>,
 }
 
 impl<'m, 'r> Generator<'m, 'r> {
@@ -321,6 +329,15 @@ impl<'m, 'r> Generator<'m, 'r> {
         // `generated` 就是纯粹的"本轮生成"，不必再按 `prompt.len()` 的字节偏移去切全文。
         let n_prompt = ids.len();
         let prompt_text = tokenizer.decode(&ids[..n_prompt]);
+        // 图片区间：只有挂载了码本（K>0）且有占位符（P>0）才启用受约束采样
+        let image = tokenizer
+            .image_tokens()
+            .filter(|i| i.cb_count > 0 && i.count > 0);
+        // prompt 可能含 <|image|> 展开段：扫一遍状态机，确定起点处是否在图内
+        let mut img_seg = None;
+        for &id in &ids {
+            img_seg = advance_img_seg(img_seg, image, id);
+        }
         Generator {
             model,
             tokenizer,
@@ -337,7 +354,22 @@ impl<'m, 'r> Generator<'m, 'r> {
             emitted: 0,
             reason: None,
             generated: String::new(),
+            image,
+            img_seg,
+            pixels: None,
         }
+    }
+
+    /// 注入图片理解的输入像素（须在**首次 [`step`] 之前**调用）。
+    ///
+    /// prompt 必须含 `<|image|>`（展开为 P 个占位符，见 [`crate::tokenizer::IMAGE_LITERAL`]）：
+    /// 前向时视觉塔的 patch 特征会原位覆写这些占位符（[`Transformer::forward_mm`]）。
+    /// 没配视觉塔的 checkpoint 调用会在前向时断言失败。
+    ///
+    /// [`Transformer::forward_mm`]: crate::model::Transformer::forward_mm
+    pub fn with_pixels(mut self, pixels: Vec<f32>) -> Self {
+        self.pixels = Some(pixels);
+        self
     }
 
     /// 推进一步：一次前向 + 一次采样。
@@ -366,18 +398,32 @@ impl<'m, 'r> Generator<'m, 'r> {
         // （把 cache 提成局部变量：闭包按字段精确捕获，避免与下面的 `self.ids` 打架）
         let model = self.model;
         let cache = self.cache.as_mut();
+        // 图片理解：带 cache 时只在首步（prefill）注入像素——占位符的 K/V 从此进缓存；
+        // 无 cache 全量模式每步都重算整个上下文，占位符每次都要重新覆写。
+        // 只有当 ctx 里**恰好凑齐 P 个占位符**才注入：滑窗把图挤出窗口时 forward_mm
+        // 的数量断言会炸，此时退化成普通 embedding（图片已看不见了，与纯文本路径一致）
+        let (ph_first, ph_count) = match &model.cfg.vision {
+            Some(v) => (v.ph_first, v.patch_count()),
+            None => (0, 0),
+        };
+        let n_ph = ctx
+            .iter()
+            .filter(|&&id| id >= ph_first && id < ph_first + ph_count)
+            .count();
+        let inject = self.pixels.is_some() && ph_count > 0 && n_ph == ph_count;
+        let px = if inject { self.pixels.as_deref() } else { None };
         let logits = crate::tensor::no_grad(|| {
             if let Some(c) = cache {
                 // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
                 // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
                 if c[0].seq_len() == 0 {
-                    model.forward(ctx, 1, ctx.len(), Some(c), false)
+                    model.forward_mm(ctx, 1, ctx.len(), if inject { px } else { None }, Some(c), false)
                 } else {
                     model.forward(&self.ids[self.ids.len() - 1..], 1, 1, Some(c), false)
                 }
             } else {
                 // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-                model.forward(ctx, 1, ctx.len(), None, false)
+                model.forward_mm(ctx, 1, ctx.len(), if inject { px } else { None }, None, false)
             }
         });
 
@@ -385,20 +431,29 @@ impl<'m, 'r> Generator<'m, 'r> {
         let v = model.cfg.vocab_size;
         let n = logits.numel();
         let last_row = &logits.data()[n - v..];
-        // 只允许"接上后仍是合法 UTF-8 前缀"的 token，否则会拼出半个字符
-        let row: &[f32] = match self.vocab_bytes {
-            Some(vocab) => {
+        // 只允许"接上后仍是合法 UTF-8 前缀"的 token，否则会拼出半个字符；
+        // 图片段（start→码本×P→end）还要按状态机收紧采样域：两套掩码叠加
+        // （UTF-8 掩码只作用于内容词表，图片 token 落在 `get` 的 None 分支不受影响）。
+        let im = self.image;
+        let need_mask = self.vocab_bytes.is_some() || im.is_some();
+        let row: &[f32] = if need_mask {
+            self.masked.clear();
+            self.masked.extend_from_slice(last_row);
+            if let Some(vocab) = self.vocab_bytes {
                 let pending = pending_tail(vocab, &self.ids);
-                self.masked.clear();
-                self.masked.extend_from_slice(last_row);
                 mask_illegal_utf8(&mut self.masked, vocab, &pending);
-                &self.masked
             }
-            None => last_row,
+            if let Some(im) = im {
+                mask_image(&mut self.masked, im, self.img_seg);
+            }
+            &self.masked
+        } else {
+            last_row
         };
         // 重复惩罚的回看窗口：只看最近 N 个 token（含 prompt），更早的不再计入。
         // 窗口过大时高频 token 会被持续压低，可能影响语句的连贯性。
-        let recent = if self.opts.repetition_window == 0 {
+        // 图段内跳过惩罚：VQ 码本里重复是常态，按出现次数累乘的惩罚会把常见码打崩。
+        let recent = if self.opts.repetition_window == 0 || self.img_seg.is_some() {
             &[][..]
         } else {
             let start = self.ids.len().saturating_sub(self.opts.repetition_window);
@@ -406,6 +461,8 @@ impl<'m, 'r> Generator<'m, 'r> {
         };
         let next = sample_token(row, &self.opts, recent, self.rng);
         self.ids.push(next);
+        // 推进图内状态机：图外遇 start 进图，图内计数，遇 end 出图
+        self.img_seg = advance_img_seg(self.img_seg, self.image, next);
 
         // 采到 EOS 就收：这是模型自己学出来的结束符号（训练时每段序列末尾都带它），
         // 比"等某个字符组合出现"可靠得多。EOS 本身不进结果（`decode` 跳过特殊 token）。
@@ -494,6 +551,32 @@ impl<'m, 'r> Generator<'m, 'r> {
     /// 服务端把它当 `usage.prompt_tokens` 回给客户端。
     pub fn prompt_tokens(&self) -> usize {
         self.n_prompt
+    }
+
+    /// 提取生成段中**完整的图片码本序列**（每张图 = P 个码本下标），供 VQ-VAE 解码成像素。
+    ///
+    /// 只认「start + P 个码本 token + end」的完整段：残缺段（截断在图中间）丢弃。
+    /// 分词器没挂载码本（K=0）时恒返回空。
+    pub fn generated_images(&self) -> Vec<Vec<usize>> {
+        let Some(im) = self.image else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let segs = &self.ids[self.n_prompt..];
+        let mut i = 0;
+        while i < segs.len() {
+            if segs[i] == im.start && segs.len() > i + im.count + 1 && segs[i + im.count + 1] == im.end {
+                let seg = &segs[i + 1..=i + im.count];
+                if let Some(codes) = seg.iter().map(|&id| im.cb_index(id)).collect::<Option<Vec<_>>>()
+                {
+                    out.push(codes);
+                    i += im.count + 2; // start + P 个码本 + end
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     /// 消费状态机，取出最终结果（[`GenOutput`]）。
@@ -813,6 +896,65 @@ pub(crate) fn pending_tail(vocab: &[Vec<u8>], ids: &[usize]) -> Vec<u8> {
     Vec::new()
 }
 
+/// 图片段状态机推进：图外遇 start 进图（计 0），图内每遇占位/码本 token 计数 +1，
+/// 遇 end 出图；图内出现其他 token 保持状态不变（掩码已挡住，不会真的发生）。
+fn advance_img_seg(seg: Option<usize>, im: Option<ImageTokens>, id: usize) -> Option<usize> {
+    let im = im?;
+    match seg {
+        None => (id == im.start).then_some(0),
+        Some(n) => {
+            if id == im.end {
+                None
+            } else if (im.ph_first..im.ph_first + im.count).contains(&id)
+                || (im.cb_first..im.cb_first + im.cb_count).contains(&id)
+            {
+                Some(n + 1)
+            } else {
+                Some(n)
+            }
+        }
+    }
+}
+
+/// 图片段的采样域约束（叠加在 UTF-8 掩码之上）：
+/// - 图外：屏蔽占位符段 / 码本段 / end——模型不能凭空吐图片 token，必须先出 start；
+/// - 图内未满 P 个：只留码本段（EOS、文本全屏蔽，图必须完整采完）；
+/// - 图内已满 P 个：只留 end 收尾。
+fn mask_image(logits: &mut [f32], im: ImageTokens, seg: Option<usize>) {
+    let neg = f32::NEG_INFINITY;
+    match seg {
+        None => {
+            for id in im.ph_first..im.ph_first + im.count {
+                if let Some(l) = logits.get_mut(id) {
+                    *l = neg;
+                }
+            }
+            for id in im.cb_first..im.cb_first + im.cb_count {
+                if let Some(l) = logits.get_mut(id) {
+                    *l = neg;
+                }
+            }
+            if let Some(l) = logits.get_mut(im.end) {
+                *l = neg;
+            }
+        }
+        Some(n) if n >= im.count => {
+            for (id, l) in logits.iter_mut().enumerate() {
+                if id != im.end {
+                    *l = neg;
+                }
+            }
+        }
+        Some(_) => {
+            for (id, l) in logits.iter_mut().enumerate() {
+                if !(im.cb_first..im.cb_first + im.cb_count).contains(&id) {
+                    *l = neg;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,5 +1175,116 @@ mod tests {
         );
         // 序列从"中"的续字节开始（真实场景里前面还有 E4），也要能定位到 E4
         assert_eq!(pending_tail(vocab, &[0x41, 0xB8, 0xAD, 0xE4]), zhong[..1].to_vec());
+    }
+
+    /// 图片段受约束采样的两条腿：状态机推进（start→码本×P→end）与采样域掩码。
+    #[test]
+    fn test_image_segment_state_machine_and_mask() {
+        let im = ImageTokens {
+            start: 10,
+            ph_first: 11,
+            count: 4,
+            end: 15,
+            cb_first: 16,
+            cb_count: 8,
+        };
+        // 状态机：图外 → start 进图 → 码本逐个计数 → end 出图；
+        // 图内出现普通 token 不改变状态（掩码已挡住，防御性保持）
+        let mut seg = advance_img_seg(None, Some(im), 5);
+        assert_eq!(seg, None, "图外遇到普通 token 不进图");
+        seg = advance_img_seg(seg, Some(im), im.start);
+        assert_eq!(seg, Some(0));
+        seg = advance_img_seg(seg, Some(im), im.cb_id(3));
+        seg = advance_img_seg(seg, Some(im), im.cb_id(7));
+        assert_eq!(seg, Some(2));
+        seg = advance_img_seg(seg, Some(im), 99);
+        assert_eq!(seg, Some(2), "图内普通 token 不改变状态");
+        seg = advance_img_seg(seg, Some(im), im.end);
+        assert_eq!(seg, None);
+
+        // 图外：占位符段 / 码本段 / end 全屏蔽，start 与普通 token 保留
+        let mut l = vec![1.0f32; 32];
+        mask_image(&mut l, im, None);
+        for id in 11..=23 {
+            assert!(l[id].is_sign_negative() && l[id].is_infinite(), "图外应屏蔽 {id}");
+        }
+        assert_eq!(l[im.start], 1.0, "start 必须可采样（生成图片的唯一入口）");
+        assert_eq!(l[0], 1.0, "普通文本 token 不受影响");
+
+        // 图内未满 P 个：只留码本段（EOS / 文本全屏蔽，图必须完整采完）
+        let mut l = vec![1.0f32; 32];
+        mask_image(&mut l, im, Some(2));
+        for id in 0..32 {
+            let alive = !l[id].is_infinite();
+            assert_eq!(alive, (16..24).contains(&id), "图内(2) 应只留码本区，id={id}");
+        }
+
+        // 图内已满 P 个：只留 end 收尾
+        let mut l = vec![1.0f32; 32];
+        mask_image(&mut l, im, Some(4));
+        for id in 0..32 {
+            let alive = !l[id].is_infinite();
+            assert_eq!(alive, id == im.end, "图内(满) 应只留 end，id={id}");
+        }
+    }
+
+    /// 图片理解的采样通路（`with_pixels`）：
+    /// 1) 注入像素会覆写占位符 → 同种子下生成结果与纯文本路径不同；
+    /// 2) 无 cache 全量模式生成超过 block_size 时，滑窗把占位符挤出窗口，
+    ///    守卫自动退回纯文本路径——不触发 `forward_mm` 的数量断言，且照常出字。
+    #[test]
+    fn test_generator_with_pixels_injects_vision_and_survives_sliding_window() {
+        let corpus = "the quick brown fox jumps over the lazy dog, and then runs away.";
+        let mut tokenizer = Tokenizer::char(corpus);
+        let im = tokenizer
+            .attach_image_tokens(4, 0)
+            .expect("char 分词器自带 specials");
+        let vcfg = crate::vision::VisionConfig {
+            image_size: 8,
+            patch_size: 4,
+            n_embd: 16,
+            n_head: 2,
+            n_layer: 1,
+            dropout: 0.0,
+            ph_first: im.ph_first, // 占位符 id 必须与分词器展开的区间一致
+        };
+        let mut rng = Rng::new(5);
+        let cfg = TransformerConfig {
+            vision: Some(vcfg),
+            ..TransformerConfig::tiny(tokenizer.vocab_size())
+        };
+        let model = Transformer::new(cfg, &mut rng);
+
+        // prompt 里恰好一个 <|image|>，展开成 4 个占位符（P = (8/4)² = 4）
+        let prompt = format!("the{}", crate::tokenizer::IMAGE_LITERAL);
+        let pixels: Vec<f32> = (0..3 * 8 * 8)
+            .map(|i| ((i % 13) as f32 / 12.0) * 2.0 - 1.0)
+            .collect();
+
+        let run = |inject: bool, kv: KvOpts, max_new: usize| -> GenOutput {
+            let mut r = Rng::new(9);
+            let mut g = Generator::new(&model, &tokenizer, &prompt, max_new, &opts(), kv, &mut r);
+            if inject {
+                g = g.with_pixels(pixels.clone());
+            }
+            g.run();
+            g.into_output()
+        };
+
+        // 1) 同种子：注入像素 vs 纯文本占位符，生成应分道扬镳
+        let with_px = run(true, KvOpts::on(0, None), 12);
+        let no_px = run(false, KvOpts::on(0, None), 12);
+        assert_ne!(
+            with_px.text, no_px.text,
+            "注入像素应改变生成结果（视觉特征没进前向？）"
+        );
+
+        // 2) 生成 40 > block_size 32：占位符必被滑窗挤出，守卫须退回纯文本路径
+        //    （decode 不还原 <|image|> 字面量，所以只看生成段而非全文长度）
+        let long_run = run(true, KvOpts::off(), 40);
+        assert!(
+            !long_run.generated.is_empty(),
+            "滑窗后应照常出字：{long_run:?}"
+        );
     }
 }

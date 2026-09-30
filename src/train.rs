@@ -203,10 +203,17 @@ pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usiz
     zero_grad_all(model); // 评估前清零梯度，避免残留影响
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
-        let (x, y, mask) = loader.eval_batch(rng);
+        let (x, y, mask, pixels) = loader.eval_batch_mm(rng);
         // 评估只做前向，无需建图：no_grad 下省掉整张计算图
         let loss = crate::tensor::no_grad(|| {
-            let logits = model.forward(&x, loader.batch_size(), loader.block_size(), None, false);
+            let logits = model.forward_mm(
+                &x,
+                loader.batch_size(),
+                loader.block_size(),
+                pixels.as_deref(),
+                None,
+                false,
+            );
             cross_entropy_loss_masked(&logits, &y, mask.as_deref())
         });
         total += loss.item();
@@ -243,11 +250,12 @@ fn forward_loss(
     x: &[usize],
     y: &[usize],
     mask: Option<&[bool]>,
+    pixels: Option<&[f32]>,
     batch_size: usize,
     block_size: usize,
     accum: usize,
 ) -> Tensor {
-    let hidden = model.forward_hidden(x, batch_size, block_size, true);
+    let hidden = model.forward_hidden_mm(x, batch_size, block_size, pixels, true);
     // 必须在 forward 之后**立刻**取走：每个 Block 只保留"最近一次前向"的那份辅助损失，
     // 下一次前向会覆盖它（见 [`crate::model::Transformer::aux_loss`]）。
     let aux = model.aux_loss();
@@ -516,7 +524,7 @@ pub fn train_transformer(
     // 第一批在进入 scope 前先采（否则 spawn 后立刻 recv 会白等一次采样），工作线程
     // 从「第一批之后」的 rng 状态继续克隆采样，超前备好后续批次；每批附带采样后的
     // rng 状态，主线程消费时回写——采样序列与串行完全一致（可复现训练依赖这点）。
-    let mut first_batch = (start_step < cfg.steps).then(|| loader.sample_batch(rng));
+    let mut first_batch = (start_step < cfg.steps).then(|| loader.sample_batch_mm(rng));
     let worker_rng = rng.clone();
     std::thread::scope(|s| {
         // 有界通道：最多超前 2 批，采样快于计算时不会无限囤积内存；
@@ -525,22 +533,23 @@ pub fn train_transformer(
             Vec<usize>,
             Vec<usize>,
             Option<Vec<bool>>,
+            Option<Vec<f32>>,
             u64,
         )>(2);
         s.spawn(move || {
             let mut wrng = worker_rng;
             loop {
-                // 1. 采样 batch（SFT 语料会额外带回 loss 掩码）
-                let (x, y, mask) = loader.sample_batch(&mut wrng);
-                if tx.send((x, y, mask, wrng.state())).is_err() {
+                // 1. 采样 batch（SFT 带 loss 掩码，VLM 另带像素）
+                let (x, y, mask, pixels) = loader.sample_batch_mm(&mut wrng);
+                if tx.send((x, y, mask, pixels, wrng.state())).is_err() {
                     break; // 接收端已丢弃（训练循环结束）→ 本线程退出
                 }
             }
         });
         for step in start_step..cfg.steps {
             // 取下一批：第一批已在 scope 外采好，其余等工作线程预取的结果
-            let (x, y, mask, worker_state) = match first_batch.take() {
-                Some(b) => (b.0, b.1, b.2, rng.state()),
+            let (x, y, mask, pixels, worker_state) = match first_batch.take() {
+                Some(b) => (b.0, b.1, b.2, b.3, rng.state()),
                 None => rx.recv().expect("预取线程异常退出"),
             };
             // 回写 rng：调用方看到的状态与串行采样逐位一致（断点续训/测试依赖）
@@ -548,7 +557,16 @@ pub fn train_transformer(
 
             // 2. 前向 + 损失（梯度累积时反向按 1/accum 缩放）
             let t_seg = std::time::Instant::now();
-            let loss = forward_loss(&model, &x, &y, mask.as_deref(), batch_size, block_size, accum);
+            let loss = forward_loss(
+                &model,
+                &x,
+                &y,
+                mask.as_deref(),
+                pixels.as_deref(),
+                batch_size,
+                block_size,
+                accum,
+            );
             let fwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
 
             // 3. 反向（梯度自动累加到现有梯度上）
@@ -764,6 +782,53 @@ pub fn train_transformer(
     }
 }
 
+/// VQ-VAE 预训练：在图像像素上重建 + 码本量化，得到可供生成任务使用的码本。
+///
+/// 数据就是 `images`（每张 `[3·S·S]`，CHW [-1,1]），每步有放回采 `batch_size` 张；
+/// 骨架与 [`train_transformer`] 相同（AdamW + 梯度裁剪 + cosine 学习率），
+/// 但没有验证集/checkpoint（由调用方在训练后自行 [`crate::vqvae::Vqvae::save`]）。
+/// 返回末步 loss。
+pub fn train_vqvae(
+    vq: &crate::vqvae::Vqvae,
+    images: &[Vec<f32>],
+    cfg: &TrainConfig,
+    rng: &mut Rng,
+) -> f32 {
+    assert!(!images.is_empty(), "VQ-VAE 训练需要至少 1 张图像");
+    let steps = cfg.vq_steps;
+    let batch = cfg.batch_size;
+    let params = vq.parameters();
+    let mut opt = AdamW::new(cfg.max_lr, params.clone(), cfg.weight_decay);
+    let mut scheduler = LRScheduler::new(cfg.warmup_steps, steps, cfg.max_lr, cfg.min_lr);
+    let dim = images[0].len();
+    let mut px = Vec::with_capacity(batch * dim);
+    let mut last = 0.0f32;
+    for step in 0..steps {
+        px.clear();
+        for _ in 0..batch {
+            let i = rng.choice(images.len());
+            px.extend_from_slice(&images[i]);
+        }
+        let loss = vq.forward_loss(&px, batch);
+        loss.backward();
+        clip_grad_norm(&params, cfg.grad_clip);
+        opt.lr = scheduler.lr();
+        opt.step();
+        opt.zero_grad();
+        scheduler.step();
+        last = loss.item();
+        if (step + 1) % cfg.eval_every == 0 || step + 1 == steps {
+            logln!(
+                "vq step {:>5}/{steps} | lr {:.6} | loss {:.4}",
+                step + 1,
+                scheduler.lr(),
+                last
+            );
+        }
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +902,49 @@ mod tests {
         mp.scale = 65536.0;
         mp.unscale_gradients(&[g.clone()]);
         assert_eq!(*g.grad.borrow(), vec![1.0, -0.5]);
+    }
+
+    /// VQ-VAE 预训练冒烟：几步训练后 loss 有限且参数确实被更新（走通 AdamW + 裁剪 + cosine 骨架）。
+    #[test]
+    fn test_train_vqvae_smoke() {
+        use crate::vqvae::{VqConfig, Vqvae};
+        let cfg = VqConfig {
+            image_size: 8,
+            patch_size: 4,
+            latent_dim: 8,
+            codebook_size: 8,
+            hidden: 16,
+            ..VqConfig::default()
+        };
+        let mut rng = Rng::new(7);
+        let vq = Vqvae::new(cfg, &mut rng);
+        let before: Vec<Vec<f32>> = vq.parameters().iter().map(|p| p.data()).collect();
+        let mut images = Vec::new();
+        for i in 0..4 {
+            let mut px = Vec::with_capacity(3 * 8 * 8);
+            for c in 0..3 {
+                for y in 0..8 {
+                    for x in 0..8 {
+                        px.push(((x + y + i + c) % 8) as f32 / 4.0 - 1.0);
+                    }
+                }
+            }
+            images.push(px);
+        }
+        let tcfg = TrainConfig {
+            vq_steps: 3,
+            batch_size: 2,
+            eval_every: 3, // 只在最后一步打日志
+            ..TrainConfig::default()
+        };
+        let mut train_rng = Rng::new(7);
+        let loss = train_vqvae(&vq, &images, &tcfg, &mut train_rng);
+        assert!(loss.is_finite() && loss > 0.0, "末步 loss 应为正有限值，实际 {loss}");
+        let moved = vq
+            .parameters()
+            .iter()
+            .zip(&before)
+            .any(|(p, b)| p.data().iter().zip(b).any(|(a, c)| a != c));
+        assert!(moved, "训练后至少一个参数应发生变化");
     }
 }

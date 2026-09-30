@@ -28,8 +28,8 @@ use crate::tensor::{Shared, Tensor};
 use crate::tokenizer::Tokenizer;
 use serde::{Deserialize, Serialize};
 
-/// LayerNorm 数值稳定常数（防止方差为 0 时除零）
-const LN_EPS: f32 = 1e-5;
+/// LayerNorm 的 ε（视觉塔 [`crate::vision::VisionEncoder`] 与主干共用同一个值）
+pub(crate) const LN_EPS: f32 = 1e-5;
 
 /// 模型配置（`config/config.json` 里可调，缺省字段用 [`TransformerConfig::default`]）
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +94,20 @@ pub struct TransformerConfig {
     /// `block_size` 改成 4096 来跑长文——此时窗口放大了，但"模型见过的位置差最大到 512"
     /// 这个事实没变，YaRN 必须按 512 分段才对。
     pub rope_train_ctx: usize,
+    // ---- 多模态：图片理解 ----
+    /// 视觉编码器（ViT）配置；`None` = 纯文本模型，行为与接入多模态之前逐位一致。
+    ///
+    /// struct 级 `#[serde(default)]` 让旧 checkpoint / 旧 config 读进来就是 `None`。
+    /// 其中的 `ph_first` 必须与分词器 `ImageTokens::ph_first` 一致，
+    /// 由训练/推理入口负责写入（模型不持有分词器）。
+    pub vision: Option<crate::vision::VisionConfig>,
+    // ---- 多模态：图片生成 ----
+    /// VQ-VAE 配置（超参随主干 checkpoint 序列化；`None` = 不带生成能力）。
+    ///
+    /// 只挂**超参**：VQ-VAE 权重是独立模型、独立存档（[`crate::vqvae::Vqvae::save`]），
+    /// 不属于 Transformer 的参数表。此处存一份是为了让主干 checkpoint 自带
+    /// 生成 token 的几何（P、K），采样入口不用再读第二个配置文件。
+    pub vq: Option<crate::vqvae::VqConfig>,
 }
 
 impl Default for TransformerConfig {
@@ -117,6 +131,8 @@ impl Default for TransformerConfig {
             rope_base: rope::ROPE_BASE,
             rope_scaling: RopeScaling::None,
             rope_train_ctx: 0,
+            vision: None,
+            vq: None,
         }
     }
 }
@@ -258,7 +274,10 @@ impl Module for Ffn {
 ///   x -> RMSNorm -> SwiGLU MLP     -> Dropout -> 残差 +
 ///
 /// 前馈子层还可切换为稀疏 MoE（第 32 课，`cfg.n_expert > 1` 时）。
-struct TransformerBlock {
+///
+/// `pub(crate)`：[`crate::vision::VisionEncoder`] 复用同一个 Block 实现双向注意力
+/// （`mask = None`），没必要再写一份几乎一样的视觉 Transformer 层。
+pub(crate) struct TransformerBlock {
     ln1: NormLayer,
     attn: MultiHeadAttention,
     ln2: NormLayer,
@@ -270,7 +289,7 @@ struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    fn new(cfg: &TransformerConfig, rng: &mut Rng) -> Self {
+    pub(crate) fn new(cfg: &TransformerConfig, rng: &mut Rng) -> Self {
         let ffn = if cfg.n_expert > 1 {
             Ffn::Moe(MoELayer::new(cfg, rng))
         } else if cfg.use_swiglu {
@@ -304,7 +323,7 @@ impl TransformerBlock {
     }
 
     /// 带名字的参数（checkpoint 用）
-    fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
+    pub(crate) fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
         let mut ps = self.ln1.named_parameters(&format!("{prefix}.ln1"));
         ps.extend(self.attn.named_parameters(&format!("{prefix}.attn")));
         ps.extend(self.ln2.named_parameters(&format!("{prefix}.ln2")));
@@ -312,7 +331,7 @@ impl TransformerBlock {
         ps
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
@@ -640,6 +659,9 @@ pub struct Transformer {
     /// LoRA 微调状态：`Some` 表示主干已冻结、每层 Q/K/V 都挂了适配器（见 [`Transformer::apply_lora`]）。
     /// checkpoint 头也记录它，加载时据此重放同样的注入，参数名才能对上。
     pub lora: Option<LoRAConfig>,
+    /// 视觉塔（`cfg.vision = Some` 时构造）：把 `[b·P, 3·S²]` 的像素变成
+    /// `[b·P, n_embd]` 的 patch 特征，由 [`Transformer::forward_mm`] 注入文本序列。
+    vision: Option<crate::vision::VisionEncoder>,
     /// 最近一次部署量化的记录（[`Transformer::quantize_weights`] 写入，checkpoint 头读出/写入）。
     ///
     /// 它只记**参数**（位宽 / 算法 / 字节口径），不记整数码：存档里的权重始终是 f32
@@ -693,6 +715,11 @@ impl Transformer {
         let blocks = (0..cfg.n_layer)
             .map(|_| TransformerBlock::new(&cfg, rng))
             .collect();
+        // 视觉塔：仅当配置里带 vision 时构造（纯文本模型走 None，行为与之前逐位一致）
+        let vision = cfg
+            .vision
+            .as_ref()
+            .map(|v| crate::vision::VisionEncoder::new(v, &cfg, rng));
         Transformer {
             cfg: cfg.clone(),
             tok_emb: Embedding::new(vocab_size, n_embd, rng),
@@ -700,6 +727,7 @@ impl Transformer {
             ln_f: NormLayer::new(n_embd, LN_EPS, cfg.use_rmsnorm),
             dropout: cfg.dropout,
             lora: None,
+            vision,
             quant: None,
         }
     }
@@ -1182,8 +1210,35 @@ impl Transformer {
         training: bool,
     ) -> Tensor {
         // 权重绑定：lm_head 复用 tok_emb.table 的转置
-        self.forward_core(idx, b, t, kv_cache, training)
+        self.forward_core(idx, b, t, None, kv_cache, training)
             .matmul(&self.tok_emb.table.transpose())
+    }
+
+    /// 多模态前向：`pixels = Some([b, 3·S·S] 首尾相接的 CHW 像素，取值 [-1,1])`。
+    ///
+    /// 序列中的 `<|image|>` 必须已由 [`crate::tokenizer::Tokenizer::encode`] 展开成
+    /// `[start, ph₀..ph_{P-1}, end]`，本方法用视觉特征**原位覆写**其中 P 个占位符
+    /// （见 [`Transformer::forward_core`] 的注入说明）。`pixels = None` 时与
+    /// [`Transformer::forward`] 完全等价。
+    ///
+    /// 只在**首段（prefill）**传像素：增量解码那几步没有新图像，传 `None` 即可
+    /// （视觉特征已经进了 KV cache）。
+    pub fn forward_mm(
+        &self,
+        idx: &[usize],
+        b: usize,
+        t: usize,
+        pixels: Option<&[f32]>,
+        kv_cache: Option<&mut Vec<KVCache>>,
+        training: bool,
+    ) -> Tensor {
+        self.forward_core(idx, b, t, pixels, kv_cache, training)
+            .matmul(&self.tok_emb.table.transpose())
+    }
+
+    /// 是否带视觉塔
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
     }
 
     /// 前向到 ln_f 之后的 hidden `[B*T, d]`，不做输出头。
@@ -1191,7 +1246,20 @@ impl Transformer {
     /// 供 GPU 常驻输出头路径使用：那条路径把 `hidden @ Wᵀ` 与交叉熵一起放进显存算，
     /// 不需要中间那份 `[B*T, vocab]` 的 logits 被拉回 CPU（本配置下 33.6M 元素）。
     pub fn forward_hidden(&self, idx: &[usize], b: usize, t: usize, training: bool) -> Tensor {
-        self.forward_core(idx, b, t, None, training)
+        self.forward_core(idx, b, t, None, None, training)
+    }
+
+    /// 同 [`Transformer::forward_hidden`]，但带像素（多模态训练用）：
+    /// `pixels = Some([b, 3·S·S] 首尾相接的 CHW 像素，取值 [-1,1])`。
+    pub fn forward_hidden_mm(
+        &self,
+        idx: &[usize],
+        b: usize,
+        t: usize,
+        pixels: Option<&[f32]>,
+        training: bool,
+    ) -> Tensor {
+        self.forward_core(idx, b, t, pixels, None, training)
     }
 
     /// 同 [`Transformer::forward_hidden`]，但**带 KV cache**。
@@ -1208,7 +1276,7 @@ impl Transformer {
         kv_cache: Option<&mut Vec<KVCache>>,
         training: bool,
     ) -> Tensor {
-        self.forward_core(idx, b, t, kv_cache, training)
+        self.forward_core(idx, b, t, None, kv_cache, training)
     }
 
     /// 输出头权重 `[vocab, d]`（与词嵌入共享同一份参数）
@@ -1394,12 +1462,16 @@ impl Transformer {
         ))
     }
 
-    /// 前向主体：embedding → 逐层 Block → 最终归一化，返回 `[B*T, d]`
+    /// 前向主体：embedding → （视觉覆写）→ 逐层 Block → 最终归一化，返回 `[B*T, d]`
+    ///
+    /// `pixels = Some([b, 3·S·S] 首尾相接的 CHW 像素)` 时启用多模态：
+    /// 视觉塔先算出 `[b·P, d]` 的 patch 特征，再**原位覆写**序列里的占位符。
     fn forward_core(
         &self,
         idx: &[usize],
         b: usize,
         t: usize,
+        pixels: Option<&[f32]>,
         mut kv_cache: Option<&mut Vec<KVCache>>,
         training: bool,
     ) -> Tensor {
@@ -1408,6 +1480,48 @@ impl Transformer {
 
         // 1. token embedding
         let x = self.tok_emb.forward(idx).reshape(vec![b, t, d]);
+        // 1b. 视觉覆写：把 `<|image|>` 展开出的 P 个占位符位置换成 ViT 的 patch 特征。
+        //
+        //   用「常量差值 + scatter」实现等价于 in-place 覆写的效果（项目里没有 detach 算子）：
+        //     delta   = img - gather(x, pos)   （Rust 侧算不进图，是普通 Tensor）
+        //     x'      = x + scatter(delta, pos)
+        //   于是 pos 处 x'[i] = img[i]（值被覆盖），梯度 ∂x'/∂x = 1 - 1 = 0、∂x'/∂img = 1；
+        //   非占位符位置 delta 恒为 0，梯度是恒等映射。序列长度完全不变 ——
+        //   KV cache、loss 对齐、滑窗语义都不受影响。
+        let x = match pixels {
+            None => x,
+            Some(px) => {
+                let vis = self
+                    .vision
+                    .as_ref()
+                    .expect("配置里没有 vision，却传入了 pixels");
+                let ph = vis.cfg.ph_first;
+                let p = vis.cfg.patch_count();
+                let feats = vis.forward(px, b, training); // [b·P, d]
+                let flat = x.reshape(vec![t, d]);
+                // 扫出每个样本的占位符位置（顺序 = 视觉特征行顺序 = 样本顺序 × patch 行主序）
+                let mut rows = Vec::with_capacity(b * p);
+                for s in 0..b {
+                    let mut n = 0;
+                    for j in 0..t {
+                        let id = idx[s * t + j];
+                        if (ph..ph + p).contains(&id) {
+                            rows.push(s * t + j);
+                            n += 1;
+                        }
+                    }
+                    assert_eq!(
+                        n, p,
+                        "样本 {s} 的占位符数量为 {n}，应为 {p}（VisionConfig.ph_first={ph} 是否与分词器一致？）"
+                    );
+                }
+                assert_eq!(rows.len(), feats.shape()[0], "占位符行数与视觉特征行数不一致");
+                let gathered = flat.gather_rows(&rows);
+                let delta = feats.sub(&gathered);
+                let inj = delta.scatter_add_rows(&rows, t);
+                flat.add(&inj).reshape(vec![b, t, d])
+            }
+        };
         let x = if self.dropout > 0.0 { x.dropout(self.dropout, training) } else { x };
 
         // 2. 位置信息由 RoPE 提供（在注意力内部旋转 Q/K，见 MultiHeadAttention::forward）。
@@ -1508,6 +1622,9 @@ impl Transformer {
             ps.extend(block.named_parameters(&format!("blocks.{i}")));
         }
         ps.extend(self.ln_f.named_parameters("ln_f"));
+        if let Some(v) = &self.vision {
+            ps.extend(v.named_parameters());
+        }
         ps
     }
 }
@@ -1519,6 +1636,9 @@ impl Module for Transformer {
             ps.extend(block.parameters());
         }
         ps.extend(self.ln_f.parameters());
+        if let Some(v) = &self.vision {
+            ps.extend(v.named_parameters().into_iter().map(|(_, t)| t));
+        }
         ps
     }
 }
@@ -1530,6 +1650,83 @@ mod tests {
     use crate::loss::cross_entropy_loss;
     use crate::module::{Module, zero_grad_all};
     use crate::optim::{AdamW, Optimizer};
+
+    /// 多模态前向：
+    /// 1) `pixels = None` 时 `forward_mm` 与 `forward` 逐位相同（纯文本路径零改动）；
+    /// 2) 传入像素后占位符位置确实被视觉特征覆写（logits 变了）；
+    /// 3) 反向后视觉塔参数拿到非零梯度 —— 证明 straight-through 注入没把梯度掐断。
+    #[test]
+    fn test_forward_mm_injects_vision_and_keeps_text_path() {
+        let mut rng = Rng::new(11);
+        let vcfg = crate::vision::VisionConfig {
+            image_size: 8,
+            patch_size: 4,
+            n_embd: 16,
+            n_head: 2,
+            n_layer: 1,
+            dropout: 0.0,
+            ph_first: 20, // 占位符首 id（测试里手写序列，不经过分词器）
+        };
+        let p = vcfg.patch_count(); // 4
+        let cfg = TransformerConfig {
+            vision: Some(vcfg),
+            ..TransformerConfig::tiny(64)
+        };
+        let model = Transformer::new(cfg, &mut rng);
+        assert!(model.has_vision());
+
+        // 序列：[10, 11, 12, start=18, ph 20..23, end=24, 13, 14] —— 占位符恰好 p 个
+        let mut idx = vec![10usize, 11, 12, 18];
+        idx.extend(20..20 + p);
+        idx.extend([24, 13, 14]);
+        let b = 1;
+        let t = idx.len();
+        // 像素取非零的确定性图案：全 0 会让 patch_embed 的权重梯度恰为 0（输入为 0），
+        // 那样测不出"梯度有没有通到视觉塔"
+        let pixels: Vec<f32> = (0..b * 3 * 8 * 8)
+            .map(|i| ((i % 17) as f32 / 16.0) * 2.0 - 1.0)
+            .collect();
+
+        // 1) 纯文本路径：pixels=None 与 forward 完全一致
+        let a = model.forward_mm(&idx, b, t, None, None, false);
+        let c = model.forward(&idx, b, t, None, false);
+        assert_eq!(a.data(), c.data(), "pixels=None 时 forward_mm 必须等价于 forward");
+
+        // 2) 传像素 → 输出变化（视觉特征进来了）；换一批像素 → 输出再变
+        let with_img = model.forward_mm(&idx, b, t, Some(&pixels), None, false);
+        assert_ne!(with_img.data(), a.data(), "传入像素后输出没有任何变化：视觉注入没生效");
+        let flipped: Vec<f32> = pixels.iter().map(|v| -v).collect();
+        let with_img2 = model.forward_mm(&idx, b, t, Some(&flipped), None, false);
+        assert_ne!(with_img.data(), with_img2.data(), "不同像素应产生不同输出");
+
+        // 3) 梯度要流进视觉塔（ST 注入：∂out/∂feats = 1）
+        zero_grad_all(&model);
+        let targets = vec![11usize, 12, 18, 20, 21, 22, 23, 24, 13, 14, 10];
+        assert_eq!(targets.len(), t);
+        let logits = model.forward_mm(&idx, b, t, Some(&pixels), None, false);
+        let loss = cross_entropy_loss(&logits, &targets);
+        assert!(loss.item().is_finite());
+        loss.backward();
+        let vision_grads: Vec<(String, bool)> = model
+            .named_parameters()
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("vision."))
+            .map(|(n, tp)| {
+                let g = tp.grad();
+                (n, g.iter().any(|x| *x != 0.0))
+            })
+            .collect();
+        assert!(!vision_grads.is_empty(), "没找到任何 vision.* 参数");
+        assert!(
+            vision_grads.iter().all(|(_, has)| *has),
+            "视觉塔有参数没收到梯度：{:?}",
+            vision_grads
+                .iter()
+                .filter(|(_, has)| !*has)
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// RoPE + KV cache 一致性（第 18-19 课）：
     /// 用 KV cache 分步推理得到"位置 10 的 logits"，应与全量前向 11 个 token 的最后一行一致。

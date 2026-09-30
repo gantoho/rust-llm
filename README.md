@@ -14,7 +14,7 @@
 本项目是一个从零实现的 **Transformer 大语言模型**项目，目标是让你理解大语言模型（LLM）的底层原理：
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
-- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 10 个阶段、40 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），最后工程化完善并部署成 API 服务。
+- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 11 个阶段、41 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），工程化完善并部署成 API 服务，最后补齐多模态（图片理解 + 图片生成）。
 - **工程化完整**：CLI 子命令（train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
@@ -31,7 +31,7 @@
   反缩放回真实尺度再做裁剪（保证裁剪阈值仍然作用在真实梯度上），见第 26 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
-### 包含的功能（对应 40 课）
+### 包含的功能（对应 41 课）
 
 | 模块 | 文件 | 内容 |
 |------|------|------|
@@ -41,12 +41,14 @@
 | RoPE 位置编码 | `src/rope.rs` | 旋转位置编码：把相对位置揉进 Q/K 向量 |
 | 神经网络层 | `src/layers.rs` | Linear、LayerNorm、**RMSNorm**、Embedding、ReLU/GELU/Tanh、**SwiGLU**、**LoRA 适配层（`LoraAdapter`，挂在 `Linear` 上）** |
 | 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减）；**`step()` 跳过冻结参数（含权重衰减）** |
-| 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），**save/load 持久化**，配置可切换；生成时做 UTF-8 约束，不会拼出乱码字符 |
+| 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），**save/load 持久化**，配置可切换；生成时做 UTF-8 约束，不会拼出乱码字符；**图像占位 token（`<\|image\|>` 展开为 P 个占位符 + 图片 token 区间挂载）** |
 | 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、**KV Cache（含滑动窗口丢弃）**、**GQA 分组查询注意力**、**Q/K/V 注入 LoRA** |
-| Transformer 模型 | `src/model.rs` | Transformer Block 堆叠、Transformer 整体前向、checkpoint 参数名、**Dropout**、**`apply_lora`（冻结 + 注入）** |
-| 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样；**SFT 对话语料解析 + loss 掩码** |
-| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**、**按可训练子集统计梯度范数**、**`MixedPrecision` 动态损失缩放（AMP：溢出跳步 + 梯度反缩放）** |
-| 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search**，**停止标记** |
+| Transformer 模型 | `src/model.rs` | Transformer Block 堆叠、Transformer 整体前向、checkpoint 参数名、**Dropout**、**`apply_lora`（冻结 + 注入）**、**`forward_mm` 多模态前向（像素在 prefill 首步注入占位符，无像素时与纯文本路径逐位一致）** |
+| 图片理解（ViT） | `src/vision.rs` | 图片解码 / resize / 归一化（`image` crate 只做编解码）、**patchify**、`VisionEncoder`（patch embed + 可学习位置 embedding + 双向 Transformer 层 + 投影到 n_embd，**不引入 CLS token**）、`VisionConfig`；`load_image` / `save_image` / `encode_png` |
+| 图片生成（VQ-VAE） | `src/vqvae.rs` | **VQ-VAE**：patchify + Linear MLP 编码器（无 conv2d）、最近邻量化码本（量化不进 tape）、线性解码器、三项损失（重建 MSE + 码本 commit + 腾挪）、`VqConfig`、`save/load`（`vq.ckpt`）；生成通路把码本 token 解码回 PNG |
+| 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样；**SFT 对话语料解析 + loss 掩码**；**VLM 图文 JSONL 加载（`VlmLoader`：整条对齐不滑窗、尾部 pad、每批多带像素 `[B,3·S·S]`、可切换生成序列）** |
+| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**、**按可训练子集统计梯度范数**、**`MixedPrecision` 动态损失缩放（AMP：溢出跳步 + 梯度反缩放）**、**`train_vqvae` VQ-VAE 预训练循环** |
+| 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search**，**停止标记**；**`with_pixels` 视觉注入**、**图片段状态机（`generated_images` 只认完整的「start + P 码本 + end」段）** |
 | 缩放定律 | `src/scaling.rs` | 幂律拟合（固定 `b` 的闭式最小二乘 + 黄金分割搜 `b`）、`C ≈ 6ND` 与非嵌入参数口径、Chinchilla 20:1 与参数化闭式解两条最优配比、训练时长/电费估算、**真实跑多规模扫描并拟合实测指数** |
 | MoE 稀疏专家 | `src/moe.rs` | Top-K 路由（并列按下标、确定性）、两种门控口径（Top-K 重归一化 / Switch 原概率，**含 K = 1 的梯度陷阱**）、gather→expert→weighted→scatter 稀疏前向、负载均衡辅助损失、容量因子与 Token Dropping、参数/激活量口径 |
 | 量化 | `src/quant.rs` | INT8/INT4 的逐张量 / 逐通道 / 逐 token 量化与位打包、Hessian 量化（Hessian 逆 + 逐通道误差分摊）、AWQ（激活感知的缩放搜索）、校准集统计、逐层量化与 checkpoint 元信息、KIVI 式 KV cache 量化 |
@@ -57,7 +59,7 @@
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式，**头部记录 LoRA 形态（旧档兼容）** |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** |
-| API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 + 完整问答记录（问答正文只落日志文件） |
+| API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 + 完整问答记录（问答正文只落日志文件）；**模型采出图片段时解码成 PNG，内嵌进 `message.image_url`（data URI）** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
 
@@ -80,6 +82,12 @@
 |------|---------|------|
 | 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
 | 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志与完整问答记录、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)）、`web/` 前端测试页随 serve 启动 |
+
+### 多模态教程（第 41 课，代码+文档）
+
+| 主题 | 教程文档 | 内容 |
+|------|---------|------|
+| 多模态：图片理解与生成 | `docs/41-多模态.md` | 手写 ViT 视觉塔与 patchify、`<\|image\|>` 占位 token 与 `forward_mm` 像素注入、手写 VQ-VAE 离散码本与三项损失（STE）、图文 JSONL（`VlmLoader`）与 `vlm_file` / `vq_steps` 训练通路、`generate --image` 图片理解、图片段状态机采样 → `gen_image_{i}.png` / serve `message.image_url`（**已落地代码**：`src/vision.rs` + `src/vqvae.rs`） |
 
 ## 快速开始
 
@@ -332,6 +340,7 @@ cargo run --release -- generate [参数]
 | `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--prompt <文本>` | string | `""`（空） | 初始提示词（模型从这里开始续写） |
+| `--image <路径>` | string | 无（不用） | **图片理解输入**：图片经视觉编码器（ViT）注入前缀 embedding，模型围绕它生成文字。prompt 里没有 `<\|image\|>` 时自动在尾部补一个；需要 `model.vision` 配置；**Beam Search 分支不支持，会忽略并打日志** |
 | `--max-new <数量>` | int | `100` | 最多生成的新 token 数 |
 | `--temperature <温度>` | float | `0.8` | 采样温度（>1 更随机，<1 更确定，0 = 贪心） |
 | `--top-k <数量>` | int | `40` | top-k 采样：只从概率最高的 k 个 token 里选 |
@@ -532,6 +541,34 @@ cargo run --release -- generate --config config/config.json --prompt "The fox" -
 cargo run --release -- generate --config config/config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
 
 # ═══════════════════════════════════════════
+#  多模态：图片理解（--image）
+# ═══════════════════════════════════════════
+
+# 给一张图让模型描述（需 config 里配了 model.vision，且用带视觉塔训出的 checkpoint）
+cargo run --release -- generate --config config/config.json --image data/demo.png --prompt "图里的内容是" --max-new 80
+
+# prompt 不含 <|image|> 时程序自动在尾部补占位段；也可以自己写在任意位置
+cargo run --release -- generate --config config/config.json --prompt "看这张图<|image|>，用一句话描述" --image data/demo.png --max-new 80
+
+# 注入策略：带 KV cache 时只在首步（prefill）注入，全量模式每步注入；
+# 上下文里的占位符被滑动窗口挤出后自动退回纯文本路径，不会 panic
+cargo run --release -- generate --config config/config.json --image data/demo.png --prompt "描述" --max-new 300
+
+# Beam Search 不支持图片输入（会打日志忽略 --image，走纯文本 beam）
+
+# ═══════════════════════════════════════════
+#  多模态：图片生成（模型采出 VQ 码本 token 段）
+# ═══════════════════════════════════════════
+
+# 配了 model.vq 的模型在生成时可能采出「图片 start + P 个码本 token + 图片 end」完整段，
+# 程序用 VQ-VAE 把它解码成 PNG 落到 {out_dir}/gen_image_{i}.png（需要 {out_dir}/vq.ckpt）
+cargo run --release -- generate --config config/config.json --prompt "画一张" --max-new 200
+
+# 想提高出图概率就给足生成长度（P = (image_size/patch_size)² 个码本 token 要一个不少地采对）
+cargo run --release -- generate --config config/config.json --prompt "画一张风景" --max-new 400 --temperature 0.8
+# serve 场景下同一段码本 token 会被解码成 data:image/png;base64,... 内嵌进 message.image_url
+
+# ═══════════════════════════════════════════
 #  GPU 加速生成
 # ═══════════════════════════════════════════
 
@@ -675,6 +712,14 @@ embeddings 向量化、health/status/models 状态总览。页面请求经 vite 
 
 **客户端断开即中止**：客户端关掉连接后服务端立刻停止生成（不再对空连接烧
 CPU），日志打印 `客户端提前断开，生成已中止（N token）`。
+
+**图片生成（`message.image_url`）**：配了 `model.vq` 且 `{out_dir}/vq.ckpt`
+存在的服务，模型采出完整的图片段（图片 start + P 个码本 token + end）时，服务端
+用 VQ-VAE 解码成 PNG，以 `data:image/png;base64,...` 内嵌进非流式响应的
+`message[0].image_url` 字段（`content` 文本里保留 `<|image|>` 字面量）；没出图
+或没配 VQ-VAE 时该字段不出现，回包与纯文本服务逐字节一致。流式帧不带图——
+SSE 逐 token 下发，图片只在整段采完后才成立，要看图就用非流式请求。
+OpenAPI 规范里 `message` 的 schema 已同步声明该字段。
 
 **并发模型**：每请求一个线程处理 HTTP，但模型只有一份、生成串行排队
 （`/v1/status` 的 `queue.queued` 就是队列长度）——单机 CPU 推理时并行只会互相
@@ -1288,9 +1333,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **240 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **260 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 250 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 270 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1382,6 +1427,20 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `yaml_quoting_never_leaks_ambiguous_scalars` | YAML 引号安全：`1.1.1` / `on` / 含 `:` `#` 等会被误解析的标量一律加引号 |
 | `dump_openapi_files_writes_both_formats` | `serve` 启动自动写出的 `openapi/{json,yaml}` 与端点字节逐字一致 |
 | `openapi_examples_pass_real_parsers` | 规范里 requestBody 的 `example` 能过真实 `parse_chat` / input 类型校验——导入 Postman 点 Send 直接 200（防「示例一发就 400」漂移） |
+| `test_patchify_row_major_order` / `test_vit_output_shape` | 图片理解：patch 切分行主序正确、ViT 输出形状 =（batch, P, n_embd） |
+| `test_encode_decode_roundtrip_shapes` / `test_forward_loss_backward_all_get_grads` | VQ-VAE：编解码形状往返、三项损失前向 + 反向后编码器 / 码本 / 解码器都拿到梯度 |
+| `test_codebook_loss_isolates_encoder` | VQ 码本损失对编码器梯度为 0（量化不进 tape，梯度走直通估计） |
+| `test_unpatchify_inverts_patchify` / `test_save_load_roundtrip` | `unpatchify` 与 `patchify` 互逆；`vq.ckpt` 存取后参数逐位一致 |
+| `test_train_vqvae_smoke` | VQ-VAE 预训练循环：多步训练 loss 下降且码本被用到 |
+| `test_image_tokens_expand_and_survive_save_load` / `test_image_tokens_require_specials` | `<\|image\|>` 展开为 start + P 占位符 + end 并随 tokenizer.json 存取往返；分词器缺 specials 时拒绝挂载 |
+| `test_forward_mm_injects_vision_and_keeps_text_path` | `forward_mm`：有像素时占位符被视觉特征覆写、logits 变化；无像素时与纯文本前向逐位一致 |
+| `vlm_loader_batches_pad_and_carry_pixels` / `vlm_loader_requires_exactly_one_image_literal` | VLM 加载器：整条采样 + 尾部 pad（掩码为 false）+ 每批带像素；每条样本必须恰好 1 次 `<\|image\|>` |
+| `vlm_attach_generation_swaps_codes_and_mixes_batches` | 生成序列切换：占位符段换成码本 token，理解 / 生成两种批次混合采样 |
+| `test_image_segment_state_machine_and_mask` | 生成侧图片段状态机：只有「start + P 码本 + end」完整段才算一张图，残段不产出 |
+| `test_generator_with_pixels_injects_vision_and_survives_sliding_window` | `Generator::with_pixels`：注入像素改变生成结果；占位符被滑窗挤出后退回纯文本路径照常出字 |
+| `test_restore_tolerates_extra_vision_params` | checkpoint 只带主干参数时仍能恢复（视觉塔参数另存 / 多出参数容忍） |
+| `b64encode_matches_rfc4648_vectors` | 手写 base64：RFC 4648 标准向量 + 多字节 UTF-8 |
+| `generated_image_uri_decodes_full_segment` | 生成图 data URI：完整码本段 → PNG → base64；没出图 / 没配 VQ-VAE 返回 None |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
 
@@ -1530,7 +1589,26 @@ SwiGLU 就足以让整条路径放弃）。
     "moe_top_k": 1,            // 每个 token 激活几个专家
     "moe_capacity_factor": 0.0,// 专家容量因子。0 = 不限（推理必须 0）
     "moe_aux_coef": 0.0,       // 负载均衡辅助损失系数 α。0 = 不加
-    "moe_switch_gate": false   // 门控口径：false = Top-K 重归一化（Σw = 1）；true = Switch 原概率
+    "moe_switch_gate": false,  // 门控口径：false = Top-K 重归一化（Σw = 1）；true = Switch 原概率
+    // ---- 多模态（图片理解；缺省 null = 纯文本模型）----
+    "vision": {
+      "image_size": 64,        // 输入图统一 resize 到 image_size×image_size
+      "patch_size": 16,        // patch 边长；P = (image_size/patch_size)² = <|image|> 展开的占位符数
+      "n_embd": 64,            // 视觉塔隐藏维度（可与主干不同）
+      "n_head": 4,             // 视觉塔注意力头数
+      "n_layer": 2,            // 视觉塔 Transformer 层数
+      "dropout": 0.0,          // 视觉塔 dropout
+      "ph_first": 0            // 图片占位符首 token id；训练入口自动写入，手写配 0 即可
+    },
+    // ---- 多模态（图片生成；缺省 null = 不做生成，只做理解）----
+    "vq": {
+      "image_size": 64,        // 必须与 vision.image_size 相同（训练入口断言）
+      "patch_size": 8,         // VQ 编码器 patch 边长（可与 vision.patch_size 不同）
+      "latent_dim": 64,        // 码本向量维度
+      "codebook_size": 512,    // 码本大小 K：模型多出 K 个图像生成 token
+      "hidden": 256,           // 编码 / 解码 MLP 隐层宽度
+      "beta": 0.25             // VQ 损失里 commit 项的权重
+    }
   }
 }
 ```
@@ -1551,6 +1629,8 @@ SwiGLU 就足以让整条路径放弃）。
 | `moe_capacity_factor` | float | `0.0` | 专家容量因子（`capacity = cf × n·K/E`，超出按 token 顺序先到先得丢弃）。`0` = 不限容量，**推理时必须 0** |
 | `moe_aux_coef` | float | `0.0` | 负载均衡辅助损失系数 α（`L_aux = α·E·Σ f_i·p_i`）。`0` = 不加 |
 | `moe_switch_gate` | bool | `false` | 门控口径：`false` = Top-K 内部重归一化（Mixtral / DeepSeek 式，`Σw = 1`）；`true` = 全部专家上的 softmax 原概率（Switch Transformer 式，`Σw < 1`）。**`moe_top_k = 1` 时必须置 `true`**，否则权重恒为 1、路由器拿不到主损失梯度 |
+| `vision` | object/null | `null` | **图片理解（ViT 视觉塔）配置**。`null` = 纯文本模型；给出则启用 `<\|image\|>` 通路：`<\|image\|>` 展开为 P = (`image_size`/`patch_size`)² 个占位符，前向时由视觉塔特征原位覆写。子字段：`image_size`(64) / `patch_size`(16) / `n_embd`(64) / `n_head`(4) / `n_layer`(2) / `dropout`(0.0) / `ph_first`(0，占位符首 id，**训练入口自动写入**)。`image_size` 必须能被 `patch_size` 整除、`n_embd` 必须能被 `n_head` 整除 |
+| `vq` | object/null | `null` | **图片生成（VQ-VAE）配置**。`null` = 不挂生成通路；给出则词表多出 `codebook_size` 个图像 token，生成时采出完整图片段即可解码成 PNG。子字段：`image_size`(64，**必须等于 `vision.image_size`**) / `patch_size`(8) / `latent_dim`(64) / `codebook_size`(512) / `hidden`(256) / `beta`(0.25)。依赖 `vision` 同时存在 |
 
 ### train 段 —— 训练参数
 
@@ -1580,7 +1660,9 @@ SwiGLU 就足以让整条路径放弃）。
     "lora": null,             // LoRA 配置；finetune 子命令读它（CLI 的 --lora-rank/--lora-alpha/--lora-targets 会覆盖）
     "log_file": "logs/train.csv", // 训练指标日志。null = 不记录；默认 logs/train.csv（自动建目录）
     "early_stop_patience": 0,  // 早停耐心值。0 = 不启用；N = 连续 N 次评估不改善则停止
-    "sft_file": null          // SFT / LoRA 微调语料（逗号分隔，可为文件/目录/含 * 的路径）
+    "sft_file": null,         // SFT / LoRA 微调语料（逗号分隔，可为文件/目录/含 * 的路径）
+    "vlm_file": null,         // 图文训练语料（JSONL）。null = 纯文本训练；给出则走 VlmLoader（需 model.vision）
+    "vq_steps": 0             // VQ-VAE 预训练步数：model.vq 配置时正式训练前先预训练；已有 {out_dir}/vq.ckpt 则直接加载跳过；0 = 强制不预训练
   }
 }
 ```
@@ -1611,6 +1693,8 @@ SwiGLU 就足以让整条路径放弃）。
 | `log_file` | string/null | `"logs/train.csv"` | 训练指标日志文件路径。默认 `logs/train.csv`（`logs/` 目录自动创建）；`null` = 不记录；指定路径 = **每个评估点**（每 `eval_every` 步 + 最后一步）写一行 CSV，列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`。无验证集时 `val_loss` / `ppl` 两列留空。**每次训练覆盖该文件**，不是追加 |
 | `early_stop_patience` | int | `0` | 早停耐心值。`0` = 不启用；`N` = 验证 loss 连续 N 次评估不改善就提前停止（停止前仍会保存 checkpoint 与日志） |
 | `sft_file` | string/null | `null` | 对话语料路径，逗号分隔，每项可以是文件、目录或含 `*` 的路径。**被 `sft` 与 `finetune` 两个子命令读取**（LoRA 微调与全参 SFT 共用同一份语料，效果才可对比）；`--sft-file` 优先于它。两处命令行都未指定且这里也是 `null` 时直接报错 |
+| `vlm_file` | string/null | `null` | **图文训练语料（JSONL）**，只对 `train` 有意义。每行 `{"image":"img/0.png","conversations":[{"role":"human","content":"图:<\|image\|> 是什么？"},{"role":"gpt","content":"答案"},...]}`；`image` 路径相对 JSONL 所在目录，每条样本必须恰好 1 次 `<\|image\|>`。给出则训练改走 `VlmLoader`（整条对齐不滑窗、尾部 pad 不计 loss、每批多带像素），**必须同时配 `model.vision`**（否则启动即报错） |
+| `vq_steps` | int | `0` | **VQ-VAE 预训练步数**，只对 `train` 有意义。配置了 `model.vq` 时，正式训练前先在语料图片上预训练 VQ-VAE 并存 `{out_dir}/vq.ckpt`；该文件已存在则直接加载跳过。`0` = 强制不预训练（且 `vq.ckpt` 不存在时报错——没有码本就挂不上生成 token） |
 
 ### 完整配置示例（仓库当前 `config/config.json`）
 
@@ -1707,7 +1791,7 @@ SwiGLU 就足以让整条路径放弃）。
 
 ```
 llm_from_scratch/
-├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / windows-sys + 可选 wgpu / pollster
+├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / tiny_http / image（仅编解码）/ windows-sys + 可选 wgpu / pollster
 ├── README.md           # 本文件
 ├── config/             # 配置文件目录
 │   └── config.json     #   默认训练配置（模型超参 + 训练参数）
@@ -1737,12 +1821,14 @@ llm_from_scratch/
 │   ├── loss.rs         # 损失函数（第 6 课）
 │   ├── optim.rs        # 优化器（第 6、17 课）
 │   ├── module.rs       # 参数管理 trait（第 5 课）
-│   ├── tokenizer.rs    # 分词器（第 8 课）
-│   ├── model.rs        # Transformer 模型：Transformer Block + 前向（第 9-12、19 课）
-│   ├── data.rs         # 数据集 + SFT 对话解析与 loss 掩码（第 14 课）
-│   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）
-│   ├── sample.rs       # 推理与采样（第 15、30 课）
-│   ├── serve.rs        # OpenAI 兼容 API 服务：路由/鉴权/SSE 流式/排队（第 40 课）
+│   ├── tokenizer.rs    # 分词器（第 8 课）+ 图像占位 token 区间挂载
+│   ├── model.rs        # Transformer 模型：Transformer Block + 前向（第 9-12、19 课）+ forward_mm 多模态前向
+│   ├── vision.rs       # 图片理解：图像 IO / patchify / ViT 视觉编码器（image crate 只做编解码）
+│   ├── vqvae.rs        # 图片生成：VQ-VAE（编码器 / 码本 / 解码器 + 三项损失），vq.ckpt 存取
+│   ├── data.rs         # 数据集 + SFT 对话解析与 loss 掩码（第 14 课）+ VlmLoader 图文 JSONL
+│   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）+ VQ-VAE 预训练
+│   ├── sample.rs       # 推理与采样（第 15、30 课）+ 视觉注入与图片段提取
+│   ├── serve.rs        # OpenAI 兼容 API 服务：路由/鉴权/SSE 流式/排队（第 40 课）+ 生成图 data URI
 │   ├── scaling.rs      # Scaling Laws：幂律拟合、算力/参数口径、Chinchilla 最优配比、实测扫描（第 31 课）
 │   └── moe.rs          # MoE 稀疏专家：Top-K 路由、两种门控口径、稀疏前向、辅助损失、容量因子（第 32 课）
 ├── openapi/           # OpenAPI 接口规范静态版（serve 启动时自动写出，与端点同源，删了会重建）
@@ -1751,7 +1837,7 @@ llm_from_scratch/
 ├── web/               # 前端测试页（vite + React + TS，serve 默认随 API 一起启动，--no-web 关闭）
 │   ├── vite.config.ts #   dev server 代理 /v1、/health、/openapi.* → API 端口（同源转发，免 --cors）
 │   └── src/           #   App.tsx（三个页签：流式对话 / embeddings / 状态总览）+ api.ts（SSE 客户端）
-└── docs/               # 40 课教程文档（00-学习计划 + 01~40 各课）
+└── docs/               # 41 课教程文档（00-学习计划 + 01~41 各课）
 ```
 
 ### 产物目录约定（自动创建，无需手动 mkdir）
@@ -1760,6 +1846,8 @@ llm_from_scratch/
 |------|----------|----------|------|
 | 配置文件 | `config/config.json` | `--config` / `--output` | 所有子命令的配置默认路径；`preset --output` 写同类路径 |
 | 权重 | `checkpoints/` | `train.out_dir` | `latest.ckpt` / `best.ckpt` / `final.ckpt` 与 `tokenizer.json`；`sft` 另写 `{out_dir}-sft`，`finetune` 写回 `{out_dir}` |
+| VQ-VAE 码本 | `checkpoints/vq.ckpt` | `train.out_dir` | `train` 在配了 `model.vq` 时预训练并保存（`train.vq_steps` 步；已存在则直接加载跳过）；`generate` / `serve` 解码生成图时读取。`VQCP1` 自描述格式（魔数 + JSON 头 + f32 数据块） |
+| 生成图片 | `checkpoints/gen_image_*.png` | `train.out_dir` | `generate` 采出完整图片段时由 VQ-VAE 解码落盘，按序编号 `gen_image_0.png`、`gen_image_1.png`…；serve 场景不落盘，改内嵌 `message.image_url` |
 | 训练指标日志 | `logs/train.csv` | `train.log_file` | CSV：`step,lr,train_loss,val_loss,ppl,tokens_per_sec` |
 | 运行日志 | `logs/{操作}_{时间戳}.log` | 程序自动生成 | 每次 `train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` 各写一份，文件名含操作名与毫秒级本地时间；内容 = 完整命令行 + 完整配置 + 该次运行的全部输出（`serve` 是常驻进程，日志在启动时落一份，之后每个请求的接口行与**完整问答记录**——system/历史条数/输入/输出/收尾/采样参数/用量——只追加到日志文件，控制台保持简洁接口行） |
 
@@ -1792,10 +1880,11 @@ llm_from_scratch/
 > | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
 > | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 31-38 ✅ |
 > | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、微调工作流、SFT 监督微调、交互式对话 | ✅ |
+> | 十一、多模态 | 41 | ViT 图片理解、VQ-VAE 图片生成、图文训练与部署 | ✅ |
 
 ## 代码验证状态
 
-- **240 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `240 passed; 0 failed`，release 全量约 43 秒；
+- **260 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `260 passed; 0 failed`，release 全量约 43 秒；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
@@ -1819,7 +1908,12 @@ llm_from_scratch/
   **推测解码（贪心路径逐位一致、拒绝采样的分布等价、缓存回滚不变量、MTP 头形状与梯度、多步训练 loss 下降）**、
   **对齐（DPO = `ln 2`、PPO 裁剪梯度为 0、GRPO 优势均值 0 / 方差 1、奖励模型排序准确率高于随机）**、
   **RAG（分块不变量、余弦相似度自比 1 / 正交 0、MMR 多样化、提示预算截断）**、
-  **分布式（环形 allreduce = 数据和、DP / ZeRO 与单进程全 batch 一致、TP 前向反向与单卡一致、PP 两种调度等价、3D 切分互不重叠且覆盖完整）**
+  **分布式（环形 allreduce = 数据和、DP / ZeRO 与单进程全 batch 一致、TP 前向反向与单卡一致、PP 两种调度等价、3D 切分互不重叠且覆盖完整）**、
+  **多模态（patchify / unpatchify 互逆与行主序、ViT 输出形状、VQ-VAE 编解码往返与三项损失梯度隔离、
+  `vq.ckpt` 存取往返、VQ 预训练 smoke、`<|image|>` 展开与存档存活 / 特殊 token 校验、
+  `forward_mm` 注入视觉且纯文本路径逐位一致、VlmLoader pad / 像素携带 / 恰好一个图片字面量、
+  生成序列切换混批、图片段状态机与掩码、`with_pixels` 注入与滑窗回退、checkpoint 容忍视觉参数、
+  base64 RFC 4648 向量、`generated_image_uri` 整段解码）**
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、Transformer 训练 loss 1.30→0.16、文本生成正常
 - **工程化功能已全部集成**：监督微调（`sft`，带 loss 掩码，默认输出到 `{out_dir}-sft`，不覆盖预训练权重）、
   LoRA 微调（`finetune`，冻结主干只训适配层，实测可训练参数 1.32%，可选挂载位置 / 链式续训 / 推理合并，默认输出到 `{out_dir}-lora`）、
@@ -1847,6 +1941,11 @@ llm_from_scratch/
   reduce-scatter + all-gather，每 rank 只与左右邻居通信）、DP / ZeRO-1/2 的训练轨迹与状态分片、
   TP / PP / 3D 的切分与激活驻留报告；单测保证 DP / ZeRO 与单进程全 batch **数值一致**、
   TP 前向反向与单卡一致
+- **多模态已落地**（图片理解 + 图片生成）：`vision.rs` 的 ViT 视觉塔把图片编码进前缀占位符
+  （`forward_mm` 在 prefill 首步注入像素，无像素时与纯文本路径逐位一致），`generate --image` 可围着图片生成文字
+  （Beam Search 分支不支持，会忽略并打日志）；`vqvae.rs` 的 VQ-VAE 码本把图片离散成 token，
+  模型采出完整图片段后解码落盘 `gen_image_{i}.png`，非流式 serve 回包内嵌 `message.image_url`；
+  `train.vlm_file` 指定图文 JSONL 做 VLM 训练，`train.vq_steps` 负责 VQ-VAE 预训练（已有 `vq.ckpt` 自动跳过）
 
 ## 性能优化与基准测试
 

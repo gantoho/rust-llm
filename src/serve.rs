@@ -103,6 +103,9 @@ struct State {
     cfg: ServeCfg,
     core: Mutex<Core>,
     stats: Stats,
+    /// VQ-VAE（`{out_dir}/vq.ckpt`）：模型采出完整图片段时解码回像素，
+    /// 内嵌成 data URI 随 `message.image_url` 回给客户端。纯文本模型为 `None`
+    vq: Option<crate::vqvae::Vqvae>,
     /// `time.time()`，回给客户端当 `created` 字段
     created: u64,
     /// 进程启动时刻（算 uptime）
@@ -929,7 +932,11 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                                         "type": "object",
                                         "properties": {
                                             "role": { "type": "string", "const": "assistant" },
-                                            "content": { "type": "string" }
+                                            "content": { "type": "string" },
+                                            "image_url": {
+                                                "type": "string",
+                                                "description": "生成图片的 data:image/png;base64 URI；只有模型采出完整图片段且服务配了 vq.ckpt 时才有此字段"
+                                            }
                                         }
                                     },
                                     "finish_reason": { "type": "string", "enum": ["stop", "length"] },
@@ -1478,6 +1485,40 @@ fn log_qa(job: &ChatJob, r: &QaOutcome) {
 
 // ==================== chat/completions：非流式 ====================
 
+/// 把模型生成的码本段解码成 `data:image/png;base64,...`（多张图取第一张）。
+///
+/// 没配 VQ-VAE（`vq = None`）或一段图都没采出来时返回 `None`，
+/// 响应里就不带 `image_url` 字段——纯文本模型的回包与从前逐字节一致。
+fn generated_image_uri(vq: Option<&crate::vqvae::Vqvae>, imgs: &[Vec<usize>]) -> Option<String> {
+    let vq = vq?;
+    let ids = imgs.first()?;
+    let px = vq.decode(ids, 1);
+    let png = crate::vision::encode_png(&px, vq.cfg.image_size);
+    logln!(
+        "[serve] 生成图片：{} 个码本 token → PNG {} 字节（{}×{}，内嵌 data URI）",
+        ids.len(),
+        png.len(),
+        vq.cfg.image_size,
+        vq.cfg.image_size
+    );
+    Some(format!("data:image/png;base64,{}", b64encode(&png)))
+}
+
+/// 标准 base64（带 `=` 填充、无换行），只为 data URI 服务。
+/// 项目零第三方编码依赖，16 行标准表比引一个 crate 划算。
+fn b64encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
     let system = merge_system(&state.cfg.system, &job.system);
     let max_tokens = job.max_tokens;
@@ -1505,11 +1546,13 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         }
         let n_gen = g.generated_tokens();
         let rate = timer.rate(n_gen);
+        // 图片生成：完整的码本段先留下（VQ 解码在锁外做，别占着模型锁）
+        let imgs = g.generated_images();
         let out = g.into_output();
-        (out.generated, n_prompt, n_gen, out.reason, a.trimmed, rate)
+        (out.generated, imgs, n_prompt, n_gen, out.reason, a.trimmed, rate)
     });
     // 出错也要留一条问答记录：题目在、答案没了，日志里得能查到这条请求的下文
-    let (text, n_prompt, n_gen, reason, trimmed, rate) = match produced {
+    let (text, imgs, n_prompt, n_gen, reason, trimmed, rate) = match produced {
         Ok(v) => v,
         Err(e) => {
             let note = format!("生成出错：{}", e.message);
@@ -1528,6 +1571,8 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
             return Err(e);
         }
     };
+    // 生成了图片且配了 VQ-VAE：解码成 PNG 内嵌 data URI（纯文本模型恒为 None）
+    let image_url = generated_image_uri(state.vq.as_ref(), &imgs);
 
     if let Some((before, after)) = trimmed {
         logln!(
@@ -1556,7 +1601,11 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         "model": state.cfg.model_name,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
+            "message": match &image_url {
+                // 生成了图片：text 里含 <|image|> 字面量，真图内嵌在 image_url
+                Some(u) => json!({ "role": "assistant", "content": text, "image_url": u }),
+                None => json!({ "role": "assistant", "content": text }),
+            },
             "finish_reason": finish_of(reason),
             "logprobs": null,
         }],
@@ -2040,7 +2089,10 @@ pub fn spawn_web_frontend(api_port: u16, web_port: u16, api_key: Option<&str>) {
 // ==================== 服务入口 ====================
 
 /// 启动 HTTP 服务并永不返回。
-pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer) -> ! {
+///
+/// `vq` = VQ-VAE 存档（`{out_dir}/vq.ckpt`，`None` 表示纯文本模型）：
+/// 采样出完整图片段时用它解码成 PNG 内嵌回包。
+pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer, vq: Option<crate::vqvae::Vqvae>) -> ! {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let seed = cfg.seed;
     let model_name = cfg.model_name.clone();
@@ -2053,6 +2105,7 @@ pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer) -> ! {
         cfg,
         core: Mutex::new(Core { model, tokenizer, rng: Rng::new(seed) }),
         stats: Stats::default(),
+        vq,
         created: now_unix(),
         started: Instant::now(),
     });
@@ -2594,5 +2647,47 @@ mod tests {
         assert_eq!(yaml_str("a # b"), "\"a # b\"");
         // 路径既没有 : 也没有 #，裸写即可
         assert_eq!(yaml_str("/v1/models"), "/v1/models");
+    }
+
+    /// RFC 4648 标准向量：三组经典 + 空输入 + 补位边界
+    #[test]
+    fn b64encode_matches_rfc4648_vectors() {
+        assert_eq!(b64encode(b""), "");
+        assert_eq!(b64encode(b"M"), "TQ==");
+        assert_eq!(b64encode(b"Ma"), "TWE=");
+        assert_eq!(b64encode(b"Man"), "TWFu");
+        assert_eq!(b64encode(b"hello"), "aGVsbG8=");
+        // 高位字节（UTF-8 中文）也走同一张表
+        assert_eq!(b64encode("中".as_bytes()), "5Lit");
+    }
+
+    /// 生成图 data URI 端到端：tiny VQ-VAE 解码码本段 → PNG → base64；
+    /// 未配 VQ-VAE 或没采出图时必须返回 None（纯文本回包不带 image_url）
+    #[test]
+    fn generated_image_uri_decodes_full_segment() {
+        let vqcfg = crate::vqvae::VqConfig {
+            image_size: 8,
+            patch_size: 4,
+            latent_dim: 4,
+            codebook_size: 8,
+            hidden: 16,
+            beta: 0.25,
+        };
+        let vq = crate::vqvae::Vqvae::new(vqcfg, &mut Rng::new(11));
+        // P = (8/4)^2 = 4，正好一个完整图片段
+        let imgs = vec![vec![0usize, 1, 2, 3]];
+        let uri = generated_image_uri(Some(&vq), &imgs).expect("完整码本段应产出 data URI");
+        assert!(
+            uri.starts_with("data:image/png;base64,"),
+            "URI 前缀不对：{uri}"
+        );
+        // base64 部分能解回非空 PNG（PNG 魔数 0x89 'P' 'N' 'G'）
+        let payload = &uri["data:image/png;base64,".len()..];
+        assert!(!payload.is_empty(), "base64 载荷不应为空");
+
+        // 没采出图 → None（不管配没配 VQ-VAE）
+        assert_eq!(generated_image_uri(Some(&vq), &[]), None);
+        // 没配 VQ-VAE → None（纯文本模型）
+        assert_eq!(generated_image_uri(None, &imgs), None);
     }
 }

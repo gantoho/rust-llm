@@ -51,13 +51,15 @@ mod speculative;
 mod tensor;
 mod tokenizer;
 mod train;
+mod vision;
+mod vqvae;
 
 use cli::{AlignArgs, Cli, Cmd, DistArgs, RagArgs, RopeArgs, SpecArgs};
 use autograd::clear_tape;
 use config::Config;
 use data::{
-    BatchSource, CORPUS, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, load_documents,
-    load_text, load_texts,
+    BatchSource, CORPUS, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, VlmLoader,
+    load_documents, load_text, load_texts,
 };
 use layers::{Linear, tanh};
 use loss::cross_entropy_loss;
@@ -168,6 +170,7 @@ fn main() {
             tokenizer,
             merge_lora,
             prompt,
+            image,
             max_new,
             temperature,
             top_k,
@@ -187,6 +190,7 @@ fn main() {
             tokenizer.as_deref(),
             merge_lora,
             &prompt,
+            image.as_deref(),
             max_new,
             SampleOpts {
                 temperature,
@@ -611,7 +615,41 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
     let train_docs = load_documents(&tcfg.train_file);
     let val_text = tcfg.val_file.as_deref().map(read_text);
     // 分词器语料 = 所有文档以 "\n" 相连，与 load_text 的拼接口径逐字一致
-    let tokenizer = build_tokenizer(tcfg, &train_docs.join("\n"), 0); // 训练时词表由分词器决定
+    let mut tokenizer = build_tokenizer(tcfg, &train_docs.join("\n"), 0); // 训练时词表由分词器决定
+
+    // 词表大小 0 表示"由分词器决定"
+    let mut model_cfg = cfg.model.clone();
+
+    // 图文训练：把图片 token 区间挂到分词器上，并把占位符首 id 写进视觉配置。
+    // 必须在**保存分词器、计算词表大小、构建模型**之前完成——三者都依赖这个区间
+    //（tokenizer.json 要带 image 字段、vocab_size 要含图片 token、视觉塔注入要用 ph_first）。
+    if tcfg.vlm_file.is_some() {
+        let vcfg = model_cfg
+            .vision
+            .as_mut()
+            .expect("配置了 train.vlm_file，但 model.vision 为空——图文训练必须有视觉塔");
+        let p = vcfg.patch_count();
+        // K = VQ 码本大小：模型配置了 model.vq 就一并挂上码本 token（图像生成通路），
+        // 否则 K=0 只做理解。挂载必须发生在保存分词器/计算词表之前。
+        let k = model_cfg
+            .vq
+            .as_ref()
+            .map(|v| v.codebook_size)
+            .unwrap_or(0);
+        let im = tokenizer
+            .attach_image_tokens(p, k)
+            .expect("分词器没有特殊 token，无法挂载图片区间");
+        vcfg.ph_first = im.ph_first;
+        if k > 0 {
+            logln!(
+                "图片 token 已挂载：P={p} 个占位符 + K={k} 码本，ph_first={}，cb_first={}（VQ 预训练见下方日志）",
+                im.ph_first,
+                im.cb_first
+            );
+        } else {
+            logln!("图片 token 已挂载：P={p} 个占位符，ph_first={}（K=0，仅图片理解）", im.ph_first);
+        }
+    }
 
     // 训练完成后保存分词器（out_dir 不存在时 save 会自动创建）
     let tok_path = tcfg.tokenizer_file.clone()
@@ -619,8 +657,6 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
     tokenizer.save(&tok_path);
     logln!("分词器已保存到 {tok_path}");
 
-    // 词表大小 0 表示"由分词器决定"
-    let mut model_cfg = cfg.model.clone();
     if model_cfg.vocab_size == 0 {
         model_cfg.vocab_size = tokenizer.vocab_size();
     }
@@ -664,17 +700,68 @@ fn cmd_train(config_path: &str, resume: Option<&str>) {
             ),
         ],
     );
-    let loader = DataLoader::from_documents(
-        &train_docs,
-        val_text.as_deref(),
-        &tokenizer,
-        model_cfg.block_size,
-        tcfg.batch_size,
-    );
+    // 图文训练走 VlmLoader（JSONL 样本 + 像素张量），否则维持纯文本加载器
+    let loader: Box<dyn data::BatchSource> = if let Some(vlm_path) = tcfg.vlm_file.as_deref() {
+        let image_size = model_cfg
+            .vision
+            .as_ref()
+            .expect("配置了 train.vlm_file，但 model.vision 为空")
+            .image_size;
+        let mut vl = VlmLoader::from_jsonl(
+            vlm_path,
+            &tokenizer,
+            model_cfg.block_size,
+            tcfg.batch_size,
+            image_size,
+        );
+        logln!(
+            "VLM 语料：{} 条样本，监督 token 占比 {:.1}%",
+            vl.num_samples(),
+            vl.supervised_ratio() * 100.0
+        );
+        // 图像生成通路：先备好 VQ-VAE（有存档直接加载，否则预训练并保存），
+        // 再把每条样本的占位符段替换为码本 token，供生成批次采样。
+        if let Some(vq_cfg) = model_cfg.vq.as_ref() {
+            assert_eq!(
+                vq_cfg.image_size, image_size,
+                "model.vq.image_size 必须等于 vision.image_size（像素按 vision.image_size 加载）"
+            );
+            let vq_path = format!("{}/vq.ckpt", tcfg.out_dir);
+            let vq = if std::path::Path::new(&vq_path).exists() {
+                logln!("VQ-VAE：加载已有存档 {vq_path}（跳过预训练）");
+                crate::vqvae::Vqvae::load(&vq_path)
+            } else {
+                assert!(
+                    tcfg.vq_steps > 0,
+                    "{vq_path} 不存在且 train.vq_steps = 0——没有码本就无法挂载生成 token"
+                );
+                logln!("VQ-VAE：开始预训练（{} 步）→ {vq_path}", tcfg.vq_steps);
+                let vq = crate::vqvae::Vqvae::new(vq_cfg.clone(), &mut rng);
+                train::train_vqvae(&vq, vl.images(), tcfg, &mut rng);
+                vq.save(&vq_path);
+                logln!("VQ-VAE：预训练完成，已保存到 {vq_path}");
+                vq
+            };
+            vl.attach_generation(&vq, &tokenizer);
+            logln!(
+                "生成序列已挂载：{} 条样本的占位符段替换为 VQ 码本 token",
+                vl.num_samples()
+            );
+        }
+        Box::new(vl)
+    } else {
+        Box::new(DataLoader::from_documents(
+            &train_docs,
+            val_text.as_deref(),
+            &tokenizer,
+            model_cfg.block_size,
+            tcfg.batch_size,
+        ))
+    };
     let best = train::train_transformer(
         &model,
         &tokenizer,
-        &loader,
+        loader.as_ref(),
         tcfg,
         Some(&tcfg.out_dir),
         resume,
@@ -980,6 +1067,7 @@ fn cmd_generate(
     tokenizer_path: Option<&str>,
     merge_lora: bool,
     prompt: &str,
+    image: Option<&str>,
     max_new: usize,
     opts: SampleOpts,
     seed: u64,
@@ -1011,6 +1099,10 @@ fn cmd_generate(
             ),
             ("模型结构", format!("{:?}", ckpt.model)),
             ("prompt", format!("{prompt:?}")),
+            (
+                "图片理解输入",
+                image.unwrap_or("无（纯文本）").to_string(),
+            ),
             ("max_new", max_new.to_string()),
             ("seed", seed.to_string()),
             (
@@ -1040,8 +1132,13 @@ fn cmd_generate(
         logln!("[rope] {note}");
     }
 
+    // 采样分支顺带收集模型生成的图片段（码本 token），beam 分支不产出
+    let mut gen_images: Vec<Vec<usize>> = Vec::new();
     let out = if let Some(beam_size) = beam {
         // Beam Search 生成（每条 beam 持有独立缓存，见 `sample::beam_search`）
+        if image.is_some() {
+            logln!("[image] Beam Search 不支持图片理解输入，忽略 --image（请走采样分支）");
+        }
         logln!(
             "Beam Search 生成（beam_size={} length_penalty={}，{}）：",
             beam_size, length_penalty, describe_kv(&kv)
@@ -1066,9 +1163,49 @@ fn cmd_generate(
             opts.repetition_window,
             describe_kv(&kv)
         );
-        generate(&model, &tokenizer, prompt, max_new, &opts, kv, &mut rng)
+        // 图片理解：--image 时把像素在 prefill 首步注入视觉塔（见 Generator::with_pixels）。
+        // prompt 不含 <|image|> 就在尾部补一个，给像素一个落脚的占位段
+        let mut full_prompt = prompt.to_string();
+        if image.is_some() {
+            let vcfg = model
+                .cfg
+                .vision
+                .as_ref()
+                .expect("--image 需要模型带视觉塔（model.vision 为空）");
+            if !full_prompt.contains(crate::tokenizer::IMAGE_LITERAL) {
+                full_prompt.push_str(crate::tokenizer::IMAGE_LITERAL);
+                logln!(
+                    "[image] prompt 未含 {}，已在尾部补上（patch {}×{}）",
+                    crate::tokenizer::IMAGE_LITERAL,
+                    vcfg.image_size,
+                    vcfg.patch_size
+                );
+            }
+        }
+        let mut g = sample::Generator::new(&model, &tokenizer, &full_prompt, max_new, &opts, kv, &mut rng);
+        if let Some(path) = image {
+            let vcfg = model.cfg.vision.as_ref().unwrap();
+            let px = crate::vision::load_image(path, vcfg.image_size);
+            logln!("[image] 已加载 {path}（{}×{}，CHW [-1,1]）", vcfg.image_size, vcfg.image_size);
+            g = g.with_pixels(px);
+        }
+        g.run();
+        gen_images = g.generated_images();
+        g.into_output().text
     };
     logln!("{out}");
+
+    // 图片生成：模型采出完整的码本 token 段时，用 VQ-VAE 解码成像素存成 PNG
+    if !gen_images.is_empty() {
+        let vq_path = format!("{}/vq.ckpt", tcfg.out_dir);
+        let vq = crate::vqvae::Vqvae::load(&vq_path);
+        for (i, ids) in gen_images.iter().enumerate() {
+            let px = vq.decode(ids, 1);
+            let path = format!("{}/gen_image_{i}.png", tcfg.out_dir);
+            crate::vision::save_image(&px, vq.cfg.image_size, &path);
+            logln!("[image] 生成图片已保存：{path}（{} 个码本 token）", ids.len());
+        }
+    }
     runlog::append(&format!("[done] 输出总长 {} 字符（含 prompt）", out.chars().count()));
     runlog::finish();
 }
@@ -1230,6 +1367,16 @@ fn cmd_serve(
     if !no_web {
         serve::spawn_web_frontend(port, web_port, api_key.as_deref());
     }
+    // 图片生成能力：{out_dir}/vq.ckpt 存在就加载，模型采出完整图片段时解码回 PNG。
+    // 纯文本模型没有这个文件，vq = None，serve 行为与从前完全一致
+    let vq_path = format!("{}/vq.ckpt", tcfg.out_dir);
+    let vq = if std::path::Path::new(&vq_path).exists() {
+        logln!("VQ-VAE：加载 {vq_path}（serve 的图片生成通路已启用）");
+        Some(crate::vqvae::Vqvae::load(&vq_path))
+    } else {
+        logln!("VQ-VAE：未找到 {vq_path}，serve 仅提供文本生成");
+        None
+    };
     serve::run(
         serve::ServeCfg {
             host: host.to_string(),
@@ -1247,6 +1394,7 @@ fn cmd_serve(
         },
         model,
         tokenizer,
+        vq,
     );
 }
 

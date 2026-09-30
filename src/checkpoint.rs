@@ -244,11 +244,16 @@ pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut AdamW) -> Checkp
             decode_f32s(&metas, &data[block * 2..]),
         )
     };
-    // 词表被扩大时（模型词表大于存档词表），存档里的动量只覆盖旧词表的那些行。
-    // 多出来的行按"从未更新过"补零：AdamW 的 m=v=0 加上偏置校正，第一步就等价于
+    // 模型参数可以多于存档（如给纯文本存档接上 vision.* 视觉参数）：多出来的参数
+    // 按"从未更新过"补零，与下面词表扩展的补零同一语义。
+    // 词表被扩大时（模型词表大于存档词表），存档里的动量只覆盖旧词表的那些行，
+    // 多出来的行同样补零——AdamW 的 m=v=0 加上偏置校正，第一步就等价于
     // 用该行自己的梯度从头开始累积，不会污染旧行的历史。
     for (i, p) in opt.params().iter().enumerate() {
-        if m[i].len() < p.numel() {
+        if i >= m.len() {
+            m.push(vec![0.0f32; p.numel()]);
+            v.push(vec![0.0f32; p.numel()]);
+        } else if m[i].len() < p.numel() {
             m[i].resize(p.numel(), 0.0);
             v[i].resize(p.numel(), 0.0);
         }
@@ -381,36 +386,56 @@ fn is_vocab_extension(name: &str, meta: &ParamMeta, t: &Tensor) -> bool {
         && t.shape()[0] >= meta.shape[0]
 }
 
-/// 按名字、形状把参数数据写回模型
+/// 按名字、形状把参数数据写回模型。
+///
+/// 参数**按名字**对齐，不要求数量相等：模型可以比存档多出 `vision.*`（给纯文本
+/// 存档接上视觉编码器），这些多出来的参数保持模型自身的初始化值，语义等同于
+/// "新增模块从零开始训练"。反过来，存档里的参数必须全部能在模型中找到，
+/// 否则就是配置不一致（如层数不同），一律报错。
 fn restore_params(model: &Transformer, metas: &[ParamMeta], bytes: &[u8]) {
     let named = model.named_parameters();
-    assert_eq!(
-        named.len(),
-        metas.len(),
-        "checkpoint 参数数量（{}）与模型（{}）不匹配，请检查配置是否一致",
-        metas.len(),
-        named.len()
-    );
-    // 先逐个校验名字与形状，避免形状不符时把错位的数据写进模型
-    for ((name, t), meta) in named.iter().zip(metas) {
-        assert_eq!(
-            name, &meta.name,
-            "参数名不匹配：checkpoint='{}' vs 模型='{}'",
-            meta.name, name
+    // 存档参数名 → 模型参数下标；同时校验每个参数的形状
+    let mut slot_of_meta: Vec<usize> = Vec::with_capacity(metas.len());
+    let mut covered = vec![false; named.len()];
+    for meta in metas {
+        let si = named
+            .iter()
+            .position(|(n, _)| n == &meta.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "checkpoint 参数 '{}' 在模型中不存在，请检查配置是否一致",
+                    meta.name
+                )
+            });
+        assert!(
+            !covered[si],
+            "checkpoint 参数名重复：{}",
+            meta.name
         );
-        if is_vocab_extension(name, meta, t) {
+        covered[si] = true;
+        slot_of_meta.push(si);
+        let t = &named[si].1;
+        if is_vocab_extension(&meta.name, meta, t) {
             continue; // 词表扩展：行数允许更多，下面只写前缀行
         }
         assert_eq!(
             t.shape(),
             &meta.shape[..],
             "参数 {} 形状不匹配：checkpoint={:?} vs 模型={:?}",
-            name,
+            meta.name,
             meta.shape,
             t.shape()
         );
     }
-    for ((name, t), data) in named.iter().zip(decode_f32s(metas, bytes)) {
+    // 模型多出来的参数只允许 vision.*——语言侧参数缺失意味着配置不一致
+    for (i, (name, _)) in named.iter().enumerate() {
+        assert!(
+            covered[i] || name.starts_with("vision."),
+            "模型参数 '{name}' 不在 checkpoint 中（仅允许缺少 vision.* 视觉参数），请检查配置是否一致"
+        );
+    }
+    for (mi, data) in decode_f32s(metas, bytes).into_iter().enumerate() {
+        let (name, t) = &named[slot_of_meta[mi]];
         if t.numel() == data.len() {
             t.set_data(data);
         } else {
@@ -775,5 +800,108 @@ mod tests {
         std::panic::set_hook(hook);
         let _ = std::fs::remove_file(&path);
         assert!(err.is_err(), "配置不一致时必须报错，而不是悄悄装进去一半");
+    }
+
+    fn vision_cfg() -> crate::vision::VisionConfig {
+        crate::vision::VisionConfig {
+            image_size: 8,
+            patch_size: 4,
+            n_embd: 16,
+            n_head: 2,
+            n_layer: 1,
+            dropout: 0.0,
+            ph_first: 4,
+        }
+    }
+
+    /// 纯文本存档 → 带视觉塔的模型：模型可以比存档多 `vision.*`（保持随机初始化），
+    /// 其余参数按名字逐位还原；优化器给多出来的参数补零动量，能合法续训一步。
+    ///（多模态改造的旧纯文本存档必须还能继续训练）
+    #[test]
+    fn test_restore_tolerates_extra_vision_params() {
+        let (model, opt) = trained_tiny(51);
+        let path = tmp_path("text_only");
+        save(&path, &model, &opt, 8, 0.7);
+
+        let mut cfg = TransformerConfig::tiny(64);
+        cfg.vision = Some(vision_cfg());
+        let mut rng = Rng::new(123);
+        let model2 = Transformer::new(cfg, &mut rng);
+        let vision_before: Vec<(String, Vec<f32>)> = model2
+            .named_parameters()
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("vision."))
+            .map(|(n, t)| (n, t.data_ref().to_vec()))
+            .collect();
+        assert!(!vision_before.is_empty(), "带视觉塔的模型应有 vision.* 参数");
+
+        let mut opt2 = AdamW::new(1e-3, model2.parameters(), 0.1);
+        load_with_opt(&path, &model2, &mut opt2);
+        let _ = std::fs::remove_file(&path);
+
+        // 共享参数按名字逐位还原（zip 对齐不可靠：一边没有 vision 段）
+        let named2 = model2.named_parameters();
+        for (name, a) in model.named_parameters() {
+            let (_, b) = named2
+                .iter()
+                .find(|(n, _)| n == &name)
+                .unwrap_or_else(|| panic!("模型缺少存档参数 {name}"));
+            assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
+        }
+
+        // 视觉塔未被存档数据触碰，保持构造时的初始化值
+        for (n, before) in &vision_before {
+            let (_, now) = named2
+                .iter()
+                .find(|(m, _)| m == n)
+                .unwrap_or_else(|| panic!("模型缺少视觉参数 {n}"));
+            assert_bits_eq(before, &now.data_ref(), &format!("视觉参数 {n} 应保持初始化"));
+        }
+
+        // 优化器动量与新参数表对齐：存档里的历史保留、多出来的 vision.* 补零
+        let params = opt2.params();
+        let (_, m, v) = opt2.state();
+        assert_eq!(m.len(), params.len(), "m 数量应对齐模型参数表");
+        assert_eq!(v.len(), params.len(), "v 数量应对齐模型参数表");
+        for (i, p) in params.iter().enumerate() {
+            assert_eq!(m[i].len(), p.numel(), "m[{i}] 长度应对齐");
+            assert_eq!(v[i].len(), p.numel(), "v[{i}] 长度应对齐");
+        }
+        let n_shared = model.parameters().len();
+        assert!(
+            m[..n_shared].iter().flatten().any(|x| *x != 0.0),
+            "共享参数的动量来自存档（trained_tiny 灌过非零梯度），不应全零"
+        );
+        assert!(
+            m[n_shared..].iter().flatten().all(|x| *x == 0.0),
+            "vision.* 是存档里没有的新参数，动量应补零"
+        );
+        opt2.step(); // 合法续训起点，能真实走一步
+    }
+
+    /// 反向约束：存档里有、模型里没有的参数必须报错——配置不一致不能悄悄装一半。
+    #[test]
+    fn test_restore_rejects_checkpoint_params_missing_from_model() {
+        let mut cfg = TransformerConfig::tiny(64);
+        cfg.vision = Some(vision_cfg());
+        let mut rng = Rng::new(77);
+        let model = Transformer::new(cfg, &mut rng);
+        let opt = AdamW::new(1e-3, model.parameters(), 0.1);
+        let path = tmp_path("with_vision");
+        save(&path, &model, &opt, 3, 1.0);
+
+        let mut rng2 = Rng::new(78);
+        let plain = Transformer::new(TransformerConfig::tiny(64), &mut rng2);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_params(&path, &plain);
+        }));
+        std::panic::set_hook(hook);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.is_err(),
+            "存档参数在模型中不存在时必须报错（按名恢复的兜底约束）"
+        );
     }
 }

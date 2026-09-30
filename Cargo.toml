@@ -17,6 +17,8 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 # `serve` 子命令的 HTTP 服务：同步阻塞模型（一个连接一个线程），API 面小、零异步运行时
 tiny_http = "0.12"
+# 图像编解码/缩放（PNG/JPEG 读写与双线性 resize 属于 IO 工具库，模型与训练算法仍为纯手写）
+image = "0.25"
 # 可选：GPU 加速（wgpu 计算着色器，支持 NVIDIA / Intel 核显，Windows 走 DX12/Vulkan）
 wgpu = { version = "30", optional = true }
 # wgpu 的异步初始化需要事件循环，pollster 提供最简单的同步阻塞工具（零依赖）

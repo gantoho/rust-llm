@@ -91,6 +91,15 @@ pub struct TrainConfig {
     /// 只对 `sft` 子命令有意义。语料按对话解析：行首带角色标记的算一轮问答，
     /// 不带任何角色标记的文本会被整体跳过（所以指向混杂目录也不会把小说正文喂进来）。
     pub sft_file: Option<String>,
+    /// VLM（图文指令）语料路径：JSONL，每行 `{"image": "图片路径", "conversations": [{"role", "content"}]}`。
+    ///
+    /// 只对 `train` 子命令有意义（设置了它就走图文训练通路）。文本里出现 `<|image|>`
+    /// 字面量的位置会展开为视觉占位符序列，前向时由 ViT 特征原位覆写。
+    pub vlm_file: Option<String>,
+    /// VQ-VAE 预训练步数：模型配置了 `model.vq` 时，正式训练前先在 VLM 语料的
+    /// 图像像素上预训练 VQ-VAE（已有 `{out_dir}/vq.ckpt` 则直接加载、跳过）。
+    /// 0 = 强制不预训练（此时要求已有 checkpoint，否则无法挂载码本 token）。
+    pub vq_steps: usize,
 }
 
 /// LoRA 微调配置
@@ -238,6 +247,8 @@ impl Default for TrainConfig {
             log_file: Some(DEFAULT_LOG_FILE.to_string()),
             early_stop_patience: 0,
             sft_file: None,
+            vlm_file: None,
+            vq_steps: 1000,
         }
     }
 }

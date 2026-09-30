@@ -337,6 +337,74 @@ impl BPETokenizer {
 pub const BOS_LITERAL: &str = "<|bos|>";
 pub const EOS_LITERAL: &str = "<|eos|>";
 pub const PAD_LITERAL: &str = "<|pad|>";
+/// 图片占位符字面写法。挂在分词器上（[`ImageTokens`]）后，
+/// [`Tokenizer::encode`] 会把它展开成 `[start, ph₀..ph_{P-1}, end]` ——
+/// P = (image_size / patch_size)² 个与 ViT patch 数一一对应的占位 token。
+pub const IMAGE_LITERAL: &str = "<|image|>";
+
+/// 图片相关 token 的 id 分配。
+///
+/// 排在三个常规特殊 token（BOS/EOS/PAD）之后，形成一段连续区间：
+///
+/// ```text
+/// [内容词表][bos][eos][pad][start][ph₀..ph_{P-1}][end][vq₀..vq_{K-1}]
+/// ```
+///
+/// - `start` / `ph*` / `end`：**图片理解**用。`<|image|>` 展开成这一整段，
+///   占位符个数 P 与 patch 数相同，于是视觉 embedding 可以**原位覆写**
+///   占位符位置（序列长度不变，loss 对齐与 KV cache 都不受影响）。
+/// - `cb*`：**图片生成**用，是 VQ-VAE 码本 id 的直接偏移
+///   （真实 code = `cb_first + 码本下标`），训练序列里它们就是普通 token。
+///
+/// 这一段 id 同样排在内容词表之后，旧 checkpoint 靠前缀行恢复继续可用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageTokens {
+    /// 图片段起始标记
+    pub start: usize,
+    /// 占位符区间首 id（共 [`Self::count`] 个）
+    pub ph_first: usize,
+    /// 占位符个数 P = (image_size / patch_size)²
+    pub count: usize,
+    /// 图片段结束标记
+    pub end: usize,
+    /// VQ 码本 token 区间首 id（共 [`Self::cb_count`] 个）
+    pub cb_first: usize,
+    /// VQ 码本大小 K
+    pub cb_count: usize,
+}
+
+impl ImageTokens {
+    /// 追加到词表里的 id 总数：start + P 个占位符 + end + K 个码本 token
+    pub fn len(&self) -> usize {
+        2 + self.count + self.cb_count
+    }
+
+    /// id 是否属于图片区间（占位符 / 起止标记 / 码本）
+    pub fn contains(&self, id: usize) -> bool {
+        id >= self.start && id < self.start + self.len()
+    }
+
+    /// 真实 VQ 码本下标 -> 词表 id
+    pub fn cb_id(&self, code: usize) -> usize {
+        assert!(code < self.cb_count, "VQ 码 {code} 超出码本大小 {}", self.cb_count);
+        self.cb_first + code
+    }
+
+    /// 词表 id -> 真实 VQ 码本下标（不属于码本区间时返回 None）
+    pub fn cb_index(&self, id: usize) -> Option<usize> {
+        let i = id.checked_sub(self.cb_first)?;
+        (i < self.cb_count).then_some(i)
+    }
+
+    /// 展开 `<|image|>` 得到的完整 id 段：`[start, ph₀..ph_{P-1}, end]`
+    pub fn expand(&self) -> Vec<usize> {
+        let mut ids = Vec::with_capacity(self.count + 2);
+        ids.push(self.start);
+        ids.extend(self.ph_first..self.ph_first + self.count);
+        ids.push(self.end);
+        ids
+    }
+}
 
 /// 特殊 token 的 id 分配（BOS / EOS / PAD）
 ///
@@ -447,6 +515,8 @@ impl Inner {
 pub struct Tokenizer {
     inner: Inner,
     specials: Option<SpecialTokens>,
+    /// 图片 token 区间；`None` = 该分词器不支持多模态（旧文件读入的一律为 None）
+    image: Option<ImageTokens>,
 }
 
 impl Tokenizer {
@@ -472,7 +542,37 @@ impl Tokenizer {
     /// 新建分词器都要挂上特殊 token：id 从内容词表的末尾接着排
     fn wrap(inner: Inner) -> Self {
         let specials = Some(SpecialTokens::new(inner.vocab_size()));
-        Tokenizer { inner, specials }
+        Tokenizer { inner, specials, image: None }
+    }
+
+    /// 挂上图片 token 区间（id 紧跟在 PAD 之后），供图片理解/生成使用。
+    ///
+    /// - `patch_count`：一张图的 patch 数 P = (image_size / patch_size)²
+    /// - `codebook_size`：VQ-VAE 码本大小 K（生成任务用；纯理解可传 0）
+    ///
+    /// 幂等：重复调用以最后一次参数为准。未带特殊 token 的旧分词器返回 `None`
+    /// （id 空间没有 PAD 可以接续，无法安置图片区间）。
+    pub fn attach_image_tokens(
+        &mut self,
+        patch_count: usize,
+        codebook_size: usize,
+    ) -> Option<ImageTokens> {
+        let sp = self.specials?;
+        let im = ImageTokens {
+            start: sp.pad + 1,
+            ph_first: sp.pad + 2,
+            count: patch_count,
+            end: sp.pad + 2 + patch_count,
+            cb_first: sp.pad + 3 + patch_count,
+            cb_count: codebook_size,
+        };
+        self.image = Some(im);
+        Some(im)
+    }
+
+    /// 图片 token 区间；`None` = 该分词器不支持多模态
+    pub fn image_tokens(&self) -> Option<ImageTokens> {
+        self.image
     }
 
     /// 内容词表大小（不含特殊 token）
@@ -480,10 +580,11 @@ impl Tokenizer {
         self.inner.vocab_size()
     }
 
-    /// 完整词表大小 = 内容词表 + 特殊 token 个数
+    /// 完整词表大小 = 内容词表 + 特殊 token 个数 + 图片 token 个数
     pub fn vocab_size(&self) -> usize {
         self.content_vocab_size()
             + self.specials.map_or(0, |_| SpecialTokens::COUNT)
+            + self.image.map_or(0, |im| im.len())
     }
 
     pub fn specials(&self) -> Option<SpecialTokens> {
@@ -502,6 +603,7 @@ impl Tokenizer {
     /// 模型词表是硬约束——多出来的 3 行没有对应的嵌入行，只能按老格式对齐。
     pub fn without_specials(mut self) -> Self {
         self.specials = None;
+        self.image = None;
         self
     }
 
@@ -515,8 +617,13 @@ impl Tokenizer {
         self.specials.map(|s| s.bos)
     }
 
+    /// 填充标记 id；旧分词器返回 `None`（多模态序列对齐填充必须用它，见 `data::VlmLoader`）
+    pub fn pad_id(&self) -> Option<usize> {
+        self.specials.map(|s| s.pad)
+    }
+
     fn is_special(&self, id: usize) -> bool {
-        self.specials.map_or(false, |s| s.contains(id))
+        self.specials.map_or(false, |s| s.contains(id)) || self.image.map_or(false, |im| im.contains(id))
     }
 
     /// 文本 -> id 序列。
@@ -536,20 +643,39 @@ impl Tokenizer {
         let mut rest = text;
         loop {
             // 找"最靠前"的那个字面量；同一位置不可能同时命中两个（字面量互不为前缀）
-            let mut hit: Option<(usize, usize, usize)> = None; // (位置, id, 字面量字节数)
+            // 命中结果三选一：普通特殊 token 的 id、图片占位段（展开）、没有命中
+            #[derive(Clone, Copy)]
+            enum Hit {
+                Id(usize),
+                Image,
+            }
+            let mut hit: Option<(usize, Hit, usize)> = None; // (位置, 命中, 字面量字节数)
+            let note = |p: usize, h: Hit, len: usize, hit: &mut Option<(usize, Hit, usize)>| {
+                if hit.map_or(true, |(best, _, _)| p < best) {
+                    *hit = Some((p, h, len));
+                }
+            };
             for (lit, id) in sp.literals() {
                 if let Some(p) = rest.find(lit) {
-                    if hit.map_or(true, |(best, _, _)| p < best) {
-                        hit = Some((p, id, lit.len()));
-                    }
+                    note(p, Hit::Id(id), lit.len(), &mut hit);
+                }
+            }
+            if self.image.is_some() {
+                if let Some(p) = rest.find(IMAGE_LITERAL) {
+                    note(p, Hit::Image, IMAGE_LITERAL.len(), &mut hit);
                 }
             }
             match hit {
-                Some((p, id, len)) => {
+                Some((p, what, len)) => {
                     if p > 0 {
                         ids.extend(self.inner.encode(&rest[..p]));
                     }
-                    ids.push(id);
+                    match what {
+                        Hit::Id(id) => ids.push(id),
+                        // 展开成 [start, ph₀..ph_{P-1}, end]：与 ViT 的 patch 一一对应，
+                        // 视觉 embedding 会在前向时原位覆写这些占位符
+                        Hit::Image => ids.extend(self.image.unwrap().expand()),
+                    }
                     rest = &rest[p + len..];
                 }
                 None => {
@@ -593,7 +719,38 @@ impl Tokenizer {
         };
         let mut out = String::new();
         let mut run: Vec<usize> = Vec::new();
-        for &id in ids {
+        let mut i = 0;
+        while i < ids.len() {
+            let id = ids[i];
+            // 图片段折叠成单个 <|image|>：占位符逐个打印没有可读性，
+            // 而折叠后重新 encode 会得到同一段 id（往返稳定）
+            if let Some(im) = self.image {
+                if id == im.start {
+                    if !run.is_empty() {
+                        out.push_str(&self.inner.decode(&run));
+                        run.clear();
+                    }
+                    out.push_str(IMAGE_LITERAL);
+                    // 跳到 end（缺失时只跳一个，避免越界死循环）
+                    while i + 1 < ids.len() && ids[i + 1] != im.end {
+                        i += 1;
+                    }
+                    if i + 1 < ids.len() {
+                        i += 1; // 落在 end 上，一并吃掉
+                    }
+                    i += 1;
+                    continue;
+                }
+                if let Some(code) = im.cb_index(id) {
+                    if !run.is_empty() {
+                        out.push_str(&self.inner.decode(&run));
+                        run.clear();
+                    }
+                    out.push_str(&format!("<|vq:{code}|>"));
+                    i += 1;
+                    continue;
+                }
+            }
             match sp.name(id) {
                 Some(name) => {
                     if !run.is_empty() {
@@ -604,6 +761,7 @@ impl Tokenizer {
                 }
                 None => run.push(id),
             }
+            i += 1;
         }
         if !run.is_empty() {
             out.push_str(&self.inner.decode(&run));
@@ -642,6 +800,12 @@ impl Tokenizer {
         if let Some(sp) = self.specials {
             json["specials"] = serde_json::json!({
                 "bos": sp.bos, "eos": sp.eos, "pad": sp.pad,
+            });
+        }
+        if let Some(im) = self.image {
+            json["image"] = serde_json::json!({
+                "start": im.start, "ph_first": im.ph_first, "count": im.count,
+                "end": im.end, "cb_first": im.cb_first, "cb_count": im.cb_count,
             });
         }
         write_json(path, &json);
@@ -692,7 +856,38 @@ impl Tokenizer {
         } else {
             None
         };
-        Tokenizer { inner, specials }
+        // 图片 token 区间：可选字段，缺席 = 非多模态分词器（旧文件）
+        let image = if json["image"].is_object() {
+            let s = &json["image"];
+            let read = |k: &str| {
+                s[k].as_u64()
+                    .unwrap_or_else(|| panic!("分词器 image.{k} 缺失或不是整数")) as usize
+            };
+            let im = ImageTokens {
+                start: read("start"),
+                ph_first: read("ph_first"),
+                count: read("count"),
+                end: read("end"),
+                cb_first: read("cb_first"),
+                cb_count: read("cb_count"),
+            };
+            // 区间必须紧接 PAD 且内部连续，否则词表大小与模型嵌入表对不上
+            let pad = specials.expect("分词器带 image 字段时必须也有 specials").pad;
+            assert_eq!(
+                im.start,
+                pad + 1,
+                "分词器文件损坏：image.start（{}）应为 pad+1（{}）",
+                im.start,
+                pad + 1
+            );
+            assert_eq!(im.ph_first, im.start + 1, "image.ph_first 必须紧跟 start");
+            assert_eq!(im.end, im.ph_first + im.count, "image.end 必须紧跟占位符区间");
+            assert_eq!(im.cb_first, im.end + 1, "image.cb_first 必须紧跟 end");
+            Some(im)
+        } else {
+            None
+        };
+        Tokenizer { inner, specials, image }
     }
 }
 
@@ -935,5 +1130,67 @@ mod tests {
         assert_eq!(tok.eos_id(), None);
         assert_eq!(tok.encode("hi"), vec![0, 1]);
         assert_eq!(tok.decode(&[1, 0]), "ih");
+    }
+
+    /// `<|image|>` 展开成 `[start, ph₀.., end]`，且 id 区间紧跟特殊 token、
+    /// 往返 save/load 后完全一致。
+    #[test]
+    fn test_image_tokens_expand_and_survive_save_load() {
+        let mut tok = Tokenizer::bpe("你好世界你好世界", 300);
+        let content = tok.content_vocab_size();
+        let im = tok
+            .attach_image_tokens(4 /* P=4 个占位符 */, 8 /* K=8 个码本 token */)
+            .expect("带 specials 的新分词器应能挂图片 token");
+
+        // id 排布：[内容][bos,eos,pad][start][ph×4][end][vq×8]
+        let sp = tok.specials().unwrap();
+        assert_eq!(im.start, sp.pad + 1);
+        assert_eq!(im.ph_first, content + 4); // [内容][bos,eos,pad][start] → ph_first
+        assert_eq!(im.end, im.ph_first + 4);
+        assert_eq!(im.cb_first, im.end + 1);
+        assert_eq!(tok.vocab_size(), im.cb_first + 8);
+        assert_eq!(im.expand(), vec![im.start, im.ph_first, im.ph_first + 1, im.ph_first + 2, im.ph_first + 3, im.end]);
+
+        // 编码时字面量展开；decode 丢弃、verbose 折叠回字面量
+        let plain = tok.encode("图:");
+        let ids = tok.encode(&format!("图:{IMAGE_LITERAL}"));
+        let k = plain.len();
+        assert_eq!(&ids[..k], &plain[..], "图片字面量之前的正文编码不变");
+        assert_eq!(ids[k], im.start, "字面量应展开成 start 打头");
+        assert_eq!(ids[k + 1], im.ph_first, "start 之后是第一个占位符");
+        // expand 只含 [start, ph×P, end]（码本 token 是生成时才用的，不参与图片占位）
+        assert_eq!(im.expand().len(), 2 + im.count);
+        assert_eq!(ids.len(), k + im.expand().len());
+        assert_eq!(tok.decode(&ids), "图:");
+        assert!(tok.decode_verbose(&ids).contains(IMAGE_LITERAL));
+
+        // 码本 id 映射与 is_special 判定
+        assert_eq!(im.cb_id(0), im.cb_first);
+        assert_eq!(im.cb_index(im.cb_first + 3), Some(3));
+        assert_eq!(im.cb_index(im.start), None);
+        assert!(tok.is_special(im.ph_first) && tok.is_special(im.cb_first + 7));
+        assert!(!tok.is_special(content - 1));
+
+        // save/load 往返
+        let mut path = std::env::temp_dir();
+        path.push(format!("llm_tok_img_test_{}.json", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        tok.save(&path);
+        let back = Tokenizer::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.image_tokens(), Some(im));
+        assert_eq!(back.vocab_size(), tok.vocab_size());
+        assert_eq!(back.encode(&format!("图:{IMAGE_LITERAL}")), ids);
+    }
+
+    /// 没有 specials 的旧分词器挂不上图片 token（返回 None，词表不变）。
+    #[test]
+    fn test_image_tokens_require_specials() {
+        let mut tok = Tokenizer::from_json(&serde_json::json!({
+            "type": "char",
+            "chars": ["h", "i"],
+        }));
+        assert!(tok.attach_image_tokens(4, 8).is_none());
+        assert_eq!(tok.vocab_size(), 2);
     }
 }
