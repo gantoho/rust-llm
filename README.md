@@ -541,8 +541,23 @@ cargo run --release -- generate --config config/config.json --prompt "The fox" -
 cargo run --release -- generate --config config/config.json --prompt "The fox" --beam 8 --length-penalty 0.8 --max-new 100
 
 # ═══════════════════════════════════════════
+#  多模态：VLM 训练（配置 config/vlm.json，产物在 checkpoints/vlm/）
+# ═══════════════════════════════════════════
+
+# 图文训练：首次先预训练 VQ-VAE（vq_steps 步存 vq.ckpt）再训主干；--resume 断点续训
+cargo run --release -- train --config config/vlm.json
+cargo run --release -- train --config config/vlm.json --resume checkpoints/vlm/latest.ckpt
+
+# ═══════════════════════════════════════════
 #  多模态：图片理解（--image）
 # ═══════════════════════════════════════════
+
+# 实测示例：generate 的 --prompt 是裸输入，套 SFT 模板（用户：/助手：）才与训练一致
+cargo run --release -- generate --config config/vlm.json \
+  --image data/vlm/img/0.png --prompt "用户：
+图:<|image|>这是什么颜色？
+助手：
+" --max-new 16 --temperature 0.1
 
 # 给一张图让模型描述（需 config 里配了 model.vision，且用带视觉塔训出的 checkpoint）
 cargo run --release -- generate --config config/config.json --image data/demo.png --prompt "图里的内容是" --max-new 80
@@ -566,6 +581,10 @@ cargo run --release -- generate --config config/config.json --prompt "画一张"
 
 # 想提高出图概率就给足生成长度（P = (image_size/patch_size)² 个码本 token 要一个不少地采对）
 cargo run --release -- generate --config config/config.json --prompt "画一张风景" --max-new 400 --temperature 0.8
+
+# 实测示例：条件指令（颜色/形状）放最前 + 套 SFT 模板，采出完整图片段后自动落盘
+cargo run --release -- generate --config config/vlm.json --prompt "用户：
+请画一张蓝色的三角形" --max-new 100 --temperature 0.8
 # serve 场景下同一段码本 token 会被解码成 data:image/png;base64,... 内嵌进 message.image_url
 
 # ═══════════════════════════════════════════
@@ -1593,7 +1612,7 @@ SwiGLU 就足以让整条路径放弃）。
     // ---- 多模态（图片理解；缺省 null = 纯文本模型）----
     "vision": {
       "image_size": 64,        // 输入图统一 resize 到 image_size×image_size
-      "patch_size": 16,        // patch 边长；P = (image_size/patch_size)² = <|image|> 展开的占位符数
+      "patch_size": 16,        // patch 边长；P = (image_size/patch_size)² = <|image|> 展开的占位符数（配 model.vq 时必须与 vq.patch_size 相同）
       "n_embd": 64,            // 视觉塔隐藏维度（可与主干不同）
       "n_head": 4,             // 视觉塔注意力头数
       "n_layer": 2,            // 视觉塔 Transformer 层数
@@ -1603,7 +1622,7 @@ SwiGLU 就足以让整条路径放弃）。
     // ---- 多模态（图片生成；缺省 null = 不做生成，只做理解）----
     "vq": {
       "image_size": 64,        // 必须与 vision.image_size 相同（训练入口断言）
-      "patch_size": 8,         // VQ 编码器 patch 边长（可与 vision.patch_size 不同）
+      "patch_size": 8,         // VQ 编码器 patch 边长：必须等于 vision.patch_size（码本 token 数要等于占位符数 P，否则 attach_generation 断言失败）
       "latent_dim": 64,        // 码本向量维度
       "codebook_size": 512,    // 码本大小 K：模型多出 K 个图像生成 token
       "hidden": 256,           // 编码 / 解码 MLP 隐层宽度
@@ -1794,10 +1813,12 @@ llm_from_scratch/
 ├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / tiny_http / image（仅编解码）/ windows-sys + 可选 wgpu / pollster
 ├── README.md           # 本文件
 ├── config/             # 配置文件目录
-│   └── config.json     #   默认训练配置（模型超参 + 训练参数）
+│   ├── config.json     #   默认训练配置（模型超参 + 训练参数）
+│   └── vlm.json        #   多模态训练配置（vision + vq + vlm_file / vq_steps）
 ├── checkpoints/        # 权重目录（自动创建）；各实验按 out_dir 分成子目录
 │   ├── zh/             #   本仓库已训好的中文权重：latest/best/final.ckpt + tokenizer.json + train.csv
 │   ├── zh-sft/         #   `sft` 的默认输出（{out_dir}-sft），不会覆盖上面的预训练权重
+│   ├── vlm/            #   多模态产物：best/latest.ckpt + vq.ckpt + tokenizer.json + gen_image_*.png
 │   └── ...             #   其他实验目录，如 checkpoints/perf、checkpoints/probe_b2
 ├── logs/               # 日志目录（自动创建）：运行日志（每次 train/eval/generate/chat/serve/sft/finetune 各一份）
 │                       #      与训练指标 CSV（由 train.log_file 指定，本项目配的是 checkpoints/zh/train.csv）
@@ -1805,6 +1826,7 @@ llm_from_scratch/
 │                       #      corpus/（中英文混合语料，含文章/代码/对话/新闻/诗歌）
 │                       #      corpus_zh/（《红楼梦》《三国演义》等中文名著）
 │                       #      corpus_perf/（性能测试用节选）、sft/（SFT 问答语料 zh_qa.txt）
+│                       #      vlm/（多模态：360 张 64×64 合成图 img/ + 720 条图文 vlm.jsonl）、vlm_train.txt（VLM BPE 语料）
 ├── src/
 │   ├── main.rs         # CLI 入口：train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling / moe
 │   ├── cli.rs          # 命令行定义（clap）
