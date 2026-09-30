@@ -1498,7 +1498,8 @@ impl Transformer {
                 let ph = vis.cfg.ph_first;
                 let p = vis.cfg.patch_count();
                 let feats = vis.forward(px, b, training); // [b·P, d]
-                let flat = x.reshape(vec![t, d]);
+                // 展平成 [b·T, d]（rows 按 s*t+j 索引，必须覆盖全部 batch）
+                let flat = x.reshape(vec![b * t, d]);
                 // 扫出每个样本的占位符位置（顺序 = 视觉特征行顺序 = 样本顺序 × patch 行主序）
                 let mut rows = Vec::with_capacity(b * p);
                 for s in 0..b {
@@ -1518,7 +1519,7 @@ impl Transformer {
                 assert_eq!(rows.len(), feats.shape()[0], "占位符行数与视觉特征行数不一致");
                 let gathered = flat.gather_rows(&rows);
                 let delta = feats.sub(&gathered);
-                let inj = delta.scatter_add_rows(&rows, t);
+                let inj = delta.scatter_add_rows(&rows, b * t);
                 flat.add(&inj).reshape(vec![b, t, d])
             }
         };
