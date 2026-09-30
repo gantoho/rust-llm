@@ -19,6 +19,10 @@ interface Turn {
   streaming?: boolean
   /** 本轮耗时毫秒 / finish_reason / usage / tok/s 摘要 */
   meta?: string
+  /** 用户随本轮上传的输入图（base64 data URI） */
+  imageUrl?: string
+  /** 模型本轮生成的图（delta.image_url / message.image_url，data URI） */
+  genImage?: string
 }
 
 const DEFAULT_PARAMS: ChatParams = {
@@ -181,8 +185,28 @@ function ChatTab({
   const [busy, setBusy] = useState(false)
   const [raw, setRaw] = useState('')
   const [drawer, setDrawer] = useState(false)
+  // 待发送的输入图（base64 data URI）：随末条 user 消息的 image_url 上行
+  const [attach, setAttach] = useState('')
+  const [attachErr, setAttachErr] = useState('')
   const abortRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  // 选图 → data URI（与后端 data URI;base64, 格式一致）；上限 8MB（请求体 16MB）
+  function pickImage(f: File | undefined) {
+    if (!f) return
+    if (f.size > 8 * 1024 * 1024) {
+      setAttachErr('图片超过 8MB，请压缩后再传')
+      return
+    }
+    const r = new FileReader()
+    r.onload = () => {
+      setAttach(String(r.result))
+      setAttachErr('')
+    }
+    r.onerror = () => setAttachErr('图片读取失败')
+    r.readAsDataURL(f)
+  }
 
   // 新内容落盘后自动滚到底
   useEffect(() => {
@@ -191,15 +215,24 @@ function ChatTab({
 
   async function send() {
     const question = input.trim()
-    if (!question || busy) return
+    if ((!question && !attach) || busy) return
     setInput('')
     setBusy(true)
     setRaw('')
 
-    // 拼历史：只保留 user/assistant 轮次，末条必为 user（服务端强校验）
-    const history: ChatMessage[] = [...turns.map(({ role, content }) => ({ role, content })), { role: 'user', content: question }]
-    const next: Turn[] = [...turns, { role: 'user', content: question }, { role: 'assistant', content: '', streaming: stream }]
+    // 拼历史：只保留 user/assistant 轮次，末条必为 user（服务端强校验）；
+    // 输入图只挂在末条 user 的 image_url 上（服务端只认末条）
+    const history: ChatMessage[] = [
+      ...turns.map(({ role, content }) => ({ role, content })),
+      { role: 'user', content: question, image_url: attach || undefined },
+    ]
+    const next: Turn[] = [
+      ...turns,
+      { role: 'user', content: question, imageUrl: attach || undefined },
+      { role: 'assistant', content: '', streaming: stream },
+    ]
     setTurns(next)
+    setAttach('')
 
     const t0 = performance.now()
     // 注意：updater 必须是纯函数——StrictMode 在 dev 下会把 setState updater
@@ -236,6 +269,8 @@ function ChatTab({
             },
             onFinish: (r) => (finish = r),
             onUsage: (u) => (usage = u),
+            // 生成图帧（finish 之前，delta.image_url = data URI）
+            onImage: (u) => patchLast((t) => ({ ...t, genImage: u })),
           },
           (abortRef.current = new AbortController()).signal,
         )
@@ -253,6 +288,7 @@ function ChatTab({
       } else {
         const resp: any = await chat(apiKey, history, params, model)
         const text = resp.choices?.[0]?.message?.content ?? ''
+        const genImage = resp.choices?.[0]?.message?.image_url ?? ''
         const u = resp.usage
         // 优先服务端实测速率，缺失时退回「completion_tokens ÷ 请求耗时」的本地估算
         const srv = typeof u?.tokens_per_second === 'number' ? u.tokens_per_second : null
@@ -262,6 +298,7 @@ function ChatTab({
         patchLast((t) => ({
           ...t,
           content: text,
+          genImage: genImage || undefined,
           streaming: false,
           meta: `${elapsed()}s · ${resp.choices?.[0]?.finish_reason ?? 'stop'}${
             u ? ` · ${u.completion_tokens} tokens` : ''
@@ -338,7 +375,10 @@ function ChatTab({
             <div key={i} className={`bubble ${t.role}${t.streaming ? ' streaming' : ''}`}>
               <span className="avatar">{t.role === 'user' ? '我' : '◆'}</span>
               <div className="body">
-                <pre>{t.content}</pre>
+                {t.imageUrl && <img className="msg-img" src={t.imageUrl} alt="上传图" />}
+                {/* 模型回复里可能带 <|image|> 占位符，展示时滤掉 */}
+                <pre>{t.content.split('<|image|>').join('')}</pre>
+                {t.genImage && <img className="msg-img gen" src={t.genImage} alt="生成图" />}
                 {t.meta && <small className="meta">{renderMeta(t.meta)}</small>}
               </div>
             </div>
@@ -348,29 +388,55 @@ function ChatTab({
       </div>
 
       <div className="dock">
-        <div className="composer-pill">
-          <textarea
-            rows={2}
-            placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-            value={input}
-            disabled={busy}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                void send()
-              }
-            }}
-          />
-          {busy ? (
-            <button className="danger stop" onClick={stop}>
-              停止
+        <div className="composer-pill col">
+          <div className="attach-row">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={(e) => {
+                pickImage(e.target.files?.[0])
+                e.target.value = ''
+              }}
+            />
+            <button className="ghost clip" title="附一张输入图（模型需带视觉塔）" onClick={() => fileRef.current?.click()} disabled={busy}>
+              📎
             </button>
-          ) : (
-            <button className="send" onClick={() => void send()} disabled={!input.trim()}>
-              发送
-            </button>
-          )}
+            {attach && (
+              <span className="attach">
+                <img src={attach} alt="附件预览" />
+                <button className="attach-x" title="移除" onClick={() => setAttach('')}>
+                  ✕
+                </button>
+              </span>
+            )}
+            {attachErr && <span className="attach-err">{attachErr}</span>}
+          </div>
+          <div className="compose-line">
+            <textarea
+              rows={2}
+              placeholder="输入消息，Enter 发送，Shift+Enter 换行；📎 可附一张图"
+              value={input}
+              disabled={busy}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  void send()
+                }
+              }}
+            />
+            {busy ? (
+              <button className="danger stop" onClick={stop}>
+                停止
+              </button>
+            ) : (
+              <button className="send" onClick={() => void send()} disabled={!input.trim() && !attach}>
+                发送
+              </button>
+            )}
+          </div>
         </div>
       </div>
 

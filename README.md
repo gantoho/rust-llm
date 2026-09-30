@@ -714,7 +714,10 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 server（React + TS），浏览器打开 `http://localhost:5173` 即可可视化调接口——
 三个页签分别对应流式/非流式对话（带采样参数、原始 JSON、等价 cURL，每条回复
 底部显示耗时 / 停止原因 / token 数 / tok/s——速率为服务端实测值）、
-embeddings 向量化、health/status/models 状态总览。页面请求经 vite 代理
+embeddings 向量化、health/status/models 状态总览。对话页输入坞有 📎 按钮可
+附一张输入图（自动转 base64 data URI 挂在末条 `message.image_url` 上，需模型
+带视觉塔），回复里的生成图（`delta.image_url` / `message.image_url`）直接渲染
+在气泡中。页面请求经 vite 代理
 **同源转发**到 API 端口，因此不需要开 `--cors`；侧边栏的 API Key 由 serve 用
 `VITE_API_KEY` 自动注入——没给 `--api-key`（随机 key）时页面也开箱可用。
 首次使用先装依赖
@@ -732,19 +735,29 @@ embeddings 向量化、health/status/models 状态总览。页面请求经 vite 
 **客户端断开即中止**：客户端关掉连接后服务端立刻停止生成（不再对空连接烧
 CPU），日志打印 `客户端提前断开，生成已中止（N token）`。
 
+**图片理解（请求 `message.image_url`）**：配了 `model.vision` 的服务，把
+`messages` 末条 `user` 消息加一个 `image_url` 字段（`data:image/...;base64,...`
+data URI 或裸 base64 字符串）即可随文传一张输入图——服务端解码缩放到模型输入
+尺寸、注入 ViT 视觉塔，并把文本自动补成训练格式 `图:<|image|>{问题}`（已含
+`<|image|>` 字面量则原样使用）。只认末条 `user`，其它位置的 `image_url` 不生效；
+没配视觉塔、base64 非法或不是图片都会返回 400 并指明原因。图片理解与文字共用
+`/v1/chat/completions`，流式/非流式都支持。
+
 **图片生成（`message.image_url`）**：配了 `model.vq` 且 `{out_dir}/vq.ckpt`
 存在的服务，模型采出完整的图片段（图片 start + P 个码本 token + end）时，服务端
 用 VQ-VAE 解码成 PNG，以 `data:image/png;base64,...` 内嵌进非流式响应的
 `message[0].image_url` 字段（`content` 文本里保留 `<|image|>` 字面量）；没出图
-或没配 VQ-VAE 时该字段不出现，回包与纯文本服务逐字节一致。流式帧不带图——
-SSE 逐 token 下发，图片只在整段采完后才成立，要看图就用非流式请求。
-OpenAPI 规范里 `message` 的 schema 已同步声明该字段。
+或没配 VQ-VAE 时该字段不出现，回包与纯文本服务逐字节一致。流式下图片只在整段
+采完后才成立，因此在 `finish_reason` 帧**之前**单独发一帧只带
+`delta.image_url` 的增量帧，客户端拿到它即可展示。OpenAPI 规范里 `message`
+与 `delta` 的 schema 已同步声明该字段。
 
 **并发模型**：每请求一个线程处理 HTTP，但模型只有一份、生成串行排队
 （`/v1/status` 的 `queue.queued` 就是队列长度）——单机 CPU 推理时并行只会互相
 抢核心，排队反而让延迟曲线平稳。
 
-**限制**：请求体 ≤ 2 MB、`messages` ≤ 200 条且末条必须是 `user`、`n` 只接受 1、
+**限制**：请求体 ≤ 16 MB（图片走 base64，8 MB 原图约占 10.7 MB）、
+`messages` ≤ 200 条且末条必须是 `user`、`n` 只接受 1、
 `stop` ≤ 4 个且每个 ≤ 64 字节、embeddings 单批 ≤ 32 条；不认识的字段一律忽略
 （OpenAI SDK 才能直连），认识的字段严格校验并指明错在哪。
 
@@ -1352,9 +1365,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **260 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **263 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 270 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 273 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1906,7 +1919,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **260 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `260 passed; 0 failed`，release 全量约 43 秒；
+- **263 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `263 passed; 0 failed`，release 全量约 43 秒；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的

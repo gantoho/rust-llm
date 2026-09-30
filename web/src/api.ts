@@ -4,6 +4,8 @@
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
+  /** 输入图（base64 data URI），只在末条 user 消息上生效；后端没视觉塔会回 400 */
+  image_url?: string
 }
 
 export interface ChatParams {
@@ -91,6 +93,8 @@ export interface StreamCallbacks {
   onRole?: () => void
   /** 收到 content 增量 */
   onDelta: (text: string) => void
+  /** 收到生成图帧（finish 之前，delta.image_url = data URI） */
+  onImage?: (url: string) => void
   /** 收到 finish_reason 帧 */
   onFinish?: (reason: string) => void
   /** 收到 usage 帧（choices 为空数组的最后一帧） */
@@ -150,6 +154,7 @@ export async function chatStream(
         if (!choice) continue
         if (choice.delta?.role) cb.onRole?.()
         if (choice.delta?.content) cb.onDelta(choice.delta.content)
+        if (choice.delta?.image_url) cb.onImage?.(choice.delta.image_url)
         if (choice.finish_reason) cb.onFinish?.(choice.finish_reason)
       }
     }

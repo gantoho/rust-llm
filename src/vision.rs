@@ -86,9 +86,22 @@ impl VisionConfig {
 /// 读图 → 缩放到 `size × size` → CHW、[-1,1]
 pub fn load_image(path: &str, size: usize) -> Vec<f32> {
     let img = image::open(path).unwrap_or_else(|e| panic!("打开图片 {path} 失败: {e}"));
-    let rgb = img.to_rgb8();
+    to_chw(&img.to_rgb8(), size)
+}
+
+/// 内存字节（PNG/JPEG/WebP…）→ 缩放到 `size × size` → CHW、[-1,1]。
+///
+/// `serve` 收客户端上传的 `data:image/...;base64,...` 时用它，解码失败回 400 而不是 panic；
+/// 输出与 [`load_image`] 完全一致（同一套缩放与归一化）。
+pub fn decode_image_bytes(bytes: &[u8], size: usize) -> Result<Vec<f32>, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
+    Ok(to_chw(&img.to_rgb8(), size))
+}
+
+/// RGB → 缩放 `size × size` → CHW、[-1,1]（文件与内存两条解码路径共用）
+fn to_chw(rgb: &image::RgbImage, size: usize) -> Vec<f32> {
     let resized = image::imageops::resize(
-        &rgb,
+        rgb,
         size as u32,
         size as u32,
         image::imageops::FilterType::Triangle,

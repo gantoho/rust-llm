@@ -35,8 +35,9 @@ use crate::runlog;
 use crate::sample::{Generator, KvOpts, SampleOpts, StopReason};
 use crate::tokenizer::Tokenizer;
 
-/// 请求体上限：本项目的 prompt 预算也就上下文窗口那么大，2 MB 绰绰有余
-const MAX_BODY: usize = 2 * 1024 * 1024;
+/// 请求体上限：纯文本 prompt 也就上下文窗口那么大，但 `message.image_url`
+/// 要装下整张图的 base64（8 MB 原图 ≈ 10.7 MB 文本），所以放宽到 16 MB
+const MAX_BODY: usize = 16 * 1024 * 1024;
 /// 单次请求最多带多少条消息（防止有人拿一万个 message 把内存撑爆）
 const MAX_MESSAGES: usize = 200;
 /// 单次请求最多带几个 `stop` 字符串
@@ -75,6 +76,9 @@ pub struct ServeCfg {
     pub sample: SampleOpts,
     /// 上下文窗口（用于限制 `max_tokens` 与 embedding 输入长度）
     pub block_size: usize,
+    /// 视觉塔超参（`model.vision`）：`Some` 时 `message.image_url` 可用；
+    /// 解码图片要缩放归一化，放配置里让请求线程不占模型锁。纯文本模型为 `None`
+    pub vision: Option<crate::vision::VisionConfig>,
 }
 
 /// 独占的模型核心：一次只有一个线程能碰到它
@@ -375,6 +379,85 @@ pub fn random_api_key() -> String {
         out.push_str(&format!("{:016x}", h.finish()));
     }
     out
+}
+
+/// [`b64encode`] 的逆：标准 base64 → 字节（忽略空白，校验 `=` 填充位置）。
+/// 非法输入返回 `Err` 文案，由调用方转成 400。
+fn b64decode(s: &str) -> Result<Vec<u8>, String> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rev = [255u8; 256];
+    for (i, &c) in T.iter().enumerate() {
+        rev[c as usize] = i as u8;
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut nbits = 0u32;
+    let mut padded = false;
+    for ch in s.bytes() {
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+        if ch == b'=' {
+            padded = true;
+            continue;
+        }
+        if padded {
+            return Err("base64 的 = 填充后面还有数据".to_string());
+        }
+        let v = rev[ch as usize];
+        if v == 255 {
+            return Err(format!("base64 含非法字符「{}」", ch as char));
+        }
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// 把请求里的 `message.image_url` 解成模型要的像素，并把问题补成训练时的理解样本格式。
+///
+/// - 文本：训练样本 human 是 `图:<|image|>{问题}`；用户没自带 `<|image|>` 就按同一格式补
+/// - 图片：data URI 剥掉 `data:...;base64,` 前缀（没前缀当裸 base64），解码后
+///   走 [`crate::vision::decode_image_bytes`]（与 `vision::load_image` 同一条
+///   缩放/归一化路径），失败回 400 而不是 panic。
+///
+/// 必须在 `with_core` **外面**调用：解码错误要干净地回 400，而 `with_core`
+/// 的闭包只能靠 panic 报错（见该函数文档）。
+fn prepare_vision(
+    vcfg: Option<&crate::vision::VisionConfig>,
+    input: &str,
+    image: Option<&str>,
+) -> Result<(String, Option<Vec<f32>>), ApiError> {
+    let Some(uri) = image else {
+        return Ok((input.to_string(), None));
+    };
+    let Some(vcfg) = vcfg else {
+        return Err(bad("当前模型没有视觉塔（config 的 model.vision 缺席），无法接受图片输入"));
+    };
+    let text = if input.contains(crate::tokenizer::IMAGE_LITERAL) {
+        input.to_string()
+    } else {
+        format!("图:{}{input}", crate::tokenizer::IMAGE_LITERAL)
+    };
+    let b64 = match uri.strip_prefix("data:") {
+        Some(rest) => {
+            let (head, tail) = rest.split_once(',').ok_or_else(|| {
+                bad("data URI 缺少 `,` 分隔符（形如 data:image/png;base64,<base64>）")
+            })?;
+            if !head.to_ascii_lowercase().contains("base64") {
+                return Err(bad("message.image_url 目前只支持 base64 编码（`;base64,`）"));
+            }
+            tail
+        }
+        None => uri,
+    };
+    let bytes = b64decode(b64).map_err(|e| bad(format!("message.image_url 解码失败：{e}")))?;
+    let px = crate::vision::decode_image_bytes(&bytes, vcfg.image_size).map_err(bad)?;
+    Ok((text, Some(px)))
 }
 
 /// 校验 `Authorization: Bearer <key>`
@@ -867,7 +950,11 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                             "enum": ["system", "developer", "user", "assistant"],
                             "description": "system/developer 汇成人设，最后一条必须是 user"
                         },
-                        "content": { "type": "string" }
+                        "content": { "type": "string" },
+                        "image_url": {
+                            "type": "string",
+                            "description": "可选；只认最后一条 user 消息。输入图的 base64 data URI（data:image/png;base64,...）或裸 base64；服务配了视觉塔（config 的 model.vision）才接受，否则 400"
+                        }
                     }
                 },
                 "ChatCompletionRequest": {
@@ -964,10 +1051,14 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                                     "index": { "type": "integer", "const": 0 },
                                     "delta": {
                                         "type": "object",
-                                        "description": "首帧只有 role+空 content，其后是增量 content",
+                                        "description": "首帧只有 role+空 content，其后是增量 content；finish 前可能有一帧只带 image_url（生成图片的 data URI）",
                                         "properties": {
                                             "role": { "type": "string" },
-                                            "content": { "type": "string" }
+                                            "content": { "type": "string" },
+                                            "image_url": {
+                                                "type": "string",
+                                                "description": "生成图片的 data:image/png;base64 URI；仅当模型采出完整图片段且服务配了 vq.ckpt 时出现"
+                                            }
                                         }
                                     },
                                     "finish_reason": { "type": ["string", "null"], "enum": ["stop", "length", null] }
@@ -1179,6 +1270,8 @@ struct ChatJob {
     history_turns: usize,
     /// 末条 user 消息
     input: String,
+    /// 末条 user 消息带的输入图（`image_url` 字段，`None` = 纯文本请求）
+    image: Option<String>,
     max_tokens: usize,
     sample: SampleOpts,
     /// 请求指定的种子；`None` = 用服务级 `--seed`
@@ -1230,6 +1323,19 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
     if msgs.last().map(|(r, _)| r.as_str()) != Some("user") {
         return Err(bad("messages 的最后一条必须是 role=user"));
     }
+
+    // ---- 输入图（只认末条 user 的 image_url）----
+    // null 当没带；非字符串是客户端拼包错误，直接指出字段名
+    let image = match arr.last().and_then(|m| m.get("image_url")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                return Err(bad("message.image_url 不能为空字符串"));
+            }
+            Some(s.clone())
+        }
+        Some(_) => return Err(bad("message.image_url 必须是字符串（data URI 或裸 base64）")),
+    };
 
     // 历史条数 = 非 system 消息去掉末条 user（问答日志用，只记条数不记全文）
     let history_turns =
@@ -1326,6 +1432,7 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         history,
         history_turns,
         input,
+        image,
         max_tokens,
         sample,
         seed,
@@ -1521,6 +1628,10 @@ fn b64encode(bytes: &[u8]) -> String {
 
 fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
     let system = merge_system(&state.cfg.system, &job.system);
+    // 输入图先解码（锁外、可回 400）：图解不出来就不进生成队列。
+    // 训练格式补全也在完成——`input` 是补过 `图:<|image|>` 的版本，日志仍记原始 `job.input`
+    let (input, pixels) =
+        prepare_vision(state.cfg.vision.as_ref(), &job.input, job.image.as_deref())?;
     let max_tokens = job.max_tokens;
     // 给生成预留 max_new，剩下的才是输入预算（见 prompt::assemble 的分配顺序）
     let prompt_budget = state.cfg.block_size.saturating_sub(max_tokens);
@@ -1532,12 +1643,16 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         // 拆开字段借用：`Generator` 同时要 `&Transformer` / `&Tokenizer` 和 `&mut Rng`，
         // 直接借 `core` 会因为"一个可变 + 两个共享"打架
         let Core { model, tokenizer, rng: shared_rng } = core;
-        let a = prompt::assemble(tokenizer, &system, &job.history, &job.input, use_sft, prompt_budget);
+        let a = prompt::assemble(tokenizer, &system, &job.history, &input, use_sft, prompt_budget);
         let rng = match owned_rng.as_mut() {
             Some(r) => r,
             None => shared_rng,
         };
         let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
+        // 图片理解：像素已在锁外解码好，这里只是挂上（prefill 时视觉塔覆写占位符）
+        if let Some(px) = pixels.as_ref() {
+            g = g.with_pixels(px.clone());
+        }
         let n_prompt = g.prompt_tokens();
         // 与 `g.run()` 等价的手写循环：多拿一个「prefill 结束」的计时点（见 DecodeTimer）
         let mut timer = DecodeTimer::new();
@@ -1706,6 +1821,8 @@ struct StreamOutcome {
     aborted: bool,
     /// 纯解码段速率（tok/s），样本不足时为 None
     rate: Option<f64>,
+    /// 生成出的码本段（锁外用 VQ 解码成 data URI，在 finish 帧之前发出）
+    imgs: Vec<Vec<usize>>,
 }
 
 fn stream_reply(req: Request, state: &Arc<State>, job: ChatJob) -> u16 {
@@ -1748,15 +1865,43 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     let kv = state.cfg.kv;
     let mut owned_rng = job.seed.map(Rng::new);
 
+    // 输入图解码（锁外）。响应头已是 200，出错只能走 SSE 报错：error 帧 + [DONE]
+    let (input, pixels) =
+        match prepare_vision(state.cfg.vision.as_ref(), &job.input, job.image.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(sse(&e.to_value().to_string()));
+                let _ = tx.send(b"data: [DONE]\n\n".to_vec());
+                let note = format!("图片输入错误：{}", e.message);
+                log_qa(
+                    &job,
+                    &QaOutcome {
+                        system: &system,
+                        output: "",
+                        reason: None,
+                        n_prompt: 0,
+                        n_gen: 0,
+                        rate: None,
+                        note: Some(&note),
+                    },
+                );
+                return;
+            }
+        };
+
     let res = with_core(&state, |core| {
         let Core { model, tokenizer, rng: shared_rng } = core;
-        let a = prompt::assemble(tokenizer, &system, &job.history, &job.input, use_sft, prompt_budget);
+        let a = prompt::assemble(tokenizer, &system, &job.history, &input, use_sft, prompt_budget);
         let trimmed = a.trimmed;
         let rng = match owned_rng.as_mut() {
             Some(r) => r,
             None => shared_rng,
         };
         let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
+        // 图片理解：像素已在锁外解码好，这里只是挂上（prefill 时视觉塔覆写占位符）
+        if let Some(px) = pixels.as_ref() {
+            g = g.with_pixels(px.clone());
+        }
         let n_prompt = g.prompt_tokens();
 
         let mut timer = DecodeTimer::new();
@@ -1777,6 +1922,7 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
                     trimmed,
                     aborted: true,
                     rate: timer.rate(n_gen),
+                    imgs: Vec::new(),
                 };
             }
         }
@@ -1784,10 +1930,12 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
         let tail = g.flush();
         let n_gen = g.generated_tokens();
         let rate = timer.rate(n_gen);
+        // 图片生成：完整码本段留下，VQ 解码放到锁外做（见 finish 帧之前那段）
+        let imgs = g.generated_images();
         let out = g.into_output();
         let aborted = !tail.is_empty()
             && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": tail }), None))).is_err();
-        StreamOutcome { n_prompt, n_gen, reason: out.reason, text: out.generated, trimmed, aborted, rate }
+        StreamOutcome { n_prompt, n_gen, reason: out.reason, text: out.generated, trimmed, aborted, rate, imgs }
     });
 
     let outcome = match res {
@@ -1832,6 +1980,13 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     }
     if let Some((before, after)) = outcome.trimmed {
         logln!("[serve] 历史超出输入预算：{before} → {after} token（预算 {prompt_budget}）");
+    }
+    // 图片生成：锁外解码成 data URI，在 finish 帧**之前**发一个 image_url delta 帧
+    // （客户端在 `delta.image_url` 里拿到真图，与非流式 `message.image_url` 同源）
+    if let Some(uri) = generated_image_uri(state.vq.as_ref(), &outcome.imgs)
+        && tx.send(sse(&delta_chunk(&state, &id, json!({ "image_url": uri }), None))).is_err()
+    {
+        return;
     }
     let fr = finish_of(outcome.reason);
     let _ = tx.send(sse(&delta_chunk(&state, &id, json!({}), Some(fr))));
@@ -2114,6 +2269,15 @@ pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer, vq: Option<c
 
     logln!("[serve] 已监听 http://{addr}");
     logln!("[serve] 模型 {model_name}（上下文窗口 {block_size}）");
+    // 图片输入通路状态：与 main 的 runlog 行同源，控制台一眼能看出能不能传图
+    match &state.cfg.vision {
+        Some(v) => logln!(
+            "[serve] 视觉塔已启用（输入 {}px、patch {}px）：message.image_url 可用",
+            v.image_size,
+            v.patch_size
+        ),
+        None => logln!("[serve] 视觉塔未配置：不接受图片输入"),
+    }
     // 接口规范静态版：与端点同一份数据，启动即写（删了也会自动重建）
     dump_openapi_files("openapi", &state.cfg);
     logln!(
@@ -2167,7 +2331,15 @@ mod tests {
             model_name: "test-model".into(),
             sample,
             block_size: 512,
+            vision: None,
         }
+    }
+
+    /// 带视觉塔的配置（测 image_url 通路；64px / patch 16 → 每图 16 个占位符）
+    fn vision_cfg() -> ServeCfg {
+        let mut c = cfg(true);
+        c.vision = Some(crate::vision::VisionConfig::default());
+        c
     }
 
     fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -2270,6 +2442,89 @@ mod tests {
         assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"top_p":0}"#, &c).is_err());
         // 非法 stop 元素
         assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"stop":[1]}"#, &c).is_err());
+    }
+
+    /// `message.image_url` 的解析规则：只认末条 user，null 当没带，非字符串/空串 400
+    #[test]
+    fn parse_chat_reads_image_url() {
+        let c = vision_cfg();
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"这是什么","image_url":"data:image/png;base64,AAAA"}]}"#,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(job.image.as_deref(), Some("data:image/png;base64,AAAA"));
+
+        // 不带字段 / 显式 null → 纯文本请求
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c).unwrap();
+        assert!(job.image.is_none());
+        let job =
+            parse_chat(r#"{"messages":[{"role":"user","content":"q","image_url":null}]}"#, &c)
+                .unwrap();
+        assert!(job.image.is_none());
+
+        // 中间消息带图不算数（只认末条 user）
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q1","image_url":"data:image/png;base64,AAAA"},
+                            {"role":"assistant","content":"a1"},
+                            {"role":"user","content":"q2"}]}"#,
+            &c,
+        )
+        .unwrap();
+        assert!(job.image.is_none());
+
+        // 非字符串 / 空串 → 400
+        assert!(parse_chat(
+            r#"{"messages":[{"role":"user","content":"q","image_url":123}]}"#,
+            &c
+        )
+        .is_err());
+        assert!(parse_chat(
+            r#"{"messages":[{"role":"user","content":"q","image_url":""}]}"#,
+            &c
+        )
+        .is_err());
+    }
+
+    /// 输入图解码：补训练格式、像素归一化、各类坏输入回 400 而不是 panic
+    #[test]
+    fn prepare_vision_decodes_and_formats_prompt() {
+        // 没带图：原样透传（视觉塔缺席也不碍事）
+        let (t, px) = prepare_vision(None, "你好", None).unwrap();
+        assert_eq!(t, "你好");
+        assert!(px.is_none());
+
+        // 带图但模型没视觉塔 → 400
+        assert!(prepare_vision(None, "q", Some("AAAA")).is_err());
+
+        // 真图（64px PNG，与 VisionConfig::default 对齐）→ 3×64×64、值域 [-1,1]
+        let vcfg = crate::vision::VisionConfig::default();
+        let px_in: Vec<f32> = (0..3 * 64 * 64).map(|i| (i % 255) as f32 / 127.5 - 1.0).collect();
+        let png = crate::vision::encode_png(&px_in, 64);
+        let uri = format!("data:image/png;base64,{}", b64encode(&png));
+
+        let (t, px) = prepare_vision(Some(&vcfg), "这是什么颜色？", Some(&uri)).unwrap();
+        // 问题被补成训练时的理解样本格式 `图:<|image|>{问题}`
+        assert_eq!(t, format!("图:{}这是什么颜色？", crate::tokenizer::IMAGE_LITERAL));
+        let px = px.unwrap();
+        assert_eq!(px.len(), 3 * 64 * 64);
+        assert!(px.iter().all(|v| (-1.0..=1.0).contains(v)), "像素必须在 [-1,1]");
+
+        // 已自带占位符：不重复补前缀
+        let q = format!("看图{}说颜色", crate::tokenizer::IMAGE_LITERAL);
+        let (t, _) = prepare_vision(Some(&vcfg), &q, Some(&uri)).unwrap();
+        assert_eq!(t, q);
+
+        // 裸 base64（无 data: 前缀）也认
+        let (t, px) = prepare_vision(Some(&vcfg), "q", Some(&b64encode(&png))).unwrap();
+        assert!(t.starts_with("图:"));
+        assert!(px.is_some());
+
+        // 坏 base64 / 合法 base64 但不是图 / 非 base64 的 data URI → 全部 400
+        assert!(prepare_vision(Some(&vcfg), "q", Some("data:image/png;base64,!!!")).is_err());
+        assert!(prepare_vision(Some(&vcfg), "q", Some("data:image/png;base64,AAAA")).is_err());
+        assert!(prepare_vision(Some(&vcfg), "q", Some("data:image/png,abc")).is_err());
+        assert!(prepare_vision(Some(&vcfg), "q", Some("data:image/png;base64")).is_err());
     }
 
     #[test]
@@ -2659,6 +2914,24 @@ mod tests {
         assert_eq!(b64encode(b"hello"), "aGVsbG8=");
         // 高位字节（UTF-8 中文）也走同一张表
         assert_eq!(b64encode("中".as_bytes()), "5Lit");
+    }
+
+    /// b64decode 是 b64encode 的逆：RFC 向量 + 任意字节往返 + MIME 换行 + 坏输入
+    #[test]
+    fn b64decode_inverts_b64encode() {
+        assert_eq!(b64decode("").unwrap(), Vec::<u8>::new());
+        assert_eq!(b64decode("TQ==").unwrap(), b"M");
+        assert_eq!(b64decode("TWE=").unwrap(), b"Ma");
+        assert_eq!(b64decode("TWFu").unwrap(), b"Man");
+        assert_eq!(b64decode("aGVsbG8=").unwrap(), b"hello");
+        // 256 种字节全量往返
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(b64decode(&b64encode(&all)).unwrap(), all);
+        // 空白（MIME 风格换行）忽略
+        assert_eq!(b64decode("TW\r\nFu").unwrap(), b"Man");
+        // 非法字符、填充后再有数据
+        assert!(b64decode("!!").is_err());
+        assert!(b64decode("TQ==Q").is_err());
     }
 
     /// 生成图 data URI 端到端：tiny VQ-VAE 解码码本段 → PNG → base64；

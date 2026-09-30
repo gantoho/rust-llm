@@ -1321,6 +1321,20 @@ fn cmd_serve(
             ("prompt 模板", prompt_format.to_string()),
             ("每轮最大新 token", max_new.to_string()),
             ("上下文窗口", block_size.to_string()),
+            (
+                "视觉塔（图片输入）",
+                match &model.cfg.vision {
+                    Some(v) => format!(
+                        "已启用：输入 {}×{}、patch {}×{}、每图 {} 个占位符（请求带 message.image_url 即可传图）",
+                        v.image_size,
+                        v.image_size,
+                        v.patch_size,
+                        v.patch_size,
+                        v.patch_count()
+                    ),
+                    None => "未配置（config 的 model.vision 缺席，不接受图片输入）".to_string(),
+                },
+            ),
             ("seed", seed.to_string()),
             ("temperature", opts.temperature.to_string()),
             ("top_k", opts.top_k.to_string()),
@@ -1391,6 +1405,7 @@ fn cmd_serve(
             model_name,
             sample: opts,
             block_size,
+            vision: model.cfg.vision.clone(),
         },
         model,
         tokenizer,

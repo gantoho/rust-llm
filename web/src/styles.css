@@ -599,6 +599,82 @@ a {
   padding: 9px 18px;
 }
 
+/* 竖排输入坞：附件行在上、输入行在下 */
+.composer-pill.col {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.attach-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 0;
+}
+
+.composer-pill .clip {
+  padding: 3px 8px;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 8px;
+}
+
+/* 附件缩略图 + 移除按钮 */
+.attach {
+  position: relative;
+  display: inline-flex;
+  line-height: 0;
+}
+
+.attach img {
+  height: 40px;
+  max-width: 120px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+}
+
+.attach-x {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 10px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+
+.attach-err {
+  font-size: 12px;
+  color: var(--rose, #f87171);
+}
+
+.compose-line {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+/* 气泡里的输入图 / 生成图 */
+.msg-img {
+  display: block;
+  max-width: 240px;
+  max-height: 240px;
+  border-radius: 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--line);
+}
+
+.msg-img.gen {
+  margin: 6px 0 0;
+  border-color: rgba(109, 92, 255, 0.5);
+}
+
 /* ============ 抽屉 ============ */
 
 .scrim {

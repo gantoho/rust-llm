@@ -32,9 +32,12 @@ components:
           items:
             properties:
               delta:
-                description: 首帧只有 role+空 content，其后是增量 content
+                description: 首帧只有 role+空 content，其后是增量 content；finish 前可能有一帧只带 image_url（生成图片的 data URI）
                 properties:
                   content:
+                    type: string
+                  image_url:
+                    description: "生成图片的 data:image/png;base64 URI；仅当模型采出完整图片段且服务配了 vq.ckpt 时出现"
                     type: string
                   role:
                     type: string
@@ -155,6 +158,9 @@ components:
                 properties:
                   content:
                     type: string
+                  image_url:
+                    description: "生成图片的 data:image/png;base64 URI；只有模型采出完整图片段且服务配了 vq.ckpt 时才有此字段"
+                    type: string
                   role:
                     const: assistant
                     type: string
@@ -185,6 +191,9 @@ components:
     ChatMessage:
       properties:
         content:
+          type: string
+        image_url:
+          description: "可选；只认最后一条 user 消息。输入图的 base64 data URI（data:image/png;base64,...）或裸 base64；服务配了视觉塔（config 的 model.vision）才接受，否则 400"
           type: string
         role:
           description: system/developer 汇成人设，最后一条必须是 user
