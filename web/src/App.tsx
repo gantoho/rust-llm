@@ -23,6 +23,22 @@ interface Turn {
   imageUrl?: string
   /** 模型本轮生成的图（delta.image_url / message.image_url，data URI） */
   genImage?: string
+  /** 收尾原因（finish_reason：stop/length…；'error' = 请求失败）——空/截断轮下次不写回历史 */
+  stopReason?: string
+}
+
+// 空 / 被截断 / 失败的助手轮**不写回历史**（连同紧跟的 user 轮一起丢）：
+// 训练语料里没有「助手：\n\n用户：」这种空示范，把空回复喂回去，模型看到
+// in-context 示范会跟着沉默，下一轮第一步就采到 EOS（见 main.rs 多轮重试的同款处理）。
+function historyTurns(turns: Turn[]): Turn[] {
+  const out: Turn[] = []
+  for (const t of turns) {
+    const blank = !t.content.trim() && !t.genImage
+    const bad = t.role === 'assistant' && (blank || t.stopReason === 'length' || t.stopReason === 'error')
+    if (bad) out.pop() // 丢掉紧邻它前面的那条 user 轮
+    else out.push(t)
+  }
+  return out
 }
 
 const DEFAULT_PARAMS: ChatParams = {
@@ -221,9 +237,11 @@ function ChatTab({
     setRaw('')
 
     // 拼历史：只保留 user/assistant 轮次，末条必为 user（服务端强校验）；
-    // 输入图只挂在末条 user 的 image_url 上（服务端只认末条）
+    // 输入图只挂在末条 user 的 image_url 上（服务端只认末条）。
+    // 空/截断/失败的助手轮经 historyTurns 剔除（页面上仍显示，只是不进下一轮上下文）
+    const prior = historyTurns(turns)
     const history: ChatMessage[] = [
-      ...turns.map(({ role, content }) => ({ role, content })),
+      ...prior.map(({ role, content }) => ({ role, content })),
       { role: 'user', content: question, image_url: attach || undefined },
     ]
     const next: Turn[] = [
@@ -281,6 +299,7 @@ function ChatTab({
         patchLast((t) => ({
           ...t,
           streaming: false,
+          stopReason: finish || undefined,
           meta: `${elapsed()}s · ${finish || 'stop'}${
             usage ? ` · ${usage.completion_tokens} tokens` : ''
           }${rate !== null ? ` · ${rate.toFixed(1)} tok/s` : ''}`,
@@ -300,6 +319,7 @@ function ChatTab({
           content: text,
           genImage: genImage || undefined,
           streaming: false,
+          stopReason: resp.choices?.[0]?.finish_reason ?? undefined,
           meta: `${elapsed()}s · ${resp.choices?.[0]?.finish_reason ?? 'stop'}${
             u ? ` · ${u.completion_tokens} tokens` : ''
           }${rate}`,
@@ -310,6 +330,8 @@ function ChatTab({
       patchLast((t) => ({
         ...t,
         streaming: false,
+        // 请求失败 = 半截话，同样不写回历史
+        stopReason: 'error',
         meta: `失败：${(e as Error).message}`,
       }))
     } finally {
