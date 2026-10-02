@@ -59,6 +59,37 @@ pub struct TrainConfig {
     /// 始终在 f32 下计算（master weights 语义）。与 [`TrainConfig::amp`] 独立，
     /// 两者可同时开。详见 [`crate::tensor::Tensor::to_bf16`]。
     pub bf16: bool,
+    /// FP8 权重存储**模拟**开关：开启后每步参数更新完，把所有二维权重矩阵按
+    /// E4M3 + 每 32 个元素一个 scale 往返量化一次（模拟"权重以 FP8 精度存储"）。
+    ///
+    /// ⚠️ 这**不会快任何一点**：本仓库算子全在 CPU 的 f32 上跑，真实 FP8 训练收益来自
+    /// GPU 的 FP8 tensor core。这里只做数值模拟，用来量出"权重掉到 8 位后模型损失多少精度"。
+    /// 详见 [`crate::fp8`]。
+    pub fp8: bool,
+    /// 学习率调度曲线（见 [`crate::train::LRScheduler`]）：
+    /// - `"cosine"`（默认）：warmup → cosine 衰减，行为与加 WSD 之前**逐位一致**；
+    /// - `"wsd"`：warmup → 恒定（stable）→ 末段线性退火（decay）。
+    ///
+    /// WSD（warmup-stable-decay）是 MiniCPM / DeepSeek 等使用的调度：稳定段保持峰值学习率
+    /// 充分学习，最后一段快速退火收敛。它的额外好处是**总步数不必一开始就定死**——
+    /// 稳定段任意时刻都能切出来退火，续训实验成本低得多。
+    pub lr_schedule: String,
+    /// WSD 退火段的比例：占"扣除 warmup 之后剩余步数"的比例，默认 `0.1`。
+    /// 只对 `lr_schedule = "wsd"` 生效；实际退火步数至少 1 步。
+    pub wsd_decay_frac: f32,
+    /// 优化器选择（见 [`crate::optim`]）：
+    /// - `"adamw"`（默认）：全套 AdamW，行为与加 Muon 之前**逐位一致**；
+    /// - `"muon"`：二维权重矩阵走 Muon（动量矩阵 Newton–Schulz 正交化），
+    ///   一维参数（bias、RMSNorm 的 γ）自动回退 AdamW。
+    ///
+    /// ⚠️ Muon 的每元素更新量约 `lr/√cols`，要比 AdamW 大 `√cols` 倍才等效，
+    /// 直接套用 `max_lr` 会几乎不动（见 [`crate::optim::Muon`] 的说明）。
+    pub optimizer: String,
+    /// Muon 的动量系数 μ（默认 0.95），只对 `optimizer = "muon"` 生效。
+    pub muon_momentum: f32,
+    /// Muon 的 Newton–Schulz 迭代步数（默认 5），只对 `optimizer = "muon"` 生效。
+    /// 步数越多正交化越充分、也越慢；5 是 Muon 论文/参考实现的推荐值。
+    pub muon_ns_steps: usize,
     pub eval_every: usize,        // 每 N 步评估一次验证集并保存 latest checkpoint
     pub eval_iters: usize,        // 评估时采样的批数
     pub tokenizer: String,        // "char" 字符级 / "bpe" BPE
@@ -234,6 +265,12 @@ impl Default for TrainConfig {
             amp_init_scale_log2: 16,
             amp_growth_interval: 2000,
             bf16: false,
+            fp8: false,
+            lr_schedule: "cosine".to_string(),
+            wsd_decay_frac: 0.1,
+            optimizer: "adamw".to_string(),
+            muon_momentum: 0.95,
+            muon_ns_steps: 5,
             eval_every: 100,
             eval_iters: 20,
             tokenizer: "bpe".to_string(),
@@ -312,6 +349,27 @@ impl Config {
             t.amp_growth_interval >= 1,
             "train.amp_growth_interval 必须 >= 1（用于累计无溢出步数）"
         );
+        assert!(
+            matches!(t.lr_schedule.as_str(), "cosine" | "wsd"),
+            "train.lr_schedule 只支持 \"cosine\" 或 \"wsd\"，当前是 \"{}\"",
+            t.lr_schedule
+        );
+        assert!(
+            t.wsd_decay_frac > 0.0 && t.wsd_decay_frac <= 1.0,
+            "train.wsd_decay_frac（{}）必须在 (0, 1] 之间",
+            t.wsd_decay_frac
+        );
+        assert!(
+            matches!(t.optimizer.as_str(), "adamw" | "muon"),
+            "train.optimizer 只支持 \"adamw\" 或 \"muon\"，当前是 \"{}\"",
+            t.optimizer
+        );
+        assert!(
+            t.muon_momentum >= 0.0 && t.muon_momentum < 1.0,
+            "train.muon_momentum（{}）必须在 [0, 1) 之间",
+            t.muon_momentum
+        );
+        assert!(t.muon_ns_steps >= 1, "train.muon_ns_steps 必须 >= 1");
         assert!(t.bpe_vocab >= 256, "train.bpe_vocab 必须 >= 256（字节级基础词表）");
         // 模型参数
         assert!(m.n_embd >= 1, "model.n_embd 必须 >= 1");
@@ -323,6 +381,18 @@ impl Config {
         if m.n_kv_head > 0 {
             assert!(m.n_kv_head <= m.n_head, "model.n_kv_head（{}）不能大于 model.n_head（{}）", m.n_kv_head, m.n_head);
             assert!(m.n_head % m.n_kv_head == 0, "model.n_head（{}）必须能被 model.n_kv_head（{}）整除", m.n_head, m.n_kv_head);
+        }
+        // MLA（低秩压缩 KV cache）：0 = 关闭；开启时必须真的比 K/V 的完整维度小，
+        // 否则"压缩"名不副实（缓存只会更大，还平白多一层投影）。
+        if m.kv_lora_rank > 0 {
+            let n_kv = if m.n_kv_head == 0 { m.n_head } else { m.n_kv_head };
+            let kv_dim = n_kv * (m.n_embd / m.n_head);
+            assert!(
+                m.kv_lora_rank < kv_dim,
+                "model.kv_lora_rank（{}）必须小于 K/V 的完整维度（{} = n_kv_head × head_dim）",
+                m.kv_lora_rank,
+                kv_dim
+            );
         }
         // LoRA
         if let Some(ref lora) = t.lora {

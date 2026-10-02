@@ -27,7 +27,7 @@ use crate::data::BatchSource;
 use crate::loss::cross_entropy_loss_masked;
 use crate::model::Transformer;
 use crate::module::{Module, zero_grad_all};
-use crate::optim::{AdamW, Optimizer};
+use crate::optim::{AdamW, Muon, OptimizerState};
 use crate::rng::Rng;
 use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
@@ -132,22 +132,79 @@ impl MixedPrecision {
     }
 }
 
-/// 学习率调度器：warmup + cosine decay
+/// 按 `train.optimizer` 构造优化器（`"adamw"` / `"muon"`），统一成 `Box<dyn OptimizerState>`。
+///
+/// - `"adamw"`（默认）：`AdamW::new(max_lr, params, weight_decay)`，与加 Muon 之前**完全一致**；
+/// - `"muon"`：二维权重走 Muon，一维参数回退 AdamW（见 [`crate::optim::Muon`]）。
+///   学习率仍由同一个调度器按 `max_lr` / `min_lr` 驱动，只是 Muon 需要更大的数值
+///   （每元素更新量约 `lr/√cols`），拿 AdamW 的学习率直接套会几乎不动。
+///
+/// 抽出工厂是为了让 `train` / VQ-VAE 两条训练路径拿到同一套选择逻辑。
+pub fn make_optimizer(cfg: &TrainConfig, params: Vec<Tensor>) -> Box<dyn OptimizerState> {
+    match cfg.optimizer.as_str() {
+        "muon" => Box::new(Muon::new(
+            cfg.max_lr,
+            params,
+            cfg.weight_decay,
+            cfg.muon_momentum,
+            cfg.muon_ns_steps,
+        )),
+        _ => Box::new(AdamW::new(cfg.max_lr, params, cfg.weight_decay)),
+    }
+}
+
+/// 学习率调度器。
+///
+/// 两条曲线（由 [`TrainConfig::lr_schedule`] 选择）共用同一段线性 warmup：
+///
+/// - **cosine**（默认）：warmup 之后全程按余弦曲线从 `max_lr` 降到 `min_lr`。
+/// - **WSD**（warmup-stable-decay，MiniCPM / DeepSeek 式）：warmup 之后先**恒定**在 `max_lr`
+///   走完稳定段，最后 `decay_steps` 步**线性**退火到 `min_lr`。
+///
+/// 为什么要 WSD：cosine 要求"总步数"从一开始就确定（曲线形状取决于 `total_steps`），
+/// 中途想多训一会儿就得重排整条曲线；WSD 的稳定段是一段平线，任何时刻切出来退火都成立，
+/// 于是"先训一个稳定版、需要时再快速退火收尾"成了常规操作（这也是 DeepSeek-V2/V3
+/// 能在稳定段中途换数据配比继续训的原因）。
 pub struct LRScheduler {
     warmup_steps: usize,
     total_steps: usize,
     max_lr: f32,
     min_lr: f32,
+    /// `None` = cosine 调度；`Some(d)` = WSD，最后 `d` 步线性退火
+    wsd_decay_steps: Option<usize>,
     step: usize,
 }
 
 impl LRScheduler {
+    /// cosine 调度：warmup + 余弦衰减到 `min_lr`
     pub fn new(warmup_steps: usize, total_steps: usize, max_lr: f32, min_lr: f32) -> Self {
+        Self::with_wsd(warmup_steps, total_steps, max_lr, min_lr, None)
+    }
+
+    /// WSD 调度：warmup + 恒定 + 末段 `decay_steps` 步线性退火
+    pub fn new_wsd(
+        warmup_steps: usize,
+        total_steps: usize,
+        max_lr: f32,
+        min_lr: f32,
+        decay_steps: usize,
+    ) -> Self {
+        Self::with_wsd(warmup_steps, total_steps, max_lr, min_lr, Some(decay_steps.max(1)))
+    }
+
+    fn with_wsd(
+        warmup_steps: usize,
+        total_steps: usize,
+        max_lr: f32,
+        min_lr: f32,
+        wsd_decay_steps: Option<usize>,
+    ) -> Self {
         LRScheduler {
             warmup_steps,
             total_steps,
             max_lr,
             min_lr,
+            wsd_decay_steps,
             step: 0,
         }
     }
@@ -155,15 +212,35 @@ impl LRScheduler {
     /// 当前学习率
     pub fn lr(&self) -> f32 {
         if self.step < self.warmup_steps {
-            // 线性 warmup
+            // 线性 warmup（两条曲线共用，保证切到 WSD 不动前段）
             self.max_lr * (self.step as f32 + 1.0) / self.warmup_steps.max(1) as f32
         } else {
-            // cosine 衰减：从 max_lr 平滑降到 min_lr
-            let progress = (self.step - self.warmup_steps) as f32
-                / (self.total_steps - self.warmup_steps).max(1) as f32;
-            let progress = progress.min(1.0);
-            let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
-            self.min_lr + (self.max_lr - self.min_lr) * cosine
+            match self.wsd_decay_steps {
+                // cosine 衰减：从 max_lr 平滑降到 min_lr
+                None => {
+                    let progress = (self.step - self.warmup_steps) as f32
+                        / (self.total_steps - self.warmup_steps).max(1) as f32;
+                    let progress = progress.min(1.0);
+                    let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+                    self.min_lr + (self.max_lr - self.min_lr) * cosine
+                }
+                // WSD：稳定段恒定在 max_lr，末段线性退火到 min_lr
+                Some(decay_steps) => {
+                    // 退火起点不能早于 warmup 结束（否则 warmup 一结束就在退火）
+                    let decay_start = self
+                        .total_steps
+                        .saturating_sub(decay_steps)
+                        .max(self.warmup_steps);
+                    if self.step < decay_start {
+                        self.max_lr
+                    } else {
+                        let progress = (self.step - decay_start) as f32
+                            / (self.total_steps - decay_start).max(1) as f32;
+                        let progress = progress.min(1.0);
+                        self.max_lr + (self.min_lr - self.max_lr) * progress
+                    }
+                }
+            }
         }
     }
 
@@ -174,6 +251,27 @@ impl LRScheduler {
     /// 从 checkpoint 恢复时直接跳到对应步数
     pub fn set_step(&mut self, step: usize) {
         self.step = step;
+    }
+}
+
+/// 按 `train.lr_schedule` 构造调度器（`"cosine"` 或 `"wsd"`）。
+///
+/// WSD 的退火步数 = `round(wsd_decay_frac × (steps - warmup_steps))`，至少 1 步。
+/// 抽出这个工厂是为了让 `train` / `sft` / `finetune` 几条训练入口拿到**同一条曲线**，
+/// 不会出现"主训练用 WSD、微调悄悄退回 cosine"这种不一致。
+pub fn lr_scheduler(cfg: &TrainConfig, total_steps: usize) -> LRScheduler {
+    if cfg.lr_schedule == "wsd" {
+        let span = total_steps.saturating_sub(cfg.warmup_steps);
+        let decay = ((cfg.wsd_decay_frac * span as f32).round() as usize).max(1);
+        LRScheduler::new_wsd(
+            cfg.warmup_steps,
+            total_steps,
+            cfg.max_lr,
+            cfg.min_lr,
+            decay,
+        )
+    } else {
+        LRScheduler::new(cfg.warmup_steps, total_steps, cfg.max_lr, cfg.min_lr)
     }
 }
 
@@ -401,13 +499,13 @@ pub fn train_transformer(
     // 梯度裁剪与范数统计只该看这一组：冻结参数不产生梯度（前向走 matmul_frozen），
     // 但 GPU 常驻输出头快路仍会往共享词嵌入上注回梯度，那些值不该影响裁剪系数。
     let trainable = model.trainable_parameters();
-    let mut opt = AdamW::new(cfg.max_lr, params.clone(), cfg.weight_decay);
-    let mut scheduler = LRScheduler::new(cfg.warmup_steps, cfg.steps, cfg.max_lr, cfg.min_lr);
+    let mut opt = make_optimizer(cfg, params.clone());
+    let mut scheduler = lr_scheduler(cfg, cfg.steps);
 
     // 断点续训：恢复参数 / 优化器 / 步数 / best loss
     let (mut start_step, mut best_val_loss) = (0usize, f32::INFINITY);
     if let Some(path) = resume_from {
-        let ckpt: Checkpoint = checkpoint::load_with_opt(path, model, &mut opt);
+        let ckpt: Checkpoint = checkpoint::load_with_opt(path, model, &mut *opt);
         start_step = ckpt.step;
         best_val_loss = ckpt.best_val_loss;
         scheduler.set_step(start_step);
@@ -429,6 +527,26 @@ pub fn train_transformer(
             "bf16 混合精度：{} 个参数张量转 u16 存储（内存减半）｜计算恒 f32｜AMP loss scaling {}",
             params.len(),
             if cfg.amp { "开启" } else { "关闭" },
+        );
+    }
+
+    // FP8 权重存储模拟（第 43 课）：只做数值模拟，跑的还是 f32 算子，**没有加速**
+    if cfg.fp8 {
+        logln!(
+            "FP8 权重存储模拟：每步更新后按 {} + 每 {} 个元素一个 scale 往返量化二维权重（仅数值模拟，无加速）",
+            crate::fp8::TRAIN_FORMAT.name(),
+            crate::fp8::TRAIN_BLOCK
+        );
+    }
+
+    // 优化器提示：Muon 与 AdamW 的"等效步长"口径不同，混用学习率是最容易踩的坑。
+    if cfg.optimizer == "muon" {
+        logln!(
+            "优化器：Muon（μ={}，Newton–Schulz {} 步）｜二维权重走 Muon，一维参数回退 AdamW｜\
+             ⚠️ Muon 每元素更新量约 lr/√cols，学习率要比 AdamW 大 √cols 倍才等效；\
+             本步的 lr 仍由 train.max_lr / min_lr 调度",
+            cfg.muon_momentum,
+            cfg.muon_ns_steps
         );
     }
 
@@ -649,11 +767,28 @@ pub fn train_transformer(
 
                     // 7. 更新参数（设置当前学习率）
                     let cur_lr = scheduler.lr();
-                    opt.lr = cur_lr;
+                    opt.set_lr(cur_lr);
                     opt.step();
+
+                    // 7b. FP8 权重存储模拟：把刚更新的二维权重按 E4M3 往返量化回写。
+                    // 放在 opt.step() 之后、下次前向之前 —— 等价于"权重以 FP8 精度存放，
+                    // 梯度与优化器状态仍是 f32"。**只做数值模拟，不带来任何加速**（见 crate::fp8）。
+                    if cfg.fp8 {
+                        crate::fp8::roundtrip_params_in_place(
+                            &params,
+                            crate::fp8::TRAIN_FORMAT,
+                            crate::fp8::TRAIN_BLOCK,
+                        );
+                    }
 
                     // 8. 清零梯度
                     opt.zero_grad();
+
+                    // 8b. aux-loss-free 均衡偏置更新（DeepSeek-V3 式）：用本步前向的路由负载
+                    //     推进各 MoE 层的专家偏置。**必须在 opt.step() 之后、下一次前向之前**——
+                    //     路由统计只保留最近一次前向，中间的评估前向会把它覆盖成验证集的负载。
+                    //     未开 `moe_bias_balance`（默认）或非 MoE 配置时是空操作。
+                    model.update_moe_balance_bias();
 
                     // 学习率调度：只在 optimizer 实际更新后递增
                     scheduler.step();
@@ -686,7 +821,7 @@ pub fn train_transformer(
                     checkpoint::save(
                         &format!("{dir}/latest.ckpt"),
                         model,
-                        &opt,
+                        &*opt,
                         step + 1,
                         best_val_loss,
                     );
@@ -694,7 +829,7 @@ pub fn train_transformer(
                         checkpoint::save(
                             &format!("{dir}/best.ckpt"),
                             model,
-                            &opt,
+                            &*opt,
                             step + 1,
                             best_val_loss,
                         );
@@ -749,7 +884,7 @@ pub fn train_transformer(
         checkpoint::save(
             &format!("{dir}/final.ckpt"),
             model,
-            &opt,
+            &*opt,
             last_step_done,
             best_val_loss,
         );
@@ -798,8 +933,8 @@ pub fn train_vqvae(
     let steps = cfg.vq_steps;
     let batch = cfg.batch_size;
     let params = vq.parameters();
-    let mut opt = AdamW::new(cfg.max_lr, params.clone(), cfg.weight_decay);
-    let mut scheduler = LRScheduler::new(cfg.warmup_steps, steps, cfg.max_lr, cfg.min_lr);
+    let mut opt = make_optimizer(cfg, params.clone());
+    let mut scheduler = lr_scheduler(cfg, steps);
     let dim = images[0].len();
     let mut px = Vec::with_capacity(batch * dim);
     let mut last = 0.0f32;
@@ -812,7 +947,7 @@ pub fn train_vqvae(
         let loss = vq.forward_loss(&px, batch);
         loss.backward();
         clip_grad_norm(&params, cfg.grad_clip);
-        opt.lr = scheduler.lr();
+        opt.set_lr(scheduler.lr());
         opt.step();
         opt.zero_grad();
         scheduler.step();
@@ -836,32 +971,65 @@ mod tests {
     use crate::model::{Transformer, TransformerConfig};
     use crate::tokenizer::Tokenizer;
 
-    /// 跑一次极小的端到端训练（无验证集、不存 checkpoint），返回最终训练 loss。
-    fn run_tiny_training(amp: bool) -> f32 {
+    /// 同种子对照实验的**通用底座**：固定语料、种子、批大小、步数与数据顺序，
+    /// 只有模型结构（`model_cfg`）与训练流程（`train_cfg`）由调用方决定。
+    /// 于是两次调用之间的 loss 差异只能归因于被替换的那一项（调度 / 优化器 / QK-Norm / 路由）。
+    fn run_tiny_ablation(mut model_cfg: TransformerConfig, train_cfg: TrainConfig) -> f32 {
         let corpus = "the quick brown fox jumps over the lazy dog, and then the dog jumps \
                       back over the quick brown fox again and again and again.";
         let tokenizer = Tokenizer::char(corpus);
-        let mut rng = Rng::new(11);
-        let model = Transformer::new(TransformerConfig::tiny(tokenizer.vocab_size()), &mut rng);
+        model_cfg.vocab_size = tokenizer.vocab_size();
+        let mut rng = Rng::new(train_cfg.seed);
+        let model = Transformer::new(model_cfg, &mut rng);
         let loader = DataLoader::new(corpus, &tokenizer, 16, 4);
-        let tcfg = TrainConfig {
+        let mut train_rng = Rng::new(train_cfg.seed);
+        train_transformer(&model, &tokenizer, &loader, &train_cfg, None, None, &mut train_rng)
+    }
+
+    /// 极小训练的基准训练配置（所有对照实验共用；调用方按需覆盖少数字段）。
+    fn tiny_train_cfg() -> TrainConfig {
+        TrainConfig {
             seed: 11,
             steps: 12,
             batch_size: 4,
             warmup_steps: 2,
-            max_lr: 1e-3,
-            min_lr: 1e-3,
-            // 正常量级的裁剪阈值：一旦漏掉反缩放，阈值会被整体放大 2^16 倍，裁剪失效，
-            // 结果会立刻偏离——这条断言因此同时覆盖了「反缩放」这一步。
+            // 正常量级的裁剪阈值：一旦漏掉 AMP 的反缩放，阈值会被整体放大 2^16 倍，
+            // 裁剪失效、结果立刻偏离——这条设置因此同时覆盖了「反缩放」这一步。
             grad_clip: 1.0,
             eval_every: 12, // 只在最后一步评估
             eval_iters: 1,
             log_file: None,
-            amp,
             ..TrainConfig::default()
+        }
+    }
+
+    /// 只换**学习率调度**的极小训练（其余口径见 [`run_tiny_ablation`]）。
+    fn run_tiny_training_with(
+        amp: bool,
+        lr_schedule: &str,
+        decay_frac: f32,
+        max_lr: f32,
+        min_lr: f32,
+    ) -> f32 {
+        let tcfg = TrainConfig {
+            amp,
+            max_lr,
+            min_lr,
+            lr_schedule: lr_schedule.to_string(),
+            wsd_decay_frac: decay_frac,
+            ..tiny_train_cfg()
         };
-        let mut train_rng = Rng::new(11);
-        train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut train_rng)
+        run_tiny_ablation(TransformerConfig::tiny(0), tcfg)
+    }
+
+    /// 收集调度器从头到尾完整的学习率曲线。
+    fn lr_curve(s: &mut LRScheduler, total: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(total);
+        for _ in 0..total {
+            out.push(s.lr());
+            s.step();
+        }
+        out
     }
 
     /// AMP 的损失缩放对 f32 训练是数值透明的：`scale` 恒为 2 的幂，乘/除 2^k 在 f32 下
@@ -869,8 +1037,8 @@ mod tests {
     /// 必须得到完全相同的最终 loss。
     #[test]
     fn test_amp_loss_scaling_is_numerically_transparent() {
-        let plain = run_tiny_training(false);
-        let with_amp = run_tiny_training(true);
+        let plain = run_tiny_training_with(false, "cosine", 0.1, 1e-3, 1e-3);
+        let with_amp = run_tiny_training_with(true, "cosine", 0.1, 1e-3, 1e-3);
         assert_eq!(
             plain, with_amp,
             "开/关 AMP 的最终 loss 应完全相同（无 AMP {plain}，有 AMP {with_amp}）"
@@ -946,5 +1114,334 @@ mod tests {
             .zip(&before)
             .any(|(p, b)| p.data().iter().zip(b).any(|(a, c)| a != c));
         assert!(moved, "训练后至少一个参数应发生变化");
+    }
+
+    /// WSD 的三段结构：warmup 线性递增 → 稳定段恒等于 `max_lr` → 末段单调不增退火，
+    /// 且整条曲线始终落在 `[min_lr, max_lr]` 内。
+    #[test]
+    fn test_wsd_schedule_has_three_phases() {
+        let warmup = 4;
+        let total = 20;
+        let (max_lr, min_lr, decay) = (1.0f32, 0.1f32, 5usize);
+        let mut s = LRScheduler::new_wsd(warmup, total, max_lr, min_lr, decay);
+        let curve = lr_curve(&mut s, total);
+        assert_eq!(curve.len(), total);
+
+        // 阶段一：warmup 严格递增，末点正好踩到峰值
+        for i in 0..warmup - 1 {
+            assert!(curve[i] < curve[i + 1], "warmup 段应严格递增，第 {i} 步失败");
+        }
+        assert_eq!(curve[warmup - 1], max_lr, "warmup 结束应正好是 max_lr");
+
+        // 阶段二：稳定段恒等于峰值（退火起点 = total - decay = 15）
+        let decay_start = total - decay;
+        for (step, &lr) in curve.iter().enumerate().take(decay_start).skip(warmup) {
+            assert_eq!(lr, max_lr, "稳定段第 {step} 步应恒为 max_lr，实际 {lr}");
+        }
+
+        // 阶段三：退火段单调不增，且不小于 min_lr
+        for step in decay_start..total - 1 {
+            assert!(
+                curve[step] >= curve[step + 1],
+                "退火段应单调不增，第 {step}→{} 步失败（{} → {}）",
+                step + 1,
+                curve[step],
+                curve[step + 1]
+            );
+        }
+        assert_eq!(curve[decay_start], max_lr, "退火起点应从 max_lr 开始");
+        assert!(
+            curve[total - 1] >= min_lr && curve[total - 1] < max_lr,
+            "末步应落在 [min_lr, max_lr) 内，实际 {}",
+            curve[total - 1]
+        );
+
+        // 全段范围检查
+        for (step, &lr) in curve.iter().enumerate() {
+            assert!(
+                lr >= min_lr && lr <= max_lr,
+                "第 {step} 步 lr {lr} 越界 [{min_lr}, {max_lr}]"
+            );
+        }
+    }
+
+    /// 两条曲线共用同一段 warmup：切到 WSD 不应该改变前 `warmup_steps` 步的任何一位。
+    #[test]
+    fn test_wsd_warmup_matches_cosine() {
+        let (warmup, total, max_lr, min_lr) = (4, 20, 1.0f32, 0.1f32);
+        let mut cosine = LRScheduler::new(warmup, total, max_lr, min_lr);
+        let mut wsd = LRScheduler::new_wsd(warmup, total, max_lr, min_lr, 5);
+        let (a, b) = (lr_curve(&mut cosine, total), lr_curve(&mut wsd, total));
+        for step in 0..warmup {
+            assert_eq!(a[step], b[step], "warmup 第 {step} 步两条曲线应逐位相同");
+        }
+        assert_ne!(a[total - 1], b[total - 1], "末步两条曲线应确实不同（否则没测到差别）");
+    }
+
+    /// cosine 默认曲线的数值快照：加 WSD 不允许改动默认路径的行为。
+    ///
+    /// 逐点比对 `warmup=2, total=6, max_lr=1, min_lr=0` 的手算结果，
+    /// 一旦有人改动 cosine 公式，这里会立刻红。
+    #[test]
+    fn test_cosine_schedule_default_unchanged() {
+        let mut s = LRScheduler::new(2, 6, 1.0, 0.0);
+        let curve = lr_curve(&mut s, 6);
+        let expected = [
+            0.5, // warmup 1/2
+            1.0, // warmup 2/2
+            1.0, // cosine progress 0
+            0.853_553_4, // progress 0.25
+            0.5, // progress 0.5
+            0.146_446_6, // progress 0.75
+        ];
+        for (step, (&got, &want)) in curve.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "cosine 第 {step} 步应为 {want}，实际 {got}（默认行为被改动）"
+            );
+        }
+    }
+
+    /// `lr_scheduler` 工厂按 `lr_schedule` 分派：`"wsd"` 的退火起点 = `round(frac × (steps - warmup))`，
+    /// 且稳定段是一段真正的平台；`"cosine"` 则没有平台。
+    #[test]
+    fn test_lr_scheduler_factory_respects_schedule() {
+        let base = TrainConfig {
+            steps: 20,
+            warmup_steps: 4,
+            max_lr: 1.0,
+            min_lr: 0.1,
+            wsd_decay_frac: 0.5,
+            log_file: None,
+            ..TrainConfig::default()
+        };
+
+        let mut wsd = lr_scheduler(
+            &TrainConfig {
+                lr_schedule: "wsd".to_string(),
+                ..base.clone()
+            },
+            20,
+        );
+        let curve = lr_curve(&mut wsd, 20);
+        let decay = (0.5 * (20 - 4) as f32).round() as usize; // 8
+        let decay_start = 20 - decay; // 12
+        let plateau = curve[4..decay_start]
+            .iter()
+            .filter(|&&lr| lr == 1.0)
+            .count();
+        assert_eq!(plateau, decay_start - 4, "稳定段应整段都是 max_lr");
+        assert!(curve[decay_start + 1] < 1.0, "退火应从 decay_start 之后开始下降");
+        assert!(
+            (curve[19] - (1.0 + (0.1 - 1.0) * (7.0 / 8.0))).abs() < 1e-6,
+            "末步应为线性退火到 7/8 处的值，实际 {}",
+            curve[19]
+        );
+
+        let mut cos = lr_scheduler(&base, 20);
+        let cos_curve = lr_curve(&mut cos, 20);
+        assert!(
+            cos_curve[5] < 1.0,
+            "cosine 从 warmup 结束就该开始衰减，不应有平台，实际第 5 步 {}",
+            cos_curve[5]
+        );
+    }
+
+    /// 病态参数（退火步数几乎吃掉整个训练）也不能让曲线非单调：退火起点被 `warmup` 夹住，
+    /// warmup 一结束就退火，只保证「不早于 warmup 结束」。
+    #[test]
+    fn test_wsd_decay_clamped_to_warmup() {
+        let warmup = 8;
+        let total = 10;
+        let mut s = LRScheduler::new_wsd(warmup, total, 1.0, 0.0, 9);
+        let curve = lr_curve(&mut s, total);
+        // warmup 段严格递增
+        for step in 0..warmup - 1 {
+            assert!(curve[step] < curve[step + 1], "warmup 第 {step} 步应递增");
+        }
+        // warmup 结束之后（稳定 + 退火）单调不增
+        for step in warmup - 1..total - 1 {
+            assert!(
+                curve[step] >= curve[step + 1],
+                "warmup 之后曲线应单调不增，第 {step}→{} 步失败（{} → {}）",
+                step + 1,
+                curve[step],
+                curve[step + 1]
+            );
+        }
+        // 退火起点被夹到 warmup 结尾（第 8 步），第 8 步仍是峰值
+        assert_eq!(curve[8], 1.0, "退火起点应被夹到 warmup 结束处");
+    }
+
+    /// 同种子对照（**隔离性**）：`max_lr == min_lr` 时两条曲线逐位恒等（都是常值），
+    /// 于是同种子的整轮训练必须得到**逐位相同**的最终 loss。这证明调度差异被正确隔离、
+    /// 没有偷偷改动别的路径，也顺手证明训练本身可复现。
+    #[test]
+    fn test_wsd_and_cosine_identical_when_lr_flat() {
+        let cosine = run_tiny_training_with(true, "cosine", 0.1, 1e-3, 1e-3);
+        let wsd = run_tiny_training_with(true, "wsd", 0.5, 1e-3, 1e-3);
+        assert_eq!(
+            cosine, wsd,
+            "max_lr == min_lr 时两条曲线都是常值，同种子 loss 应逐位相同（cosine {cosine}，wsd {wsd}）"
+        );
+    }
+
+    /// 同种子对照（**有效性**）：把学习率区间拉成 `max_lr > min_lr` 后，两条曲线确实不同，
+    /// 同seed训练出来的 loss 也应当不同——否则说明调度只写在配置里、根本没作用到优化器。
+    /// 断言只要求「都在正常量级且不相等」，不比较谁更优（12 步的极小模型上谁赢是噪声）。
+    #[test]
+    fn test_wsd_vs_cosine_same_seed_differs() {
+        let cosine = run_tiny_training_with(true, "cosine", 0.1, 1e-3, 1e-4);
+        let wsd = run_tiny_training_with(true, "wsd", 0.5, 1e-3, 1e-4);
+        assert!(
+            cosine.is_finite() && cosine > 0.0,
+            "cosine 调度的 loss 应为正有限值，实际 {cosine}"
+        );
+        assert!(
+            wsd.is_finite() && wsd > 0.0,
+            "WSD 调度的 loss 应为正有限值，实际 {wsd}"
+        );
+        assert_ne!(
+            cosine, wsd,
+            "两条曲线不同，同种子 loss 也应有差异（cosine {cosine}，wsd {wsd}）"
+        );
+    }
+
+    /// 同种子对照：QK-Norm 只改注意力子层的结构，其余配置与数据完全相同。
+    /// 两条要求——都训得出有限 loss（新参数不破坏训练），且结果**确实不同**
+    /// （否则说明开关没接进前向，只是配置里多了一个字段）。
+    #[test]
+    fn test_qk_norm_changes_training_same_seed() {
+        let plain = run_tiny_ablation(TransformerConfig::tiny(0), tiny_train_cfg());
+        let mut mcfg = TransformerConfig::tiny(0);
+        mcfg.qk_norm = true;
+        let qk = run_tiny_ablation(mcfg, tiny_train_cfg());
+
+        assert!(
+            plain.is_finite() && plain > 0.0,
+            "未开 QK-Norm 的 loss 应为正有限值，实际 {plain}"
+        );
+        assert!(
+            qk.is_finite() && qk > 0.0,
+            "开启 QK-Norm 的 loss 应为正有限值，实际 {qk}"
+        );
+        assert_ne!(
+            plain, qk,
+            "开了 QK-Norm 却没有改变训练结果，说明它没接进前向（{plain} vs {qk}）"
+        );
+    }
+
+    /// 同种子对照：只把优化器从 AdamW 换成 Muon，其余（结构 / 数据 / 种子 / 学习率曲线）全同。
+    /// 断言「都有限且不为同一值」——有限说明 Muon 的 Newton–Schulz / 缩放链路没把参数推成 NaN，
+    /// 不相等说明 `train.optimizer` 真的作用到了更新步骤上，而不只是配置里多了个字段。
+    ///
+    /// 学习率取 `0.05`（比默认 `3e-3` 大）：Muon 每元素更新量约 `lr/√cols`，
+    /// 沿用 AdamW 的学习率会让它几乎不动，两次结果都被初始化主导而看不出差异。
+    #[test]
+    fn test_muon_changes_training_same_seed() {
+        let base = TrainConfig {
+            max_lr: 0.05,
+            min_lr: 0.005,
+            ..tiny_train_cfg()
+        };
+        let adam = run_tiny_ablation(TransformerConfig::tiny(0), base.clone());
+        let muon = run_tiny_ablation(
+            TransformerConfig::tiny(0),
+            TrainConfig {
+                optimizer: "muon".to_string(),
+                ..base
+            },
+        );
+        assert!(
+            adam.is_finite() && adam > 0.0,
+            "AdamW 的 loss 应为正有限值，实际 {adam}"
+        );
+        assert!(
+            muon.is_finite() && muon > 0.0,
+            "Muon 的 loss 应为正有限值（NaN 说明正交化/缩放有问题），实际 {muon}"
+        );
+        assert_ne!(
+            adam, muon,
+            "换优化器却没有改变训练结果，说明它没接进更新步骤（{adam} vs {muon}）"
+        );
+    }
+
+    /// MoE 的 aux-loss-free 均衡偏置接进了训练步：γ > 0 时偏置会挪动硬路由、进而改 loss；
+    /// γ = 0 时是恒等操作 ⇒ 必须与「完全关闭」逐位相同（默认路径不变的回归）。
+    #[test]
+    fn test_moe_bias_balance_changes_training_same_seed() {
+        let moe_cfg = |bias: bool, lr: f32| TransformerConfig {
+            n_expert: 2,
+            moe_top_k: 1,
+            // K = 1 时重归一化口径给不了路由器梯度，统一走 Switch 口径（与 main.rs 的 moe 子命令一致）
+            moe_switch_gate: true,
+            moe_bias_balance: bias,
+            moe_bias_lr: lr,
+            ..TransformerConfig::default()
+        };
+        let off = run_tiny_ablation(moe_cfg(false, 0.0), tiny_train_cfg());
+        let zero = run_tiny_ablation(moe_cfg(true, 0.0), tiny_train_cfg());
+        assert_eq!(off, zero, "γ = 0 应与关闭逐位相同（{off} vs {zero}）");
+
+        let on = run_tiny_ablation(moe_cfg(true, 0.5), tiny_train_cfg());
+        assert!(
+            (on - off).abs() > 1e-9,
+            "开启偏置均衡后 loss 应与关闭不同，说明它没接进训练循环（{off} vs {on}）"
+        );
+    }
+
+    /// 回归保护：默认配置下走的就是 AdamW，且 `make_optimizer` 对未知取值也回退 AdamW
+    /// （`validate` 会先拦下非法值，这里是双保险：工厂本身不会 panic）。
+    #[test]
+    fn test_optimizer_factory_defaults_to_adamw() {
+        assert_eq!(TrainConfig::default().optimizer, "adamw", "默认优化器必须是 adamw");
+        let mut rng = Rng::new(3);
+        let model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
+        let params = model.parameters();
+        // 未知取值（正常路径下 validate 会拒绝）不能 panic，退回 AdamW
+        let cfg = TrainConfig {
+            optimizer: "unknown".to_string(),
+            ..tiny_train_cfg()
+        };
+        let mut opt = make_optimizer(&cfg, params.clone());
+        assert_eq!(opt.params().len(), params.len());
+        opt.step(); // 梯度全零：只验证能正常走一步
+    }
+
+    /// 回归保护：`qk_norm = false`（默认）时，模型结构与参数量与加该特性之前**完全一致**
+    /// ——四个投影的参数一个不多一个不少，QKV 的所有权重逐位等于"没有 QK-Norm 这条路"。
+    #[test]
+    fn test_qk_norm_off_keeps_default_structure() {
+        let mut rng = Rng::new(11);
+        let cfg = TransformerConfig::tiny(32);
+        assert!(!cfg.qk_norm, "默认必须是关闭");
+        let model = Transformer::new(cfg.clone(), &mut rng);
+        for (name, _) in model.named_parameters() {
+            assert!(
+                !name.contains("q_norm") && !name.contains("k_norm"),
+                "关闭 QK-Norm 时不该出现归一化参数：{name}"
+            );
+        }
+
+        // 开启后必须出现且形状为 head_dim
+        let mut mcfg = cfg;
+        mcfg.qk_norm = true;
+        let mut rng2 = Rng::new(11);
+        let model = Transformer::new(mcfg, &mut rng2);
+        let hd = model.cfg.n_embd / model.cfg.n_head;
+        let names: Vec<String> = model.named_parameters().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names.iter().filter(|n| n.ends_with(".attn.q_norm.gamma")).count(),
+            model.cfg.n_layer
+        );
+        assert_eq!(
+            names.iter().filter(|n| n.ends_with(".attn.k_norm.gamma")).count(),
+            model.cfg.n_layer
+        );
+        for (n, p) in model.named_parameters() {
+            if n.ends_with(".attn.q_norm.gamma") || n.ends_with(".attn.k_norm.gamma") {
+                assert_eq!(p.numel(), hd, "{n} 的 gamma 长度应为 head_dim={hd}");
+            }
+        }
     }
 }

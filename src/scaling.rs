@@ -200,13 +200,27 @@ pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
         cfg.n_kv_head
     };
     let hd = d / cfg.n_head;
+    let kv_dim = n_kv * hd;
     // 两个归一化子层：LayerNorm 有 γ/β，RMSNorm 只有 γ
     let norm = if cfg.use_rmsnorm { d } else { 2 * d };
     // 注意力四个投影：权重 [in, out] + 长度 out 的 bias。
-    // GQA 下 K/V 只投影到 n_kv 个头，参数量随之下降
-    let attn = (d * d + d)                        // c_q
-        + 2 * (d * (n_kv * hd) + n_kv * hd)       // c_k, c_v
-        + (d * d + d);                            // c_proj
+    // GQA 下 K/V 只投影到 n_kv 个头，参数量随之下降。
+    //
+    // MLA（`kv_lora_rank > 0`）多一个把输入压到低秩 latent 的 `c_kv`（d → r），
+    // 而 `c_k` / `c_v` 的输入从 d 降到 r；净效果是参数量**变小**
+    // （`d·r + r·kv_dim` 取代 `d·kv_dim`，r ≪ d 时省一个数量级），
+    // 与"latent 缓存省显存"是两个独立的收益（见 [`crate::attention`] 的 MLA 说明）。
+    let attn = if cfg.kv_lora_rank > 0 {
+        let r = cfg.kv_lora_rank;
+        (d * d + d)                    // c_q
+            + (d * r + r)              // c_kv（低秩压缩）
+            + 2 * (r * kv_dim + kv_dim) // c_k, c_v（从 latent 升维）
+            + (d * d + d)              // c_proj
+    } else {
+        (d * d + d)                          // c_q
+            + 2 * (d * kv_dim + kv_dim)      // c_k, c_v
+            + (d * d + d)                    // c_proj
+    };
     // MLP：GELU 两个投影（隐层 4d），SwiGLU 三个投影（隐层 ≈ 2.67d）
     let mlp = if cfg.use_swiglu {
         let h = crate::layers::swiglu_hidden(d);
@@ -214,7 +228,10 @@ pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
     } else {
         (d * 4 * d + 4 * d) + (4 * d * d + d)
     };
-    2 * norm + attn + mlp
+    // QK-Norm（`qk_norm = true`）：Q、K 各一个 RMSNorm，归一化的是**每个头**的 head_dim 方向，
+    // 所以每个 `gamma` 长 `head_dim` 而不是 `d`；GQA 下 K 侧也只有一套（各 KV 头共用）。
+    let qk = if cfg.qk_norm { 2 * hd } else { 0 };
+    2 * norm + attn + mlp + qk
 }
 
 /// 非嵌入参数量：`C = 6ND` 里的 `N`（Kaplan / Chinchilla 口径）。
@@ -1043,5 +1060,39 @@ mod tests {
         assert!((points[1].compute() / points[0].compute() - 2.0).abs() < 1e-9);
         let fit = fit_over_tokens(&points);
         assert!(fit.alpha > 0.0, "数据量的幂律指数必须为正，实际 {:.4}", fit.alpha);
+    }
+
+    /// 参数量公式必须与**实际建出来的模型**逐个参数对上。
+    ///
+    /// [`params_per_layer`] 是纯算术，很容在改结构（GQA、MLA、QK-Norm、SwiGLU…）时漏改一处，
+    /// 而这种偏差不会让任何测试失败、只会让 `scaling` 扫出的幂律轴悄悄错位。
+    /// 这里直接拿 `Transformer::parameters()` 的实测和数去对公式：
+    /// 稠密 GQA、MLA、以及两者的 QK-Norm 变体各校一遍。
+    #[test]
+    fn test_params_formula_matches_built_model() {
+        use crate::model::Transformer;
+        use crate::module::Module;
+        use crate::rng::Rng;
+
+        // (n_kv_head, kv_lora_rank, qk_norm)
+        for (n_kv, lora_rank, qk_norm) in [
+            (0usize, 0usize, false),
+            (2, 4, false),
+            (0, 0, true),
+            (2, 4, true),
+        ] {
+            let mut rng = Rng::new(3);
+            let mut cfg = TransformerConfig::tiny(32);
+            cfg.n_kv_head = n_kv;
+            cfg.kv_lora_rank = lora_rank;
+            cfg.qk_norm = qk_norm;
+            let model = Transformer::new(cfg.clone(), &mut rng);
+            let actual: usize = model.parameters().iter().map(|p| p.numel()).sum();
+            assert_eq!(
+                actual,
+                params_total(&cfg),
+                "参数量公式与实际模型不符（n_kv_head={n_kv}, kv_lora_rank={lora_rank}, qk_norm={qk_norm}）"
+            );
+        }
     }
 }

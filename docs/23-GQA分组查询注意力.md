@@ -130,3 +130,75 @@ GQA KV Cache = 2 * n_layer * n_kv_head * T * head_dim
 - KV Cache 缩小 `n_head / n_kv_head` 倍，推理显存大幅降低
 - 训练时几乎不影响效果（LLaMA 2 验证）
 - 实现：K/V 投影维度变小 + flash_attention 核内按 `hh / n_rep` 索引共享头（零物化）
+
+---
+
+## 8. 延伸：MLA 低秩压缩 KV Cache（DeepSeek-V2/V3）
+
+> **已落地代码**：[`src/attention.rs`](../src/attention.rs) 的 `MultiHeadAttention`
+> （`kv_lora_rank > 0` 时走 `forward_mla`）+ `KVCache::new_latent` / `append_latent` /
+> `positions`。配置开关：`model.kv_lora_rank`（默认 `0` = 关闭）。
+
+### 8.1 GQA 之后，为什么还要 MLA
+
+GQA 的思路是"**少存几份**"：让多个 Q 头共享 K/V 头，缓存缩小 `n_head / n_kv_head` 倍。
+
+MLA（Multi-head Latent Attention）换了个方向："**每份压扁**"——K 和 V 不再各自从输入
+投影，而是先压到一份低秩 latent，再从 latent 升维出来：
+
+```text
+    GQA:   x ──c_k──> K ┐                       缓存：K、V 两份
+           x ──c_v──> V ┘
+
+    MLA:   x ──c_kv──> c (r 维)  ─┬─c_k──> K   缓存：只有 c
+                                  └─c_v──> V
+```
+
+两种思路可以叠加（MLA 里同样有 `n_kv_head`），但收益来源不同：GQA 省的是"份数"，
+MLA 省的是"每份的体积"。
+
+### 8.2 省了多少
+
+```text
+MHA/GQA 缓存 = 2 * n_layer * T * n_kv_head * head_dim * 4 字节
+MLA   缓存 =     n_layer * T * kv_lora_rank          * 4 字节
+```
+
+DeepSeek-V2：`kv_lora_rank = 512`，对比 `n_kv_head × head_dim = 128 × 192`，
+缓存小了约 96 倍。长上下文下 KV Cache 常常比权重还大，这一项直接决定能开多长的上下文。
+
+### 8.3 代价写在明处：算力换显存
+
+普通注意力每次只算**新 token** 的 K/V；MLA 每次推理都要把**整段 latent 升维回 K/V**
+（`forward_mla` 第 3 步是全量 `c_k`/`c_v` 投影）。省的是显存，付的是算力——
+这不是"免费的压缩"，而是一个明确的取舍。
+
+### 8.4 本实现的取舍（教学版）
+
+- **保留论文的核心**：KV 联合低秩压缩 + 缓存只存 latent。
+- **省略论文的 decoupled RoPE**：论文把 Q/K 的 rope 子维单独拎出来只对那部分旋转，
+  让压缩后的 latent 不必带位置信息。本实现让 RoPE 作用在完整的 `head_dim` 上，
+  因此缓存里的 latent 是**未旋转**的，靠 `KVCache::positions` 每步按各自绝对位置补旋
+  （滑动窗口丢行后位置并不连续，所以必须存每个位置的绝对下标）。
+  效果上的差别：压缩率略低、每步多一次旋转（`T` 行的 `O(T·d)` 计算，与升维同量级）。
+
+### 8.5 配置与约束
+
+```json
+{
+  "model": {
+    "n_head": 8,
+    "n_kv_head": 2,
+    "kv_lora_rank": 32
+  }
+}
+```
+
+- `kv_lora_rank: 0` 或不设 = 普通 MHA / GQA（行为与加 MLA 之前**逐位一致**，
+  包括初始化消耗的随机数顺序）。
+- **约束**：`kv_lora_rank` 必须**小于** `n_kv_head × head_dim`，否则谈不上压缩（构造时断言）。
+- MLA 模型必须配 MLA 模式的缓存：`Transformer::new_kv_cache` 会按配置自动选
+  `KVCache::new_latent`，前向里也会断言缓存类型匹配。
+- MLA 的压缩投影 `c_kv` **不挂 LoRA 适配器**：它同时供给 K 和 V 两条路，低秩增量在那里
+  既破坏"压缩"的口径，也没有现成的社区做法；要调 MLA 的 KV 表示，直接调
+  `kv_lora_rank` 重训更干净。

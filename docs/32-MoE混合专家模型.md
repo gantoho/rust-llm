@@ -1,7 +1,7 @@
 # 第 32 课：MoE 混合专家模型（Mixture of Experts）
 
-> **本课已落地为可运行代码**：核心实现在 [`src/moe.rs`](../src/moe.rs)（1174 行，含 14 个单测），
-> 接线在 [`src/model.rs`](../src/model.rs)（`TransformerConfig.n_expert` / `moe_top_k` 等 6 个字段 +
+> **本课已落地为可运行代码**：核心实现在 [`src/moe.rs`](../src/moe.rs)（1395 行，含 18 个单测），
+> 接线在 [`src/model.rs`](../src/model.rs)（`TransformerConfig.n_expert` / `moe_top_k` 等 9 个字段 +
 > `Ffn` 枚举二选一），演示在 `cargo run --release -- moe`（见文末「本项目实现」）。
 > 专家网络直接复用 `src/layers.rs` 的 `MLPEnum`（GELU 或 SwiGLU）。
 
@@ -169,7 +169,7 @@ impl MoELayer {
 
 核心代码在 [`src/moe.rs`](../src/moe.rs)，接线在 [`src/model.rs`](../src/model.rs)，
 演示命令是 `cargo run --release -- moe`（[`src/main.rs`](../src/main.rs) 的 `cmd_moe`）。
-14 个单测全部与 CPU 参考实现对齐。
+18 个单测全部与 CPU 参考实现对齐（其中 4 个专测 aux-loss-free 均衡偏置与共享专家）。
 
 ### 公开 API
 
@@ -178,9 +178,9 @@ impl MoELayer {
 | `top_k_gate` | 纯函数路由：`logits → Top-K`（并列按下标、**确定性**），返回 `RoutePlan`；选择用 `select_nth_unstable_by` O(E) 部分选择 + 对前 K 排序，不做全排序 |
 | `RoutePlan` | 一次路由的完整结果：`sel`（各专家实际处理的 token 行号，已按容量截断）、`penalty`（未选中 −∞）、`mask`（选中 1 / 其余 0）、`f`（分配比例）、`dropped` / `routed` |
 | `expert_capacity` | `ceil(cf · n·K/E)`；`cf ≤ 0` → `usize::MAX`（不限） |
-| `MoELayer` | 专家集合 + 路由器；`forward` / `forward_with_aux` / `route_plan` / `stats` |
+| `MoELayer` | 专家集合 + 路由器（+ 可选的共享专家 `shared_experts`）；`forward` / `forward_with_aux` / `route_plan` / `stats` / `update_balance_bias`（推进 aux-loss-free 偏置）/ `balance_bias`（只读诊断） |
 | `RouteStats` | 诊断：各专家被路由到的次数、`aux`、`imbalance()`、`dropped_ratio()` |
-| `sparse_stats` | 参数 / 激活量口径：`total_params` / `active_params` / `param_ratio` / `flops_saving` |
+| `sparse_stats` | 参数 / 激活量口径：`total_params` / `active_params` / `param_ratio` / `flops_saving`；末位参数 `n_shared` 决定共享专家 `shared_params()`（同时计入总参数与激活参数，见下文「共享专家」） |
 
 ### 稀疏前向：gather → expert → weighted → scatter
 
@@ -237,6 +237,90 @@ impl MoELayer {
 这正是后续工作（DeepSeek-V3 的 loss-free 均衡偏置、expert-choice 路由）要绕开的软/硬错配，
 也是「辅助损失系数要调小」的真实原因：它压的是概率分布，不是分配结果。
 
+### aux-loss-free 均衡偏置（DeepSeek-V3）
+
+软辅助损失的病根是"软/硬错配"：`L_aux` 压的是可导的**路由概率** `p`，而真正决定负载的是
+不可导的**硬路由** argmax。DeepSeek-V3 换了个思路：**不动损失、不动梯度，直接给每个专家加一个
+只用于选路的偏置 `b_i`**。选 Top-K 时看 `logits + b`，门控权重、`L_aux`、z-loss 一律仍看原始
+`logits`——于是偏置既不进梯度也不进损失，均衡"免费"。
+
+**更新规则**（目标负载取平均 `Σcount_i / E`，按**符号**更新，固定步长 γ）：
+
+```text
+target = Σ_i count_i / E
+count_i > target  ⇒  b_i ← b_i − γ      # 过载的专家：压低它的选路得分
+count_i < target  ⇒  b_i ← b_i + γ      # 欠载的专家：抬高它的选路得分
+```
+
+用**符号**而不是按失衡幅度成比例，是因为偏置的职责只是"把负载推平、推平了就停住"；
+按幅度更新会在接近均衡时来回过冲、长期震荡（DeepSeek-V3 用的就是 sign）。
+
+**与 `α·L_aux` 的对照**：
+
+| 维度 | `α·L_aux`（软辅助损失） | aux-loss-free 偏置 |
+|------|------------------------|--------------------|
+| 作用对象 | 路由**概率** `p`（可导） | **硬路由** argmax（`logits + b` 的排序） |
+| 是否进损失 / 梯度 | 进，占训练目标里的一项 | **不进**，偏置不是可导路径上的任何一环 |
+| 代价 | 拿主损失做交易（α 要调小） | 免费；但只能压 argmax，管不了概率形状 |
+| 与主损失的关系 | 会扰动路由器梯度 | 完全不碰主损失 |
+
+**代码接线**：
+
+- [`src/moe.rs`](../src/moe.rs) `MoELayer` 的 `bias: Shared<Vec<f32>>`（长度 `E`）、
+  `bias_balance: bool`、`bias_lr: f32`；`forward_with_aux` 里"选路用 `logits + bias` 的副本、
+  门控权重仍用原始 `logits`"那段就是题眼。
+- [`src/moe.rs`](../src/moe.rs) `MoELayer::update_balance_bias()`：读**最近一次前向**的路由统计
+  （`RouteStats::counts`）按符号推进偏置；未开 `moe_bias_balance` 或没跑过前向时返回 `false`
+  （空操作）。`MoELayer::balance_bias()` 是只读诊断入口。
+- [`src/model.rs`](../src/model.rs) `Transformer::update_moe_balance_bias()`：遍历所有 MoE 层调用。
+- [`src/train.rs`](../src/train.rs)：训练循环在 `opt.step()` **之后、下一次前向之前**调用
+  `model.update_moe_balance_bias()`（注释标为 `8b.`）。
+- 配置：`moe_bias_balance`（默认 `false`）/ `moe_bias_lr`（默认 `0.001`，DeepSeek-V3 的取值）。
+
+**两个使用约束**：
+
+- **必须在 `opt.step()` 之后、下一次前向（含评估前向）之前调用**：偏置靠的是"上一步实际把 token
+  分给了谁"这份统计，而统计只保留最近一次前向；中间夹一次评估前向会把它覆盖成验证集的负载。
+- **梯度累积下只反映最后一个微批**：每步只前向一次并记录统计，所以偏置看到的是最后那个微批的负载。
+- 偏置**不参与 checkpoint**：它不在 `named_parameters` 里（不是被梯度训练的量、也不该进优化器），
+  续训时从 0 重新平衡，几百万 token 的语料下可忽略。
+
+**默认路径逐位不变**：`moe_bias_balance = false`（默认）时 `update_balance_bias` 是空操作；
+偏置全 0 时"选路看 `logits + 0`"与直接看 `logits` 完全等价。单测
+`test_balance_bias_is_free_of_params_and_graph` 断言：偏置全 0 时，开与不开的参数表、输出、
+梯度**逐位相同**。`test_balance_bias_update_direction` 验证更新方向（过载 −γ、欠载 +γ），
+`test_balance_bias_converges_load_without_gradients` 验证"只做前向 + 偏置更新、完全不碰梯度"
+也能把不均衡度显著推平。
+
+### 共享专家（DeepSeek-V2/V3）
+
+路由专家有个隐含问题：总有一些**所有 token 都要用的常识**（高频语法、常见搭配），
+如果每个专家都各学一遍，就是在浪费容量。共享专家的做法是：额外放 `n_shared` 个专家，
+**全部 token 都过它们**，输出以权重 1 与路由部分**并行相加**，且**不参与路由**：
+
+```text
+y = Σ_{e ∈ TopK} w_e · Expert_e(x)   +   Σ_{s ∈ shared} SharedExpert_s(x)
+                      ↑ 路由部分（稀疏）              ↑ 共享部分（稠密，每 token 必算）
+```
+
+- **作用**：让共享专家承接"常识"，路由专家腾出来专心分工，减少专家冗余。
+- **代价**：这部分参数**没有稀疏性可言**——每 token 都要算，所以它**同时进总参数与激活参数**，
+  会按比例吃掉 MoE 省下的 FLOPs、拉低稀疏比（总参数 / 激活参数）。
+  用 [`src/moe.rs`](../src/moe.rs) 的 `SparseStats::shared_params()` / `param_ratio()` 可以精确量化：
+  `shared_params = n_shared × expert_params`，同时计入 `total_params()` 与 `active_params()`。
+
+**代码接线**：
+
+- [`src/moe.rs`](../src/moe.rs) `MoELayer::shared_experts: Vec<MLPEnum>`，与路由专家同规模
+  （DeepSeek-V2 口径：共享专家的中间维 = 路由专家之一倍）；`forward_with_aux` 第 3b 步把它们的
+  输出直接累加到路由输出上（即使路由把某些 token 全丢了，共享专家仍照常贡献——容量只管路由专家）。
+- 参数命名前缀为 `{prefix}.shared_experts.{i}`；`SparseStats` 的 `n_shared` 字段承载个数。
+- 配置：`moe_shared_experts`（默认 `0` = 不启用，行为与加它之前逐位相同）。
+
+单测 `test_shared_experts_add_parallel_and_count_params` 断言：摘掉共享专家后的输出，
+加上共享专家输出之和，恰好等于完整前向（证明是"并行相加"）；且两个共享专家各贡献一个路由专家的
+参数量，`param_ratio()` 相对纯路由版本下降。
+
 ### Router z-loss：压 logits 的幅度
 
 与 `L_aux` 互补的第二项：`L_z = β·mean(logsumexp(logits)²)`
@@ -274,13 +358,15 @@ E=8   K=2 | 单层 总 265224 / 激活 66696（3.98× / 省 74.9% FLOPs）
 ```
 
 `total = E·expert + router`（全部专家驻显存），`active = K·expert + router`（每 token 只算 K 个）。
+启用共享专家后，`total` 与 `active` 都要再加 `n_shared × expert`——共享部分每 token 必算、不稀疏，
+所以它等量地吃掉"省下的 FLOPs"（`SparseStats::shared_params()` 单独列出这一项）。
 单层口径 GELU 版 `8d²+5d`、SwiGLU 版 `3dh+2h+d`（`h = swiglu_hidden(d)`）。
 CLI 里有一处 `assert_eq!` 把「公式算出的参数」与「建层实测的参数」对账，防止公式随代码漂移。
 **MoE 省的是 FLOPs 不是显存**——卖点是「同样的 FLOPs 预算下能塞进更多参数」。
 
 ### 接线方式
 
-`TransformerConfig` 新增 6 个 MoE 字段（都带 `#[serde(default)]`，旧 `config.json` 无需改动）：
+`TransformerConfig` 新增 9 个 MoE 字段（都带 `#[serde(default)]`，旧 `config.json` 无需改动）：
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -290,6 +376,12 @@ CLI 里有一处 `assert_eq!` 把「公式算出的参数」与「建层实测�
 | `moe_aux_coef` | 0.0 | 辅助损失系数 α |
 | `moe_z_loss_coef` | 0.0 | router z-loss 系数 β（`β·mean(logsumexp(logits)²)`） |
 | `moe_switch_gate` | false | 门控口径（见上表；`moe_top_k = 1` 时应置 `true`） |
+| `moe_shared_experts` | 0 | 共享专家数 `E_s`（DeepSeek-V2/V3 式）；0 = 关闭，>0 时每个 token 都过这 `E_s` 个专家、输出与路由部分并行相加（不参与路由） |
+| `moe_bias_balance` | false | aux-loss-free 均衡偏置开关（DeepSeek-V3 式）；true 时选 Top-K 看 `logits + b`，按 **sign** 以 `moe_bias_lr` 推进偏置 |
+| `moe_bias_lr` | 0.001 | 均衡偏置的更新步长 γ，只对 `moe_bias_balance = true` 生效 |
+
+> 后三个字段是 DeepSeek-V2/V3 的两项改进，仅通过配置开启（`moe` 子命令没有对应命令行开关），
+> 默认值下与加它们之前**逐位相同**——细节见下文「aux-loss-free 均衡偏置」与「共享专家」两节。
 
 `TransformerBlock` 的前馈子层是一个 `Ffn` 枚举（`MLPEnum` 或 `MoELayer`）。两者接口一致
 （`forward` / `parameters` / `named_parameters`），所以残差、dropout、GPU 常驻快路全都不用改。

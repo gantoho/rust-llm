@@ -14,12 +14,13 @@
 本项目是一个从零实现的 **Transformer 大语言模型**项目，目标是让你理解大语言模型（LLM）的底层原理：
 
 - **算法零依赖**：所有张量运算、自动微分、网络层全部手写，算法部分不用任何第三方库。
-- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 11 个阶段、41 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），工程化完善并部署成 API 服务，最后补齐多模态（图片理解 + 图片生成）。
-- **工程化完整**：CLI 子命令（train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling）、
+- **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 12 个阶段、46 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），工程化完善并部署成 API 服务，补齐多模态（图片理解 + 图片生成），最后补上训练侧的蒸馏、FP8 低精度，以及 WSD 学习率调度 / QK-Norm / Muon 优化器这几项训练稳定性改进。
+- **工程化完整**：19 个 CLI 子命令（train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling / moe / quant / distributed / align / rag / speculative / distill / fp8）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（详见 [性能优化与基准测试](#性能优化与基准测试)）。
-- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、Flash Attention、梯度累积、Beam Search、
+- **现代 LLM 技术栈**：RoPE、RMSNorm、SwiGLU、GQA、**MLA 低秩压缩 KV Cache（DeepSeek-V2/V3 式，
+  `model.kv_lora_rank`，缓存只存一份 latent）**、Flash Attention、梯度累积、Beam Search、
   KV Cache 滑动窗口（长上下文可持续生成）、混合精度训练（AMP 动态损失缩放，已接入训练循环）。
 - **真实可用**：加载预训练权重微调、交互式对话、分词器持久化、训练指标日志、运行日志（每次训练/推理自动存档）、预设模型配置。
 - **LoRA 已接入**：`finetune` 子命令会冻结预训练主干、只训练低秩适配层（缺省挂 Q/K/V，`--lora-targets` 可扩到 O 与 MLP）
@@ -31,7 +32,7 @@
   反缩放回真实尺度再做裁剪（保证裁剪阈值仍然作用在真实梯度上），见第 26 课。
 - **透明度高**：训练过程中每一步的中间结果、梯度、损失都可以直接打印检查。
 
-### 包含的功能（对应 41 课）
+### 包含的功能（对应 46 课）
 
 | 模块 | 文件 | 内容 |
 |------|------|------|
@@ -40,25 +41,27 @@
 | 模块接口 | `src/module.rs` | `Module` trait：参数收集的统一接口（`parameters()` / **`trainable_parameters()`**） |
 | RoPE 位置编码 | `src/rope.rs` | 旋转位置编码：把相对位置揉进 Q/K 向量 |
 | 神经网络层 | `src/layers.rs` | Linear、LayerNorm、**RMSNorm**、Embedding、ReLU/GELU/Tanh、**SwiGLU**、**LoRA 适配层（`LoraAdapter`，挂在 `Linear` 上）** |
-| 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减）；**`step()` 跳过冻结参数（含权重衰减）** |
+| 损失与优化器 | `src/loss.rs` `src/optim.rs` | MSE、CrossEntropy、SGD、AdamW（动量 + 权重衰减）；**`step()` 跳过冻结参数（含权重衰减）**；**Muon（动量矩阵 + Newton–Schulz 正交化，一维参数交替回退 AdamW）**、`OptimizerState` 抽象 |
 | 分词器 | `src/tokenizer.rs` | 字符级分词 + BPE（字节对编码），**save/load 持久化**，配置可切换；生成时做 UTF-8 约束，不会拼出乱码字符；**图像占位 token（`<\|image\|>` 展开为 P 个占位符 + 图片 token 区间挂载）** |
-| 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、**KV Cache（含滑动窗口丢弃）**、**GQA 分组查询注意力**、**Q/K/V 注入 LoRA** |
+| 注意力机制 | `src/attention.rs` | 多头自注意力、因果掩码、RoPE、**KV Cache（含滑动窗口丢弃）**、**GQA 分组查询注意力**、**MLA 低秩压缩 KV Cache（`kv_lora_rank`：KV 先压到 latent 再升维，缓存只存一份 latent）**、**QK-Norm（逐头 RMSNorm，投影后 / RoPE 前）**、**Q/K/V 注入 LoRA** |
 | Transformer 模型 | `src/model.rs` | Transformer Block 堆叠、Transformer 整体前向、checkpoint 参数名、**Dropout**、**`apply_lora`（冻结 + 注入）**、**`forward_mm` 多模态前向（像素在 prefill 首步注入占位符，无像素时与纯文本路径逐位一致）** |
 | 图片理解（ViT） | `src/vision.rs` | 图片解码 / resize / 归一化（`image` crate 只做编解码）、**patchify**、`VisionEncoder`（patch embed + 可学习位置 embedding + 双向 Transformer 层 + 投影到 n_embd，**不引入 CLS token**）、`VisionConfig`；`load_image` / `save_image` / `encode_png` |
 | 图片生成（VQ-VAE） | `src/vqvae.rs` | **VQ-VAE**：patchify + Linear MLP 编码器（无 conv2d）、最近邻量化码本（量化不进 tape）、线性解码器、三项损失（重建 MSE + 码本 commit + 腾挪）、`VqConfig`、`save/load`（`vq.ckpt`）；生成通路把码本 token 解码回 PNG |
 | 数据加载 | `src/data.rs` | 外部文本文件、**目录批量加载**、train/val 划分、随机 batch 采样；**SFT 对话语料解析 + loss 掩码**；**VLM 图文 JSONL 加载（`VlmLoader`：整条对齐不滑窗、尾部 pad、每批多带像素 `[B,3·S·S]`、可切换生成序列）** |
-| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**、**按可训练子集统计梯度范数**、**`MixedPrecision` 动态损失缩放（AMP：溢出跳步 + 梯度反缩放）**、**`train_vqvae` VQ-VAE 预训练循环** |
+| 训练与评估 | `src/train.rs` | 训练循环、梯度裁剪、warmup+cosine 学习率（**可切 WSD 调度**）、验证集 loss / 困惑度、**梯度累积**、早停、**CSV 指标日志**、**SFT 掩码透传**、**按可训练子集统计梯度范数**、**`MixedPrecision` 动态损失缩放（AMP：溢出跳步 + 梯度反缩放）**、**`train_vqvae` VQ-VAE 预训练循环**、**`LRScheduler`/`lr_scheduler`（warmup / cosine / WSD）+ `make_optimizer`（AdamW / Muon 统一为 `OptimizerState`）+ MoE aux-loss-free 均衡偏置更新** |
 | 采样 | `src/sample.rs` | temperature / top-k / top-p 采样 + 重复惩罚，KV cache 推理，**Beam Search**，**停止标记**；**`with_pixels` 视觉注入**、**图片段状态机（`generated_images` 只认完整的「start + P 码本 + end」段）** |
 | 缩放定律 | `src/scaling.rs` | 幂律拟合（固定 `b` 的闭式最小二乘 + 黄金分割搜 `b`）、`C ≈ 6ND` 与非嵌入参数口径、Chinchilla 20:1 与参数化闭式解两条最优配比、训练时长/电费估算、**真实跑多规模扫描并拟合实测指数** |
-| MoE 稀疏专家 | `src/moe.rs` | Top-K 路由（并列按下标、确定性）、两种门控口径（Top-K 重归一化 / Switch 原概率，**含 K = 1 的梯度陷阱**）、gather→expert→weighted→scatter 稀疏前向、负载均衡辅助损失、容量因子与 Token Dropping、参数/激活量口径 |
+| MoE 稀疏专家 | `src/moe.rs` | Top-K 路由（并列按下标、确定性）、两种门控口径（Top-K 重归一化 / Switch 原概率，**含 K = 1 的梯度陷阱**）、gather→expert→weighted→scatter 稀疏前向、负载均衡辅助损失、容量因子与 Token Dropping、参数/激活量口径；**aux-loss-free 均衡偏置（DeepSeek-V3 式，sign 更新、不进损失/梯度）与共享专家（DeepSeek-V2/V3 式）** |
 | 量化 | `src/quant.rs` | INT8/INT4 的逐张量 / 逐通道 / 逐 token 量化与位打包、Hessian 量化（Hessian 逆 + 逐通道误差分摊）、AWQ（激活感知的缩放搜索）、校准集统计、逐层量化与 checkpoint 元信息、KIVI 式 KV cache 量化 |
+| 知识蒸馏 | `src/distill.rs` | **`SoftTargets`**（teacher logits → 温度缩放 + top-k 截断 + 重归一化 + 熵统计）、**`kd_loss`**（`T²·KL(p_t‖p_s)`，手写反向 `(T/N)(p_s−p_t)`）、**`distill_loss`**（`(1-α)·CE + α·KD`）；`distill` 子命令含有限差分梯度自检 |
+| FP8 低精度（模拟） | `src/fp8.rs` | **E4M3 / E5M2 编解码**（ties-to-even 舍入、饱和 / Inf / NaN 规则、与 OCP 一致的标准码值）、**per-block scale**（MXFP8 每 32 元素一个 f32 scale，9 bit/元素）、模拟 matmul 往返、`roundtrip_params_in_place` 训练侧权重量化；⚠️ **纯数值模拟，无加速**（真实收益需 GPU FP8 tensor core） |
 | 推测解码 | `src/speculative.rs` | 草稿→验证循环（拒绝采样 + 残差分布修正，输出**严格无损**）、`TargetStream` 缓存不变量与 `rollback_to`、`ModelDrafter`、多 Token 预测头（`MtpHeads` / `MtpDrafter`） |
 | 对齐 | `src/align.rs` | 奖励模型（标量头 + Bradley-Terry）、序列 logprob 与 loss 掩码、DPO（隐式奖励 + 参考模型）、GRPO 组内相对优势、PPO clip 目标 + KL(k3) 惩罚 |
 | RAG | `src/rag.rs` | 分块（字符域切分 + 句读对齐、可配重叠）、三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）、余弦检索与 MMR 多样化重排、按预算组装提示 |
 | 分布式 | `src/distributed.rs` | 环形 allreduce（reduce-scatter + all-gather）、数据并行、ZeRO-1/2（状态分片）、张量并行 MLP 与 QKV 列切分、GPipe / 1F1B 流水线、3D 并行规划（`DistConfig`） |
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式，**头部记录 LoRA 形态（旧档兼容）** |
-| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** |
+| 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** / **distill** / **fp8** |
 | API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 + 完整问答记录（问答正文只落日志文件）；**模型采出图片段时解码成 PNG，内嵌进 `message.image_url`（data URI）** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
 | GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
@@ -68,7 +71,7 @@
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
 | Scaling Laws | `docs/31-Scaling-Laws.md` | 幂律关系、Chinchilla 最优配比、算力估算、涌现能力（**已落地代码**：`src/scaling.rs` + `scaling` 子命令） |
-| MoE 混合专家模型 | `docs/32-MoE混合专家模型.md` | 稀疏激活、Router 门控网络、负载均衡、Switch/Mixtral/DeepSeek 架构（**已落地代码**：`src/moe.rs` + `moe` 子命令） |
+| MoE 混合专家模型 | `docs/32-MoE混合专家模型.md` | 稀疏激活、Router 门控网络、负载均衡、Switch/Mixtral/DeepSeek 架构；**已落地** DeepSeek-V3 式 aux-loss-free 均衡偏置（sign 更新、不进损失/梯度）与共享专家（DeepSeek-V2/V3 式）（**已落地代码**：`src/moe.rs` + `moe` 子命令） |
 | 量化技术 | `docs/33-量化技术.md` | INT8/INT4 量化、Hessian 量化、AWQ、GGUF、PTQ vs QAT、STE（**已落地代码**：`src/quant.rs` + `quant` 子命令） |
 | 推测解码 | `docs/34-推测解码.md` | 草稿模型 + 验证、拒绝采样、无损保证、Medusa/EAGLE（**已落地代码**：`src/speculative.rs` + `speculative` 子命令） |
 | 多 Token 预测 | `docs/35-多token预测.md` | MTP 训练目标、DeepSeek 实现、与推测解码结合（**已落地代码**：`src/speculative.rs` 的 `MtpHeads` / `MtpDrafter`） |
@@ -88,6 +91,22 @@
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
 | 多模态：图片理解与生成 | `docs/41-多模态.md` | 手写 ViT 视觉塔与 patchify、`<\|image\|>` 占位 token 与 `forward_mm` 像素注入、手写 VQ-VAE 离散码本与三项损失（STE）、图文 JSONL（`VlmLoader`）与 `vlm_file` / `vq_steps` 训练通路、`generate --image` 图片理解、图片段状态机采样 → `gen_image_{i}.png` / serve `message.image_url`（**已落地代码**：`src/vision.rs` + `src/vqvae.rs`） |
+
+### 训练进阶与低精度教程（第 42~46 课，代码+文档）
+
+| 主题 | 教程文档 | 内容 |
+|------|---------|------|
+| 知识蒸馏 | `docs/42-知识蒸馏.md` | 硬标签丢了什么（dark knowledge）、温度缩放与软标签、**`T²` 为什么不能省**、top-k 截断（`select_nth_unstable` 部分选择）、KD 反向 `(T/N)(p_s−p_t)` 与有限差分核对、`(1-α)·CE + α·KD` 对照实验（**已落地代码**：`src/distill.rs` + `distill` 子命令） |
+| FP8 低精度（模拟） | `docs/43-FP8低精度.md` | E4M3 / E5M2 位结构与标准码值、**E4M3 为什么没有 Inf**、ties-to-even 舍入、per-block scale（MXFP8 每 32 元素，9 bit/元素）、模拟 matmul 往返、权重落 FP8 后的 loss 变化、训练开关 `train.fp8`；⚠️ **明确写清"纯数值模拟、无加速，真实收益需 GPU FP8 kernel"**（**已落地代码**：`src/fp8.rs` + `fp8` 子命令） |
+| WSD 学习率调度 | `docs/44-WSD学习率调度.md` | warmup → 稳定段（恒定峰值）→ 末端退火的三段式；`decay_steps = max(round(wsd_decay_frac × (steps − warmup)), 1)`；稳定段任意时刻可切出退火（总步数不必前置）；默认 cosine **逐位不变**（**已落地代码**：`src/train.rs` 的 `LRScheduler` / `new_wsd` / 工厂 `lr_scheduler`；开关 `lr_schedule` / `wsd_decay_frac`） |
+| QK-Norm | `docs/45-QK-Norm.md` | 对每个头的 `head_dim` 向量做 RMSNorm（投影之后、RoPE 之前）；GQA 下 K 侧各 KV 头共用一套 `gamma`；每层多 `2 × head_dim` 参数；默认关闭 **逐位不变**（**已落地代码**：`src/attention.rs` 的 `q_norm` / `k_norm` / `apply_qk_norm` + `src/scaling.rs` 参数量口径；开关 `qk_norm`） |
+| Muon 优化器 | `docs/46-Muon优化器.md` | 二维权重动量矩阵做 Newton–Schulz 正交化（`3.4445 / -4.7750 / 2.0315`）、标度 `√(max(1, r/c))`、一维参数交替回退 AdamW（带偏差校正）；每元素更新量约 `lr/√cols`；默认 AdamW **逐位不变**（**已落地代码**：`src/optim.rs` 的 `Muon` + `OptimizerState` trait + `src/train.rs` 的 `make_optimizer`；开关 `optimizer` / `muon_momentum` / `muon_ns_steps`） |
+
+### 延伸阅读：MLA
+
+| 主题 | 教程文档 | 内容 |
+|------|---------|------|
+| MLA 低秩压缩 KV Cache | [`docs/23-GQA分组查询注意力.md`](docs/23-GQA分组查询注意力.md) §8 | DeepSeek-V2/V3 的 Multi-head Latent Attention：KV 先压到低秩 latent 再从 latent 升维，缓存只存一份 latent（`T × kv_lora_rank`）；GQA 省"份数"、MLA 省"每份体积"；本实现省略 decoupled RoPE 的取舍写在明处（**已落地代码**：`src/attention.rs` 的 `forward_mla` + `KVCache::new_latent`，配置 `model.kv_lora_rank`） |
 
 ## 快速开始
 
@@ -1308,11 +1327,17 @@ cargo run --release -- moe [参数]
 > 所以第二节才改用隔离实验。但塌缩的**代价**在任何规模下都一样：主损失不关心是谁在算，
 > 未被选中的专家拿不到任何梯度（等于白占显存），而 loss 曲线看不出异常。
 
+> **两个已落地的均衡 / 容量机制**：正因为软辅助损失压的是概率分布、不是分配结果，本仓库另提供了
+> DeepSeek-V3 式的 **aux-loss-free 均衡偏置**（`moe_bias_balance` / `moe_bias_lr`：给每个专家一个
+> 只用于选路的 sign 偏置，选 Top-K 看 `logits + bias`，完全不进损失与梯度）与 **共享专家**
+> （`moe_shared_experts`：DeepSeek-V2/V3 式，每个 token 都额外过这几个专家，代价是不稀疏、会拉低稀疏比）。
+> 两者默认关闭，开启前行为逐位不变。
+
 ---
 
-### 13. `quant` / `distributed` / `align` / `rag` / `speculative` —— 第 33~38 课实验
+### 13. `quant` / `distributed` / `align` / `rag` / `speculative` / `distill` / `fp8` —— 第 33~38、42~43 课实验
 
-第 33~38 课各带一个子命令，把该课的算法跑成**带断言自检**的实验：输出的是实测数字与结论，
+第 33~38、42~43 课各带一个子命令，把该课的算法跑成**带断言自检**的实验：输出的是实测数字与结论，
 参数配得不合法（如 `--gamma` 相对 `--block-size` 过大）会当场 panic，而不是给出一份看起来正常的结果。
 
 ```bash
@@ -1321,6 +1346,8 @@ cargo run --release -- distributed [参数]  # 第 38 课：集合通信 + DP / 
 cargo run --release -- align [参数]        # 第 36 课：奖励模型 / DPO / GRPO / PPO
 cargo run --release -- rag [参数]          # 第 37 课：分块 / 向量化 / 检索 / 提示组装
 cargo run --release -- speculative [参数]  # 第 34/35 课：推测解码 + 多 Token 预测
+cargo run --release -- distill [参数]      # 第 42 课：软标签 + KD 梯度自检 + 软/硬标签对照
+cargo run --release -- fp8 [参数]          # 第 43 课：E4M3/E5M2 编解码 + 分块缩放 + 权重落 FP8
 ```
 
 | 子命令 | 关键参数 | 输出分节 |
@@ -1330,9 +1357,12 @@ cargo run --release -- speculative [参数]  # 第 34/35 课：推测解码 + �
 | `align` | `--rm-steps`、`--steps`、`--beta`、`--clip-eps`、`--kl-coef`、`--group-size`、`--rm-lr` / `--lr` | 奖励模型排序准确率 → DPO 偏好边界 → GRPO 组内优势 → PPO 裁剪分支 + KL(k3) 惩罚 |
 | `rag` | `--chunk-size` / `--overlap`、`--top-k`、`--mmr-lambda` / `--mmr-pool`、`--hash-dim`、`--context-chars`、`--query` | 分块不变量 → 三种向量化对照 → top-k 与 MMR 检索 → 提示组装（含预算截断） |
 | `speculative` | `--gamma`、`--mtp-heads` / `--mtp-steps`、`--trials`、`--temperature`、`--block-size` | 无损性核对（与逐 token 解码逐位对照）→ 接受率与 γ 取舍 → 缓存不变量 → 首 token 分布等价 → MTP 头当草稿 |
+| `distill` | `--temperature`、`--alpha`、`--top-k`、`--teacher-steps` / `--steps`、`--lr`、`--batch-size` / `--block`、`--teacher-n-embd` / `--teacher-n-layer`、`--student-n-embd` / `--student-n-layer`、`--seed` | 教师训练与软标签熵（温度对照）→ KD 梯度解析反向 vs 有限差分 → 软标签 vs 硬标签对照（CE / 困惑度 / KL / top-1 一致率） |
+| `fp8` | `--fmt e4m3\|e5m2`、`--block`、`--rows` / `--cols`、`--steps`、`--lr`、`--batch-size` / `--block-size`、`--n-embd` / `--n-layer`、`--seed` | E4M3/E5M2 标准码值对照 → 分块缩放的误差 / 开销权衡 → 权重落 FP8 后的验证 CE（⚠️ 纯数值模拟，无加速） |
 
 > `quant` 需要一个已训练好的 checkpoint（缺省读 `out_dir/latest.ckpt`，可 `--ckpt` 指定）；
-> 其余四个自带小模型与内置语料，直接跑即可。
+> 其余六个自带小模型与内置语料，直接跑即可。
+> 也想看 MLA（第 23 课延伸）？它没有独立子命令，用 `model.kv_lora_rank > 0` 配进 checkpoint 即可走 MLA 前向。
 
 ---
 
@@ -1365,9 +1395,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **263 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **318 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 273 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 328 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1446,6 +1476,32 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `test_sparse_stats_matches_real_layer` | 参数/激活量公式与真实建层逐位一致（GELU 与 SwiGLU 两种专家）；4 专家取 2 ⇒ 激活约一半、省约一半 FLOPs |
 | `test_aux_loss_gradient_balances_routing` | 只优化 `L_aux` 能把偏斜的负载推平（不均衡度下降）——这是"加不加辅助损失"对照实验的机理 |
 | `test_moe_layer_trains` | 端到端：MoE 层 + 输出头在簇状合成任务上真的能学起来（专家可分工） |
+| `test_balance_bias_update_direction` | aux-loss-free 均衡偏置的更新方向：过载专家 `−γ`、欠载专家 `+γ`（按 sign，不按失衡幅度） |
+| `test_balance_bias_is_free_of_params_and_graph` | 均衡偏置不进参数表、不产生计算图节点（既不进损失也不进梯度） |
+| `test_shared_experts_add_parallel_and_count_params` | 共享专家与稀疏专家并联相加；参数量口径把共享专家同时计入总参数与激活参数 |
+| `test_balance_bias_converges_load_without_gradients` | 不跑主损失、完全无梯度，只靠偏置就能把负载推平（"免费"均衡的机理验证） |
+| `test_wsd_schedule_has_three_phases` | WSD 三段式：warmup 上升 → 稳定段恒为 `max_lr` → 末端退火到 `min_lr` |
+| `test_wsd_warmup_matches_cosine` | WSD 与 cosine 的 warmup 段逐位一致（共用同一段预热） |
+| `test_cosine_schedule_default_unchanged` | `lr_schedule = "cosine"` 与加 WSD 之前**逐位不变**（默认路径不回退） |
+| `test_lr_scheduler_factory_respects_schedule` | 工厂 `lr_scheduler` 按配置选 cosine / WSD；非法取值被 `validate` 拦下 |
+| `test_wsd_decay_clamped_to_warmup` | 退火步数至少 1 步、`decay_start` 不早于 `warmup_steps`（边界钳制） |
+| `test_wsd_and_cosine_identical_when_lr_flat` | `max_lr = min_lr` 时两种调度退化成同一条常数曲线 |
+| `test_wsd_vs_cosine_same_seed_differs` | 同种子下 WSD 与 cosine 的训练轨迹确实不同（开关真的接进了训练循环） |
+| `test_qk_norm_changes_training_same_seed` / `test_muon_changes_training_same_seed` / `test_moe_bias_balance_changes_training_same_seed` | 分别打开 QK-Norm / Muon / aux-loss-free 偏置后，同种子训练轨迹发生改变 |
+| `test_optimizer_factory_defaults_to_adamw` | `make_optimizer` 缺省构造 AdamW，`"muon"` 走 Muon，两者统一成 `Box<dyn OptimizerState>` |
+| `test_qk_norm_off_keeps_default_structure` | `qk_norm = false` 时参数表结构与加 QK-Norm 之前完全一致（不多出算子或参数） |
+| `test_qk_norm_makes_each_head_unit_rms_and_is_scale_invariant` | QK-Norm 后每个头向量 RMS = 1，且对输入整体缩放不变 |
+| `test_qk_norm_does_not_change_weight_initialization` | 加 QK-Norm 不改变权重初始化消耗的随机数顺序（默认路径仍可复现） |
+| `test_qk_norm_gradients_reach_gamma` | 反向后 `q_norm` / `k_norm` 的 `gamma` 拿得到梯度 |
+| `test_qk_norm_incremental_cache_matches_full_recompute` | QK-Norm 下 KV cache 增量推理与全量前向逐位一致 |
+| `test_qk_norm_with_mla_latent_cache_matches_full_recompute` | QK-Norm 与 MLA latent cache 组合时，增量推理仍与全量前向一致 |
+| `test_newton_schulz_matches_polynomial_on_orthogonal_input` | NS 迭代在"奇异值全相同"的输入上等于闭式 `p⁵(1/‖Q‖_F)·Q`（`p(x) = 3.4445x − 4.775x³ + 2.0315x⁵`） |
+| `test_muon_zero_gradient_yields_zero_update` | 零梯度 ⇒ 零更新（动量不会凭空造出更新方向） |
+| `test_muon_matrix_update_matches_closed_form` | 二维权重的 Muon 更新与闭式正交化 + 标度结果吻合 |
+| `test_muon_scaling_uses_dimension_ratio` | 标度取 `√(max(1, rows/cols))`；`rows > cols` 时先转置再正交化 |
+| `test_muon_falls_back_to_adamw_on_1d_params` | 一维参数（bias / Norm 的 `gamma`）走 AdamW 回退分支（beta1 / beta2 / eps 与偏差校正一致） |
+| `test_muon_skips_frozen_params` | 冻结参数不被 Muon 更新（含动量状态） |
+| `test_muon_state_roundtrip` | Muon 的 `state` / `restore_state` 往返一致（才能存进 checkpoint 续训） |
 | `split_sft_history_shape` / `split_raw_history_shape` | `serve` 历史拼接：SFT 模板形态与裸续写形态的三段（system / 历史 / 最后一问） |
 | `split_sft_two_rounds_join_with_newline` / `split_merges_multiple_system_messages` / `merge_system_service_level_comes_first` | 多轮历史换行拼接、多条 system 合并、服务级 system 排在会话级之前 |
 | `parse_chat_rejects_bad_requests` / `parse_chat_applies_defaults_and_overrides` | `chat/completions` 入参：空 messages / 超长 / 末条非 user / 非法 role 报 400；采样参数逐字段覆盖默认值 |
@@ -1613,15 +1669,20 @@ SwiGLU 就足以让整条路径放弃）。
     "n_layer": 2,          // Transformer 层数（越深越强）
     "block_size": 32,      // 最大上下文长度（能处理的最长序列）
     "n_kv_head": 0,        // KV 头数。0 = 标准 MHA；< n_head 时启用 GQA
+    "kv_lora_rank": 0,     // MLA 低秩压缩 KV Cache（第 23 课延伸）。0 = 关闭；>0 时 K/V 先压到这维 latent 再升维
     "use_rmsnorm": true,   // true = RMSNorm（LLaMA 风格，默认），false = LayerNorm（经典风格）
     "use_swiglu": true,    // true = SwiGLU MLP（LLaMA 风格，默认），false = GELU MLP（经典风格）
     "dropout": 0.0,        // Dropout 概率。0 = 不丢弃，>0 时训练中随机丢弃
+    "qk_norm": false,      // QK-Norm（第 45 课）：对每个头的 head_dim 向量做 RMSNorm（投影后、RoPE 前）。false = 关闭（与以前逐位相同）
     // ---- MoE 稀疏专家（第 32 课；n_expert = 1 就是稠密 FFN，行为与以前逐位相同）----
     "n_expert": 1,             // 每个 MoE 层的专家数（≥ 2 时该前馈子层换成 MoE）
     "moe_top_k": 1,            // 每个 token 激活几个专家
     "moe_capacity_factor": 0.0,// 专家容量因子。0 = 不限（推理必须 0）
     "moe_aux_coef": 0.0,       // 负载均衡辅助损失系数 α。0 = 不加
     "moe_switch_gate": false,  // 门控口径：false = Top-K 重归一化（Σw = 1）；true = Switch 原概率
+    "moe_shared_experts": 0,   // 共享专家数（DeepSeek-V2/V3 式）：0 = 关闭；>0 时每个 token 都过这几个专家（不稀疏）
+    "moe_bias_balance": false, // aux-loss-free 均衡偏置（DeepSeek-V3 式）：按 sign 推进每专家选路偏置，不进损失/梯度
+    "moe_bias_lr": 0.001,      // 均衡偏置的更新步长 γ，只对 moe_bias_balance = true 生效
     // ---- 多模态（图片理解；缺省 null = 纯文本模型）----
     "vision": {
       "image_size": 64,        // 输入图统一 resize 到 image_size×image_size
@@ -1653,14 +1714,19 @@ SwiGLU 就足以让整条路径放弃）。
 | `n_layer` | int | `2` | Transformer 层数 |
 | `block_size` | int | `32` | 最大上下文长度（token 数） |
 | `n_kv_head` | int | `0` | KV 头数。`0` = 与 `n_head` 相同（标准 MHA）；设为更小值启用 GQA（如 `n_head=8, n_kv_head=2`） |
+| `kv_lora_rank` | int | `0` | **MLA 低秩压缩 KV Cache**（DeepSeek-V2/V3，第 23 课延伸，代码在 [attention.rs](src/attention.rs)）。`0` = 关闭；`> 0` 时 K/V 先压到该维 latent、再升维，KV Cache 只存 `n_layer × T × kv_lora_rank` 一份（对比 GQA 的两份 `n_kv_head × head_dim`）。**约束**：必须小于 `n_kv_head × head_dim`（未配 `n_kv_head` 时按 `n_head` 算），否则启动断言失败。代价是**算力换显存**——每步都要把整段 latent 升维回 K/V。教学版省略 decoupled RoPE，见 [第 23 课 §8](docs/23-GQA分组查询注意力.md) |
 | `use_rmsnorm` | bool | `true` | 是否使用 RMSNorm 替代 LayerNorm（默认 LLaMA 风格；`false` 退回经典的 LayerNorm） |
 | `use_swiglu` | bool | `true` | 是否使用 SwiGLU MLP 替代 GELU MLP（默认 LLaMA 风格；`false` 退回经典的 GELU） |
 | `dropout` | float | `0.0` | Dropout 概率（0~1）。用于注意力权重和残差连接 |
+| `qk_norm` | bool | `false` | **QK-Norm**（第 45 课，代码在 [attention.rs](src/attention.rs)）。`true` 时对 Q、K 的每个头向量（长度 `head_dim`）做 RMSNorm，位置在**投影之后、RoPE 之前**；GQA 下 K 侧各 KV 头共用一套 `gamma`。每层多 `2 × head_dim` 个参数（`scaling.rs` 参数量口径同步）。`false`（默认）时该算子完全不产生，与加 QK-Norm 之前**逐位相同** |
 | `n_expert` | int | `1` | 每个 MoE 层的专家数。**`1` = 稠密 FFN**（与加 MoE 之前逐位相同）；`≥ 2` 时该前馈子层换成 MoE |
 | `moe_top_k` | int | `1` | 每个 token 激活几个专家（`1 ≤ K ≤ n_expert`） |
 | `moe_capacity_factor` | float | `0.0` | 专家容量因子（`capacity = cf × n·K/E`，超出按 token 顺序先到先得丢弃）。`0` = 不限容量，**推理时必须 0** |
 | `moe_aux_coef` | float | `0.0` | 负载均衡辅助损失系数 α（`L_aux = α·E·Σ f_i·p_i`）。`0` = 不加 |
 | `moe_switch_gate` | bool | `false` | 门控口径：`false` = Top-K 内部重归一化（Mixtral / DeepSeek 式，`Σw = 1`）；`true` = 全部专家上的 softmax 原概率（Switch Transformer 式，`Σw < 1`）。**`moe_top_k = 1` 时必须置 `true`**，否则权重恒为 1、路由器拿不到主损失梯度 |
+| `moe_shared_experts` | int | `0` | **共享专家数**（DeepSeek-V2/V3 式，第 32 课）。`0` = 关闭（与以前逐位相同）；`> 0` 时每个 token 除走 Top-K 专家外还**全部**经过这 `E_s` 个共享专家（`y = Σ w_e·Expert_e(x) + Σ SharedExpert_s(x)`）。代价：共享专家不参与稀疏、同时计入总参数与激活参数，会拉低稀疏比 |
+| `moe_bias_balance` | bool | `false` | **aux-loss-free 均衡偏置**（DeepSeek-V3 式，第 32 课）。`true` 时给每个专家维护一个只用于选路的偏置 `b_i`（选 Top-K 看 `logits + b`，门控权重与 `L_aux`/z-loss 仍看原始 `logits`），训练循环在 `opt.step()` 后按 **sign** 更新：低于平均负载 `+γ`、高于平均负载 `−γ`。偏置不进损失、不进梯度、不进 checkpoint；`false`（默认）时与以前逐位相同 |
+| `moe_bias_lr` | float | `0.001` | 均衡偏置的更新步长 γ（DeepSeek-V3 取值），只对 `moe_bias_balance = true` 生效 |
 | `vision` | object/null | `null` | **图片理解（ViT 视觉塔）配置**。`null` = 纯文本模型；给出则启用 `<\|image\|>` 通路：`<\|image\|>` 展开为 P = (`image_size`/`patch_size`)² 个占位符，前向时由视觉塔特征原位覆写。子字段：`image_size`(64) / `patch_size`(16) / `n_embd`(64) / `n_head`(4) / `n_layer`(2) / `dropout`(0.0) / `ph_first`(0，占位符首 id，**训练入口自动写入**)。`image_size` 必须能被 `patch_size` 整除、`n_embd` 必须能被 `n_head` 整除 |
 | `vq` | object/null | `null` | **图片生成（VQ-VAE）配置**。`null` = 不挂生成通路；给出则词表多出 `codebook_size` 个图像 token，生成时采出完整图片段即可解码成 PNG。子字段：`image_size`(64，**必须等于 `vision.image_size`**) / `patch_size`(8) / `latent_dim`(64) / `codebook_size`(512) / `hidden`(256) / `beta`(0.25)。依赖 `vision` 同时存在 |
 
@@ -1675,11 +1741,17 @@ SwiGLU 就足以让整条路径放弃）。
     "max_lr": 3e-3,           // 峰值学习率（warmup 后达到）
     "min_lr": 3e-4,           // cosine 衰减的最低学习率
     "warmup_steps": 20,       // 线性预热步数（从 0 线性升到 max_lr）
+    "lr_schedule": "cosine",  // 学习率调度（第 44 课）："cosine"（默认，与以前逐位相同）或 "wsd"
+    "wsd_decay_frac": 0.1,    // WSD 末端退火占比：退火步数 = max(round(frac × (steps − warmup)), 1)，只对 lr_schedule = "wsd" 生效
     "weight_decay": 0.01,     // AdamW 权重衰减系数
+    "optimizer": "adamw",     // 优化器（第 46 课）："adamw"（默认，与以前逐位相同）或 "muon"
+    "muon_momentum": 0.95,    // Muon 动量系数 μ，只对 optimizer = "muon" 生效
+    "muon_ns_steps": 5,       // Muon 的 Newton–Schulz 迭代步数，只对 optimizer = "muon" 生效
     "grad_clip": 1.0,          // 梯度裁剪阈值（梯度总范数超过此值时等比缩放；1.0 是大模型常用值）
     "amp": true,              // 动态损失缩放（AMP）：loss 先乘 scale 再反向，更新前查溢出并反缩放
     "amp_init_scale_log2": 16, // 初始 scale = 2^16 = 65536
     "amp_growth_interval": 2000, // 连续这么多步无溢出就把 scale 翻倍（上限 2^24）
+    "fp8": false,             // FP8 低精度模拟（第 43 课）：每步更新后把参数按 E4M3 + 每 32 元素一 scale 量化往返一遍。⚠️ 纯数值模拟，不加速、不省显存
     "eval_every": 100,        // 每 N 步评估一次验证集（同时保存 latest checkpoint）
     "eval_iters": 20,         // 评估时采样的批数（取平均减少方差）
     "tokenizer": "bpe",       // 分词器类型："char"（字符级）或 "bpe"（字节对编码）
@@ -1707,11 +1779,17 @@ SwiGLU 就足以让整条路径放弃）。
 | `max_lr` | float | `0.003` | 峰值学习率。AdamW 的初始学习率 |
 | `min_lr` | float | `0.0003` | cosine 衰减的最低学习率。训练后期学习率衰减到此值 |
 | `warmup_steps` | int | `20` | 线性预热步数。前 N 步学习率从 0 线性升到 `max_lr`（≤ `steps`） |
+| `lr_schedule` | string | `"cosine"` | 学习率调度（第 44 课，代码在 [train.rs](src/train.rs) 的 `LRScheduler` / `lr_scheduler`）。`"cosine"`（默认）= warmup + 余弦衰减，与加 WSD 之前**逐位相同**；`"wsd"` = warmup → 稳定段（恒定 `max_lr`）→ 末端退火。只接受这两个值 |
+| `wsd_decay_frac` | float | `0.1` | WSD 末端退火占比，须在 `(0, 1]`。退火步数 = `max(round(wsd_decay_frac × (steps − warmup)), 1)`；只对 `lr_schedule = "wsd"` 生效 |
 | `weight_decay` | float | `0.01` | AdamW 权重衰减。正则化防过拟合 |
+| `optimizer` | string | `"adamw"` | 优化器（第 46 课，代码在 [train.rs](src/train.rs) 的 `make_optimizer`）。`"adamw"`（默认）= 与加 Muon 之前**逐位相同**；`"muon"` = 二维权重用 Muon（动量矩阵 + Newton–Schulz 正交化），一维参数自动回退 AdamW。只接受这两个值 |
+| `muon_momentum` | float | `0.95` | Muon 动量系数 μ，须在 `[0, 1)`；只对 `optimizer = "muon"` 生效 |
+| `muon_ns_steps` | int | `5` | Muon 的 Newton–Schulz 迭代步数（须 ≥ 1）；只对 `optimizer = "muon"` 生效 |
 | `grad_clip` | float | `1.0` | 梯度裁剪。所有参数梯度的 L2 范数超过此值时等比缩放（大模型训练常用 1.0，裁剪不改变方向只限制步长） |
 | `amp` | bool | `true` | 动态损失缩放（AMP，见第 26 课）。开启后 loss 先乘 `scale` 再反向；参数更新前检查梯度是否含 Inf/NaN（含则丢弃本步、不更新参数，并把 `scale` 减半）与梯度反缩放，再执行裁剪与更新。`scale` 恒为 2 的幂，f32 下乘除都是精确的指数移位，所以数值上与关闭 AMP 完全一致——它换来的是**溢出保护**与裁剪阈值的正确性 |
 | `amp_init_scale_log2` | int | `16` | AMP 初始缩放因子以 2 的幂给出（`scale = 2^16 = 65536`）。取值须 ≤ `24`（`scale` 上限就是 2^24） |
 | `amp_growth_interval` | int | `2000` | AMP 缩放因子增长间隔：连续这么多步没有溢出就把 `scale` 翻倍 |
+| `fp8` | bool | `false` | **FP8 低精度模拟**（第 43 课，代码在 [fp8.rs](src/fp8.rs)）。开启后每步 `opt.step()` 之后把参数按 **E4M3 + 每 32 元素一个 scale** 编码再解码回来（原地量化往返），用于观察"权重落 FP8 会让 loss 变差多少"。⚠️ **纯数值模拟，没有任何速度或显存收益**——真实收益来自 GPU 的 FP8 tensor core（本仓库算子在 CPU 上跑 f32，编解码反而更慢）。实测 300 步小模型上 E4M3 的 loss 劣化约 `+0.07%`（[第 43 课](docs/43-FP8低精度.md)） |
 | `eval_every` | int | `100` | 每 N 步在验证集上评估 loss / 困惑度，并保存 `latest.ckpt` |
 | `eval_iters` | int | `20` | 评估时采样多少批取平均（减少随机波动） |
 | `tokenizer` | string | `"bpe"` | `"char"` = 字符级分词；`"bpe"` = 字节对编码 |
@@ -1841,12 +1919,14 @@ llm_from_scratch/
 │                       #      corpus_perf/（性能测试用节选）、sft/（SFT 问答语料 zh_qa.txt）
 │                       #      vlm/（多模态：360 张 64×64 合成图 img/ + 720 条图文 vlm.jsonl）、vlm_train.txt（VLM BPE 语料）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling / moe
+│   ├── main.rs         # CLI 入口：train / eval / generate / chat / serve / sft / finetune / preset / demo / bench
+│   │                   #           scaling / moe / quant / distributed / align / rag / speculative / distill / fp8
 │   ├── cli.rs          # 命令行定义（clap）
-│   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）
+│   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）+ 超参校验（含 MLA kv_lora_rank、lr_schedule / optimizer / wsd_decay_frac / muon_* 约束）
 │   ├── runlog.rs       # 运行日志：每次训练 / 推理自动写 logs/{操作}_{时间戳}.log（命令行 + 完整配置 + 过程输出）
+│   ├── prompt.rs       # 对话 prompt 组装：system + 历史按 token 裁剪 + 角色模板（chat 与 serve 共用）
 │   ├── checkpoint.rs   # checkpoint 保存 / 恢复
-│   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、23、25 课）
+│   ├── attention.rs    # 多头注意力 + KV Cache（第 9-10、23、25 课）+ MLA 低秩压缩 KV Cache（`kv_lora_rank`，第 23 课延伸）+ QK-Norm（第 45 课）
 │   ├── autograd.rs     # 自动微分：线性 tape + backward 逆序扫描（第 2 课）
 │   ├── tensor.rs       # 张量运算（第 1、3-4 课）
 │   ├── gpu.rs          # GPU 计算后端（第 27 课，--features gpu）：WGSL 计算着色器
@@ -1854,25 +1934,32 @@ llm_from_scratch/
 │   ├── rng.rs          # 随机数（第 5 课）
 │   ├── layers.rs       # 网络层（第 5、11、19、21-22、29 课）
 │   ├── loss.rs         # 损失函数（第 6 课）
-│   ├── optim.rs        # 优化器（第 6、17 课）
+│   ├── optim.rs        # 优化器（第 6、17 课）+ Muon（动量矩阵 + Newton–Schulz 正交化，第 46 课）
 │   ├── module.rs       # 参数管理 trait（第 5 课）
 │   ├── tokenizer.rs    # 分词器（第 8 课）+ 图像占位 token 区间挂载
 │   ├── model.rs        # Transformer 模型：Transformer Block + 前向（第 9-12、19 课）+ forward_mm 多模态前向
 │   ├── vision.rs       # 图片理解：图像 IO / patchify / ViT 视觉编码器（image crate 只做编解码）
 │   ├── vqvae.rs        # 图片生成：VQ-VAE（编码器 / 码本 / 解码器 + 三项损失），vq.ckpt 存取
 │   ├── data.rs         # 数据集 + SFT 对话解析与 loss 掩码（第 14 课）+ VlmLoader 图文 JSONL
-│   ├── train.rs        # 训练循环、学习率调度、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）+ VQ-VAE 预训练
+│   ├── train.rs        # 训练循环、学习率调度（cosine + WSD，第 44 课）、梯度累积、早停、CSV 日志、SFT 掩码透传（第 13、18、28 课）+ VQ-VAE 预训练 + FP8 量化往返（train.fp8）+ 优化器工厂 `make_optimizer`（AdamW / Muon）
 │   ├── sample.rs       # 推理与采样（第 15、30 课）+ 视觉注入与图片段提取
 │   ├── serve.rs        # OpenAI 兼容 API 服务：路由/鉴权/SSE 流式/排队（第 40 课）+ 生成图 data URI
 │   ├── scaling.rs      # Scaling Laws：幂律拟合、算力/参数口径、Chinchilla 最优配比、实测扫描（第 31 课）
-│   └── moe.rs          # MoE 稀疏专家：Top-K 路由、两种门控口径、稀疏前向、辅助损失、容量因子（第 32 课）
+│   ├── moe.rs          # MoE 稀疏专家：Top-K 路由、两种门控口径、稀疏前向、辅助损失、容量因子（第 32 课）+ aux-loss-free 均衡偏置与共享专家（DeepSeek-V2/V3 式）
+│   ├── quant.rs        # 量化基础：int8/int4 编解码、位打包、Hessian 量化、AWQ、校准集（第 33 课）
+│   ├── speculative.rs  # 推测解码（第 34 课）与多 Token 预测 MTP（第 35 课）
+│   ├── align.rs        # RLHF 与对齐：奖励模型、DPO、GRPO、PPO（第 36 课）
+│   ├── rag.rs          # RAG 检索增强：分块、向量化、top-k / MMR 检索、提示组装（第 37 课）
+│   ├── distributed.rs  # 分布式训练：集合通信、DP / ZeRO、张量并行、流水线并行、3D 并行（第 38 课）
+│   ├── distill.rs      # 知识蒸馏：软标签、温度、top-k 截断、`kd_loss` / `distill_loss`（第 42 课）
+│   └── fp8.rs          # FP8 低精度**模拟**：E4M3 / E5M2 编解码 + 分块（micro-scaling）缩放 + 往返误差（第 43 课）
 ├── openapi/           # OpenAPI 接口规范静态版（serve 启动时自动写出，与端点同源，删了会重建）
 │   ├── openapi.json   #   OpenAPI 3.1，JSON（缩进输出），可导入 Postman / Apifox / Swagger UI
 │   └── openapi.yaml   #   同一份规范的 YAML 格式
 ├── web/               # 前端测试页（vite + React + TS，serve 默认随 API 一起启动，--no-web 关闭）
 │   ├── vite.config.ts #   dev server 代理 /v1、/health、/openapi.* → API 端口（同源转发，免 --cors）
 │   └── src/           #   App.tsx（三个页签：流式对话 / embeddings / 状态总览）+ api.ts（SSE 客户端）
-└── docs/               # 41 课教程文档（00-学习计划 + 01~41 各课）
+└── docs/               # 46 课教程文档（00-学习计划 + 01~46 各课）
 ```
 
 ### 产物目录约定（自动创建，无需手动 mkdir）
@@ -1911,15 +1998,16 @@ llm_from_scratch/
 > | 四、Transformer | 09-12 | 注意力、多头、位置编码、Transformer | ✅ |
 > | 五、训练与推理 | 13-16 | 训练循环、数据、采样、训练小 Transformer | ✅ |
 > | 六、训练进阶与正则化 | 17-19 | AdamW、学习率调度、Dropout | ✅ |
-> | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA、Flash Attention | ✅ |
+> | 七、现代 LLM 架构 | 20-24 | RoPE、RMSNorm、SwiGLU、GQA（延伸 MLA 低秩压缩 KV Cache）、Flash Attention | ✅ |
 > | 八、工程优化 | 25-30 | KV Cache、混合精度、GPU、梯度累积、LoRA、Beam Search | ✅ |
 > | 九、前沿技术 | 31-38 | Scaling Laws、MoE、量化、推测解码、RLHF、RAG、分布式 | 31-38 ✅ |
-> | 十、工程化完善 | 39 | CLI 工程、分词器持久化、预设配置、微调工作流、SFT 监督微调、交互式对话 | ✅ |
+> | 十、工程化完善 | 39-40 | CLI 工程、分词器持久化、预设配置、微调工作流、SFT 监督微调、交互式对话、API 服务 | ✅ |
 > | 十一、多模态 | 41 | ViT 图片理解、VQ-VAE 图片生成、图文训练与部署 | ✅ |
+> | 十二、训练进阶与低精度 | 42-46 | 知识蒸馏（软标签 / 温度 / `T²`）、FP8 低精度模拟（E4M3 / E5M2 / 分块缩放）、WSD 学习率调度、QK-Norm、Muon 优化器（另含 MoE 的 aux-loss-free 均衡偏置与共享专家） | ✅ |
 
 ## 代码验证状态
 
-- **263 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `263 passed; 0 failed`，release 全量约 43 秒；
+- **318 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `318 passed; 0 failed`；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
@@ -1959,7 +2047,10 @@ llm_from_scratch/
   并导出 CSV；参数口径与真实建层共用公式 + 扫描时逐位断言，公式漂移会当场 panic 而不是给出错数字
 - **MoE 稀疏专家已落地**（第 32 课）：`moe` 子命令四节实验（参数口径 / 负载均衡隔离实验 / 端到端对照 /
   容量因子与 Token Dropping）；`TransformerConfig.n_expert = 1` 时行为与加 MoE 之前**逐位相同**；
-  `moe_top_k = 1` 时必须配 `moe_switch_gate`，否则路由器拿不到主损失梯度（子命令与单测都会指出这一点）
+  `moe_top_k = 1` 时必须配 `moe_switch_gate`，否则路由器拿不到主损失梯度（子命令与单测都会指出这一点）。
+  另已落地 DeepSeek-V3 式 **aux-loss-free 均衡偏置**（`moe_bias_balance` / `moe_bias_lr`：给每个专家一个
+  只用于选路的 sign 偏置，不进损失 / 梯度 / checkpoint，训练循环在 `opt.step()` 后更新）与 **共享专家**
+  （`moe_shared_experts`，DeepSeek-V2/V3 式，与稀疏专家并联相加）；两者默认关闭，开启前行为逐位不变
 - **量化已落地**（第 33 课）：`quant` 子命令支持 RTN / Hessian 量化 / AWQ 三种 weight-only 量化（int8 / int4），
   校准集走 Hessian `XᵀX`（含 act-order、阻尼、分块），AWQ 的缩放指数 α 可在 0~1 网格上按代理误差逐层搜索，
   可选 `--eval` 对比量化前后验证集 loss / 困惑度，并把量化权重与元信息落盘到 checkpoint
@@ -1981,6 +2072,37 @@ llm_from_scratch/
   （Beam Search 分支不支持，会忽略并打日志）；`vqvae.rs` 的 VQ-VAE 码本把图片离散成 token，
   模型采出完整图片段后解码落盘 `gen_image_{i}.png`，非流式 serve 回包内嵌 `message.image_url`；
   `train.vlm_file` 指定图文 JSONL 做 VLM 训练，`train.vq_steps` 负责 VQ-VAE 预训练（已有 `vq.ckpt` 自动跳过）
+- **MLA 低秩压缩 KV Cache 已落地**（第 23 课延伸）：`MultiHeadAttention` 在 `kv_lora_rank > 0` 时走
+  `forward_mla`——KV 不再各自从输入投影，而是先压到一份低秩 latent 再从 latent 升维，`KVCache::new_latent`
+  只缓存这一份 latent（`层数 × T × kv_lora_rank`）；单测保证 `kv_lora_rank = 0` 时与普通 MHA/GQA
+  **逐位一致**（含初始化消耗的随机数顺序），MLA 模式的下一个 token 与全量前向一致、缓存显存公式成立
+- **知识蒸馏已落地**（第 42 课）：`distill` 子命令三节——教师软标签的熵随温度变化、`kd_loss` 的解析反向
+  与有限差分核对（最大误差 ~1e-4）、「同一学生同一数据只差 α」的对照（实测 CE 5.59 → 3.97、KL 0.30 → 0.16、
+  top-1 一致率 22.7% → 32.8%）；单测覆盖 `T`/`top_k`/`α` 的边界语义与蒸馏优于硬标签
+- **FP8 低精度模拟已落地**（第 43 课）：`fp8` 子命令三节——E4M3/E5M2 与 OCP 一致的标准码值对照、
+  分块缩放的误差 / 开销权衡（整张 / 128 / 32 / 1 四档）、权重落 FP8 后的验证 CE；
+  单测覆盖已知码值、次正规数与 ±0、溢出 / Inf / NaN、ties-to-even 舍入、分块优于单 scale、
+  模拟 matmul 误差量级、权重往返 SNR 与 loss 稳定性。
+  ⚠️ **纯数值模拟**：算子仍跑 CPU f32，**不带来任何加速**；`train.fp8` 只把二维权重按 E4M3 + 每 32 元素一 scale
+  往返量化回写（梯度与优化器状态仍 f32）
+- **WSD 学习率调度已落地**（第 44 课）：`train.rs` 的 `LRScheduler::new`（cosine，与以前逐位不变）与 `new_wsd`
+  共用同一段 warmup；WSD 在稳定段恒定 `max_lr`、末段按 `decay_steps = max(round(wsd_decay_frac × (steps − warmup)), 1)`
+  线性退火到 `min_lr`（稳定段任意时刻可切出退火，总步数不必前置）。配置 `lr_schedule` / `wsd_decay_frac`；
+  单测覆盖三段形状、warmup 与 cosine 逐位一致、`max_lr = min_lr` 退化同曲线、退火边界钳制与"默认 cosine 逐位不变"
+- **QK-Norm 已落地**（第 45 课）：`attention.rs` 的 `MultiHeadAttention` 新增 `q_norm` / `k_norm`（`Option<RMSNorm>`），
+  在 **投影之后、RoPE 之前** 对每个头向量（`head_dim`）做 RMSNorm；GQA 下 K 侧各 KV 头共用一套 `gamma`；
+  `scaling.rs` 参数量口径同步（每层 +`2 × head_dim`）。配置 `qk_norm`，默认 `false` 时该算子**完全不产生**、逐位不变；
+  单测保证"每头 RMS = 1 且尺度不变"、不改变初始化随机数顺序、`gamma` 拿到梯度，以及增量 KV cache（含与 MLA 组合）与全量前向一致
+- **Muon 优化器已落地**（第 46 课）：`optim.rs` 新增 `Muon`——二维权重沿动量矩阵做 Newton–Schulz 正交化
+  （常数 `3.4445 / -4.7750 / 2.0315`、标度 `√(max(1, rows/cols))`、`rows > cols` 先转置），一维参数（bias / `gamma`）
+  自动回退 AdamW；同时抽出 `OptimizerState` trait，`train.rs` 的 `make_optimizer` 按 `train.optimizer` 构造 AdamW 或 Muon。
+  配置 `optimizer` / `muon_momentum` / `muon_ns_steps`，默认 AdamW **逐位不变**；单测含 NS 闭式核对、维度标度、
+  一维回退、冻结参数跳过与状态往返
+- **MoE aux-loss-free 均衡偏置与共享专家已落地**（第 32 课）：`moe.rs` 新增 `bias: Shared<Vec<f32>>` +
+  `update_balance_bias()`（选 Top-K 看 `logits + bias`、门控权重仍看原始 `logits`，按 **sign** 以 `moe_bias_lr`
+  推进偏置，不进损失 / 梯度 / checkpoint，训练循环在 `opt.step()` 之后调用）；以及 `shared_experts: Vec<MLPEnum>`
+  （与稀疏专家并联相加、同时计入总参数与激活参数）。配置 `moe_bias_balance` / `moe_bias_lr` / `moe_shared_experts`，
+  默认关闭时**逐位不变**；单测覆盖偏置方向、不进参数表与计算图、无梯度也能推平负载、共享专家参数量口径
 
 ## 性能优化与基准测试
 
@@ -2166,6 +2288,19 @@ loss 直接变 NaN，整轮实验作废。
   谁先说"判定；**跨文件共用一张表会把后面文件的角色弄反**，所以加载时要保留文件边界
   （`load_texts` 而不是拼成一份）。人名标签只在整份文件 ≥90% 非空行是角色行、且说话人只有两个时
   才启用——否则小说正文（`秦琼道：……`）会被当成对话喂进来。
+- **FP8 编码前必须 `clamp` 到格式上限**：per-block scale 用 `scale = max|x| / fmt.max()` 算出，
+  理论上有 `|x/scale| ≤ fmt.max()`。但 `1/(amax/max)` 这一步本身带舍入误差，恰好等于 `amax` 的
+  那个元素算出来会**略大于** `max`——E4M3 会饱和到 448（问题不大），E5M2 直接编成 **Inf**，
+  一个元素污染整张张量算出 inf/NaN。修法是在 `encode` 前 `clamp(-lim, lim)`（见 [fp8.rs](src/fp8.rs) 的 `from_slice`）。
+- **FP8 分块 scale 的开销别算错**：每 32 个元素共享一个 f32 scale，额外开销是 `4 字节 / 32 元素 = 1 bit/元素`，
+  总位宽是 **9 bit**（不是 8.125 bit），对 f32 的压缩比是**约 3.6 倍**（不是 4 倍）。这个数字直接决定
+  CLI 打出的"占用 %"是否自洽，早期文档与代码在这里对不上。
+- **蒸馏的 `T²` 不能省**：`∂(KL)/∂z_s` 里 softmax 的 `1/T` 与 log 的 `T` 相乘后，梯度天然带一个 `1/T²`；
+  若 loss 不乘回 `T²`，换温度就等于偷偷改了学习率——`T=4` 时有效步长只有 `T=1` 的 1/16，
+  对照组会"看起来很稳"其实根本没在学。
+- **MLA 缓存里存的是"未旋转"的 latent**：教学版让 RoPE 作用在完整 `head_dim` 上，压缩后再旋转会破坏
+  latent 的低秩结构，所以缓存里保留原始 latent、每步按 `KVCache::positions` 记录的**绝对位置**补旋。
+  滑动窗口丢行后位置并不连续，因此必须存每个位置的绝对下标（不能靠 `seq_len` 推断）。
 
 ## 后续方向
 
@@ -2181,9 +2316,22 @@ loss 直接变 NaN，整轮实验作废。
 - **RAG 检索增强生成**（第 37 课）→ `src/rag.rs`（分块、向量化、检索、提示组装）+ `rag` 子命令
 - **分布式训练**（第 38 课）→ `src/distributed.rs`（DP、ZeRO、TP、PP、3D）+ `distributed` 子命令
 - **长度外推**（第 20 课）→ `src/rope.rs`（Linear PI / NTK-aware / YaRN）
+- **多模态**（第 41 课）→ `src/vision.rs`（ViT 图片理解）+ `src/vqvae.rs`（VQ-VAE 图片生成）+ `generate --image` / serve `message.image_url`
+- **知识蒸馏**（第 42 课）→ `src/distill.rs`（软标签 / 温度 / top-k / `T²` 缩放）+ `distill` 子命令
+- **FP8 低精度模拟**（第 43 课）→ `src/fp8.rs`（E4M3 / E5M2 编解码 + 分块缩放）+ `fp8` 子命令 + `train.fp8` 开关
+- **WSD 学习率调度**（第 44 课）→ `src/train.rs` 的 `LRScheduler::new_wsd` / `lr_scheduler` + `train.lr_schedule` / `train.wsd_decay_frac`
+- **QK-Norm**（第 45 课）→ `src/attention.rs` 的 `q_norm` / `k_norm` / `apply_qk_norm` + `src/scaling.rs` 参数量口径 + `model.qk_norm`
+- **Muon 优化器**（第 46 课）→ `src/optim.rs` 的 `Muon` + `OptimizerState` trait + `src/train.rs` 的 `make_optimizer` + `train.optimizer` / `muon_momentum` / `muon_ns_steps`
+- **MoE aux-loss-free 均衡偏置与共享专家**（第 32 课延伸）→ `src/moe.rs` 的 `update_balance_bias` / `shared_experts` + `model.moe_bias_balance` / `moe_bias_lr` / `moe_shared_experts`
+- **MLA 低秩压缩 KV Cache**（第 23 课延伸）→ `src/attention.rs` 的 `forward_mla` + `KVCache::new_latent` + `model.kv_lora_rank`
 
 仍可继续推进的方向：
 
 - 更大的语料与模型规模（`config/config.json` 可直接调大，CPU 训练需耐心）
+- **真实 FP8 训练**：本仓库的 `src/fp8.rs` 只是数值模拟（编解码往返），要拿到 2 倍吞吐与一半显存
+  必须把 matmul 换成 GPU 的 FP8 tensor core kernel（前向 E4M3、反向 E5M2 + 主权重高精度副本），
+  当前实现的价值是给出可对照的误差基准
+- **MLA 的 decoupled RoPE**：当前教学版让 RoPE 作用在完整 `head_dim` 上、缓存只存未旋转的 latent，
+  每步按 `KVCache::positions` 补旋；论文式做法是把 rope 子维单独拎出来只对那部分旋转，可省掉这次补旋
 - 真实多机多卡通信后端：`distributed.rs` 目前是单进程模拟 world，语义与数值对齐真实集合通信，
   换成 NCCL / MPI 时算法本身无需改动，但需要另写通信层

@@ -212,8 +212,8 @@ LLM 判断: "这个问题我不确定" → 触发检索
 
 ## 本项目的实际实现
 
-上面的原理已全部落地为可运行代码。核心文件是 [`src/rag.rs`](../src/rag.rs)（19 个单测），
-CLI 入口是 [`rag`](../README.md#13-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令。
+上面的原理已全部落地为可运行代码。核心文件是 [`src/rag.rs`](../src/rag.rs)（9 个单测），
+CLI 入口是 [`rag`](../README.md#13-quant--distributed--align--rag--speculative--distill--fp8--第-33384243-课实验) 子命令。
 
 ### 代码结构
 

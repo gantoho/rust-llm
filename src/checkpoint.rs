@@ -27,7 +27,7 @@ use std::io::{Read, Write};
 
 use crate::config::LoRAConfig;
 use crate::model::{Transformer, TransformerConfig};
-use crate::optim::{AdamW, Optimizer};
+use crate::optim::OptimizerState;
 use crate::quant::{QuantMeta, QuantMethod, QuantOpts};
 use crate::tensor::Tensor;
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ pub struct Checkpoint {
 /// 加载端重放量化得到的模型与内存里那个不是同一个）。真写错了会在下面直接断言拦下。
 ///
 /// 没有优化器状态可写（量化产物导出等）时改用 [`save_weights`]。
-pub fn save(path: &str, model: &Transformer, opt: &AdamW, step: usize, best_val_loss: f32) {
+pub fn save(path: &str, model: &Transformer, opt: &dyn OptimizerState, step: usize, best_val_loss: f32) {
     let named = model.named_parameters();
     let (opt_t, opt_m, opt_v) = opt.state();
     let header = make_header(model, &named, step, best_val_loss, opt_t, false);
@@ -223,7 +223,7 @@ pub fn load_params(path: &str, model: &Transformer) -> Checkpoint {
 }
 
 /// 加载参数并恢复优化器状态（resume 用）
-pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut AdamW) -> Checkpoint {
+pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut dyn OptimizerState) -> Checkpoint {
     let (ckpt, metas, data, opt_t) = read_file(path);
     let block = numel_total(&metas) * 4;
     restore_params(model, &metas, &data[..block]);
@@ -458,7 +458,7 @@ mod tests {
     use super::*;
     use crate::model::TransformerConfig;
     use crate::module::Module;
-    use crate::optim::Optimizer;
+    use crate::optim::{AdamW, Muon, Optimizer};
     use crate::quant::QBits;
     use crate::rng::Rng;
     use crate::tensor::Tensor;
@@ -526,6 +526,57 @@ mod tests {
         }
         for (i, (a, b)) in opt_v.iter().zip(v2).enumerate() {
             assert_bits_eq(a, b, &format!("二阶动量 v[{i}]"));
+        }
+    }
+
+    /// 构造一个"用 Muon 训练过几步"的模型 + 优化器（与 [`trained_tiny`] 同构）。
+    /// 二维参数的动量缓冲在 `m` 段、`v` 段是全零占位，一维参数则用满 m/v——
+    /// 一段存档里同时覆盖这两种语义，才能验证三段布局对 Muon 也成立。
+    fn trained_tiny_muon(seed: u64) -> (Transformer, Muon) {
+        let mut rng = Rng::new(seed);
+        let model = Transformer::new(TransformerConfig::tiny(64), &mut rng);
+        let mut opt = Muon::new(1e-2, model.parameters(), 0.1, 0.95, 5);
+        for k in 0..3 {
+            for p in opt.params() {
+                let mut g = p.grad.borrow_mut();
+                for (i, x) in g.iter_mut().enumerate() {
+                    *x = ((i + k) as f32 * 0.01).sin();
+                }
+            }
+            opt.step();
+        }
+        (model, opt)
+    }
+
+    /// Muon 与 AdamW 共用同一套三段式存档（参数 / m / v），恢复后应逐位一致，
+    /// 否则选 Muon 的训练无法精确续训。
+    #[test]
+    fn test_muon_save_load_roundtrip_is_bit_exact() {
+        let (model, opt) = trained_tiny_muon(31);
+        let (opt_t, opt_m, opt_v) = opt.state();
+        let (opt_t, opt_m, opt_v) = (opt_t, opt_m.to_vec(), opt_v.to_vec());
+
+        let path = tmp_path("muon_roundtrip");
+        save(&path, &model, &opt, 13, 0.9);
+
+        let mut rng = Rng::new(777);
+        let model2 = Transformer::new(TransformerConfig::tiny(64), &mut rng);
+        let mut opt2 = Muon::new(1e-2, model2.parameters(), 0.1, 0.95, 5);
+        let ckpt = load_with_opt(&path, &model2, &mut opt2);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(ckpt.step, 13);
+        assert_eq!(ckpt.best_val_loss, 0.9);
+        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+            assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
+        }
+        let (t2, m2, v2) = opt2.state();
+        assert_eq!(t2, opt_t, "优化器步数未还原");
+        for (i, (a, b)) in opt_m.iter().zip(m2).enumerate() {
+            assert_bits_eq(a, b, &format!("动量缓冲 m[{i}]"));
+        }
+        for (i, (a, b)) in opt_v.iter().zip(v2).enumerate() {
+            assert_bits_eq(a, b, &format!("占位 v[{i}]"));
         }
     }
 

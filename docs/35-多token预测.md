@@ -163,7 +163,7 @@ MTP 的 K 个损失会累加，总梯度比 NTP 大 K 倍。需要：
 ## 本项目的实际实现
 
 上面的原理已全部落地为可运行代码。MTP 相关组件与第 34 课共用 [`src/speculative.rs`](../src/speculative.rs)（8 个单测），
-CLI 入口是 [`speculative`](../README.md#13-quant--distributed--align--rag--speculative--第-3338-课实验) 子命令（通过 `--mtp-heads` / `--mtp-steps` 控制）。
+CLI 入口是 [`speculative`](../README.md#13-quant--distributed--align--rag--speculative--distill--fp8--第-33384243-课实验) 子命令（通过 `--mtp-heads` / `--mtp-steps` 控制）。
 
 ### 代码结构
 

@@ -46,8 +46,25 @@ pub struct TransformerConfig {
     /// 0 表示与 n_head 相同（标准 Multi-Head Attention）。
     /// LLaMA 2 70B 用 n_head=64, n_kv_head=8；Mistral 7B 用 n_head=32, n_kv_head=8。
     pub n_kv_head: usize,
+    /// **MLA 的低秩维**（Multi-head Latent Attention，DeepSeek-V2/V3）：`> 0` 时 K/V 不再
+    /// 各自从输入投影，而是先压到 `kv_lora_rank` 维的 latent，再从 latent 升维出 K/V；
+    /// 推理缓存里**只存这份 latent**（`T × kv_lora_rank`），而不是 K、V 两份
+    /// （`2 × T × n_kv_head × head_dim`）。详见 [`crate::attention::MultiHeadAttention`]。
+    ///
+    /// 必须严格小于 `n_kv_head × head_dim`（否则不是压缩，构造时会报错）。
+    /// 0 = 关闭（默认），行为与加 MLA 之前逐位一致。
+    /// 参考量级：DeepSeek-V2 用 512，对照 `128 头 × 192 维`。
+    pub kv_lora_rank: usize,
     /// 是否使用 RMSNorm（true = LLaMA 风格，false = 经典风格 LayerNorm）
     pub use_rmsnorm: bool,
+    /// **QK-Norm**：在每个注意力层的 Q/K 投影之后、RoPE 之前，对**每个头**的
+    /// `head_dim` 向量做一次 RMSNorm。`false` = 关闭（默认，行为与之前**逐位一致**）。
+    ///
+    /// 作用是把注意力打分的幅度钉死，抑制大 logit 让 softmax 饱和、梯度消失——
+    /// Gemma 2 / Chameleon / ViT-22B 都用它换取更稳的训练（允许更大学习率、更短 warmup）。
+    /// 多出的参数是每层 `2 × head_dim` 个 `gamma`（相对整个模型可忽略）。
+    /// 与 MLA 正交、可同时开启。详见 [`crate::attention::MultiHeadAttention`]。
+    pub qk_norm: bool,
     /// 是否使用 SwiGLU MLP（true = LLaMA 风格，false = 经典风格 GELU MLP）
     pub use_swiglu: bool,
     /// Dropout 概率（0 = 不丢弃）。用于注意力权重和残差连接。
@@ -77,6 +94,26 @@ pub struct TransformerConfig {
     ///   K = 1 请置 `true`，否则路由器只能靠辅助损失训练。
     /// - `true`：用**全部专家**上的 softmax 原概率（Switch Transformer 式），`Σw < 1`。
     pub moe_switch_gate: bool,
+    /// **共享专家**个数（DeepSeek-V2/V3 式）：这些 FFN 对**全部** token 生效、不参与路由，
+    /// 输出直接加到路由专家的结果上。0 = 不启用（默认，行为与之前**逐位一致**）。
+    ///
+    /// 共享专家承接"所有 token 都要用的常识"，让路由专家专心分工，从而缓解路由冗余
+    /// （多个专家重复学同一批常见模式）。代价是这部分参数**没有稀疏性可言**，
+    /// 每 token 都要算，会按比例吃掉 MoE 省下的 FLOPs（见 [`crate::moe::SparseStats`]）。
+    pub moe_shared_experts: usize,
+    /// **aux-loss-free 均衡偏置**开关（DeepSeek-V3 式）。false = 关闭（默认，逐位不变）。
+    ///
+    /// 开启后每个专家多一个**只用于选路**的偏置 `b_i`：Top-K 选择看 `logits + b`，
+    /// 而门控权重仍用**原始** `logits`——所以偏置不进梯度、不进损失、不改输出数值口径。
+    /// 每次训练步按"目标负载 − 实际负载"的**符号**以固定步长 γ 调整 b（过载 ↓、欠载 ↑）。
+    ///
+    /// 与 α·L_aux 互补，可以并用，也可以**替代** α：α 靠辅助损失持续扰动路由器梯度
+    /// 来换均衡（要牺牲一点主损失），而偏置均衡完全不碰主损失，只改硬路由（argmax）。
+    /// 详见 [`crate::moe::MoELayer::update_balance_bias`]。
+    pub moe_bias_balance: bool,
+    /// aux-loss-free 偏置的更新步长 γ（默认 0.001，DeepSeek-V3 的取值）。
+    /// 只对 `moe_bias_balance = true` 生效。
+    pub moe_bias_lr: f32,
     // ---- RoPE 频率（第 20 课长度外推）----
     /// RoPE 的频率底数：10 000 = 原始 RoPE 论文；LLaMA-3 用 500 000。
     /// 底数本身就是一种静态的频率缩放，改它必须与训练时保持一致。
@@ -119,7 +156,9 @@ impl Default for TransformerConfig {
             n_layer: 2,
             block_size: 32,
             n_kv_head: 0,
+            kv_lora_rank: 0,
             use_rmsnorm: true,
+            qk_norm: false,
             use_swiglu: true,
             dropout: 0.0,
             n_expert: 1,
@@ -128,6 +167,9 @@ impl Default for TransformerConfig {
             moe_aux_coef: 0.0,
             moe_z_loss_coef: 0.0,
             moe_switch_gate: false,
+            moe_shared_experts: 0,
+            moe_bias_balance: false,
+            moe_bias_lr: 0.001,
             rope_base: rope::ROPE_BASE,
             rope_scaling: RopeScaling::None,
             rope_train_ctx: 0,
@@ -303,6 +345,8 @@ impl TransformerBlock {
                 cfg.n_embd,
                 cfg.n_head,
                 cfg.n_kv_head,
+                cfg.kv_lora_rank,
+                cfg.qk_norm,
                 // 训练窗口取 block_size：YaRN 的分段边界与 NTK 的 factor 都是相对它而言
                 cfg.rope_spec(),
                 rng,
@@ -412,6 +456,15 @@ impl TransformerBlock {
         use crate::attention::{expand_kv_head, fold_kv_head_grad};
 
         if !crate::tensor::grad_enabled() || self.attn.has_lora() || self.attn.has_quant() {
+            return None;
+        }
+        // MLA 整段让路：这条路径假设 `c_k/c_v` 直接吃 `d` 维输入（内核按 x @ Wkᵀ 算 K/V），
+        // 而 MLA 的 K/V 来自 latent 升维，喂进去只会得到形状不匹配或语义错误的结果。
+        if self.attn.kv_lora_rank > 0 {
+            return None;
+        }
+        // QK-Norm 同理让路：内核把「Q/K 投影 → RoPE」融成一段，没有插入逐头 RMSNorm 的位置。
+        if self.attn.q_norm.is_some() {
             return None;
         }
         // GPU 内核里的 RoPE 角度按 `base = 10000`、不缩放写死（见 `gpu.rs` 的
@@ -1171,6 +1224,22 @@ impl Transformer {
         any
     }
 
+    /// 按最近一次前向的路由负载推进各 MoE 层的**均衡偏置**（DeepSeek-V3 的 aux-loss-free
+    /// 更新），返回是否真的更新过（非 MoE 配置或未开 `moe_bias_balance` 时返回 false）。
+    ///
+    /// 训练循环必须在每次 `opt.step()` 之后、下一次前向（含评估）之前调用一次：
+    /// 偏置更新不是梯度、不进计算图，靠的是"上一步实际把 token 分给了谁"这份统计，
+    /// 而统计只保留最近一次前向（见 [`Transformer::route_stats`]）。
+    pub fn update_moe_balance_bias(&self) -> bool {
+        let mut any = false;
+        for b in &self.blocks {
+            if let Ffn::Moe(m) = &b.ffn {
+                any |= m.update_balance_bias();
+            }
+        }
+        any
+    }
+
     /// 推理期改写 RoPE 频率参数与上下文长度（第 20 课长度外推），返回改前的窗口。
     ///
     /// 可以直接套在**已加载的权重**上：`rope_base` / `rope_scaling` / `block_size`
@@ -1309,7 +1378,15 @@ impl Transformer {
     ) -> Option<Tensor> {
         use crate::attention::{expand_kv_head, fold_kv_head_grad};
         use crate::gpu::{STACK_PARAMS_PER_LAYER, StackArgs, StackLayerArgs};
-        if !crate::tensor::grad_enabled() || self.blocks.is_empty() || self.has_lora() || self.has_quant()
+        if !crate::tensor::grad_enabled()
+            || self.blocks.is_empty()
+            || self.has_lora()
+            || self.has_quant()
+            // MLA 整段让路（理由同 `TransformerBlock::attn_resident`）
+            || self.cfg.kv_lora_rank > 0
+            // QK-Norm 让路：内核把 Q/K 投影与 RoPE 融成一段，中间插不进逐头 RMSNorm，
+            // 强行走常驻路径会**静默丢掉归一化**（前向照跑、数值却与逐算子路径不一致）。
+            || self.cfg.qk_norm
         {
             return None;
         }
@@ -1602,14 +1679,24 @@ impl Transformer {
     ///   流式生成想看到"丢开头也不崩"就必须开它，见 [`KvCacheOpts::sink`]。
     /// - `bits = Some(_)`：缓存以 int8/int4 存放（KIVI：K 逐通道、V 逐 token），
     ///   显存占用降到 1/4 或 1/8，代价是每次读回时反量化。
+    ///
+    /// MLA 配置（`kv_lora_rank > 0`）下自动改用**latent 缓存**
+    /// （[`KVCache::new_latent`]）：缓存里只有一份压缩表示，量化口径相应变成逐 token。
     pub fn new_kv_cache_with(&self, sink: usize, bits: Option<QBits>) -> Vec<KVCache> {
         let opts = KvCacheOpts {
             window: self.cfg.block_size,
             sink,
             bits,
         };
+        let mla = self.cfg.kv_lora_rank > 0;
         (0..self.cfg.n_layer)
-            .map(|_| KVCache::new(opts))
+            .map(|_| {
+                if mla {
+                    KVCache::new_latent(opts)
+                } else {
+                    KVCache::new(opts)
+                }
+            })
             .collect()
     }
 
@@ -1758,6 +1845,56 @@ mod tests {
                 .zip(&last_full)
                 .all(|(a, b)| (a - b).abs() < 1e-4),
             "KV cache 推理与全量前向的同一位置 logits 应一致"
+        );
+    }
+
+    /// MLA（低秩压缩 KV cache）在模型层面的三件事：
+    /// 1. 缓存自动换成 latent 缓存（每层只有一份压缩表示）；
+    /// 2. 增量推理与全量前向一致（latent 未旋转 → RoPE 补旋口径正确）；
+    /// 3. 缓存字节数明显小于同配置的 GQA 缓存。
+    #[test]
+    fn test_mla_model_uses_latent_cache_and_matches_full_forward() {
+        let mut rng = Rng::new(42);
+        let mut cfg = TransformerConfig::tiny(32);
+        cfg.n_kv_head = 2; // kv_dim = 2 × (64/4) = 32
+        cfg.kv_lora_rank = 4; // 压到 4 维
+        let model = Transformer::new(cfg, &mut rng);
+        let (n_layer, v) = (model.cfg.n_layer, model.cfg.vocab_size);
+        let seq = vec![1, 5, 7, 3, 9, 2, 8, 4, 6, 0];
+
+        let mut cache = model.new_kv_cache();
+        assert!(
+            cache.iter().all(|c| c.is_latent()),
+            "MLA 配置下 new_kv_cache 必须给出 latent 缓存"
+        );
+        let _ = model.forward(&seq, 1, seq.len(), Some(&mut cache), false);
+        let new_id = 3;
+        let one = model.forward(&[new_id], 1, 1, Some(&mut cache), false);
+        let last_one = one.data()[one.numel() - v..].to_vec();
+
+        let mut seq2 = seq.clone();
+        seq2.push(new_id);
+        let full = model.forward(&seq2, 1, seq2.len(), None, false);
+        let last_full = full.data()[full.numel() - v..].to_vec();
+        assert!(
+            last_one.iter().zip(&last_full).all(|(a, b)| (a - b).abs() < 1e-4),
+            "MLA 的增量推理与全量前向应给出同一位置一致的 logits"
+        );
+
+        // 缓存字节：每层 T×r 个 f32（普通 GQA 是每层 2×T×kv_dim）
+        let t = seq2.len();
+        let latent_bytes: usize = cache.iter().map(|c| c.byte_len()).sum();
+        assert_eq!(latent_bytes, n_layer * t * 4 * 4);
+
+        let plain = Transformer::new(TransformerConfig::tiny(32), &mut rng);
+        assert_eq!(plain.cfg.n_kv_head, 0);
+        let mut pcache = plain.new_kv_cache();
+        let _ = plain.forward(&seq2, 1, t, Some(&mut pcache), false);
+        let plain_bytes: usize = pcache.iter().map(|c| c.byte_len()).sum();
+        assert_eq!(plain_bytes, n_layer * 2 * t * (4 * 16) * 4);
+        assert!(
+            latent_bytes * 8 <= plain_bytes,
+            "MLA 缓存应显著更小：{latent_bytes} vs {plain_bytes} 字节"
         );
     }
 

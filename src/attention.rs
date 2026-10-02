@@ -6,7 +6,8 @@
 //! - [`KVCache`]：推理时缓存历史 K/V，避免重复计算
 //! - [`MultiHeadAttention`]：多头自注意力 + RoPE 位置编码（第 20 课）
 
-use crate::layers::Linear;
+use crate::layers::{Linear, RMSNorm};
+use crate::model::LN_EPS;
 use crate::module::Module;
 use crate::quant::{QAxis, QBits, QMatrix};
 use crate::rng::Rng;
@@ -136,6 +137,9 @@ impl KvBlock {
 ///   （列 scale 是共享的，随追加重算会让已写入的历史码值失效）。
 /// - **V 逐 token（[`QAxis::Row`]）**：V 的每个位置是一行，行内数值同尺度、
 ///   行间差异大，逐行 scale 既准确又不影响历史数据（每行自带一个 scale）。
+/// **MLA 模式**（[`KVCache::new_latent`]）下缓存里存的是**压缩后的 latent**：
+/// 一份 `[T, kv_lora_rank]` 就同时蕴含了 K 和 V 两条路径的信息，
+/// 而普通模式下要存两份 `[T, n_kv_head·head_dim]`。
 pub struct KVCache {
     k: KvBlock,
     v: KvBlock,
@@ -143,7 +147,10 @@ pub struct KVCache {
     seen: usize,   // 累计喂进来的位置总数，只增不减（RoPE 绝对位置基准）
     window: usize, // 保留上限；0 = 不丢弃（缓存只拼不丢）
     sink: usize,   // 永久保留的最前面若干位置
-    d: usize,      // 隐藏维 D，第一次 append 时确定
+    d: usize,      // 隐藏维 D（MLA 模式下是 kv_lora_rank），第一次 append 时确定
+    /// MLA（低秩压缩）模式：缓存里只有一个流（latent），`v` 流保持为空。
+    /// 见 [`KVCache::new_latent`]。
+    latent: bool,
 }
 
 impl KVCache {
@@ -163,7 +170,27 @@ impl KVCache {
             window: opts.window,
             sink: opts.sink,
             d: 0,
+            latent: false,
         }
+    }
+
+    /// **MLA 模式**的缓存：只存一份低秩 latent（见 [`crate::attention::MultiHeadAttention`]
+    /// 的 MLA 说明），而不是 K、V 两份。
+    ///
+    /// 长上下文推理的显存瓶颈就是这份缓存：普通 GQA 要存
+    /// `2 × 层数 × T × n_kv_head × head_dim × 4` 字节，MLA 只存
+    /// `层数 × T × kv_lora_rank × 4` 字节——DeepSeek-V2 里
+    /// `kv_lora_rank = 512` 对比 `n_head·head_dim = 128 × 192`，缓存小了约 96 倍。
+    /// 代价是**算力换显存**：每次生成都要把整段 latent 升维回 K/V（见 `forward_mla`），
+    /// 而不是像普通模式那样只算新 token 的 K/V。
+    ///
+    /// 量化口径：latent 逐 token 一行、行内同尺度，所以逐行（[`QAxis::Row`]）定标，
+    /// 与 V 同理；滑动窗口 / Attention Sink / 推测解码回滚 / Beam 分叉全部照旧可用。
+    pub fn new_latent(opts: KvCacheOpts) -> Self {
+        let mut c = Self::new(opts);
+        c.latent = true;
+        c.k = KvBlock::new(opts.bits, QAxis::Row);
+        c
     }
 
     /// 带滑动窗口的缓存：最多保留 `window` 个位置，超出则丢最旧的；`window = 0` 表示不丢弃
@@ -173,6 +200,11 @@ impl KVCache {
             sink: 0,
             bits: None,
         })
+    }
+
+    /// 是否 MLA（低秩压缩）模式
+    pub fn is_latent(&self) -> bool {
+        self.latent
     }
 
     /// 深拷贝一份（Beam Search 的每条候选路径都要有自己独立的缓存）。
@@ -195,11 +227,14 @@ impl KVCache {
             window: self.window,
             sink: self.sink,
             d: self.d,
+            latent: self.latent,
         }
     }
 
     pub fn reset(&mut self) {
-        self.k = KvBlock::new(self.bits(), QAxis::Col);
+        // MLA 模式下 `k` 流存的是 latent，逐 token 定标（与 `new_latent` 一致）
+        let axis = if self.latent { QAxis::Row } else { QAxis::Col };
+        self.k = KvBlock::new(self.bits(), axis);
         self.v = KvBlock::new(self.bits(), QAxis::Row);
         self.len = 0;
         self.seen = 0;
@@ -242,6 +277,10 @@ impl KVCache {
     /// 把新的 k/v 追加到缓存末尾（只拷贝新块，不复制历史数据），
     /// 并在超过窗口时丢弃最旧的若干行（跳过最前面的 `sink` 个位置）。
     pub fn append(&mut self, k: &Tensor, v: &Tensor) {
+        assert!(
+            !self.latent,
+            "MLA 模式的缓存只接收 latent（请用 KVCache::append_latent），它不存 K/V 两份"
+        );
         assert_eq!(k.shape(), v.shape(), "K/V 形状必须一致");
         assert_eq!(k.rank(), 3, "K/V 必须为 3D [1, T, D]，实际 {:?}", k.shape());
         assert_eq!(k.shape()[0], 1, "KV cache 只支持 batch = 1");
@@ -265,6 +304,53 @@ impl KVCache {
             self.v.drop_front_from(self.sink, drop, self.d);
             self.len = self.window;
         }
+    }
+
+    /// **MLA 模式**：追加新的 latent（`[1, t, kv_lora_rank]`），返回缓存里**全部** latent
+    /// `[1, len, kv_lora_rank]`（f32 路径零拷贝）。
+    ///
+    /// 与 [`KVCache::append`] 的滑动窗口 / Attention Sink 记账完全一致，只是只有一个流。
+    /// 调用方拿全量 latent 后再升维出 K/V——MLA 的就是这么用算力换显存的。
+    pub fn append_latent(&mut self, latent: &Tensor) -> Tensor {
+        assert!(
+            self.latent,
+            "当前缓存不是 MLA 模式（构造时用 KVCache::new_latent），收不到 latent"
+        );
+        assert_eq!(latent.rank(), 3, "latent 必须为 3D [1, T, r]，实际 {:?}", latent.shape());
+        assert_eq!(latent.shape()[0], 1, "KV cache 只支持 batch = 1");
+        let t = latent.shape()[1];
+        let d = latent.shape()[2];
+        if self.d == 0 {
+            self.d = d;
+        } else {
+            assert_eq!(self.d, d, "latent 维度不能中途改变");
+        }
+        self.k.push(&latent.data_ref(), t, d);
+        self.len += t;
+        self.seen += t;
+        if self.window > 0 && self.len > self.window {
+            let drop = self.len - self.window;
+            self.k.drop_front_from(self.sink, drop, self.d);
+            self.len = self.window;
+        }
+        self.k()
+    }
+
+    /// 缓存里每一行对应的**绝对位置**（RoPE 用）。
+    ///
+    /// 未触发丢弃时就是 `0..seen`；一旦滑动窗口开始丢行，留下的行是
+    /// `[0, sink) ∪ [seen - (len - sink), seen)` ——**绝对位置不连续**。
+    ///
+    /// 普通模式用不到它（K 在写进缓存之前就已经旋转好了，缓存里存的是"已旋转的 K"）；
+    /// MLA 模式必须用：缓存里存的是**未旋转的 latent**，每次推理都要按每行各自的
+    /// 绝对位置重新旋转升维出来的 K，否则滑动窗口下的相对距离会整体错位。
+    pub fn positions(&self) -> Vec<usize> {
+        if self.len >= self.seen {
+            return (0..self.seen).collect();
+        }
+        let mut p: Vec<usize> = (0..self.sink).collect();
+        p.extend(self.seen - (self.len - self.sink)..self.seen);
+        p
     }
 
     /// 返回完整缓存张量 [1, T, D]。
@@ -305,7 +391,10 @@ impl KVCache {
             return;
         }
         self.k.drop_back(n, self.d);
-        self.v.drop_back(n, self.d);
+        // MLA 模式只有 latent 一个流（`v` 是空的，回滚它会让长度下溢）
+        if !self.latent {
+            self.v.drop_back(n, self.d);
+        }
         self.len -= n;
         self.seen -= n;
     }
@@ -383,23 +472,75 @@ impl KvBlock {
 /// - n_kv_head = n_head：标准 MHA
 /// - n_kv_head = 1：Multi-Query Attention（MQA）
 /// - 1 < n_kv_head < n_head：GQA（LLaMA 2/3、Mistral 使用）
+///
+/// # MLA（Multi-head Latent Attention，DeepSeek-V2/V3）
+///
+/// `kv_lora_rank > 0` 时切换到 MLA：**K 和 V 不再各自从输入投影，而是先压到一份
+/// 低秩 latent，再从 latent 升维出来**：
+///
+/// ```text
+///     GQA:   x ──c_k──> K ┐                       缓存：K、V 两份
+///            x ──c_v──> V ┘
+///
+///     MLA:   x ──c_kv──> c (r 维)  ─┬─c_k──> K   缓存：**只有 c**
+///                                   └─c_v──> V
+/// ```
+///
+/// 为什么省显存：推理时的缓存是 `2 × 层数 × T × n_kv_head × head_dim × 4` 字节，
+/// 长上下文下它比权重还大。MLA 只缓存 `层数 × T × r × 4`，而 `r` 可以远小于
+/// `n_kv_head × head_dim`（DeepSeek-V2：r = 512，对比 128 头 × 192 维）。
+/// 代价写在明处：**每次推理都要把整段 latent 升维回 K/V**（用算力换显存），
+/// 而不是只算新 token 的 K/V。
+///
+/// 本实现的取舍（教学版，与论文的差异写在这里而不是藏起来）：
+/// - 保留论文的**核心**：KV 联合低秩压缩 + 缓存只存 latent。
+/// - 省略论文的 **decoupled RoPE**（把 Q/K 的 rope 子维单独拎出来、只对那部分旋转，
+///   让压缩后的 latent 不必带位置信息）。因此这里的 RoPE 作用在完整的 head_dim 上，
+///   缓存里的 latent 是**未旋转**的，靠 [`KVCache::positions`] 每步按各自绝对位置补旋。
+///   效果上的差别：压缩率略低、每步多一次旋转（`T` 行的 O(T·d) 计算，与升维同量级）。
 pub struct MultiHeadAttention {
     pub c_q: Linear,
+    /// K 的投影。普通模式下是 `d -> n_kv_head·head_dim`；MLA 模式下是
+    /// `kv_lora_rank -> n_kv_head·head_dim`（"升维"那一半）。
     pub c_k: Linear,
+    /// V 的投影，输入维口径同 [`MultiHeadAttention::c_k`]。
     pub c_v: Linear,
     pub c_proj: Linear,
+    /// MLA 的**压缩投影** `d -> kv_lora_rank`；`None` = 不走 MLA（`kv_lora_rank = 0`）。
+    pub c_kv: Option<Linear>,
+    /// MLA 的低秩维 `r`；0 = 关闭（普通 MHA / GQA）。
+    pub kv_lora_rank: usize,
     pub n_head: usize,
     pub n_kv_head: usize,
+    /// **QK-Norm**（Query-Key Normalization）：`Some` 时在 Q/K 投影之后、RoPE 之前，
+    /// 对**每个头**的 `head_dim` 向量做一次 RMSNorm。`None` = 关闭（默认，逐位不变）。
+    ///
+    /// 为什么有用：注意力打分 `q·k/√d` 的幅度不受约束，训练中 Q/K 的尺度会一起漂移，
+    /// 大 logit 把 softmax 推到饱和区（梯度趋零），这是长训练里突然发散的最常见原因之一。
+    /// 在 Q/K 上各加一层归一化把尺度钉死，Gemma 2 / Chameleon / ViT-22B 都靠它换来了
+    /// 更稳的训练（可以用更大的学习率、更少的 warmup）。注意它归一化的是 **head_dim
+    /// 方向**（每个头内部），不是隐藏维——所以 `gamma` 长度是 `head_dim` 而不是 `n_embd`。
+    pub q_norm: Option<RMSNorm>,
+    /// K 侧的 QK-Norm（GQA 下 `gamma` 长度仍是 `head_dim`，各 KV 头共用一套参数）。
+    pub k_norm: Option<RMSNorm>,
     /// RoPE 的频率参数（底数 + 长度外推方式）。**结构的一部分**：训练与推理、
     /// checkpoint 加载与续训必须一致，否则同一段文本会被旋转到不同角度。
     pub rope: RopeSpec,
 }
 
 impl MultiHeadAttention {
+    /// `kv_lora_rank = 0`：普通 MHA / GQA（行为与加 MLA 之前**逐位一致**，包括初始化
+    /// 消耗的随机数顺序）；`> 0`：走 MLA，见结构体文档。
+    ///
+    /// `qk_norm = false` 同样逐位不变：RMSNorm 的 `gamma` 初始化为全 1，不消耗随机数，
+    /// 所以老配置（`config.json` 里没有这个字段、serde 取默认值 `false`）训出来的权重
+    /// 与加了 QK-Norm 之前的代码完全一致。
     pub fn new(
         n_embd: usize,
         n_head: usize,
         n_kv_head: usize,
+        kv_lora_rank: usize,
+        qk_norm: bool,
         rope: RopeSpec,
         rng: &mut Rng,
     ) -> Self {
@@ -407,13 +548,46 @@ impl MultiHeadAttention {
         assert!(n_head % n_kv == 0, "n_head 必须能被 n_kv_head 整除");
         let head_dim = n_embd / n_head;
         let kv_dim = n_kv * head_dim;
+        assert!(
+            kv_lora_rank < kv_dim,
+            "MLA 的低秩维（{kv_lora_rank}）必须小于 K/V 的完整维度（{kv_dim} = n_kv_head × head_dim），否则谈不上压缩"
+        );
+        // 先按**普通模式**的随机数顺序建 c_q/c_k/c_v/c_proj，再建 MLA 的压缩投影：
+        // `kv_lora_rank = 0` 时不消耗任何额外随机数，老配置的初始化逐位不变。
+        let c_q = Linear::new(n_embd, n_embd, rng);
+        let (c_k, c_v) = if kv_lora_rank > 0 {
+            (
+                Linear::new(kv_lora_rank, kv_dim, rng),
+                Linear::new(kv_lora_rank, kv_dim, rng),
+            )
+        } else {
+            (
+                Linear::new(n_embd, kv_dim, rng),
+                Linear::new(n_embd, kv_dim, rng),
+            )
+        };
+        let c_proj = Linear::new(n_embd, n_embd, rng);
+        let c_kv = (kv_lora_rank > 0).then(|| Linear::new(n_embd, kv_lora_rank, rng));
+        // QK-Norm 放在所有投影之后构造：它不消耗随机数，但保持"老路径的随机数顺序在前"这条规矩
+        let (q_norm, k_norm) = if qk_norm {
+            (
+                Some(RMSNorm::new(head_dim, LN_EPS)),
+                Some(RMSNorm::new(head_dim, LN_EPS)),
+            )
+        } else {
+            (None, None)
+        };
         MultiHeadAttention {
-            c_q: Linear::new(n_embd, n_embd, rng),
-            c_k: Linear::new(n_embd, kv_dim, rng),
-            c_v: Linear::new(n_embd, kv_dim, rng),
-            c_proj: Linear::new(n_embd, n_embd, rng),
+            c_q,
+            c_k,
+            c_v,
+            c_proj,
+            c_kv,
+            kv_lora_rank,
             n_head,
             n_kv_head: n_kv,
+            q_norm,
+            k_norm,
             rope,
         }
     }
@@ -435,11 +609,22 @@ impl MultiHeadAttention {
         let head_dim = d / self.n_head;
         assert_eq!(head_dim * self.n_head, d, "n_embd 必须能被 n_head 整除");
 
+        // MLA 走另一条前向：K/V 由 latent 升维而来，缓存里存的是 latent
+        if self.c_kv.is_some() {
+            return self.forward_mla(x, mask, kv_cache, base);
+        }
+
         // 1. 投影得到 Q、K、V
         let q = self.c_q.forward(x).reshape(vec![b, t, d]); // [B, T, D]
         let kv_dim = self.n_kv_head * head_dim;
         let k = self.c_k.forward(x).reshape(vec![b, t, kv_dim]); // [B, T, kv_dim]
         let v = self.c_v.forward(x).reshape(vec![b, t, kv_dim]);
+
+        // 1.5 QK-Norm（若开启）：投影之后、RoPE 之前，对每个头做 RMSNorm。
+        //     放在 RoPE 前是因为旋转是正交变换、不改变向量范数，先归一化即"旋转前钉死尺度"；
+        //     放在缓存之前，于是缓存里存的仍是归一化+旋转后的 K，历史复用不受影响。
+        let q = self.apply_qk_norm(q, &self.q_norm, self.n_head);
+        let k = self.apply_qk_norm(k, &self.k_norm, self.n_kv_head);
 
         // 2. RoPE：Q/K 按 head_dim 旋转（GQA 时 K 只有 n_kv_head 个头）
         let mut positions = Vec::with_capacity(b * t);
@@ -454,7 +639,7 @@ impl MultiHeadAttention {
             k.reshape(vec![b, t, kv_dim]),
         );
 
-        // 3. KV cache
+        // 3. KV cache（缓存里存的是**已旋转的** K，历史直接复用，新 token 只算新块）
         let (k, v) = match kv_cache {
             Some(cache) => {
                 cache.append(&k, &v);
@@ -462,37 +647,123 @@ impl MultiHeadAttention {
             }
             None => (k, v),
         };
-        let t_total = k.shape()[1];
 
-        // 4. 拆头（GQA 不再物化 repeat_kv：flash_attention 的 CPU 分块核按 Q 头
-        //    核内索引共享 KV 头，GPU 路径在 `Tensor::flash_attention` 内核外展开）
-        let q = q
-            .reshape(vec![b, t, self.n_head, head_dim])
-            .permute(&[0, 2, 1, 3])
-            .reshape(vec![b * self.n_head, t, head_dim]);
+        // 4-8. 拆头 → flash attention → 合并头 → 输出投影
+        self.attend(&q, &k, &v, mask, b, t)
+    }
 
+    /// MLA 前向：`x → latent →（缓存）→ K/V → 注意力`。
+    ///
+    /// 与普通前向的三处不同：
+    /// 1. K/V 不是从 `x` 直接投影，而是从**压缩 latent** 升维（`c_kv` → `c_k`/`c_v`）；
+    /// 2. 缓存里存的是 latent（[`KVCache::append_latent`]），每次要**全量**升维回 K/V；
+    /// 3. latent 是**未旋转**的，所以 K 必须按缓存里每一行各自的绝对位置补旋
+    ///    （[`KVCache::positions`]；滑动窗口丢行后这些位置并不连续）。
+    fn forward_mla(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        mut kv_cache: Option<&mut KVCache>,
+        base: usize,
+    ) -> Tensor {
+        let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+        let head_dim = d / self.n_head;
+        let kv_dim = self.n_kv_head * head_dim;
+        let c_kv = self.c_kv.as_ref().expect("forward_mla 只应在 MLA 模式下调用");
+
+        // 1. Q 投影 + latent 压缩投影
+        let q = self.c_q.forward(x).reshape(vec![b, t, d]);
+        let latent = c_kv.forward(x).reshape(vec![b, t, self.kv_lora_rank]);
+
+        // 2. latent 进缓存（MLA 省显存的地方就在这一步：只存这一份）
+        let (latent, k_pos) = match kv_cache.as_deref_mut() {
+            Some(cache) => {
+                assert!(
+                    cache.is_latent(),
+                    "MLA 模型必须配 MLA 模式的缓存（Transformer::new_kv_cache 会按配置自动选）"
+                );
+                let all = cache.append_latent(&latent);
+                let pos = cache.positions();
+                (all, pos)
+            }
+            None => {
+                let pos: Vec<usize> = (0..b).flat_map(|_| base..base + t).collect();
+                (latent, pos)
+            }
+        };
+        let tk = latent.shape()[1];
+
+        // 3. 全量升维回 K/V（用算力换显存）
+        let k = self.c_k.forward(&latent).reshape(vec![b, tk, kv_dim]);
+        let v = self.c_v.forward(&latent).reshape(vec![b, tk, kv_dim]);
+
+        // 3.5 QK-Norm（若开启）：口径与普通路径一致——升维出来的 K 按头归一化后再旋转。
+        //     注意缓存里存的是**未归一化**的 latent，归一化每步在升维之后重做，
+        //     因此"全量重算"与"latent 缓存增量"两条路的结果仍然一致。
+        let q = self.apply_qk_norm(q, &self.q_norm, self.n_head);
+        let k = self.apply_qk_norm(k, &self.k_norm, self.n_kv_head);
+
+        // 4. RoPE：Q 用本次新 token 的绝对位置；K 用它自己每一行的绝对位置
+        let q_pos: Vec<usize> = (0..b).flat_map(|_| base..base + t).collect();
+        let q = q.reshape(vec![b * t, d]).rotary(&q_pos, &self.rope).reshape(vec![b, t, d]);
         let k = k
-            .reshape(vec![b, t_total, self.n_kv_head, head_dim])
-            .permute(&[0, 2, 1, 3])
-            .reshape(vec![b * self.n_kv_head, t_total, head_dim]);
-        let v = v
-            .reshape(vec![b, t_total, self.n_kv_head, head_dim])
-            .permute(&[0, 2, 1, 3])
-            .reshape(vec![b * self.n_kv_head, t_total, head_dim]);
+            .reshape(vec![b * tk, kv_dim])
+            .rotary(&k_pos, &self.rope)
+            .reshape(vec![b, tk, kv_dim]);
 
-        // 5-7. Flash Attention 融合算子：CPU 走分块在线 softmax（不物化掩码、不落地 P，
-        //      `block_size` 真实生效）；GPU 常驻/probe 路径才消费 mask（见 `Tensor::flash_attention`）
+        self.attend(&q, &k, &v, mask, b, t)
+    }
+
+    /// QK-Norm 的具体动作：把 `[…, n_head·head_dim]` 摊成 `[…·n_head, head_dim]`，
+    /// 逐头做 RMSNorm，再**还原成原来的形状**。`norm = None` 时原样返回
+    /// （**不产生任何算子**，默认配置下这条路径的开销是一次所有权转移）。
+    ///
+    /// GQA 下 K 传 `n_kv_head`，每行仍是一个头的 `head_dim` 向量，逐头归一化口径不变；
+    /// 所有 KV 头共用同一套 `gamma`（与 Gemma 2 一致——它也是每个注意力层一套 QK 归一化）。
+    fn apply_qk_norm(&self, x: Tensor, norm: &Option<RMSNorm>, n_head: usize) -> Tensor {
+        match norm {
+            None => x,
+            Some(n) => {
+                let shape = x.shape().to_vec();
+                let rows: usize = shape[..shape.len() - 1].iter().product();
+                let dim = shape[shape.len() - 1];
+                let head_dim = dim / n_head;
+                x.reshape(vec![rows * n_head, head_dim])
+                    .rmsnorm(&n.gamma, n.eps)
+                    .reshape(shape)
+            }
+        }
+    }
+
+    /// 注意力核心（两条前向路径共用）：
+    /// 拆头 → Flash Attention → 合并头 → 输出投影。
+    ///
+    /// GQA 不再物化 repeat_kv：flash_attention 的 CPU 分块核按 Q 头核内索引共享 KV 头，
+    /// GPU 路径在 `Tensor::flash_attention` 内核外展开（见 `crate::attention::expand_kv_head`）。
+    /// 缓存路径下 `k`/`v` 的行数是 `T_total`（≥ 本次的 `t`），据此推出序列长度。
+    fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, b: usize, t: usize) -> Tensor {
+        let d = q.shape()[2];
+        let head_dim = d / self.n_head;
+        let t_total = k.shape()[1];
+        let split = |x: &Tensor, n_head: usize, rows: usize| {
+            x.reshape(vec![b, rows, n_head, head_dim])
+                .permute(&[0, 2, 1, 3])
+                .reshape(vec![b * n_head, rows, head_dim])
+        };
+        // 1. 拆头
+        let q = split(q, self.n_head, t);
+        let k = split(k, self.n_kv_head, t_total);
+        let v = split(v, self.n_kv_head, t_total);
+        // 2. Flash Attention 融合算子：CPU 走分块在线 softmax（不物化掩码、不落地 P，
+        //    `block_size` 真实生效）；GPU 常驻/probe 路径才消费 mask
         let out = Tensor::flash_attention(&q, &k, &v, mask, 32);
-
-        // 8. 合并头回 [B, T, D]
+        // 3. 合并头回 [B, T, D]
         let out = out
             .reshape(vec![b, self.n_head, t, head_dim])
             .permute(&[0, 2, 1, 3])
             .reshape(vec![b, t, d]);
-
-        // 9. 输出投影
-        let out = self.c_proj.forward(&out);
-        out
+        // 4. 输出投影
+        self.c_proj.forward(&out)
     }
 
     /// 按 `targets` 给 Q/K/V/输出投影挂上 LoRA 适配器。
@@ -502,6 +773,9 @@ impl MultiHeadAttention {
     /// 加适配器收益最小而参数与 Q 一样多，所以默认关闭（`--lora-targets` 可打开）。
     ///
     /// 主干冻结不在这里做，由 [`crate::model::Transformer::apply_lora`] 统一处理。
+    /// MLA 的压缩投影 `c_kv` **不挂适配器**：它同时供给 K 和 V 两条路，
+    /// 低秩增量在那里既破坏"压缩"的口径（增量本身可能与主干同维），
+    /// 也没有现成的社区做法；要调 MLA 的 KV 表示，直接调 `kv_lora_rank` 重训更干净。
     pub fn apply_lora(&mut self, lora: &crate::config::LoRAConfig, rng: &mut Rng) {
         let t = lora.targets;
         for (on, lin) in [
@@ -516,14 +790,27 @@ impl MultiHeadAttention {
         }
     }
 
+    /// 本层的全部投影：`c_q / c_k / c_v / c_proj`，MLA 模式下再加压缩投影 `c_kv`。
+    /// 量化、反量化、冻结这些"扫一遍所有权重"的操作都走它，避免每加一个投影就要改三处。
+    fn linears(&self) -> Vec<&Linear> {
+        let mut v = vec![&self.c_q, &self.c_k, &self.c_v, &self.c_proj];
+        if let Some(c) = &self.c_kv {
+            v.push(c);
+        }
+        v
+    }
+
+    fn linears_mut(&mut self) -> Vec<&mut Linear> {
+        let mut v = vec![&mut self.c_q, &mut self.c_k, &mut self.c_v, &mut self.c_proj];
+        if let Some(c) = self.c_kv.as_mut() {
+            v.push(c);
+        }
+        v
+    }
+
     /// 把本层各投影的适配器合并进主干（推理用，见 [`Linear::merge_lora`]）
     pub fn merge_lora(&mut self) {
-        for lin in [
-            &mut self.c_q,
-            &mut self.c_k,
-            &mut self.c_v,
-            &mut self.c_proj,
-        ] {
+        for lin in self.linears_mut() {
             lin.merge_lora();
         }
     }
@@ -531,66 +818,84 @@ impl MultiHeadAttention {
     /// 本层是否有任一投影挂了适配器
     /// （GPU 常驻显存快路据此让路，见 [`crate::model`]）
     pub fn has_lora(&self) -> bool {
-        [&self.c_q, &self.c_k, &self.c_v, &self.c_proj]
-            .iter()
-            .any(|l| l.lora.is_some())
+        self.linears().iter().any(|l| l.lora.is_some())
     }
 
     /// 本层是否有任一投影被量化（GPU 常驻显存快路据此让路，见 [`crate::model`]）
     pub fn has_quant(&self) -> bool {
-        [&self.c_q, &self.c_k, &self.c_v, &self.c_proj]
-            .iter()
-            .any(|l| l.has_quant())
+        self.linears().iter().any(|l| l.has_quant())
     }
 
     /// 把各投影的量化状态烘焙回 f32（checkpoint 里写的始终是 f32 权重）
     pub fn dequantize_weights(&mut self) {
-        for lin in [
-            &mut self.c_q,
-            &mut self.c_k,
-            &mut self.c_v,
-            &mut self.c_proj,
-        ] {
+        for lin in self.linears_mut() {
             lin.dequantize_weight();
         }
     }
 
     /// 带名字的参数（checkpoint 用）：`{prefix}.c_q/c_k/c_v/c_proj.*`
     /// （挂了 LoRA 时各投影下还有 `.lora_a` / `.lora_b`，由 [`Linear::named_parameters`] 递归带出）
+    ///
+    /// QK-Norm 开启时额外带 `{prefix}.q_norm.gamma` / `{prefix}.k_norm.gamma`；
+    /// 关闭时这两个名字不出现，于是**老 checkpoint 与老配置仍然逐位兼容**。
     pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
-        self.named_linears(prefix)
+        let mut ps: Vec<(String, Tensor)> = self
+            .named_linears(prefix)
             .into_iter()
             .flat_map(|(p, lin)| lin.named_parameters(&p))
-            .collect()
+            .collect();
+        if let Some(n) = &self.q_norm {
+            ps.extend(n.named_parameters(&format!("{prefix}.q_norm")));
+        }
+        if let Some(n) = &self.k_norm {
+            ps.extend(n.named_parameters(&format!("{prefix}.k_norm")));
+        }
+        ps
     }
 
-    /// 四个投影 + 各自的参数名前缀。`named_parameters` 由它派生，
-    /// 名字因此只有一处定义——量化要按同一套名字取校准统计，见 [`crate::quant::CalibStats`]。
+    /// 各投影 + 各自的参数名前缀（MLA 模式下 `c_kv` 排在 `c_q` 之后）。
+    /// `named_parameters` 由它派生，名字因此只有一处定义——
+    /// 量化要按同一套名字取校准统计，见 [`crate::quant::CalibStats`]。
     pub fn named_linears(&self, prefix: &str) -> Vec<(String, &Linear)> {
-        vec![
-            (format!("{prefix}.c_q"), &self.c_q),
-            (format!("{prefix}.c_k"), &self.c_k),
-            (format!("{prefix}.c_v"), &self.c_v),
-            (format!("{prefix}.c_proj"), &self.c_proj),
-        ]
+        let mut v = Vec::with_capacity(5);
+        v.push((format!("{prefix}.c_q"), &self.c_q));
+        if let Some(c) = &self.c_kv {
+            v.push((format!("{prefix}.c_kv"), c));
+        }
+        v.push((format!("{prefix}.c_k"), &self.c_k));
+        v.push((format!("{prefix}.c_v"), &self.c_v));
+        v.push((format!("{prefix}.c_proj"), &self.c_proj));
+        v
     }
 
     pub fn named_linears_mut(&mut self, prefix: &str) -> Vec<(String, &mut Linear)> {
-        vec![
-            (format!("{prefix}.c_q"), &mut self.c_q),
-            (format!("{prefix}.c_k"), &mut self.c_k),
-            (format!("{prefix}.c_v"), &mut self.c_v),
-            (format!("{prefix}.c_proj"), &mut self.c_proj),
-        ]
+        let mut v = Vec::with_capacity(5);
+        v.push((format!("{prefix}.c_q"), &mut self.c_q));
+        if let Some(c) = self.c_kv.as_mut() {
+            v.push((format!("{prefix}.c_kv"), c));
+        }
+        v.push((format!("{prefix}.c_k"), &mut self.c_k));
+        v.push((format!("{prefix}.c_v"), &mut self.c_v));
+        v.push((format!("{prefix}.c_proj"), &mut self.c_proj));
+        v
     }
 }
 
 impl Module for MultiHeadAttention {
     fn parameters(&self) -> Vec<Tensor> {
         let mut ps = self.c_q.parameters();
+        if let Some(c) = &self.c_kv {
+            ps.extend(c.parameters());
+        }
         ps.extend(self.c_k.parameters());
         ps.extend(self.c_v.parameters());
         ps.extend(self.c_proj.parameters());
+        if let Some(n) = &self.q_norm {
+            ps.extend(n.parameters());
+        }
+        if let Some(n) = &self.k_norm {
+            ps.extend(n.parameters());
+        }
         ps
     }
 }
@@ -927,5 +1232,373 @@ mod tests {
             (lhs - rhs).abs() < 1e-4 * lhs.abs().max(1.0),
             "折回不是展开的共轭：{lhs} vs {rhs}"
         );
+    }
+
+    // ==================== MLA（低秩压缩 KV cache） ====================
+
+    /// 测试用的普通 RoPE 参数
+    fn spec() -> RopeSpec {
+        RopeSpec::new(crate::rope::ROPE_BASE, crate::rope::RopeScaling::None, 64)
+    }
+
+    /// 造一个 MLA 注意力 + 一段输入（`[1, t, d]` 展平数据，确定性伪随机）
+    fn mla_fixture(
+        d: usize,
+        n_head: usize,
+        n_kv: usize,
+        r: usize,
+        t: usize,
+        seed: u64,
+    ) -> (MultiHeadAttention, Vec<f32>) {
+        let mut rng = Rng::new(seed);
+        let attn = MultiHeadAttention::new(d, n_head, n_kv, r, false, spec(), &mut rng);
+        let data: Vec<f32> = (0..t * d).map(|i| ((i * 7 % 23) as f32 * 0.31).sin()).collect();
+        (attn, data)
+    }
+
+    /// MLA：缓存里只存**一份 latent**，显存随低秩维 r 走，而不是随 K/V 的完整维度走。
+    #[test]
+    fn test_mla_cache_stores_only_latent_and_saves_bytes() {
+        let (d, n_head, n_kv, r) = (32usize, 4usize, 2usize, 4usize);
+        let (attn, data) = mla_fixture(d, n_head, n_kv, r, 8, 7);
+        let hd = d / n_head;
+        let kv_dim = n_kv * hd;
+        // 结构：压缩投影 d -> r，升维投影 r -> kv_dim（K、V 各一个）
+        assert_eq!(attn.kv_lora_rank, r);
+        assert_eq!(attn.c_kv.as_ref().unwrap().dims(), (d, r));
+        assert_eq!(attn.c_k.dims(), (r, kv_dim));
+        assert_eq!(attn.c_v.dims(), (r, kv_dim));
+
+        let t = 8;
+        let x = Tensor::from_vec(data, vec![1, t, d]);
+        let mut cache = KVCache::new_latent(KvCacheOpts {
+            window: 0,
+            sink: 0,
+            bits: None,
+        });
+        let _ = attn.forward(&x, None, Some(&mut cache), 0);
+        assert!(cache.is_latent());
+        assert_eq!(cache.seq_len(), t);
+        assert_eq!(cache.byte_len(), t * r * 4, "MLA 缓存只该占 T×r 个 f32");
+
+        // 同样长度的普通缓存要存 K、V 两份（每份 kv_dim）
+        let mut plain = KVCache::new(KvCacheOpts {
+            window: 0,
+            sink: 0,
+            bits: None,
+        });
+        let kv = Tensor::from_vec(vec![0.0f32; t * kv_dim], vec![1, t, kv_dim]);
+        plain.append(&kv, &kv);
+        assert_eq!(plain.byte_len(), 2 * t * kv_dim * 4);
+        assert!(
+            cache.byte_len() * 4 <= plain.byte_len(),
+            "r={r} 对 kv_dim={kv_dim}：MLA 应省下 4 倍以上（{} vs {} 字节）",
+            cache.byte_len(),
+            plain.byte_len()
+        );
+        // 参数上也省：c_k/c_v 的输入维从 d 降到 r
+        assert!(attn.c_k.dims().0 < d);
+    }
+
+    /// MLA 增量推理（latent 缓存）与全量重算必须给出同一个结果。
+    ///
+    /// 这条测试盯的是最容易被写错的地方：缓存里存的是**未旋转**的 latent，
+    /// 所以升维出来的 K 必须按缓存里每一行各自的绝对位置补旋（[`KVCache::positions`]）。
+    #[test]
+    fn test_mla_latent_cache_matches_full_recompute() {
+        let (d, n_head, n_kv, r) = (24usize, 3usize, 3usize, 5usize);
+        let t = 6;
+        let (attn, rows) = mla_fixture(d, n_head, n_kv, r, t, 13);
+        let x = Tensor::from_vec(rows.clone(), vec![1, t, d]);
+        let full = attn.forward(&x, None, None, 0).data();
+
+        let mut cache = KVCache::new_latent(KvCacheOpts {
+            window: 0,
+            sink: 0,
+            bits: None,
+        });
+        let mut inc = Vec::new();
+        for i in 0..t {
+            let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+            let o = attn.forward(&xi, None, Some(&mut cache), i);
+            inc.extend_from_slice(&o.data());
+        }
+        for (i, (a, b)) in full.iter().zip(&inc).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4 * (1.0 + a.abs()),
+                "第 {i} 个元素不一致：全量 {a} vs 增量 {b}（缓存里的 latent 补旋口径错了？）"
+            );
+        }
+    }
+
+    /// MLA + 滑动窗口：留下的是最近 `window` 行，`positions()` 给出的绝对位置必须让
+    /// 增量推理**等价于只喂这几行的全量前向**（相对距离一致）。
+    #[test]
+    fn test_mla_cache_window_matches_subsequence() {
+        let (d, n_head, n_kv, r) = (16usize, 2usize, 1usize, 4usize);
+        let t = 6;
+        let window = 3;
+        let (attn, rows) = mla_fixture(d, n_head, n_kv, r, t, 23);
+
+        let mut cache = KVCache::new_latent(KvCacheOpts {
+            window,
+            sink: 0,
+            bits: None,
+        });
+        let mut last = Vec::new();
+        for i in 0..t {
+            let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+            last = attn.forward(&xi, None, Some(&mut cache), i).data();
+        }
+        assert_eq!(cache.seq_len(), window);
+        assert_eq!(cache.positions_seen(), t);
+        assert_eq!(cache.positions(), vec![3, 4, 5], "留下的正是位置 3/4/5");
+
+        // 全量重算：只喂第 3..6 个 token、绝对位置从 3 开始
+        let sub = Tensor::from_vec(rows[3 * d..].to_vec(), vec![1, window, d]);
+        let full = attn.forward(&sub, None, None, 3).data();
+        for (i, (a, b)) in last.iter().zip(&full[2 * d..]).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4 * (1.0 + a.abs()),
+                "第 {i} 个元素不一致：窗口推理 {a} vs 子序列全量 {b}"
+            );
+        }
+    }
+
+    /// MLA + Attention Sink：被丢的是**中间**的行，最前面 `sink` 行留下，
+    /// `positions()` 因此必须输出**不连续**的绝对位置；留下的 latent 行就是那几行的压缩结果。
+    #[test]
+    fn test_mla_cache_sink_positions_and_rows() {
+        let (d, n_head, n_kv, r) = (16usize, 2usize, 2usize, 6usize);
+        let t = 6;
+        let (attn, rows) = mla_fixture(d, n_head, n_kv, r, t, 29);
+        let mut cache = KVCache::new_latent(KvCacheOpts {
+            window: 3,
+            sink: 1,
+            bits: None,
+        });
+        let per_token: Vec<Vec<f32>> = (0..t)
+            .map(|i| {
+                let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+                attn.c_kv.as_ref().unwrap().forward(&xi).data()
+            })
+            .collect();
+        for i in 0..t {
+            let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+            let _ = attn.forward(&xi, None, Some(&mut cache), i);
+        }
+        assert_eq!(cache.seq_len(), 3);
+        assert_eq!(cache.positions(), vec![0, 4, 5], "0 是注意力汇，另两个名额给最近的行");
+        // 缓存里的三行 = 位置 0/4/5 各自的 latent（latent 逐 token 独立，不跨位置混合）
+        let got = cache.k().data();
+        for (k, src) in [0usize, 4, 5].iter().enumerate() {
+            for j in 0..r {
+                assert!(
+                    (got[k * r + j] - per_token[*src][j]).abs() < 1e-6,
+                    "第 {k} 行第 {j} 列应为位置 {src} 的 latent"
+                );
+            }
+        }
+    }
+
+    /// 量化 + MLA：缓存压到 int8/int4 后读回的 latent 要贴着 f32 版本（逐 token 定标）。
+    #[test]
+    fn test_mla_quantized_cache_matches_f32() {
+        let (d, n_head, n_kv, r) = (16usize, 2usize, 2usize, 8usize);
+        let t = 6;
+        let (attn, rows) = mla_fixture(d, n_head, n_kv, r, t, 31);
+        let mut plain = KVCache::new_latent(KvCacheOpts {
+            window: 0,
+            sink: 0,
+            bits: None,
+        });
+        for i in 0..t {
+            let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+            let _ = attn.forward(&xi, None, Some(&mut plain), i);
+        }
+        for (bits, tol) in [(QBits::Int8, 0.02f32), (QBits::Int4, 0.15f32)] {
+            let mut q = KVCache::new_latent(KvCacheOpts {
+                window: 0,
+                sink: 0,
+                bits: Some(bits),
+            });
+            for i in 0..t {
+                let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+                let _ = attn.forward(&xi, None, Some(&mut q), i);
+            }
+            assert_eq!(q.bits(), Some(bits));
+            assert!(q.byte_len() < plain.byte_len(), "{bits:?} 应更省字节");
+            let err = plain
+                .k()
+                .data()
+                .iter()
+                .zip(q.k().data())
+                .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(err <= tol, "{bits:?} 的 latent 最大误差 {err} 超过 {tol}");
+        }
+    }
+
+    /// 训练侧：梯度必须穿过 latent —— 压缩投影 `c_kv` 拿得到梯度，
+    /// 否则"低秩压缩"就只是个前向技巧，根本训不起来。
+    #[test]
+    fn test_mla_gradients_reach_compression_projection() {
+        let (attn, data) = mla_fixture(16, 2, 1, 4, 3, 37);
+        let x = Tensor::from_vec(data, vec![1, 3, 16]);
+        let loss = attn.forward(&x, None, None, 0).sum();
+        loss.backward();
+        let peak = |t: &Tensor| t.grad().iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak(&attn.c_kv.as_ref().unwrap().weight) > 0.0, "压缩投影 c_kv 没拿到梯度");
+        assert!(peak(&attn.c_k.weight) > 0.0, "升维投影 c_k 没拿到梯度");
+        assert!(peak(&attn.c_v.weight) > 0.0, "升维投影 c_v 没拿到梯度");
+        assert!(peak(&attn.c_q.weight) > 0.0, "Q 投影没拿到梯度");
+    }
+
+    /// `kv_lora_rank = 0` 时必须是**普通 MHA/GQA**：没有压缩投影、参数形状与老代码一致，
+    /// 且 MLA 的局部缓存/位置接口不会被误用。
+    #[test]
+    fn test_mla_disabled_keeps_plain_gqa_shape() {
+        let mut rng = Rng::new(41);
+        let attn = MultiHeadAttention::new(32, 4, 2, 0, false, spec(), &mut rng);
+        assert!(attn.c_kv.is_none());
+        assert_eq!(attn.kv_lora_rank, 0);
+        assert_eq!(attn.c_k.dims(), (32, 16));
+        assert_eq!(attn.c_v.dims(), (32, 16));
+        assert_eq!(attn.named_linears("a").len(), 4);
+    }
+
+    // ==================== QK-Norm（Q/K 逐头归一化） ====================
+
+    /// 造一个开了 QK-Norm 的普通注意力 + 一段输入（`[1, t, d]` 展平数据）
+    fn qk_fixture(d: usize, n_head: usize, n_kv: usize, t: usize, seed: u64) -> (MultiHeadAttention, Vec<f32>) {
+        let mut rng = Rng::new(seed);
+        let attn = MultiHeadAttention::new(d, n_head, n_kv, 0, true, spec(), &mut rng);
+        let data: Vec<f32> = (0..t * d).map(|i| ((i * 11 % 29) as f32 * 0.43).sin()).collect();
+        (attn, data)
+    }
+
+    /// QK-Norm 的核心数学：把 `[B, T, n_head·head_dim]` 摊成逐头的 `head_dim` 向量后，
+    /// 每个头的向量都落到**单位 RMS**（`gamma = 1` 时）；且对任意大的输入尺度都成立
+    /// （这正是它抑制大 logit 的原理）。关闭时（`None`）必须逐位原样返回。
+    #[test]
+    fn test_qk_norm_makes_each_head_unit_rms_and_is_scale_invariant() {
+        let (d, n_head, hd) = (16usize, 4usize, 4usize);
+        let mut rng = Rng::new(5);
+        let attn = MultiHeadAttention::new(d, n_head, n_head, 0, true, spec(), &mut rng);
+        assert_eq!(attn.q_norm.as_ref().unwrap().gamma.shape(), vec![hd]);
+
+        // 输入放大 1000 倍：RMSNorm 对正尺度不变，归一化后的范数不该变
+        for scale in [1.0f32, 1e3] {
+            let data: Vec<f32> = (0..2 * d).map(|i| ((i as f32 * 0.7).sin()) * scale).collect();
+            let x = Tensor::from_vec(data, vec![1, 2, d]);
+            let out = attn.apply_qk_norm(x, &attn.q_norm, n_head);
+            assert_eq!(out.shape(), vec![1, 2, d]);
+            for head in 0..2 * n_head {
+                let v = &out.data()[head * hd..(head + 1) * hd];
+                let rms = (v.iter().map(|a| a * a).sum::<f32>() / hd as f32).sqrt();
+                assert!(
+                    (rms - 1.0).abs() < 1e-4,
+                    "scale={scale}：第 {head} 个头的 RMS 应为 1，实际 {rms}"
+                );
+            }
+        }
+
+        // 关闭 QK-Norm：原样返回，逐位相同
+        let data: Vec<f32> = (0..2 * d).map(|i| (i as f32 * 0.31).cos()).collect();
+        let x = Tensor::from_vec(data, vec![1, 2, d]);
+        let same = attn.apply_qk_norm(x.clone(), &None, n_head);
+        assert_eq!(same.data(), x.data(), "关闭 QK-Norm 时必须逐位原样返回");
+    }
+
+    /// 开启 QK-Norm **不能扰动老权重的初始化**：它不消耗随机数，所以同 seed 下
+    /// 四个投影的权重与偏置必须与关闭时**逐位相同**；多出来的只有每层两个 `gamma`。
+    #[test]
+    fn test_qk_norm_does_not_change_weight_initialization() {
+        let (d, n_head, n_kv) = (32usize, 4usize, 2usize);
+        let mut r1 = Rng::new(17);
+        let plain = MultiHeadAttention::new(d, n_head, n_kv, 0, false, spec(), &mut r1);
+        let mut r2 = Rng::new(17);
+        let qk = MultiHeadAttention::new(d, n_head, n_kv, 0, true, spec(), &mut r2);
+
+        assert_eq!(plain.c_q.weight.data(), qk.c_q.weight.data());
+        assert_eq!(plain.c_k.weight.data(), qk.c_k.weight.data());
+        assert_eq!(plain.c_v.weight.data(), qk.c_v.weight.data());
+        assert_eq!(plain.c_proj.weight.data(), qk.c_proj.weight.data());
+        assert_eq!(plain.c_proj.bias.data(), qk.c_proj.bias.data());
+
+        assert!(plain.q_norm.is_none() && plain.k_norm.is_none());
+        // 4 个 Linear × (weight + bias) = 8；开启后每层多 Q、K 两个 gamma
+        assert_eq!(plain.parameters().len(), 8, "关闭时不应多出任何参数");
+        assert_eq!(qk.parameters().len(), 10, "开启时应多出 q_norm/k_norm 两个 gamma");
+        assert_eq!(qk.q_norm.as_ref().unwrap().gamma.numel(), d / n_head);
+        assert_eq!(qk.k_norm.as_ref().unwrap().gamma.numel(), d / n_head);
+    }
+
+    /// 梯度必须流到 QK-Norm 的 `gamma` 上，否则"归一化"就只是个前向技巧、根本学不动。
+    #[test]
+    fn test_qk_norm_gradients_reach_gamma() {
+        let (attn, data) = qk_fixture(16, 2, 2, 3, 23);
+        let x = Tensor::from_vec(data, vec![1, 3, 16]);
+        attn.forward(&x, None, None, 0).sum().backward();
+        let peak = |t: &Tensor| t.grad().iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak(&attn.q_norm.as_ref().unwrap().gamma) > 0.0, "q_norm.gamma 没拿到梯度");
+        assert!(peak(&attn.k_norm.as_ref().unwrap().gamma) > 0.0, "k_norm.gamma 没拿到梯度");
+    }
+
+    /// QK-Norm 与增量推理共存：普通（已旋转 K 进缓存）路径下，逐 token 增量前向
+    /// 必须与全量重算逐位一致 —— 归一化发生在入缓存**之前**，所以历史 K 仍然是
+    /// "归一化 + 旋转"后的结果，缓存复用不受影响。
+    #[test]
+    fn test_qk_norm_incremental_cache_matches_full_recompute() {
+        let (d, n_head, n_kv, t) = (16usize, 2usize, 2usize, 5usize);
+        let (attn, rows) = qk_fixture(d, n_head, n_kv, t, 29);
+        let x = Tensor::from_vec(rows.clone(), vec![1, t, d]);
+        let full = attn.forward(&x, None, None, 0).data();
+
+        let mut cache = KVCache::new(KvCacheOpts {
+            window: 0,
+            sink: 0,
+            bits: None,
+        });
+        let mut inc = Vec::new();
+        for i in 0..t {
+            let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+            inc.extend_from_slice(&attn.forward(&xi, None, Some(&mut cache), i).data());
+        }
+        for (i, (a, b)) in full.iter().zip(&inc).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4 * (1.0 + a.abs()),
+                "第 {i} 个元素不一致：全量 {a} vs 增量 {b}"
+            );
+        }
+    }
+
+    /// QK-Norm + MLA：latent 缓存里存的是**未归一化**的 latent，归一化每步在升维后重做，
+    /// 因此两条路径仍然一致（这是 MLA + QK-Norm 能组合使用的前提）。
+    #[test]
+    fn test_qk_norm_with_mla_latent_cache_matches_full_recompute() {
+        let (d, n_head, n_kv, r, t) = (24usize, 3usize, 3usize, 6usize, 5usize);
+        let mut rng = Rng::new(31);
+        let attn = MultiHeadAttention::new(d, n_head, n_kv, r, true, spec(), &mut rng);
+        let rows: Vec<f32> = (0..t * d).map(|i| ((i * 13 % 31) as f32 * 0.29).sin()).collect();
+
+        let x = Tensor::from_vec(rows.clone(), vec![1, t, d]);
+        let full = attn.forward(&x, None, None, 0).data();
+
+        let mut cache = KVCache::new_latent(KvCacheOpts {
+            window: 0,
+            sink: 0,
+            bits: None,
+        });
+        let mut inc = Vec::new();
+        for i in 0..t {
+            let xi = Tensor::from_vec(rows[i * d..(i + 1) * d].to_vec(), vec![1, 1, d]);
+            inc.extend_from_slice(&attn.forward(&xi, None, Some(&mut cache), i).data());
+        }
+        for (i, (a, b)) in full.iter().zip(&inc).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4 * (1.0 + a.abs()),
+                "第 {i} 个元素不一致：全量 {a} vs latent 增量 {b}"
+            );
+        }
     }
 }

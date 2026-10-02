@@ -26,12 +26,20 @@
 //! cargo run -- speculative [--max-new 48] [--gamma 4] [--mtp-heads 4] [--mtp-steps 80]
 //!                       [--trials 2000] [--temperature 0.8] [--block-size 64]
 //!                       [--n-embd 32] [--n-layer 2] [--seed 42] [--prompt "..."]
+//! cargo run -- distill  [--temperature 4.0] [--alpha 0.5] [--top-k 0]
+//!                       [--teacher-steps 200] [--steps 300] [--lr 5e-3]
+//!                       [--batch-size 8] [--block 16]
+//!                       [--teacher-n-embd 64] [--teacher-n-layer 2]
+//!                       [--student-n-embd 32] [--student-n-layer 1] [--seed 42]
+//! cargo run -- fp8      [--fmt e4m3|e5m2] [--block 32] [--rows 256] [--cols 256]
+//!                       [--steps 300] [--lr 5e-3] [--batch-size 8] [--block-size 16]
+//!                       [--n-embd 32] [--n-layer 2] [--seed 42]
 //! ```
 //!
 //! 目录约定：配置在 `config/`、权重在 `checkpoints/`、日志在 `logs/`（见 [`crate::config`] 的常量）。
 //!
 //! 其中 `train` / `sft` / `finetune` / `eval` / `generate` / `chat` / `scaling` / `moe` / `quant` /
-//! `distributed` / `align` / `rag` / `speculative` 每次运行都会自动在
+//! `distributed` / `align` / `rag` / `speculative` / `distill` / `fp8` 每次运行都会自动在
 //! `logs/` 下写一份 `{操作}_{时间戳}.log` 运行日志（完整命令行 + 完整配置 + 过程输出），
 //! 见 [`crate::runlog`]。
 
@@ -515,6 +523,108 @@ pub enum Cmd {
         #[command(flatten)]
         spec: SpecArgs,
     },
+    /// 知识蒸馏实验（第 42 课）：温度/top-k 对软标签的影响 + KD 梯度数值自检
+    /// + 「软标签 vs 硬标签」同学生同数据对照
+    Distill {
+        #[command(flatten)]
+        distill: DistillArgs,
+    },
+    /// FP8 低精度模拟（第 43 课）：E4M3/E5M2 二进制对照 + 分块缩放收益
+    /// + 「权重落 FP8」对 loss 的影响（纯数值模拟，无加速）
+    Fp8 {
+        #[command(flatten)]
+        fp8: Fp8Args,
+    },
+}
+
+/// 知识蒸馏实验的参数（第 42 课）。
+///
+/// 三组旋钮分别对应蒸馏里的三件事：`temperature` / `top_k` 决定"软标签有多软、
+/// 留多长尾巴"，`alpha` 决定软硬两种监督各占多少，剩下的步数/宽度决定
+/// 教师与学生之间要有多少容量差（差得越多，蒸馏的收益越看得见）。
+#[derive(Args, Debug, Clone)]
+pub struct DistillArgs {
+    /// 蒸馏温度 T：`p = softmax(logits / T)`。T 越大分布越平（Hinton 原文用 4）
+    #[arg(long, default_value_t = 4.0)]
+    pub temperature: f32,
+    /// KD 项的权重 α：`L = (1-α)·硬标签交叉熵 + α·T²·KL`
+    #[arg(long, default_value_t = 0.5)]
+    pub alpha: f32,
+    /// 只保留教师分布的 top-k 个类别（0 = 不截断）
+    #[arg(long, default_value_t = 0)]
+    pub top_k: usize,
+    /// 教师模型的训练步数（把它训成一个"有知识可教"的模型）
+    #[arg(long, default_value_t = 200)]
+    pub teacher_steps: usize,
+    /// 学生的训练步数（对照组与蒸馏组用同一个值）
+    #[arg(long, default_value_t = 300)]
+    pub steps: usize,
+    /// 学习率（教师与学生共用）
+    #[arg(long, default_value_t = 5e-3)]
+    pub lr: f32,
+    /// 批大小（每条序列 = 上下文长度）
+    #[arg(long, default_value_t = 8)]
+    pub batch_size: usize,
+    /// 上下文长度（同时是语料切窗的长度）
+    #[arg(long, default_value_t = 16)]
+    pub block: usize,
+    /// 教师模型宽度
+    #[arg(long, default_value_t = 64)]
+    pub teacher_n_embd: usize,
+    /// 教师模型层数
+    #[arg(long, default_value_t = 2)]
+    pub teacher_n_layer: usize,
+    /// 学生模型宽度（通常小于教师，蒸馏才有意义）
+    #[arg(long, default_value_t = 32)]
+    pub student_n_embd: usize,
+    /// 学生模型层数
+    #[arg(long, default_value_t = 1)]
+    pub student_n_layer: usize,
+    /// 随机种子（教师/学生/数据切窗都从它派生，保证可复现）
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+}
+
+/// FP8 低精度模拟的参数（第 43 课）。
+///
+/// 三组旋钮：`fmt` / `block` 决定"怎么压"，后面一组决定"在什么模型上量影响"。
+/// 注意 `block` 越大越省（scale 更少），但动态范围一大就会被压平 —— 这正是
+/// `cargo run -- fp8` 要让你亲眼看到的那件事。
+#[derive(Args, Debug, Clone)]
+pub struct Fp8Args {
+    /// FP8 格式：e4m3（权重/激活，精度优先）或 e5m2（梯度，范围优先）
+    #[arg(long, default_value = "e4m3", value_parser = ["e4m3", "e5m2"])]
+    pub fmt: String,
+    /// 分块缩放大小：每多少个元素共享一个 scale（0 = 整张共用一个）
+    #[arg(long, default_value_t = 32)]
+    pub block: usize,
+    /// 演示用的随机权重行数
+    #[arg(long, default_value_t = 256)]
+    pub rows: usize,
+    /// 演示用的随机权重列数
+    #[arg(long, default_value_t = 256)]
+    pub cols: usize,
+    /// 训练几步（先让权重进入"有结构"的状态，再对比量化前后的 loss）
+    #[arg(long, default_value_t = 300)]
+    pub steps: usize,
+    /// 学习率
+    #[arg(long, default_value_t = 5e-3)]
+    pub lr: f32,
+    /// 批大小
+    #[arg(long, default_value_t = 8)]
+    pub batch_size: usize,
+    /// 上下文长度
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+    /// 小模型宽度（需能被 4 整除）
+    #[arg(long, default_value_t = 32)]
+    pub n_embd: usize,
+    /// 小模型层数
+    #[arg(long, default_value_t = 2)]
+    pub n_layer: usize,
+    /// 随机种子
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
 }
 
 /// 检索增强生成（RAG）实验的参数（第 37 课）。

@@ -147,3 +147,4 @@ pub enum NormLayer {
 - 效果相当，速度更快（少一次 reduction，少一组参数）
 - 现代 LLM（LLaMA/Mistral/Qwen/Gemma）全部使用 RMSNorm
 - 反向公式比 LayerNorm 更简洁
+- 延伸：[第 45 课 QK-Norm](45-QK-Norm.md) 就是把这个 RMSNorm 用到注意力的 Q/K 上——对每个头的 `head_dim` 向量归一化（**投影之后、RoPE 之前**），把 Q/K 的尺度钉死，避免注意力 logits 随权重增长而漂移；GQA 下 K 侧各 KV 头共用一套 `gamma`，每层只多 `2 × head_dim` 个参数

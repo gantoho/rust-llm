@@ -257,20 +257,27 @@ pub fn router_param_count(d: usize, n_expert: usize) -> usize {
 pub struct SparseStats {
     pub n_expert: usize,
     pub top_k: usize,
+    /// 共享专家个数（全部 token 都过，**不稀疏**）
+    pub n_shared: usize,
     /// 单个专家的参数量
     pub expert_params: usize,
     pub router_params: usize,
 }
 
 impl SparseStats {
-    /// 全部参数（所有专家都加载）
-    pub fn total_params(&self) -> usize {
-        self.n_expert * self.expert_params + self.router_params
+    /// 共享专家的总参数（每个与一个路由专家同规模，且**每 token 都要算**）
+    pub fn shared_params(&self) -> usize {
+        self.n_shared * self.expert_params
     }
 
-    /// 每个 token 实际参与计算的参数（只有 Top-K 个专家 + 路由器）
+    /// 全部参数（所有专家都加载）
+    pub fn total_params(&self) -> usize {
+        self.n_expert * self.expert_params + self.router_params + self.shared_params()
+    }
+
+    /// 每个 token 实际参与计算的参数（Top-K 个路由专家 + 路由器 + **全部**共享专家）
     pub fn active_params(&self) -> usize {
-        self.top_k * self.expert_params + self.router_params
+        self.top_k * self.expert_params + self.router_params + self.shared_params()
     }
 
     /// 总参数 / 激活参数（"同样的计算量能塞进多少倍容量"）
@@ -284,13 +291,23 @@ impl SparseStats {
     }
 }
 
-/// 按配置算出 MoE 的稀疏口径（n_expert ≤ 1 时视为稠密，比例都是 1）
-pub fn sparse_stats(n_expert: usize, top_k: usize, d: usize, use_swiglu: bool) -> SparseStats {
+/// 按配置算出 MoE 的稀疏口径（n_expert ≤ 1 时视为稠密，比例都是 1）。
+///
+/// `n_shared` 是共享专家个数：它们**每 token 都要算**，所以同时进入总参数与激活参数，
+/// 会把稀疏比（总/激活）拉低——这正是"共享专家用稀疏性换质量"的量化形式。
+pub fn sparse_stats(
+    n_expert: usize,
+    top_k: usize,
+    d: usize,
+    use_swiglu: bool,
+    n_shared: usize,
+) -> SparseStats {
     let e = n_expert.max(1);
     let k = top_k.clamp(1, e);
     SparseStats {
         n_expert: e,
         top_k: k,
+        n_shared,
         expert_params: expert_param_count(d, use_swiglu),
         router_params: if n_expert > 1 { router_param_count(d, e) } else { 0 },
     }
@@ -320,6 +337,15 @@ pub struct MoELayer {
     ///   ⚠️ K = 1 时权重恒为 1，主损失给不了路由器梯度——K = 1 请置 `true`。
     /// - `true`（Switch Transformer 式）：用**全部专家**上的 softmax 原概率，`Σw < 1`。
     pub switch_gate: bool,
+    /// 共享专家：**全部** token 都过（不参与路由），输出直接相加。空 = 不启用（默认）。
+    pub shared_experts: Vec<MLPEnum>,
+    /// aux-loss-free 均衡偏置是否启用（见 [`MoELayer::update_balance_bias`]）
+    bias_balance: bool,
+    /// 偏置更新步长 γ
+    bias_lr: f32,
+    /// 每个专家的均衡偏置 `b`（长度 E）。只加在**选路**的 logits 上，不改门控权重，
+    /// 所以它既不进梯度也不进损失；由 [`MoELayer::update_balance_bias`] 按负载更新。
+    bias: Shared<Vec<f32>>,
     /// 最近一次前向的路由统计（`forward` 走 `&self`，所以用 `Shared` 内部 `Mutex`）
     stats: Shared<RouteStats>,
 }
@@ -348,7 +374,18 @@ impl MoELayer {
         );
         assert!(cfg.moe_aux_coef >= 0.0, "model.moe_aux_coef 不能为负");
         assert!(cfg.moe_z_loss_coef >= 0.0, "model.moe_z_loss_coef 不能为负");
+        assert!(cfg.moe_bias_lr >= 0.0, "model.moe_bias_lr 不能为负");
         let experts = (0..cfg.n_expert)
+            .map(|_| {
+                if cfg.use_swiglu {
+                    MLPEnum::new_swiglu(d, rng)
+                } else {
+                    MLPEnum::new_gelu(d, rng)
+                }
+            })
+            .collect();
+        // 共享专家与路由专家同规模（DeepSeek-V2 的口径：共享专家的中间维 = 路由专家之一倍）
+        let shared_experts = (0..cfg.moe_shared_experts)
             .map(|_| {
                 if cfg.use_swiglu {
                     MLPEnum::new_swiglu(d, rng)
@@ -366,6 +403,10 @@ impl MoELayer {
             aux_coef: cfg.moe_aux_coef,
             z_loss_coef: cfg.moe_z_loss_coef,
             switch_gate: cfg.moe_switch_gate,
+            shared_experts,
+            bias_balance: cfg.moe_bias_balance,
+            bias_lr: cfg.moe_bias_lr,
+            bias: Shared::new(vec![0.0f32; cfg.n_expert]),
             stats: Shared::new(RouteStats::default()),
         }
     }
@@ -396,7 +437,22 @@ impl MoELayer {
         // 1. 门控 logits [n, E]
         let logits = self.router.forward(&x2);
         let capacity = expert_capacity(n, self.n_expert, self.top_k, self.capacity_factor);
-        let plan = {
+        // 选路用的是 `logits + bias`。均衡偏置只改**硬路由**（argmax），所以它加在一份
+        // 副本上；原始 `logits` 保持干净，门控权重、辅助损失、z-loss 一律只看原始值——
+        // 于是 bias 既不进梯度也不进损失，这正是 aux-loss-free 的题眼（见 update_balance_bias）。
+        let plan = if self.bias_balance {
+            let mut sel_logits = logits.data();
+            {
+                let b = self.bias.borrow();
+                for i in 0..n {
+                    let row = &mut sel_logits[i * self.n_expert..(i + 1) * self.n_expert];
+                    for (j, v) in row.iter_mut().enumerate() {
+                        *v += b[j];
+                    }
+                }
+            }
+            top_k_gate(&sel_logits, n, self.n_expert, self.top_k, capacity)
+        } else {
             let ld = logits.data_ref();
             top_k_gate(&ld[..], n, self.n_expert, self.top_k, capacity)
         };
@@ -437,6 +493,19 @@ impl MoELayer {
         // 全部 token 的分配都被容量丢掉时这里没有专家跑过：输出是全零张量。
         // 这是"被丢弃"的正确语义（该层的贡献为 0，残差照常直通）。
         let out = out.unwrap_or_else(|| Tensor::from_vec(vec![0.0f32; n * d], vec![n, d]));
+
+        // 3b. 共享专家：全部 token 都过、输出直接相加（权重 1），不参与路由。
+        //     它与路由专家的输出是**并行相加**的两路；即使路由把某些 token 全丢了，
+        //     共享专家仍然照常贡献（容量只管路由专家）。
+        let out = if self.shared_experts.is_empty() {
+            out
+        } else {
+            let mut acc = out;
+            for se in &self.shared_experts {
+                acc = acc.add(&se.forward(&x2));
+            }
+            acc
+        };
 
         // 4. 均衡辅助损失：L_aux = E · Σ f_i · p_i（惩罚 f 与 p 的背离，见文件头 §4）
         let p_mean = p_full.transpose().sum_last_dim().mul_scalar(1.0 / n as f32); // [E, 1]
@@ -507,12 +576,63 @@ impl MoELayer {
         self.stats.borrow().clone()
     }
 
+    /// 当前每个专家的均衡偏置（`moe_bias_balance = false` 时恒为全 0）。诊断/单测用。
+    #[allow(dead_code)]
+    pub fn balance_bias(&self) -> Vec<f32> {
+        self.bias.borrow().clone()
+    }
+
+    /// **aux-loss-free 均衡偏置**的一步更新（DeepSeek-V3 式），返回是否真的更新过。
+    ///
+    /// 依据是**最近一次前向**的路由负载（[`RouteStats::counts`]）：目标负载取平均
+    /// `Σcount_i / E`，过载（`count_i > 目标`）的专家 `b_i -= γ`、欠载的 `b_i += γ`。
+    ///
+    /// 两个设计点：
+    /// - 用**符号**更新而不是按失衡幅度成比例：偏置的职责只是把负载推平，推平了就停住；
+    ///   按幅度更新会在接近均衡时来回过冲、长期震荡（DeepSeek-V3 用的就是 sign）。
+    /// - 偏置**只进选路**（见 `forward_with_aux` 里 `logits + bias` 那份副本），
+    ///   不进梯度、不进损失。这是它与 α·L_aux 的本质区别：均衡是"免费"的，
+    ///   不拿主损失去做交易——代价是它只能压硬路由（argmax），
+    ///   没法像软辅助损失那样同时约束路由**概率**的形状。
+    ///
+    /// ⚠️ 训练循环必须在 `opt.step()` **之后、下一次前向之前**调用它，且中间不要夹评估前向
+    /// （`stats` 只保留最近一次前向；评估会把训练批的负载覆盖掉）。
+    /// ⚠️ 梯度累积下，负载只反映**最后一个微批**（每步只前向一次统计口径）。
+    pub fn update_balance_bias(&self) -> bool {
+        if !self.bias_balance {
+            return false;
+        }
+        let counts = self.stats.borrow().counts.clone();
+        let total: usize = counts.iter().sum();
+        if total == 0 {
+            return false; // 还没跑过前向（或本批全被容量丢弃）：没有负载信息可用
+        }
+        let target = total as f32 / self.n_expert as f32;
+        let mut b = self.bias.borrow_mut();
+        for (i, &c) in counts.iter().enumerate() {
+            let diff = target - c as f32;
+            if diff > 0.0 {
+                b[i] += self.bias_lr;
+            } else if diff < 0.0 {
+                b[i] -= self.bias_lr;
+            }
+        }
+        true
+    }
+
     /// 带名字的参数（checkpoint 用）：
-    /// `{prefix}.router.weight`、`{prefix}.experts.{i}.w_gate.weight` ...
+    /// `{prefix}.router.weight`、`{prefix}.experts.{i}.w_gate.weight`、
+    /// `{prefix}.shared_experts.{i}.w_gate.weight` ...
+    ///
+    /// 均衡偏置 `b` **不在参数表里**：它不是被梯度训练的量，也不该进优化器，
+    /// 所以不参与 checkpoint（续训时从 0 重新平衡，几百万 token 的语料下可忽略）。
     pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
         let mut ps = self.router.named_parameters(&format!("{prefix}.router"));
         for (i, e) in self.experts.iter().enumerate() {
             ps.extend(e.named_parameters(&format!("{prefix}.experts.{i}")));
+        }
+        for (i, e) in self.shared_experts.iter().enumerate() {
+            ps.extend(e.named_parameters(&format!("{prefix}.shared_experts.{i}")));
         }
         ps
     }
@@ -522,6 +642,9 @@ impl Module for MoELayer {
     fn parameters(&self) -> Vec<Tensor> {
         let mut ps = self.router.parameters();
         for e in &self.experts {
+            ps.extend(e.parameters());
+        }
+        for e in &self.shared_experts {
             ps.extend(e.parameters());
         }
         ps
@@ -550,6 +673,24 @@ mod tests {
             moe_capacity_factor: 0.0,
             moe_aux_coef: 0.0,
             moe_switch_gate: top_k == 1,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(seed);
+        MoELayer::new(&cfg, &mut rng)
+    }
+
+    /// 在 [`build`] 基础上打开 aux-loss-free 均衡偏置（γ 可调），其余口径完全一致
+    fn build_biased(d: usize, n_expert: usize, top_k: usize, seed: u64, bias_lr: f32) -> MoELayer {
+        let cfg = TransformerConfig {
+            vocab_size: 16,
+            n_embd: d,
+            n_expert,
+            moe_top_k: top_k,
+            moe_capacity_factor: 0.0,
+            moe_aux_coef: 0.0,
+            moe_switch_gate: top_k == 1,
+            moe_bias_balance: true,
+            moe_bias_lr: bias_lr,
             ..Default::default()
         };
         let mut rng = Rng::new(seed);
@@ -1030,7 +1171,7 @@ mod tests {
             let mut rng = Rng::new(2);
             let layer = MoELayer::new(&cfg, &mut rng);
             let measured: usize = layer.parameters().iter().map(|p| p.numel()).sum();
-            let ss = sparse_stats(e, k, d, use_swiglu);
+            let ss = sparse_stats(e, k, d, use_swiglu, 0);
             assert_eq!(
                 measured,
                 ss.total_params(),
@@ -1144,6 +1285,177 @@ mod tests {
         assert!(
             last < first * 0.5,
             "MoE 没能学起来：{first:.4} -> {last:.4}"
+        );
+    }
+
+    /// aux-loss-free 均衡偏置的更新方向：过载的专家偏置 **下降**、欠载的 **上升**，
+    /// 步长恰为 γ；只在 `moe_bias_balance = true` 时发生（默认关闭 ⇒ 空操作）。
+    #[test]
+    fn test_balance_bias_update_direction() {
+        let (d, e, k, n) = (4usize, 4usize, 1usize, 8usize);
+        let layer = build_biased(d, e, k, 5, 0.1);
+        // 路由器权重清零 ⇒ logits 只剩偏置（全 0）⇒ 所有 token 完全并列，按下标取专家 0
+        layer.router.weight.set_data(vec![0.0; d * e]);
+        layer.router.bias.set_data(vec![0.0; e]);
+        let x = rand_x(n, d, 9);
+
+        let _ = layer.forward(&x);
+        assert_eq!(layer.stats().counts, vec![n, 0, 0, 0], "并列时全部落到专家 0");
+        assert_eq!(layer.balance_bias(), vec![0.0; e], "初始偏置应为 0");
+
+        assert!(layer.update_balance_bias(), "开启后应返回 true");
+        let b = layer.balance_bias();
+        // 目标负载 = Σcount/E = 2：专家 0（8 > 2）过载 ⇒ −γ；其余（0 < 2）欠载 ⇒ +γ
+        assert!((b[0] + 0.1).abs() < 1e-6, "过载专家的偏置应下降：{b:?}");
+        for (i, v) in b.iter().enumerate().skip(1) {
+            assert!((v - 0.1).abs() < 1e-6, "欠载专家 {i} 的偏置应上升：{b:?}");
+        }
+
+        // 默认（关闭）：不更新、偏置恒为 0、返回 false
+        let off = build(d, e, k, 5);
+        let _ = off.forward(&x);
+        assert!(!off.update_balance_bias(), "关闭时不该返回 true");
+        assert_eq!(off.balance_bias(), vec![0.0; e]);
+
+        // 从未前向过：没有负载信息可用，不更新
+        assert!(
+            !build_biased(d, e, k, 5, 0.1).update_balance_bias(),
+            "没跑过前向就没有负载可用"
+        );
+    }
+
+    /// 均衡偏置**不进参数表、不进计算图**：偏置全 0 时，开与不开的参数、输出、
+    /// 梯度都逐位相同——这就是"默认路径逐位不变"的回归。
+    #[test]
+    fn test_balance_bias_is_free_of_params_and_graph() {
+        let (d, e, k, n) = (4usize, 3usize, 2usize, 5usize);
+        let on = build_biased(d, e, k, 11, 0.1);
+        let off = build(d, e, k, 11);
+        let sizes = |l: &MoELayer| -> Vec<usize> {
+            l.parameters().iter().map(|p| p.numel()).collect()
+        };
+        assert_eq!(sizes(&on), sizes(&off), "偏置不该出现在参数表里");
+        assert_eq!(on.balance_bias().len(), e);
+
+        let x = rand_x(n, d, 7);
+        assert_eq!(
+            on.forward(&x).data(),
+            off.forward(&x).data(),
+            "偏置为 0 时输出应逐位相同"
+        );
+
+        // 梯度同样逐位相同：偏置不是可导路径上的任何一环
+        let coef = Tensor::from_vec(
+            (0..n * d).map(|i| 0.3 + i as f32 * 0.07).collect(),
+            vec![n, d],
+        );
+        let grads = |l: &MoELayer| -> Vec<f32> {
+            zero_grad_all(l);
+            l.forward(&x).mul(&coef).sum().backward();
+            l.parameters()
+                .iter()
+                .flat_map(|p| p.grad().iter().cloned().collect::<Vec<f32>>())
+                .collect()
+        };
+        assert_eq!(grads(&on), grads(&off), "偏置为 0 时梯度应逐位相同");
+    }
+
+    /// 共享专家：**全部** token 都过、输出以权重 1 **并行相加**（与路由部分互不干扰），
+    /// 且它们同时计入总参数与**激活参数**（每 token 都要算，吃掉 MoE 省下的 FLOPs）。
+    #[test]
+    fn test_shared_experts_add_parallel_and_count_params() {
+        let (d, e, k, n) = (4usize, 3usize, 2usize, 5usize);
+        let cfg = TransformerConfig {
+            vocab_size: 16,
+            n_embd: d,
+            n_expert: e,
+            moe_top_k: k,
+            use_swiglu: false, // 与 expert_param_count(d, false) 的口径对齐
+            moe_shared_experts: 2,
+            ..Default::default()
+        };
+        let mut layer = MoELayer::new(&cfg, &mut Rng::new(11));
+        let measured: usize = layer.parameters().iter().map(|p| p.numel()).sum();
+        let x = rand_x(n, d, 7);
+
+        let full = layer.forward(&x).data();
+        // 两个共享专家各自的输出（作用在**全部** token 上）
+        let sh: Vec<Vec<f32>> = layer
+            .shared_experts
+            .iter()
+            .map(|m| m.forward(&x).data())
+            .collect();
+        // 摘掉共享专家再前向 ⇒ 只剩路由部分；两者之差必须精确等于共享专家输出之和
+        layer.shared_experts.clear();
+        let routed = layer.forward(&x).data();
+        for i in 0..n * d {
+            let expect = routed[i] + sh.iter().map(|v| v[i]).sum::<f32>();
+            assert!(
+                (full[i] - expect).abs() < 1e-5,
+                "第 {i} 个元素不是「并行相加」：实测 {}，期望 {expect}",
+                full[i]
+            );
+        }
+
+        // 参数口径：共享专家各占一个路由专家的参数量，且**同时**进总参数与激活参数
+        let ss = sparse_stats(e, k, d, false, 2);
+        let routed_only = sparse_stats(e, k, d, false, 0);
+        assert_eq!(
+            measured,
+            ss.total_params(),
+            "实测参数 {measured} 与公式 {} 不符",
+            ss.total_params()
+        );
+        assert_eq!(
+            measured,
+            routed_only.total_params() + 2 * routed_only.expert_params,
+            "两个共享专家应各贡献一个专家的参数量"
+        );
+        assert_eq!(
+            ss.active_params(),
+            routed_only.active_params() + 2 * routed_only.expert_params
+        );
+        assert!(
+            ss.param_ratio() < routed_only.param_ratio(),
+            "共享专家每 token 都要算 ⇒ 稀疏比下降（{} vs {}）",
+            ss.param_ratio(),
+            routed_only.param_ratio()
+        );
+    }
+
+    /// 偏置均衡的**负载曲线**：从"全部 token 压在一个专家上"出发，只做前向 + 偏置更新
+    /// （完全不碰梯度、不碰主损失），不均衡度必须显著下降。
+    ///
+    /// 这是与 `test_aux_loss_gradient_balances_routing` 的对照：那条路靠辅助损失的**梯度**
+    /// 把路由概率推平，这条路靠一个不进损失、不进梯度的偏置把**硬路由**推平——
+    /// 均衡可以完全不拿主损失做交易（DeepSeek-V3 aux-loss-free 的卖点）。
+    #[test]
+    fn test_balance_bias_converges_load_without_gradients() {
+        let (d, e, k, n) = (8usize, 4usize, 1usize, 32usize);
+        let layer = build_biased(d, e, k, 23, 0.02);
+        // 初始强烈偏向专家 0：几乎所有 token 都路由到它
+        layer.router.bias.set_data(vec![3.0, 0.0, 0.0, 0.0]);
+        let x = rand_x(n, d, 8);
+
+        let _ = layer.forward(&x);
+        let before = layer.stats().imbalance();
+        assert!(before > 2.0, "初始应明显偏斜，实测不均衡度 {before}");
+
+        for _ in 0..400 {
+            let _ = layer.forward(&x);
+            assert!(layer.update_balance_bias());
+        }
+        let _ = layer.forward(&x);
+        let counts = layer.stats().counts.clone();
+        let after = layer.stats().imbalance();
+        assert!(
+            after < before - 1.0,
+            "偏置均衡没能推平负载：{before} -> {after}（负载 {counts:?}）"
+        );
+        assert!(
+            layer.balance_bias()[0] < 0.0,
+            "被过度使用的专家 0 的偏置应为负：{:?}",
+            layer.balance_bias()
         );
     }
 

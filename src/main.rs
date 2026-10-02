@@ -30,7 +30,9 @@ mod checkpoint;
 mod cli;
 mod config;
 mod data;
+mod distill;
 mod distributed;
+mod fp8;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod layers;
@@ -54,7 +56,7 @@ mod train;
 mod vision;
 mod vqvae;
 
-use cli::{AlignArgs, Cli, Cmd, DistArgs, RagArgs, RopeArgs, SpecArgs};
+use cli::{AlignArgs, Cli, Cmd, DistArgs, DistillArgs, Fp8Args, RagArgs, RopeArgs, SpecArgs};
 use autograd::clear_tape;
 use config::Config;
 use data::{
@@ -428,6 +430,8 @@ fn main() {
         Cmd::Align { align } => cmd_align(&align),
         Cmd::Rag { rag } => cmd_rag(&rag),
         Cmd::Speculative { spec } => cmd_speculative(&spec),
+        Cmd::Distill { distill } => cmd_distill(&distill),
+        Cmd::Fp8 { fp8 } => cmd_fp8(&fp8),
     }
 }
 
@@ -2807,7 +2811,7 @@ fn cmd_moe(
         let k = top_k.min(e);
         let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, aux_coef, z_loss, seed);
         let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
-        let ss = moe::sparse_stats(e, k, n_embd, false);
+        let ss = moe::sparse_stats(e, k, n_embd, false, 0);
         let per_layer_total = ss.total_params();
         let per_layer_active = ss.active_params();
         // 每 token 激活参数 = 模型总参数 - 每层没被激活的 (E-K) 个专家
@@ -5075,6 +5079,720 @@ fn cmd_speculative(s: &SpecArgs) {
          彼此条件独立（都只条件于同一个隐状态），比自回归草稿『糊』，接受率通常更低，\n  \
          这正是「草稿算力 vs 接受率」的取舍。作为训练信号，它还迫使主干把更长的未来信息\n  \
          编码进隐状态里——上面交叉熵的下降就是各头真的在学。"
+    );
+
+    runlog::finish();
+}
+
+// ==================== 知识蒸馏（distill 子命令，第 42 课） ====================
+
+/// 从语料里随机切 `batch` 个长 `block` 的窗口：输入 `x` 与右移一位的目标 `y`。
+///
+/// 教师与学生必须看**同一批窗口**，否则"谁学得更好"里会混进数据差异。
+fn corpus_windows(
+    ids: &[usize],
+    block: usize,
+    batch: usize,
+    rng: &mut Rng,
+) -> (Vec<usize>, Vec<usize>) {
+    assert!(
+        ids.len() > block + 1,
+        "语料太短（{} 个 token），切不出长度为 {block} 的窗口",
+        ids.len()
+    );
+    let mut x = Vec::with_capacity(batch * block);
+    let mut y = Vec::with_capacity(batch * block);
+    for _ in 0..batch {
+        let start = (rng.next_u64() as usize) % (ids.len() - block - 1);
+        x.extend_from_slice(&ids[start..start + block]);
+        y.extend_from_slice(&ids[start + 1..start + 1 + block]);
+    }
+    (x, y)
+}
+
+/// 知识蒸馏实验（第 42 课）
+///
+/// 三节：
+/// 一、**软标签长什么样**：温度与 top-k 如何改变教师给出的分布（熵 / 非零列数 / top-5 概率）
+/// 二、**KD 梯度自检**：解析梯度 vs 有限差分。`T²` 缩放写漏、`(p_s − p_t)` 符号写反
+///     这类错误不会让 loss 报表变难看，只会让训练悄悄变差，数值核对是唯一可靠的防线
+/// 三、**对照实验**：同一个学生、同一批数据、同一步数，唯一差别是有没有 KD 项
+fn cmd_distill(d: &DistillArgs) {
+    let log_path = runlog::start("distill");
+    println!("运行日志：{log_path}");
+
+    // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
+    assert!(d.teacher_steps >= 1, "教师至少要训 1 步（实际 {}）", d.teacher_steps);
+    assert!(d.steps >= 1, "学生至少要训 1 步（实际 {}）", d.steps);
+    assert!(d.lr > 0.0, "学习率必须为正（实际 {}）", d.lr);
+    assert!(d.batch_size >= 1, "批大小至少为 1（实际 {}）", d.batch_size);
+    assert!(d.block >= 4, "上下文长度至少为 4（实际 {}）", d.block);
+    assert!(
+        d.teacher_n_embd % 4 == 0 && d.student_n_embd % 4 == 0,
+        "n_embd 必须能被 n_head=4 整除（教师 {} / 学生 {}）",
+        d.teacher_n_embd,
+        d.student_n_embd
+    );
+    // 教师得"更大"才有可教的东西：容量相同时教师给出的软标签几乎不含学生自己学不到的信息
+    let (t_cap, s_cap) = (
+        d.teacher_n_embd * d.teacher_n_layer,
+        d.student_n_embd * d.student_n_layer,
+    );
+    assert!(
+        t_cap > s_cap,
+        "教师容量（宽度×层数 = {t_cap}）必须大于学生（{s_cap}），否则蒸馏无从获益"
+    );
+    let dcfg = distill::DistillConfig {
+        temperature: d.temperature,
+        alpha: d.alpha,
+        top_k: d.top_k,
+    };
+    dcfg.validate();
+
+    let tokenizer = Tokenizer::char(CORPUS);
+    let vocab = tokenizer.vocab_size();
+    let ids = tokenizer.encode(CORPUS);
+    // 训练/验证切分：末尾 20% 只做评测，教师与学生都没在上面训过
+    let split = ids.len() * 4 / 5;
+    let (train_ids, val_ids) = (ids[..split].to_vec(), ids[split..].to_vec());
+
+    let build = |n_embd: usize, n_layer: usize, seed: u64| {
+        Transformer::new(
+            TransformerConfig {
+                n_embd,
+                n_head: 4,
+                n_layer,
+                block_size: d.block,
+                dropout: 0.0,
+                ..TransformerConfig::tiny(vocab)
+            },
+            &mut Rng::new(seed),
+        )
+    };
+    let teacher = build(d.teacher_n_embd, d.teacher_n_layer, d.seed);
+    let t_params: usize = teacher.parameters().iter().map(|p| p.numel()).sum();
+    let s_params: usize = build(d.student_n_embd, d.student_n_layer, d.seed)
+        .parameters()
+        .iter()
+        .map(|p| p.numel())
+        .sum();
+
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("温度 T", d.temperature.to_string()),
+            ("KD 权重 α", d.alpha.to_string()),
+            (
+                "top-k 截断",
+                if d.top_k == 0 {
+                    "不截断（全词表）".to_string()
+                } else {
+                    format!("{}（共 {} 类）", d.top_k, vocab)
+                },
+            ),
+            ("教师步数 / 学生步数", format!("{} / {}", d.teacher_steps, d.steps)),
+            ("学习率", d.lr.to_string()),
+            (
+                "批大小 / 上下文",
+                format!("{} / {}", d.batch_size, d.block),
+            ),
+            (
+                "教师模型",
+                format!(
+                    "n_embd={} n_layer={}（{} 参数）",
+                    d.teacher_n_embd, d.teacher_n_layer, t_params
+                ),
+            ),
+            (
+                "学生模型",
+                format!(
+                    "n_embd={} n_layer={}（{} 参数，为教师的 {:.1}%）",
+                    d.student_n_embd,
+                    d.student_n_layer,
+                    s_params,
+                    100.0 * s_params as f64 / t_params as f64
+                ),
+            ),
+            (
+                "语料 / 词表",
+                format!("{} 字符（训练 {} / 验证 {} token），词表 {}", CORPUS.len(), train_ids.len(), val_ids.len(), vocab),
+            ),
+        ],
+    );
+
+    // ---------- 一、先把教师训成一个"有知识可教"的模型 ----------
+    logln!("=== 一、教师训练：软标签里到底带着什么信息 ===");
+    let mut trng = Rng::new(d.seed + 1);
+    let mut topt = AdamW::new(d.lr, teacher.parameters(), 0.0);
+    let mut t_first = f32::NAN;
+    let mut t_last = f32::NAN;
+    for step in 0..d.teacher_steps {
+        let (tx, ty) = corpus_windows(&train_ids, d.block, d.batch_size, &mut trng);
+        topt.zero_grad();
+        let logits = teacher.forward(&tx, d.batch_size, d.block, None, true);
+        let loss = loss::cross_entropy_loss_masked(&logits, &ty, None);
+        if step == 0 {
+            t_first = loss.item();
+        }
+        t_last = loss.item();
+        loss.backward();
+        topt.step();
+    }
+    logln!(
+        "  教师 {} 步：交叉熵 {:.4} → {:.4}（困惑度 {:.2} → {:.2}）",
+        d.teacher_steps,
+        t_first,
+        t_last,
+        t_first.exp(),
+        t_last.exp()
+    );
+
+    // 拿一个验证窗口看教师的分布：这才是"标签"本身
+    let (vx, vy) = corpus_windows(&val_ids, d.block, 1, &mut Rng::new(d.seed + 9));
+    let t_logits = tensor::no_grad(|| teacher.forward(&vx, 1, d.block, None, false));
+    logln!(
+        "  取验证集里一个长度 {} 的窗口，看**第一个位置**的教师分布（正确 token = `{}`）：",
+        d.block,
+        tokenizer.decode(&[vy[0]])
+    );
+    // 一节只取一行：`[rows, vocab]` 里第 0 行
+    let row_logits = t_logits.reshape(vec![d.block, vocab]);
+
+    for t in [1.0f32, d.temperature] {
+        let s = distill::SoftTargets::from_logits(
+            &row_logits,
+            distill::DistillConfig {
+                temperature: t,
+                alpha: 0.5,
+                top_k: d.top_k,
+            },
+        );
+        logln!(
+            "  T = {t:.1}：平均熵 {:.3}（满词表均匀分布是 {:.3}），保留 {} 类",
+            s.mean_entropy(),
+            (vocab as f64).ln(),
+            s.k()
+        );
+    }
+    // 展开 T=1 与目标温度下第 0 行的 top-5，直接看"软化"改了什么
+    let show_top5 = |t: f32| -> String {
+        let s = distill::SoftTargets::from_logits(
+            &row_logits,
+            distill::DistillConfig {
+                temperature: t,
+                alpha: 0.5,
+                top_k: 0,
+            },
+        );
+        let row = &s.probs()[..vocab];
+        let mut idx: Vec<usize> = (0..vocab).collect();
+        idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+        idx.truncate(5);
+        idx.iter()
+            .map(|&j| format!("`{}` {:.3}", tokenizer.decode(&[j]).escape_default(), row[j]))
+            .collect::<Vec<_>>()
+            .join(" ｜ ")
+    };
+    logln!("  T = 1.0 的 top-5：{}", show_top5(1.0));
+    logln!("  T = {:.1} 的 top-5：{}", d.temperature, show_top5(d.temperature));
+    if d.top_k > 0 {
+        logln!(
+            "  读法：温度把 logits 除以 T 再 softmax —— T 越大，原本被压到 1e-3 量级的\n  \
+             「次优答案」被抬到能被看见的尺度，这部分才是 Hinton 说的 *dark knowledge*。\n  \
+             但长尾一起被抬起来也是噪声：top-k 截断只留最可能的 {} 类再重新归一化，\n  \
+             既省算力（反向只需遍历这 {} 列）又去掉噪声。",
+            d.top_k,
+            d.top_k
+        );
+    }
+
+    // ---------- 二、KD 梯度数值自检 ----------
+    logln!("=== 二、KD 梯度自检：解析反向 vs 有限差分 ===");
+    let (cx, _cy) = corpus_windows(&val_ids, d.block, 1, &mut Rng::new(d.seed + 21));
+    let c_logits = tensor::no_grad(|| teacher.forward(&cx, 1, d.block, None, false));
+    let soft = distill::SoftTargets::from_logits(&c_logits, dcfg);
+    // 访问器自检：软标签的 `[rows, vocab]` 必须与教师 logits 对齐，温度回读要等于配置值
+    assert_eq!(
+        soft.rows() * soft.vocab(),
+        c_logits.numel(),
+        "软标签的 rows×vocab 应与教师 logits 元素数一致"
+    );
+    assert_eq!(soft.temperature(), d.temperature, "温度回读应等于配置值");
+    // 学生 logits 取一份与教师不同的随机值：学生与教师一致时梯度恒为 0，检查不出任何问题
+    let (rows, v) = (d.block, vocab);
+    let mut srng = Rng::new(d.seed + 33);
+    let student_z: Vec<f32> = (0..rows * v).map(|_| srng.randn()).collect();
+    let z = Tensor::param(student_z.clone(), vec![rows, v]);
+    let loss = distill::kd_loss(&z, &soft, None);
+    z.zero_grad();
+    loss.backward();
+    let analytic: Vec<f32> = z.grad.borrow().to_vec();
+    let eps = 1e-3f32;
+    let value_at = |data: &[f32]| -> f32 {
+        distill::kd_loss(&Tensor::from_vec(data.to_vec(), vec![rows, v]), &soft, None).item()
+    };
+    let mut worst = 0.0f32;
+    let mut checked = 0usize;
+    // 逐个元素差分（张量很小，全查一遍；只抽样的会漏掉"某几列符号反了"这类局部错误）
+    for j in 0..rows * v {
+        let mut plus = student_z.clone();
+        plus[j] += eps;
+        let mut minus = student_z.clone();
+        minus[j] -= eps;
+        let num = (value_at(&plus) - value_at(&minus)) / (2.0 * eps);
+        worst = worst.max((analytic[j] - num).abs());
+        checked += 1;
+    }
+    logln!(
+        "  核对 {} 个元素，最大误差 {:.2e}（loss = {:.6}，T = {:.2} 时梯度量级 ~{:.3}）",
+        checked,
+        worst,
+        loss.item(),
+        d.temperature,
+        1.0 / d.temperature
+    );
+    assert!(
+        worst < 5e-3,
+        "KD 解析梯度与有限差分不一致（最大误差 {worst:.2e}）——T² 缩放或 (p_s − p_t) 多半写错了"
+    );
+    logln!(
+        "  读法：`∂L/∂z_s = (T / N)·(p_s − p_t)`。少了 `T²` 缩放，高温下 KD 的梯度会比\n  \
+         硬标签小 `T` 倍，`α` 形同虚设；`(p_s − p_t)` 写反则是一个把学生推离教师的损失。\n  \
+         两者都不会让 loss 数字看起来异常，只有数值核对能发现。"
+    );
+
+    // ---------- 三、对照实验：软标签 vs 硬标签 ----------
+    logln!("=== 三、对照实验：同一学生、同一批数据、同一步数，只差一个 α ===");
+    // 训练与评测都用固定种子的数据窗口：两组学生看到的样本逐位相同
+    let (x_train, y_train) = corpus_windows(&train_ids, d.block, d.batch_size * 4, &mut Rng::new(d.seed + 77));
+    let teacher_train = tensor::no_grad(|| teacher.forward(&x_train, d.batch_size * 4, d.block, None, false));
+    let (ev_x, ev_y) = corpus_windows(&val_ids, d.block, d.batch_size, &mut Rng::new(d.seed + 91));
+    let ev_teacher = tensor::no_grad(|| teacher.forward(&ev_x, d.batch_size, d.block, None, false));
+    let ev_soft = distill::SoftTargets::from_logits(
+        &ev_teacher,
+        distill::DistillConfig {
+            temperature: d.temperature,
+            alpha: 0.0,
+            top_k: 0,
+        },
+    );
+
+    let run = |alpha: f32| -> (f32, f64, f64) {
+        let student = build(d.student_n_embd, d.student_n_layer, d.seed + 5);
+        let mut opt = AdamW::new(d.lr, student.parameters(), 0.0);
+        let cfg = distill::DistillConfig {
+            temperature: d.temperature,
+            alpha,
+            top_k: d.top_k,
+        };
+        let s_soft = distill::SoftTargets::from_logits(&teacher_train, cfg);
+        for _ in 0..d.steps {
+            // 裁掉一部分让两组都跑同样的样本数（batch 相同时窗口正好一一对应）
+            let logits = student.forward(&x_train, d.batch_size * 4, d.block, None, true);
+            let l = distill::distill_loss(&logits, &s_soft, &y_train, None);
+            opt.zero_grad();
+            l.backward();
+            opt.step();
+        }
+        let logits = tensor::no_grad(|| student.forward(&ev_x, d.batch_size, d.block, None, false));
+        let ce = loss::cross_entropy_loss_masked(&logits, &ev_y, None).item();
+        (ce, ev_soft.kl_to(&logits), ev_soft.top1_agreement(&logits))
+    };
+
+    let (ce_hard, kl_hard, ag_hard) = run(0.0);
+    let (ce_kd, kl_kd, ag_kd) = run(d.alpha);
+    logln!("  评测集：{} 个窗口 × {} 个位置（训练时未见过）", d.batch_size, d.block);
+    logln!(
+        "  只对硬标签（α=0）：验证 CE {:.4}｜困惑度 {:.3}｜对教师的 KL {:.4}｜top-1 一致 {:.1}%",
+        ce_hard,
+        ce_hard.exp(),
+        kl_hard,
+        100.0 * ag_hard
+    );
+    logln!(
+        "  硬标签 + 蒸馏（α={:.2}）：验证 CE {:.4}｜困惑度 {:.3}｜对教师的 KL {:.4}｜top-1 一致 {:.1}%",
+        d.alpha,
+        ce_kd,
+        ce_kd.exp(),
+        kl_kd,
+        100.0 * ag_kd
+    );
+    logln!(
+        "  读法：学生参数只有教师的 {:.1}%，自己从数据里能学到的就那么多。教师的软标签是\n  \
+         「额外 supervision」——同一句话，学生得到的不再是 one-hot，而是一整套类间相似度。\n  \
+         所以它同时改善了**两者**：既更贴近教师（KL 下降、top-1 一致率上升），又因为温柔的目标\n  \
+         本身是一种正则，在真实标签上的 CE 往往也更低。",
+        100.0 * s_params as f64 / t_params as f64
+    );
+    runlog::append(&format!(
+        "[对比] 硬标签 CE={ce_hard:.4} KL={kl_hard:.4} 一致={ag_hard:.3} ｜ 蒸馏 CE={ce_kd:.4} KL={kl_kd:.4} 一致={ag_kd:.3}"
+    ));
+    assert!(
+        kl_kd < kl_hard,
+        "蒸馏学生的分布应更接近教师（KL {kl_kd:.4} vs {kl_hard:.4}）——若失败请把 --steps 调大"
+    );
+    assert!(
+        ag_kd >= ag_hard,
+        "蒸馏学生的 top-1 一致率不应更差（{ag_kd:.3} vs {ag_hard:.3}）"
+    );
+
+    runlog::finish();
+}
+
+/// FP8 低精度模拟实验（第 43 课）
+///
+/// 三节：
+/// 一、**8 位浮点长什么样**：E4M3 / E5M2 的码、解码值、相对误差对照
+/// 二、**分块缩放**：动态范围大的权重上，块大小如何同时决定误差与存储开销；
+///     以及"操作数先落 FP8 再相乘"对矩阵乘法结果的影响
+/// 三、**对 loss 的影响**：同一个模型，权重落 FP8 前后验证 loss 差多少
+///
+/// 全程只是**数值模拟**：本仓库的算子跑在 CPU 的 f32 上，编解码只会更慢，
+/// 真实的 FP8 加速需要 GPU 的 FP8 tensor core（见 [`crate::fp8`] 的模块说明）。
+fn cmd_fp8(d: &Fp8Args) {
+    let log_path = runlog::start("fp8");
+    println!("运行日志：{log_path}");
+
+    // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
+    assert!(d.rows >= 1 && d.cols >= 1, "演示矩阵尺寸至少为 1");
+    assert!(d.steps >= 1, "训练步数至少为 1（实际 {}）", d.steps);
+    assert!(d.lr > 0.0, "学习率必须为正（实际 {}）", d.lr);
+    assert!(d.batch_size >= 1, "批大小至少为 1（实际 {}）", d.batch_size);
+    assert!(d.block_size >= 4, "上下文长度至少为 4（实际 {}）", d.block_size);
+    assert!(d.n_layer >= 1, "层数至少为 1（实际 {}）", d.n_layer);
+    assert!(
+        d.n_embd >= 4 && d.n_embd % 4 == 0,
+        "n_embd 必须能被 n_head=4 整除且 >= 4（实际 {}）",
+        d.n_embd
+    );
+
+    let fmt = match d.fmt.as_str() {
+        "e4m3" => fp8::Fp8Format::E4M3,
+        "e5m2" => fp8::Fp8Format::E5M2,
+        other => panic!("未知 FP8 格式 {other}（可选 e4m3 / e5m2）"),
+    };
+
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("格式", fmt.name().to_string()),
+            (
+                "分块大小",
+                if d.block == 0 {
+                    "整张一个 scale".to_string()
+                } else {
+                    d.block.to_string()
+                },
+            ),
+            ("演示矩阵", format!("{}×{}", d.rows, d.cols)),
+            ("训练步数 / 学习率", format!("{} / {}", d.steps, d.lr)),
+            (
+                "批大小 / 上下文",
+                format!("{} / {}", d.batch_size, d.block_size),
+            ),
+            (
+                "小模型",
+                format!("n_embd={} n_layer={}", d.n_embd, d.n_layer),
+            ),
+        ],
+    );
+
+    logln!("说明：本子命令是**纯数值模拟**——算子仍跑在 CPU 的 f32 上，编解码只会更慢。");
+    logln!("     真实 FP8 训练的加速来自 GPU 的 FP8 tensor core（本仓库没有 FP8 kernel），");
+    logln!("     这里量的是「若按 FP8 存，数值会差多少」，为将来接真 kernel 留一个对照基准。");
+
+    // ---------- 一、格式本身 ----------
+    logln!("=== 一、8 位浮点长什么样 ===");
+    for f in [fp8::Fp8Format::E4M3, fp8::Fp8Format::E5M2] {
+        logln!(
+            "  {}：{} 位指数 + {} 位尾数｜最大值 {}｜最小正规数 {:.3e}｜最小非规格化 {:.3e}｜{}",
+            f.name(),
+            f.exp_bits(),
+            f.mantissa_bits(),
+            f.max(),
+            f.min_positive_normal(),
+            f.min_positive_subnormal(),
+            if f.has_inf() {
+                "有 Inf 码"
+            } else {
+                "无 Inf 码（溢出饱和到最大值）"
+            }
+        );
+    }
+    logln!("  代表性数值的编码（同一个数在两种格式下的码完全不同）：");
+    logln!(
+        "  {:<10}{:>8}{:>8}{:>18}{:>12}",
+        "数值",
+        "格式",
+        "码",
+        "解码值",
+        "相对误差"
+    );
+    for (label, x) in [
+        ("1.0", 1.0f32),
+        ("1.5", 1.5),
+        ("0.1", 0.1),
+        ("2^-9", 2f32.powi(-9)),
+        ("448", 448.0),
+        ("57344", 57344.0),
+        ("1e9", 1e9),
+    ] {
+        for f in [fp8::Fp8Format::E4M3, fp8::Fp8Format::E5M2] {
+            let code = fp8::encode(x, f);
+            let back = fp8::decode(code, f);
+            let rel = ((back - x).abs() / x.abs()) as f64;
+            logln!(
+                "  {:<10}{:>8}{:>8}{:>18.6}{:>11.4}%",
+                label,
+                f.name(),
+                format!("0x{code:02X}"),
+                back,
+                rel * 100.0
+            );
+        }
+    }
+    logln!(
+        "  读法：E4M3 的 `0.1` 只能落到 0.1016（3 位尾数就这个精度）；`1e9` 在两种格式里都\n  \
+         超出范围 —— E4M3 饱和到 448，E5M2 报 Inf。**E4M3 无 Inf 码**是它最容易被忽略的\n  \
+         特性：指数全 1 且尾数全 1 的位置留给了 NaN，所以溢出只能饱和。"
+    );
+
+    // ---------- 二、分块缩放与模拟 matmul ----------
+    logln!("=== 二、分块缩放：块越大越省，但动态范围一大就被压平 ===");
+    // 造一个"不同输出通道尺度差 6 个数量级"的权重：第 0 行 ~1.0，最后一行 ~1e-6
+    let mut rng = Rng::new(d.seed);
+    let numel = d.rows * d.cols;
+    let mut w = vec![0f32; numel];
+    for r in 0..d.rows {
+        let amp = 10f32.powf(-6.0 * r as f32 / d.rows.max(2) as f32);
+        for c in 0..d.cols {
+            w[r * d.cols + c] = amp * rng.randn();
+        }
+    }
+    let wt = Tensor::from_vec(w, vec![d.rows, d.cols]);
+    logln!(
+        "  合成权重 [{}×{}]：第 1 行尺度 ~1.0，最后一行 ~1e-6（真实权重不同通道的尺度差异就这么大）",
+        d.rows,
+        d.cols
+    );
+    logln!(
+        "  {:<12}{:>10}{:>14}{:>14}{:>16}",
+        "块大小",
+        "SNR(dB)",
+        "平均绝对误差",
+        "最大绝对误差",
+        "占用(f32 的 %)"
+    );
+    // 0 = 整张一个 scale；其余是每多少个元素一个 scale
+    let mut sizes = vec![0usize, 128, 32, 1];
+    sizes.dedup(); // 相邻重复去掉（例如 cols 恰好是 128 时不做处理也没关系）
+    for &blk in &sizes {
+        let b = if blk == 0 { numel } else { blk.min(numel) };
+        let q = fp8::Fp8Tensor::quantize(&wt, fmt, b);
+        let e = q.errors(&wt);
+        logln!(
+            "  {:<12}{:>10.1}{:>14.3e}{:>14.3e}{:>15.1}%",
+            if blk == 0 {
+                "整张".to_string()
+            } else {
+                blk.to_string()
+            },
+            e.snr_db,
+            e.mean_abs,
+            e.max_abs,
+            100.0 * q.bytes() as f64 / (numel * 4) as f64
+        );
+    }
+    logln!(
+        "  读法：块越小误差越小、但 scale 的存储开销越大（每 32 个元素多 4 字节 = 1 bit/元素，\n  \
+         合计 9 bit，对 f32 仍是约 3.6 倍压缩）。整张一个 scale 会把小尺度的行整片压平 ——\n  \
+         这正是 MXFP8 规定「每 32 个元素一个 scale」的原因。注意「块大小 1」那一行：SNR 高得\n  \
+         离谱是因为每个元素都配一个 f32 scale（5 字节/元素，比 f32 还大），那不是量化，\n  \
+         只是把 f32 换了个地方存 —— 收益与开销必须一起看，这是量化最容易自欺的地方。"
+    );
+
+    // 模拟一次"操作数先落 FP8 再相乘"的矩阵乘法
+    let a = Tensor::from_vec(
+        (0..numel).map(|_| rng.randn()).collect(),
+        vec![d.rows, d.cols],
+    );
+    let b = Tensor::from_vec(
+        (0..d.cols * d.cols).map(|_| rng.randn()).collect(),
+        vec![d.cols, d.cols],
+    );
+    let exact = a.matmul(&b);
+    let blk = if d.block == 0 { numel } else { d.block };
+    logln!(
+        "  模拟矩阵乘 a[{}×{}] @ b[{}×{}]（操作数先往返量化再乘，累加仍在 f32）：",
+        d.rows,
+        d.cols,
+        d.cols,
+        d.cols
+    );
+    logln!(
+        "  {:<8}{:>14}{:>14}",
+        "格式",
+        "相对 Frobenius 误差",
+        "最大绝对误差"
+    );
+    for f in [fp8::Fp8Format::E4M3, fp8::Fp8Format::E5M2] {
+        let sim = fp8::simulate_matmul(&a, &b, f, blk);
+        let de = exact.decode();
+        let de_ref: &[f32] = &de;
+        let ds = sim.decode();
+        let ds_ref: &[f32] = &ds;
+        let (mut sig, mut noise, mut max_abs) = (0f64, 0f64, 0f32);
+        for i in 0..de_ref.len() {
+            let err = (de_ref[i] - ds_ref[i]).abs();
+            sig += (de_ref[i] as f64).powi(2);
+            noise += (err as f64) * (err as f64);
+            max_abs = max_abs.max(err);
+        }
+        let rel_fro = (noise / sig.max(f64::MIN_POSITIVE)).sqrt();
+        logln!("  {:<8}{:>13.2}%{:>14.3e}", f.name(), rel_fro * 100.0, max_abs);
+    }
+    logln!(
+        "  读法：E4M3 的误差明显更小（3 位尾数 vs 2 位），代价是动态范围小两个数量级。\n  \
+         所以工程上分工明确：**前向的权重/激活用 E4M3，反向的梯度用 E5M2**。"
+    );
+
+    // ---------- 三、权重落 FP8 对 loss 的影响 ----------
+    logln!("=== 三、权重落 FP8 之后，loss 差多少 ===");
+    let tokenizer = Tokenizer::char(CORPUS);
+    let vocab = tokenizer.vocab_size();
+    let ids = tokenizer.encode(CORPUS);
+    let split = ids.len() * 4 / 5;
+    let (train_ids, val_ids) = (ids[..split].to_vec(), ids[split..].to_vec());
+
+    let model = Transformer::new(
+        TransformerConfig {
+            n_embd: d.n_embd,
+            n_head: 4,
+            n_layer: d.n_layer,
+            block_size: d.block_size,
+            dropout: 0.0,
+            ..TransformerConfig::tiny(vocab)
+        },
+        &mut Rng::new(d.seed),
+    );
+    let params = model.parameters();
+    let p_total: usize = params.iter().map(|p| p.numel()).sum();
+
+    // 先正常训几步：全随机权重下 loss 对扰动不敏感，看不出量化到底伤了什么
+    let mut opt = AdamW::new(d.lr, params.clone(), 0.0);
+    let mut trng = Rng::new(d.seed + 1);
+    let mut first = f32::NAN;
+    let mut last = f32::NAN;
+    for step in 0..d.steps {
+        let (x, y) = corpus_windows(&train_ids, d.block_size, d.batch_size, &mut trng);
+        opt.zero_grad();
+        let logits = model.forward(&x, d.batch_size, d.block_size, None, true);
+        let l = loss::cross_entropy_loss_masked(&logits, &y, None);
+        if step == 0 {
+            first = l.item();
+        }
+        last = l.item();
+        l.backward();
+        opt.step();
+    }
+    logln!(
+        "  小模型 n_embd={} n_layer={}（{} 参数），训练 {} 步：交叉熵 {:.4} → {:.4}（困惑度 {:.2} → {:.2}）",
+        d.n_embd,
+        d.n_layer,
+        p_total,
+        d.steps,
+        first,
+        last,
+        first.exp(),
+        last.exp()
+    );
+
+    // 验证集（训练未见过）
+    let (vx, vy) = corpus_windows(&val_ids, d.block_size, d.batch_size, &mut Rng::new(d.seed + 7));
+    let eval_ce = || -> f32 {
+        tensor::no_grad(|| {
+            let logits = model.forward(&vx, d.batch_size, d.block_size, None, false);
+            loss::cross_entropy_loss_masked(&logits, &vy, None).item()
+        })
+    };
+    let before = eval_ce();
+
+    // 备份全部参数：量化是原地写回，换格式重来前必须还原
+    let backup: Vec<Vec<f32>> = params.iter().map(|p| p.decode().to_vec()).collect();
+    let restore = |src: &[Vec<f32>]| {
+        for (p, s) in params.iter().zip(src.iter()) {
+            let sr: &[f32] = s;
+            p.decode_mut().copy_from_slice(sr);
+        }
+    };
+    let quantize = |f: fp8::Fp8Format| {
+        fp8::roundtrip_params_in_place(&params, f, fp8::TRAIN_BLOCK)
+    };
+
+    logln!(
+        "  评测集：{} 个窗口 × {} 个位置（训练时未见过）。同一个模型，唯一变化是权重落到 FP8：",
+        d.batch_size,
+        d.block_size
+    );
+    logln!(
+        "  {:<10}{:>12}{:>12}{:>14}{:>16}",
+        "权重要求",
+        "验证 CE",
+        "困惑度",
+        "相对变化",
+        "量化张量/元素"
+    );
+    let mut rows: Vec<(String, f32, usize, usize)> = Vec::new();
+    for f in [fp8::Fp8Format::E4M3, fp8::Fp8Format::E5M2] {
+        restore(&backup);
+        let (nt, ne, _bytes) = quantize(f);
+        let after = eval_ce();
+        restore(&backup); // 立刻还原，免得影响下一轮
+        rows.push((
+            format!("{}（+ 分块 {}）", f.name(), fp8::TRAIN_BLOCK),
+            after,
+            nt,
+            ne,
+        ));
+    }
+    for (label, after, nt, ne) in &rows {
+        let rel = (*after - before) as f64 / before.max(1e-6) as f64;
+        logln!(
+            "  {:<10}{:>12.4}{:>12.3}{:>13.2}%{:>16}",
+            label,
+            after,
+            after.exp(),
+            rel * 100.0,
+            format!("{nt}/{ne}")
+        );
+    }
+    // 原样（未量化）一行放在最后对照
+    logln!(
+        "  {:<10}{:>12.4}{:>12.3}{:>13.2}%{:>16}",
+        "f32（原始）",
+        before,
+        before.exp(),
+        0.0,
+        format!("0/{}", p_total)
+    );
+
+    let (label_e4, ce_e4, _, _) = &rows[0];
+    let rel_e4 = (*ce_e4 - before).abs() as f64 / before.max(1e-6) as f64;
+    runlog::append(&format!(
+        "[对比] f32 CE={before:.4} ｜ {label_e4} CE={ce_e4:.4}（相对变化 {:+.2}%）",
+        rel_e4 * 100.0
+    ));
+    assert!(
+        rel_e4 < 0.10,
+        "E4M3 + 分块 {} 量化权重后 loss 变化应 < 10%（实际 {:.2}%）——若超了多半是 scale 取错",
+        fp8::TRAIN_BLOCK,
+        rel_e4 * 100.0
+    );
+    logln!(
+        "  读法：权重掉到 8 位只让 loss 动了百分之几 —— 这就是 FP8 训练可行的前提。\n  \
+         但要注意这里只量化了**权重**：真实 FP8 训练还要把激活也压到 8 位（前向 E4M3），\n  \
+         那是一份额外误差；而省下的显存（约 3.6 倍）与 tensor core 吞吐（约 2 倍）才是收益。\n  \
+         本仓库没有 FP8 kernel，所以这份收益一分也拿不到 —— 别把这里的数字当成性能数据。"
     );
 
     runlog::finish();
