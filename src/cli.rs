@@ -445,6 +445,17 @@ pub enum Cmd {
         /// 容量因子扫描（逗号分隔；0 = 不限容量）
         #[arg(long, default_value = "0,1.0,1.25,2.0")]
         capacity_factors: String,
+        /// 共享专家个数 E_s：**全部** token 都过、不参与路由（0 = 关闭）。
+        /// 同时计入总参数与激活参数，会把稀疏比拉低——"用稀疏性换质量"的量化形式
+        #[arg(long, default_value_t = 0)]
+        shared_experts: usize,
+        /// 端到端对照额外增加一条 DeepSeek-V3 式 aux-loss-free 偏置均衡臂
+        /// （isolated 三组对照恒含该臂，它就是用来演示这个机制的）
+        #[arg(long)]
+        bias_balance: bool,
+        /// 均衡偏置的 sign 更新步长 γ（仅 `--bias-balance` 生效；对应 `model.moe_bias_lr`）
+        #[arg(long, default_value_t = 0.001)]
+        bias_lr: f32,
         /// 随机种子（各组共用，保证初始权重一致、可比）
         #[arg(long, default_value_t = 42)]
         seed: u64,
@@ -808,5 +819,63 @@ pub struct SpecArgs {
 impl Cli {
     pub fn parse_args() -> Self {
         Cli::parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// 新开的三个 MoE 开关的默认值必须与 `TransformerConfig` 的默认一致
+    /// （`moe_shared_experts = 0` / `moe_bias_balance = false` / `moe_bias_lr = 0.001`）——
+    /// 这是「不传新开关时 `moe` 子命令建出的模型逐位不变」的接线保证。
+    #[test]
+    fn test_moe_switches_default_to_config_defaults() {
+        let cli = Cli::parse_from(["llm_from_scratch", "moe"]);
+        match cli.cmd {
+            Cmd::Moe {
+                shared_experts,
+                bias_balance,
+                bias_lr,
+                aux_coef,
+                top_k,
+                ..
+            } => {
+                assert_eq!(shared_experts, 0);
+                assert!(!bias_balance);
+                assert_eq!(bias_lr, 0.001);
+                assert_eq!(aux_coef, 0.01);
+                assert_eq!(top_k, 2);
+            }
+            _ => panic!("应解析为 moe 子命令"),
+        }
+    }
+
+    /// 三个开关都能从命令行覆盖；`--bias-balance` 是不带值的布尔开关。
+    #[test]
+    fn test_moe_switches_override_from_cli() {
+        let cli = Cli::parse_from([
+            "llm_from_scratch",
+            "moe",
+            "--shared-experts",
+            "2",
+            "--bias-balance",
+            "--bias-lr",
+            "0.05",
+        ]);
+        match cli.cmd {
+            Cmd::Moe {
+                shared_experts,
+                bias_balance,
+                bias_lr,
+                ..
+            } => {
+                assert_eq!(shared_experts, 2);
+                assert!(bias_balance);
+                assert_eq!(bias_lr, 0.05);
+            }
+            _ => panic!("应解析为 moe 子命令"),
+        }
     }
 }

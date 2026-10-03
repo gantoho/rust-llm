@@ -83,7 +83,7 @@
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
-| 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
+| 工程化完善 | `docs/39-工程化完善.md` | 9 个 CLI 子命令起步（现共 19 个，见下文「命令行完整参考」）、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
 | 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志与完整问答记录、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)）、`web/` 前端测试页随 serve 启动 |
 
 ### 多模态教程（第 41 课，代码+文档）
@@ -177,8 +177,8 @@ cargo run --release -- bench --steps 30
 
 ## 命令行完整参考
 
-程序提供 16 个子命令：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` / `preset` / `demo` / `bench` /
-`scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative`。
+程序提供 19 个子命令：`train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` / `preset` / `demo` /
+`bench` / `scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative` / `distill` / `fp8`。
 
 ### 1. `train` —— 训练模型
 
@@ -224,7 +224,7 @@ JSON 头：step、best_val_loss、模型配置、优化器步数 opt_t、参数�
 
 **日志**：**每个评估点**（每 `eval_every` 步 + 最后一步）向 `logs/train.csv` 写一行（由 `train.log_file` 指定，默认 `logs/train.csv`，目录自动创建），列为 `step,lr,train_loss,val_loss,ppl,tokens_per_sec`；每次训练会覆盖该文件，要留档就一个实验配一个路径。
 
-**运行日志**：`train` / `eval` / `generate` / `chat` / `sft` / `finetune` / `scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative` 十三个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
+**运行日志**：`train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` / `scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative` / `distill` / `fp8` 十六个子命令**每次运行都会自动在 `logs/` 下写一份运行日志**，文件名是 `{操作}_{年-月-日_时-分-秒-毫秒}.log`（如 `logs/generate_2026-09-19_14-30-12-345.log`），操作名区分命令、毫秒时间戳区分同命令的多次运行，互不覆盖。每份日志包含：运行头部（操作名、开始时间（命令开始执行的时刻）、**完整命令行**、工作目录、版本 / 平台 / 线程数 / GPU）、**完整配置**（`--config` 解析后的全部字段，含被 CLI 覆盖后的最终值）、本次运行的关键参数（采样参数 / prompt / checkpoint 等）与全部过程输出（训练进度、评估点、生成文本、对话轮次），结尾附结束时间与总耗时。文件名时间戳、开始时间、总耗时同源，都取自 `main()` 入口记下的时刻，所以耗时覆盖参数解析、配置与模型加载在内的**全过程**。写入由 `src/runlog.rs` 统一负责，控制台与日志内容一致，不需要再手动重定向。
 
 **分词器自动加载；`eval` 仍需要语料**：`eval` / `generate` / `chat` 都会从 checkpoint 目录自动加载 `tokenizer.json`（不必再指定分词器）。其中 **`generate` / `chat` 只依赖 checkpoint，不需要语料**；但 **`eval` 要算验证集 loss，仍会读配置里的 `train_file`**（或 `val_file`），所以它的 `--config` 必须指向语料还在的原配置：
 
@@ -1282,45 +1282,71 @@ cargo run --release -- moe [参数]
 | `--n-layer <层数>` | int | `2` | Transformer 层数 |
 | `--aux-coef <α>` | float | `0.01` | 均衡辅助损失系数（对照组固定为 0） |
 | `--capacity-factors <列表>` | string | `0,1.0,1.25,2.0` | 容量因子扫描（0 = 不限容量） |
+| `--shared-experts <E_s>` | int | `0` | 共享专家数（DeepSeek-V2/V3 式，对应 `model.moe_shared_experts`）；作用于第一节口径与第三节端到端 |
+| `--bias-balance` | flag | 关 | 给第三节**追加**一条 DeepSeek-V3 式 sign 偏置均衡臂（对应 `model.moe_bias_balance`）；第二节隔离实验恒含该臂 |
+| `--bias-lr <γ>` | float | `0.001` | 偏置更新步长 γ（对应 `model.moe_bias_lr`），只被偏置臂使用 |
 | `--seed <种子>` | int | `42` | 随机种子（各组共用，保证初始权重一致、可比） |
+
+三个新开关的默认值与 `TransformerConfig` 的默认逐位一致，不传它们时建出的模型与旧版本**逐位相同**
+（单测 `test_moe_switches_default_to_config_defaults` 守住这条）。
 
 **输出分四节**：
 
-1. **参数 / 计算量口径**：`total = E·expert + router`（全驻显存）、`active = K·expert + router`（每 token 只算 K 个），
+1. **参数 / 计算量口径**：`total = E·expert + router + shared`（全驻显存）、`active = K·expert + router + shared`（每 token 只算 K 个，共享专家必算），
    并用 `assert_eq!` 把公式与真实建层参数对账（公式漂移会当场 panic 而不是给出错数字）；
-2. **负载均衡辅助损失：隔离实验**：人为把路由器摆到塌缩点，然后**不跑主损失、只优化 `L_aux`**；
-3. **端到端对照**：同种子 / 同语料 / 同步数，α = 0 与 α = `aux_coef` 各训一遍，比对 loss 与路由不均衡度；
+2. **负载均衡三组对照：隔离实验**：人为把路由器摆到同一个塌缩点，然后跑三组——
+   ① 什么都不做 ② 只优化 `L_aux` ③ 只推进 sign 均衡偏置；
+3. **端到端对照**：同种子 / 同语料 / 同步数，α = 0 与 α = `aux_coef` 各训一遍，比对 loss 与路由不均衡度
+   （`--bias-balance` 时追加偏置臂）；
 4. **容量因子与 Token Dropping**：拿负载最不均的那份模型扫容量因子，看丢弃比例。
 
 实测输出（`cargo run --release -- moe --steps 60`）：
 
 ```text
 === 一、参数 / 计算量口径：MoE 省的是 FLOPs，不是显存 ===
-  E=8   K=2 | 单层 总 265224 / 激活 66696（3.98× / 省 74.9% FLOPs） | 模型 总 566608 / 激活 169552（3.34× / 省 70.1% FLOPs）
+  每个专家就是一个普通 FFN（SwiGLU 版 3dh+2h+d = 49728 参数，d = 64）；
+  稠密基线（n_expert=1）实测参数：135488
+  E=8   K=2 | 单层 总 398344 / 激活 99976（3.98× / 省 74.9% FLOPs） | 模型 总 832720 / 激活 235984（3.53× / 省 71.7% FLOPs）
 
-=== 二、负载均衡辅助损失：隔离实验（不跑主损失，只优化 L_aux） ===
-  汇总：K=1：L_aux 5.932 → 1.039（p 摊平 ⇒ 1.0，不是下界），不均衡度 8.00 → 6.32，用到的专家 1/8 → 4/8
-       ｜K=2：L_aux 3.114 → 1.010（p 摊平 ⇒ 1.0，不是下界），不均衡度 4.00 → 3.92，用到的专家 2/8 → 6/8
+=== 二、负载均衡三组对照：隔离实验（同一塌缩起点，只跑均衡机制、不跑主损失） ===
+  汇总（同一塌缩起点、同一诊断口径）：
+    K=1（E=8）
+    ① 不均衡（塌缩起点，不做任何均衡）：不均衡度 8.00（用 1/8），L_aux 5.932
+    ② α·L_aux（300 步梯度）：不均衡度 3.12（用 7/8，比 ① 摊平  69.8%），L_aux 5.932 → 1.053
+    ③ sign 偏置（2000 步、γ = 0.001、不算梯度）：不均衡度 1.32（用 8/8，比 ① 摊平  95.5%），L_aux 0.929
+    K=2（E=8）
+    ① 不均衡（塌缩起点，不做任何均衡）：不均衡度 4.00（用 2/8），L_aux 3.114
+    ② α·L_aux（300 步梯度）：不均衡度 3.81（用 7/8，比 ① 摊平  59.8%），L_aux 3.114 → 1.025
+    ③ sign 偏置（2000 步、γ = 0.001、不算梯度）：不均衡度 1.11（用 8/8，比 ① 摊平  98.4%），L_aux 1.036
 
 === 三、端到端对照（同种子 / 同语料 / 同 60 步） ===
-  汇总：α=0: loss 1.9459 / 不均衡度 1.48｜α=0.01: loss 1.9771 / 不均衡度 1.26
+  汇总：α=0: loss 1.8841 / 不均衡度 1.71｜α=0.01: loss 1.8368 / 不均衡度 1.24
 
 === 四、容量因子与 Token Dropping ===
   cf = 0     → 每专家容量 不限         丢弃 0/32768 = 0.00% ｜读到 token 的专家 8/8
-  cf = 1     → 每专家容量 128        丢弃 8171/32768 = 24.94% ｜读到 token 的专家 8/8
-  cf = 1.25  → 每专家容量 160        丢弃 5317/32768 = 16.23% ｜读到 token 的专家 8/8
-  cf = 2     → 每专家容量 256        丢弃 862/32768 = 2.63% ｜读到 token 的专家 8/8
+  cf = 1     → 每专家容量 128        丢弃 9257/32768 = 28.25% ｜读到 token 的专家 8/8
+  cf = 1.25  → 每专家容量 160        丢弃 6016/32768 = 18.36% ｜读到 token 的专家 8/8
+  cf = 2     → 每专家容量 256        丢弃 1059/32768 = 3.23% ｜读到 token 的专家 8/8
 ```
 
-**两个容易踩的坑**（详见 [`docs/32-MoE混合专家模型.md`](docs/32-MoE混合专家模型.md)）：
+**几个容易踩的坑**（详见 [`docs/32-MoE混合专家模型.md`](docs/32-MoE混合专家模型.md)）：
 
 - **K = 1 配错门控口径 ⇒ 路由器拿不到主损失梯度**。Top-K 内部**重归一化**（Mixtral / DeepSeek 式）在
   K = 1 时权重恒等于 1，对 logits 的雅可比整体是 0。K = 1 必须配 `switch_gate`（Switch Transformer 式
   原概率）。`moe` 子命令与单测 `test_k1_renorm_gate_has_no_router_gradient` 都验证了这一点。
 - **「`L_aux` 掉到 1」不是负载均衡的证书**。`L_aux = E·Σ f_i·p_i` 里 `f` 由 argmax 给出（不可导），
   `p` 才是可导的；`p` 均匀时无论 `f` 长什么样都有 `L_aux = 1`。所以第二节的隔离实验里
-  `L_aux` 被压到 1.0 附近，**硬路由几乎没动**（K = 2 组 4.00 → 3.92）。1 也不是下界：
+  `L_aux` 被压到 1.0 附近，而硬路由**最多只被摊平一部分**（K = 2 组 4.00 → 3.81，几乎原地；
+  K = 1 组 8.00 → 3.12，靠的是梯度顺手把权重从 0 抬起来）。1 也不是下界：
   `f` 与 `p` 支撑集不交时 `L_aux` 可以是 0。
+- **想摊平硬路由就得直接改 argmax 的排序**。第二节第三组不算一次梯度，只按 sign 规则推进选路偏置
+  （DeepSeek-V3 的 aux-loss-free 均衡），同一个塌缩起点上不均衡度就被压下去了（K = 1 组 1.32、
+  K = 2 组 1.11）——这就是它比 `α·L_aux` 有效的原因。
+- **偏置能生效的前提是 `logits` 对 token 有区分度**。隔离实验里两组起点的扰动是刻意不同的：
+  ② 组把路由器权重**清零**（所有 token 的 logits 完全相同 ⇒ argmax 只由偏置决定 ⇒ 硬路由物理上
+  不可能被摊平，只会让"赢家"在专家间轮转），③ 组只把权重**整体缩小**（保留区分度）。
+  把权重原样留着也不行：logits 极差（实测 > 3.0）会盖过 +3.0 的偏置，K = 1 时 8 个专家里 7 个都能
+  抢到 token，起点根本没塌缩。所以"起点塌缩"与"区分度还在"必须同时成立。
 
 > **端到端对照的诚实读法**：这个规模（2 层 × 64 维、几十步）下 α = 0 那一份**不会**塌缩——
 > 随机初始化的路由器在几百步内大体保持对称，路由塌缩是「富者愈富」的**长期**动力学，
@@ -1331,7 +1357,8 @@ cargo run --release -- moe [参数]
 > DeepSeek-V3 式的 **aux-loss-free 均衡偏置**（`moe_bias_balance` / `moe_bias_lr`：给每个专家一个
 > 只用于选路的 sign 偏置，选 Top-K 看 `logits + bias`，完全不进损失与梯度）与 **共享专家**
 > （`moe_shared_experts`：DeepSeek-V2/V3 式，每个 token 都额外过这几个专家，代价是不稀疏、会拉低稀疏比）。
-> 两者默认关闭，开启前行为逐位不变。
+> 两者默认关闭，开启前行为逐位不变，且都已开成 `moe` 子命令的开关
+> （`--shared-experts` / `--bias-balance` / `--bias-lr`），不必改 `config.json` 就能跑对照实验。
 
 ---
 
@@ -1395,9 +1422,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **318 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **320 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 10 个 GPU 一致性 / 标定测试，
-合计 328 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 330 个（其中 2 个是 `#[ignore]` 的性能探针，需手动运行）。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1480,6 +1507,7 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `test_balance_bias_is_free_of_params_and_graph` | 均衡偏置不进参数表、不产生计算图节点（既不进损失也不进梯度） |
 | `test_shared_experts_add_parallel_and_count_params` | 共享专家与稀疏专家并联相加；参数量口径把共享专家同时计入总参数与激活参数 |
 | `test_balance_bias_converges_load_without_gradients` | 不跑主损失、完全无梯度，只靠偏置就能把负载推平（"免费"均衡的机理验证） |
+| `test_moe_switches_default_to_config_defaults` / `test_moe_switches_override_from_cli` | `moe` 子命令新增的 `--shared-experts` / `--bias-balance` / `--bias-lr`：默认值与 `TransformerConfig` 逐位一致（不传即旧行为），且都能从命令行覆盖 |
 | `test_wsd_schedule_has_three_phases` | WSD 三段式：warmup 上升 → 稳定段恒为 `max_lr` → 末端退火到 `min_lr` |
 | `test_wsd_warmup_matches_cosine` | WSD 与 cosine 的 warmup 段逐位一致（共用同一段预热） |
 | `test_cosine_schedule_default_unchanged` | `lr_schedule = "cosine"` 与加 WSD 之前**逐位不变**（默认路径不回退） |
@@ -2007,7 +2035,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **318 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `318 passed; 0 failed`；
+- **320 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `320 passed; 0 failed`；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
@@ -2045,12 +2073,15 @@ llm_from_scratch/
 - **Scaling Laws 已落地**（第 31 课）：`scaling` 子命令上半场算预算（20:1 法则 vs 参数化损失闭式解、
   Chinchilla 配比表、训练时长/电费、过训练曲线），下半场**真训**多个规模做幂律拟合（loss vs N / vs D）
   并导出 CSV；参数口径与真实建层共用公式 + 扫描时逐位断言，公式漂移会当场 panic 而不是给出错数字
-- **MoE 稀疏专家已落地**（第 32 课）：`moe` 子命令四节实验（参数口径 / 负载均衡隔离实验 / 端到端对照 /
-  容量因子与 Token Dropping）；`TransformerConfig.n_expert = 1` 时行为与加 MoE 之前**逐位相同**；
+- **MoE 稀疏专家已落地**（第 32 课）：`moe` 子命令四节实验（参数口径 / 负载均衡**三组对照**隔离实验
+  （① 不均衡 / ② `α·L_aux` / ③ sign 均衡偏置）/ 端到端对照 / 容量因子与 Token Dropping）；
+  `TransformerConfig.n_expert = 1` 时行为与加 MoE 之前**逐位相同**；
   `moe_top_k = 1` 时必须配 `moe_switch_gate`，否则路由器拿不到主损失梯度（子命令与单测都会指出这一点）。
   另已落地 DeepSeek-V3 式 **aux-loss-free 均衡偏置**（`moe_bias_balance` / `moe_bias_lr`：给每个专家一个
   只用于选路的 sign 偏置，不进损失 / 梯度 / checkpoint，训练循环在 `opt.step()` 后更新）与 **共享专家**
-  （`moe_shared_experts`，DeepSeek-V2/V3 式，与稀疏专家并联相加）；两者默认关闭，开启前行为逐位不变
+  （`moe_shared_experts`，DeepSeek-V2/V3 式，与稀疏专家并联相加）；两者默认关闭，开启前行为逐位不变，
+  且都已开成 `moe` 子命令的 CLI 开关（`--shared-experts` / `--bias-balance` / `--bias-lr`）。隔离实验的
+  实测结论是**同一个塌缩起点上 ③ 组压得比 ② 组平**（K = 1：8.00 → 3.12 → 1.32；K = 2：4.00 → 3.81 → 1.11）
 - **量化已落地**（第 33 课）：`quant` 子命令支持 RTN / Hessian 量化 / AWQ 三种 weight-only 量化（int8 / int4），
   校准集走 Hessian `XᵀX`（含 act-order、阻尼、分块），AWQ 的缩放指数 α 可在 0~1 网格上按代理误差逐层搜索，
   可选 `--eval` 对比量化前后验证集 loss / 困惑度，并把量化权重与元信息落盘到 checkpoint

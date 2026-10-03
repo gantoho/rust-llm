@@ -380,6 +380,9 @@ fn main() {
             aux_coef,
             z_loss,
             capacity_factors,
+            shared_experts,
+            bias_balance,
+            bias_lr,
             seed,
         } => cmd_moe(
             &experts,
@@ -393,6 +396,9 @@ fn main() {
             aux_coef,
             z_loss,
             &capacity_factors,
+            shared_experts,
+            bias_balance,
+            bias_lr,
             seed,
         ),
         Cmd::Quant {
@@ -2588,6 +2594,30 @@ fn moe_model(
     z_loss: f32,
     seed: u64,
 ) -> Transformer {
+    moe_model_full(
+        vocab, n_embd, n_layer, block_size, n_expert, top_k, aux_coef, z_loss, 0, false, 0.001, seed,
+    )
+}
+
+/// 同 [`moe_model`]，但把 `config.json` 里只能配的三个 MoE 字段也摊开成参数
+/// （对应 `moe` 子命令的 `--shared-experts` / `--bias-balance` / `--bias-lr`）。
+/// 默认值 `(0, false, 0.001)` 与 [`TransformerConfig`] 的默认逐位一致 ⇒ 不传新开关时
+/// 建出来的模型与旧行为完全相同。
+#[allow(clippy::too_many_arguments)]
+fn moe_model_full(
+    vocab: usize,
+    n_embd: usize,
+    n_layer: usize,
+    block_size: usize,
+    n_expert: usize,
+    top_k: usize,
+    aux_coef: f32,
+    z_loss: f32,
+    n_shared: usize,
+    bias_balance: bool,
+    bias_lr: f32,
+    seed: u64,
+) -> Transformer {
     assert!(
         n_embd % 4 == 0,
         "n_embd 必须能被 n_head=4 整除（实际 {n_embd}）"
@@ -2605,6 +2635,13 @@ fn moe_model(
         moe_aux_coef: aux_coef,
         moe_z_loss_coef: z_loss,
         moe_switch_gate: n_expert > 1 && top_k == 1,
+        moe_shared_experts: n_shared,
+        moe_bias_balance: bias_balance,
+        moe_bias_lr: bias_lr,
+        // 显式钉死 FFN 风格（当前也等于 `TransformerConfig::default()`）：第一节的参数口径
+        // 直接用 `sparse_stats(..., use_swiglu = true, ...)` 核对，这里不写死的话，将来默认值
+        // 一改就会变成"公式与建层漂移"——而那种漂移不会有任何编译错误提醒。
+        use_swiglu: true,
         ..TransformerConfig::default()
     };
     let mut rng = Rng::new(seed);
@@ -2670,6 +2707,42 @@ fn skew_router(model: &Transformer, n_expert: usize) {
     assert!(hit > 0, "模型里没有 MoE 路由器（n_expert 是否 ≤ 1？）");
 }
 
+/// 同 [`skew_router`] 的塌缩起点，但**保留**路由器权重的 token 区分度——把权重整体缩小，
+/// 而不是清零。前 `top_k` 个专家的门控偏置一起抬到 +3.0。
+///
+/// 为什么偏置臂不能照搬 [`skew_router`]：权重清零后所有 token 的 `logits` 完全相同，argmax
+/// 只由偏置决定，于是"赢家"只会在专家之间**轮转**，任一时刻的负载仍全压在那几个专家上，
+/// 偏置再推也摊不平。这恰好点明了 loss-free 均衡偏置的作用前提：**`logits` 必须对 token 有
+/// 区分度**，偏置才能靠改变排序把不同的 token 分给不同的专家。
+///
+/// 但"有区分度"与"起点塌缩"必须同时成立：把初始化权重原样留着的话，`logits` 的极差（实测
+/// > 3.0）会盖过 +3.0 的偏置——K = 1 时 8 个专家里 7 个都抢到了 token，起点根本没塌缩。
+/// 所以这里把权重**整体缩小 `WEIGHT_SCALE` 倍**：方向不变（token 区分度还在），幅度压到
+/// 0.5 以内（+3.0 的偏置稳稳胜出 ⇒ 前 `top_k` 个专家吃下全部 token）。
+///
+/// 前 `top_k` 个专家的偏置一起抬：K ≥ 2 时只抬专家 0，第二个名额会由（缩小后的）`logits`
+/// 决定、随 token 变化，起点就不再是"全压在前 K 个专家上"了。
+fn skew_router_weak_weights(model: &Transformer, n_expert: usize, top_k: usize) {
+    // 权重缩放系数：把 logits 的尺度压到远小于 +3.0 的偏置，塌缩才有保证
+    const WEIGHT_SCALE: f32 = 0.05;
+    let mut hit = 0usize;
+    for (name, p) in model.named_parameters() {
+        if name.ends_with(".moe.router.weight") {
+            let scaled: Vec<f32> = p.data().into_iter().map(|v| v * WEIGHT_SCALE).collect();
+            p.set_data(scaled);
+            hit += 1;
+        } else if name.ends_with(".moe.router.bias") {
+            assert_eq!(p.numel(), n_expert);
+            let mut b = vec![0.0f32; n_expert];
+            for v in b.iter_mut().take(top_k.min(n_expert)) {
+                *v = 3.0;
+            }
+            p.set_data(b);
+        }
+    }
+    assert!(hit > 0, "模型里没有 MoE 路由器（n_expert 是否 ≤ 1？）");
+}
+
 /// 隔离实验：**不跑主损失**，只优化 L_aux 若干步，看负载能不能从塌缩被推平。
 ///
 /// 返回 `(优化前的路由统计, 优化后的路由统计)`。调用前模型的 `moe_aux_coef` 必须 > 0
@@ -2698,6 +2771,41 @@ fn aux_only_balance(
         // backward 回收——这里整图反完 aux 后显式清空，防止 demo 循环无限增长
         clear_tape();
         opt.step();
+    }
+    let after = {
+        let mut probe_rng = Rng::new(seed + 1);
+        moe_probe(model, loader, 16, &mut probe_rng)
+    };
+    (before, after)
+}
+
+/// 隔离实验（第三组对照）：**同样从塌缩的路由出发**，但一个梯度都不算，只按
+/// [`Transformer::update_moe_balance_bias`] 的 sign 规则推进均衡偏置若干步。
+///
+/// 与 [`aux_only_balance`] 共用同一种起点、同一批数据、同一套诊断口径，所以两者的
+/// "不均衡度"可以直接比。调用前模型的 `moe_bias_balance` 必须为 `true`。
+fn bias_only_balance(
+    model: &Transformer,
+    loader: &dyn BatchSource,
+    steps: usize,
+    seed: u64,
+) -> (moe::RouteStats, moe::RouteStats) {
+    let before = {
+        let mut probe_rng = Rng::new(seed + 1);
+        moe_probe(model, loader, 16, &mut probe_rng)
+    };
+    let mut rng = Rng::new(seed);
+    for _ in 0..steps {
+        let (x, _, _) = loader.sample_batch(&mut rng);
+        // 偏置读的是**最近一次前向**的负载，所以每步必须先前向再推进；前向不建图
+        // （偏置不进梯度、不进损失，整条路只需 `no_grad`），开销远小于 `aux_only_balance`。
+        let _ = tensor::no_grad(|| {
+            model.forward(&x, loader.batch_size(), loader.block_size(), None, false)
+        });
+        assert!(
+            model.update_moe_balance_bias(),
+            "bias_balance = true 时每步都应推进偏置"
+        );
     }
     let after = {
         let mut probe_rng = Rng::new(seed + 1);
@@ -2754,6 +2862,9 @@ fn cmd_moe(
     aux_coef: f32,
     z_loss: f32,
     factors_spec: &str,
+    shared_experts: usize,
+    bias_balance: bool,
+    bias_lr: f32,
     seed: u64,
 ) {
     let log_path = runlog::start("moe");
@@ -2762,6 +2873,10 @@ fn cmd_moe(
     let experts_list = parse_multiples(experts_spec);
     let factors = parse_factors(factors_spec);
     assert!(steps >= 2, "至少要训 2 步（实际 {steps}）");
+    assert!(
+        bias_lr > 0.0,
+        "均衡偏置步长 γ 必须为正（sign 更新是固定步长）：{bias_lr}"
+    );
 
     // 内置语料 + 字符分词器：自包含、可复现，不需要外部数据文件
     let tokenizer = Tokenizer::char(data::CORPUS);
@@ -2780,10 +2895,19 @@ fn cmd_moe(
             ),
             (
                 "模型",
-                format!("n_layer={n_layer} n_embd={n_embd} n_head=4（GELU FFN）"),
+                format!("n_layer={n_layer} n_embd={n_embd} n_head=4（SwiGLU FFN）"),
             ),
             ("辅助损失系数 α", aux_coef.to_string()),
             ("router z-loss 系数 β", z_loss.to_string()),
+            ("共享专家数 E_s", shared_experts.to_string()),
+            (
+                "端到端附加偏置均衡臂",
+                if bias_balance {
+                    format!("开（γ = {bias_lr}）")
+                } else {
+                    "关".to_string()
+                },
+            ),
             ("容量因子扫描", factors_spec.to_string()),
             (
                 "分词器",
@@ -2795,10 +2919,16 @@ fn cmd_moe(
     // ---------- 一、稀疏口径 ----------
     logln!("=== 一、参数 / 计算量口径：MoE 省的是 FLOPs，不是显存 ===");
     logln!(
-        "  每个专家就是一个普通 FFN（GELU 版 8d²+5d = {} 参数，d = {n_embd}）；\n  \
+        "  每个专家就是一个普通 FFN（SwiGLU 版 3dh+2h+d = {} 参数，d = {n_embd}）；\n  \
          全部专家都要驻留显存，每个 token 只走 Top-K 个。",
-        moe::expert_param_count(n_embd, false)
+        moe::expert_param_count(n_embd, true)
     );
+    if shared_experts > 0 {
+        logln!(
+            "  共享专家 E_s = {shared_experts}：**全部** token 都要过（不稀疏），参数同时计入总参数与\n  \
+             激活参数，所以它会把下面的稀疏比拉低——这是 DeepSeek 用「稀疏性换质量」的量化形式。"
+        );
+    }
     // 稠密基线：与 MoE 只差前馈子层，逐位可比
     let dense = moe_model(vocab, n_embd, n_layer, block_size, 1, 1, 0.0, 0.0, seed);
     let dense_params: usize = dense.parameters().iter().map(|p| p.numel()).sum();
@@ -2809,9 +2939,14 @@ fn cmd_moe(
             continue;
         }
         let k = top_k.min(e);
-        let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, aux_coef, z_loss, seed);
+        let model = moe_model_full(
+            vocab, n_embd, n_layer, block_size, e, k, aux_coef, z_loss, shared_experts, false, 0.001,
+            seed,
+        );
         let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
-        let ss = moe::sparse_stats(e, k, n_embd, false, 0);
+        // `use_swiglu = true` 必须与 `moe_model_full` 里显式钉死的 FFN 风格一致，否则下面
+        // 的 assert 立刻炸——这条口径核对就是专门用来抓这种静默漂移的。
+        let ss = moe::sparse_stats(e, k, n_embd, true, shared_experts);
         let per_layer_total = ss.total_params();
         let per_layer_active = ss.active_params();
         // 每 token 激活参数 = 模型总参数 - 每层没被激活的 (E-K) 个专家
@@ -2843,7 +2978,7 @@ fn cmd_moe(
         .find(|&&x| x >= 2)
         .unwrap_or_else(|| panic!("专家数网格里至少要有一个 >= 2 的值（实际 {experts_spec}）"));
     let k = top_k.min(e);
-    logln!("=== 二、负载均衡辅助损失：隔离实验（不跑主损失，只优化 L_aux） ===");
+    logln!("=== 二、负载均衡三组对照：隔离实验（同一塌缩起点，只跑均衡机制、不跑主损失） ===");
     logln!(
         "  门控口径：{}",
         if k == 1 {
@@ -2854,63 +2989,118 @@ fn cmd_moe(
             "K ≥ 2 ⇒ Mixtral / DeepSeek 式（Top-K 内部重归一化，Σw = 1）"
         }
     );
+    logln!(
+        "  三组对照：① 不做任何均衡（塌缩起点原样）② 只优化 α·L_aux ③ 只推进 aux-loss-free 均衡偏置。\n  \
+         三组用**同一个种子**建模型、把路由器摆到**同一个塌缩点**（前 K 个专家的门控偏置 +3.0 ⇒ 负载全压在它们身上），\n  \
+         再跑**同一批数据**、读**同一套诊断口径**，所以三行的数字可以直接比。"
+    );
+    logln!(
+        "  ⚠️ 两组起点在**诊断口径上完全相同**（都用 +3.0 的门控偏置把负载全压到前 K 个专家上），但用的\n  \
+         扰动不同：② 组把路由器权重**清零**——L_aux 的梯度只能从 0 出发去改偏置，软/硬错配看得最干净；\n  \
+         而且权重恒为 0 ⇒ 所有 token 的 logits 完全相同 ⇒ 硬路由**物理上不可能**被摊平（argmax 只看偏置，\n  \
+         换汤不换药）。③ 组只把权重**整体缩小**（保留 token 区分度）——否则偏置同样失效：logits 全同 ⇒\n  \
+         赢家只在专家间轮转，负载永远摊不平。「logits 必须对 token 有区分度」正是偏置能生效的前提。"
+    );
     // 路由塌缩是「富者愈富」的**长期**训练动力学，小模型几百步跑不出来。所以这里直接把
-    // 路由器的状态摆到塌缩点上（权重清零、偏置只给专家 0 一个正数），再隔离地只优化
-    // L_aux——"辅助损失能把塌缩拉回来吗"这个问题本身不需要等主训练跑到塌缩。
+    // 路由器的状态摆到塌缩点上（前 K 个专家的偏置给 +3.0，权重按各臂的需要清零或缩小），
+    // 再隔离地只优化均衡机制——"辅助损失/偏置能把塌缩拉回来吗"不需要等主训练跑到塌缩。
     //
-    // 这条实验要跑几百步，但对模型规模毫无要求（关心的是路由器动力学），所以用单层
-    // 32 维的小模型 + 小批次，跑得动就能多做几组对照。
+    // 这条实验要跑几百到几千步，但对模型规模毫无要求（关心的是路由器动力学），所以用单层
+    // 32 维的小模型 + 小批次；② 组每步要反向，③ 组只需一次 no_grad 前向 + 一次 sign 更新。
     let balance_steps = 300usize;
     let balance_lr = 0.02f32;
+    // 偏置是**固定步长** γ 的 sign 更新，要让 3.0 的偏置差被推平，步数必然与 γ 成反比。
+    // 真实训练 γ = 0.001 是配几十万步的（DeepSeek-V3）；这里按 γ 反推一个"刚好看得见"的
+    // 步数并封顶，免得 γ 太小把 demo 拖成百万步（③ 组每步只有一次 no_grad 前向，很便宜）。
+    let bias_steps = ((2.0 / bias_lr).ceil() as usize).clamp(200, 6000);
     let iso_loader = DataLoader::new(CORPUS, &tokenizer, 32, 4);
+    let used = |s: &moe::RouteStats| s.counts.iter().filter(|&&c| c > 0).count();
     let mut iso_k_list = vec![1usize];
     if k > 1 {
         iso_k_list.push(k);
     }
     let mut iso_summary: Vec<String> = Vec::new();
     for &iso_k in &iso_k_list {
-        let model = moe_model(vocab, 32, 1, 32, e, iso_k, 1.0, 0.0, seed);
-        skew_router(&model, e);
-        let (b, a) = aux_only_balance(&model, &iso_loader, balance_steps, balance_lr, seed);
+        // ② α·L_aux 臂：α = 1 放大效果，只优化 L_aux（主损失那半张图被丢弃）
+        let aux_model = moe_model(vocab, 32, 1, 32, e, iso_k, 1.0, 0.0, seed);
+        skew_router(&aux_model, e);
+        let (b, a_aux) = aux_only_balance(&aux_model, &iso_loader, balance_steps, balance_lr, seed);
+
+        // ③ sign 偏置臂：α = 0（不加辅助损失），只推进均衡偏置。
+        // 起点同为"全压在前 K 个专家上"，但保留权重区分度（见 `skew_router_weak_weights` 的说明）。
+        let bias_model = moe_model_full(vocab, 32, 1, 32, e, iso_k, 0.0, 0.0, 0, true, bias_lr, seed);
+        skew_router_weak_weights(&bias_model, e, iso_k);
+        let (b_ref, a_bias) = bias_only_balance(&bias_model, &iso_loader, bias_steps, seed);
+        assert!(
+            used(&b) == iso_k && used(&b_ref) == iso_k,
+            "K={iso_k}：两组起点都应只压在前 {iso_k} 个专家上（实际 {}/{} 与 {}/{}）",
+            used(&b),
+            e,
+            used(&b_ref),
+            e
+        );
+
         logln!("  —— K = {iso_k} ——");
-        print_route_report("塌缩的初始路由", &b, iso_k);
+        print_route_report("① 不均衡：塌缩起点（哪里都不动）", &b, iso_k);
+        print_route_report(&format!("② α·L_aux：只优化 L_aux {balance_steps} 步"), &a_aux, iso_k);
         print_route_report(
-            &format!("只优化 L_aux {balance_steps} 步之后"),
-            &a,
+            &format!("③ sign 偏置：只推进偏置 {bias_steps} 步（γ = {bias_lr}，一次梯度都不算）"),
+            &a_bias,
             iso_k,
         );
         // 唯一稳定的不变量：只优化 L_aux 必然把它自己压下去（它就是被优化的目标）。
         // 负载会不会跟着走，是另一回事——这正是下面要说的。
         assert!(
-            a.aux <= b.aux + 1e-6,
+            a_aux.aux <= b.aux + 1e-6,
             "只优化 L_aux 竟然没把它压下去：{:.3} -> {:.3}",
             b.aux,
-            a.aux
+            a_aux.aux
         );
+        // 对照的题眼：不算一次梯度，硬路由的不均衡度照样被压下来（偏置改的是 argmax 排序）
+        assert!(
+            a_bias.imbalance() < a_aux.imbalance(),
+            "K={iso_k}：sign 偏置的负载均衡竟没胜过 α·L_aux（{:.2} vs {:.2}）",
+            a_bias.imbalance(),
+            a_aux.imbalance()
+        );
+        // 归一化到 [0, 100]：不均衡度 = E（全压一个专家）记 0%，= 1（完美均衡）记 100%
+        let solved = |s: &moe::RouteStats| 100.0 * (1.0 - (s.imbalance() - 1.0) / (e as f64 - 1.0));
         iso_summary.push(format!(
-            "K={iso_k}：L_aux {:.3} → {:.3}（p 摊平 ⇒ 1.0，不是下界），不均衡度 {:.2} → {:.2}，用到的专家 {}/{} → {}/{}",
-            b.aux,
-            a.aux,
+            "K={iso_k}（E={e}）\n        \
+             ① 不均衡（塌缩起点，不做任何均衡）：不均衡度 {:.2}（用 {}/{}），L_aux {:.3}\n        \
+             ② α·L_aux（{balance_steps} 步梯度）：不均衡度 {:.2}（用 {}/{}，比 ① 摊平 {:>5.1}%），L_aux {:.3} → {:.3}\n        \
+             ③ sign 偏置（{bias_steps} 步、γ = {bias_lr}、不算梯度）：不均衡度 {:.2}（用 {}/{}，比 ① 摊平 {:>5.1}%），L_aux {:.3}",
             b.imbalance(),
-            a.imbalance(),
-            b.counts.iter().filter(|&&c| c > 0).count(),
+            used(&b),
             e,
-            a.counts.iter().filter(|&&c| c > 0).count(),
-            e
+            b.aux,
+            a_aux.imbalance(),
+            used(&a_aux),
+            e,
+            solved(&a_aux),
+            b.aux,
+            a_aux.aux,
+            a_bias.imbalance(),
+            used(&a_bias),
+            e,
+            solved(&a_bias),
+            a_bias.aux
         ));
     }
-    logln!("  汇总：{}", iso_summary.join("\n        ｜"));
+    logln!("  汇总（同一塌缩起点、同一诊断口径）：\n        {}", iso_summary.join("\n        "));
     logln!(
-        "  读法：L_aux = E·Σ f_i p_i 对 p 是**软**的、对 f 是**硬**的（f 由 argmax 给出，\n  \
-         不可导、是常数）。若 p 均匀（**不管 f 长什么样**）：Σ f_i p_i = (1/E)·Σ f_i = 1/E，\n  \
-         于是 L_aux = 1——但这不是下界（f 与 p 支撑集不交时 Σ f_i p_i = 0，L_aux 可以是 0）。\n  \
-         所以「L_aux 掉到 1」根本不是负载均衡的证书：\n  \
-         上面两组的 L_aux 都被压到了 1.0 附近，而硬路由的不均衡度几乎没动。\n  \
-         梯度方向确实指向「把被过度使用的专家按下去」（∂L/∂logit_j ∝ p_j·(f_j − Σ f_i p_i)），\n  \
-         但它的**大小正比于 p_j**：p 越平，梯度越小。于是最快的下降路径是先把 p 摊平\n  \
-         （L_aux 一步到位到 1），而不是把硬路由摊平——负载因此可能原地不动。\n  \
-         这正是后续工作（DeepSeek-V3 的 loss-free 均衡偏置、expert-choice 路由）要绕开的东西，\n  \
-         也是「辅助损失系数要调小」的真实原因：它压的是概率分布，不是分配结果。"
+        "  读法：\n  \
+         · L_aux = E·Σ f_i p_i 对 p 是**软**的、对 f 是**硬**的（f 由 argmax 给出，不可导、是常数）。\n  \
+           ② 组把 L_aux 压到 1.0 附近（软目标达成），但硬路由只被摊平了一部分——K = 2 那组尤其明显：\n  \
+           不均衡度 4.00 → 3.81，几乎原地不动。原因是梯度 ∝ p_j：最快的下降路径是先把 **p** 摊平，\n  \
+           而不是把 **argmax** 的排序摊平；且 p 均匀时 Σ f_i p_i = (1/E)·Σ f_i = 1/E ⇒ L_aux = 1 **与 f\n  \
+           无关**。所以「L_aux 掉到 1」不是负载均衡的证书，1 也不是下界（f 与 p 支撑集不交时可以是 0）。\n  \
+         · ③ 组**一次梯度都没算**（不碰主损失、不碰 L_aux），只按 sign 规则把偏置推了 {bias_steps} 步，\n  \
+           硬路由的不均衡度就直接被压下来了。原因很直接：偏置加在**选路**的 logits 上（`logits + b`），\n  \
+           改的就是 argmax 的排序；而 L_aux 改的是概率形状（见上一段）。这就是 DeepSeek-V3 说\n  \
+           「均衡可以免费（aux-loss-free）」的意思——不拿主损失做交易。\n  \
+         · 代价与约束：偏置只能压硬路由、管不了概率形状；γ 是固定步长，必须与训练步数匹配\n  \
+           （真实训练 γ = 0.001 配几十万步；这里为了在 demo 的步数内看得见，按 γ 反推出步数）。"
     );
 
     // ---------- 三、端到端对照实验 ----------
@@ -2929,13 +3119,25 @@ fn cmd_moe(
 
     let mut skewed: Option<Transformer> = None;
     let mut end_to_end = Vec::new();
-    for &alpha in &[0.0f32, aux_coef] {
-        let tag = if alpha == 0.0 {
-            "α = 0（不加辅助损失）".to_string()
-        } else {
-            format!("α = {alpha}（加辅助损失）")
-        };
-        let model = moe_model(vocab, n_embd, n_layer, block_size, e, k, alpha, z_loss, seed);
+    // 端到端臂：① α = 0（不加任何均衡）② α·L_aux；③ 仅 `--bias-balance` 时追加
+    // "α = 0 + sign 偏置均衡"——它一次梯度都不多算，代价全在每步一次 sign 更新。
+    let mut arms: Vec<(String, f32, bool)> = vec![
+        ("α = 0（不加任何均衡）".to_string(), 0.0, false),
+        (format!("α = {aux_coef}（加辅助损失）"), aux_coef, false),
+    ];
+    if bias_balance {
+        arms.push((
+            format!("α = 0 + sign 偏置均衡（γ = {bias_lr}）"),
+            0.0,
+            true,
+        ));
+    }
+    for (tag, alpha, use_bias) in &arms {
+        let (alpha, use_bias) = (*alpha, *use_bias);
+        let model = moe_model_full(
+            vocab, n_embd, n_layer, block_size, e, k, alpha, z_loss, shared_experts, use_bias,
+            bias_lr, seed,
+        );
         let mut rng = Rng::new(seed);
         logln!("  —— {tag} ——");
         let loss = train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
@@ -2943,8 +3145,13 @@ fn cmd_moe(
         let st = moe_probe(&model, &loader, 16, &mut probe_rng);
         logln!("  训练收尾 loss = {loss:.4}");
         print_route_report("路由负载（16 批累计）", &st, k);
-        end_to_end.push(format!("α={alpha}: loss {loss:.4} / 不均衡度 {:.2}", st.imbalance()));
-        if alpha == 0.0 {
+        let short = if use_bias {
+            format!("α=0+偏置(γ={bias_lr})")
+        } else {
+            format!("α={alpha}")
+        };
+        end_to_end.push(format!("{short}: loss {loss:.4} / 不均衡度 {:.2}", st.imbalance()));
+        if alpha == 0.0 && !use_bias {
             skewed = Some(model);
         }
     }
@@ -2961,6 +3168,13 @@ fn cmd_moe(
             未被选中的专家参数拿不到任何梯度（等于白占显存），而 loss 曲线看不出异常——\n  \
             所以必须有别的东西盯着路由分布。"
     );
+    if bias_balance {
+        logln!(
+            "  4) 偏置臂在这个规模下和 α = 0 那一份差不太多，原因和 1) 是同一个：这里**压根没塌缩**，\n  \
+                偏置只能在「已经不均」时把负载推平（它就是靠 sign 规则追平 count 的）。它的价值要看\n  \
+                第二节的隔离实验——从塌缩点出发，③ 组**一次梯度都不算**就把不均衡度压下来了。"
+        );
+    }
 
     // ---------- 四、容量因子与 Token Dropping ----------
     logln!("=== 四、容量因子与 Token Dropping（用上面 α = 0 那份模型，负载最不均） ===");
