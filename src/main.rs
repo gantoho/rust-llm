@@ -29,14 +29,17 @@ mod autograd;
 mod checkpoint;
 mod cli;
 mod config;
+mod csa;
 mod data;
 mod distill;
 mod distributed;
 mod fp8;
+mod fp4;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod layers;
 mod loss;
+mod mhc;
 mod model;
 mod moe;
 mod module;
@@ -56,7 +59,7 @@ mod train;
 mod vision;
 mod vqvae;
 
-use cli::{AlignArgs, Cli, Cmd, DistArgs, DistillArgs, Fp8Args, RagArgs, RopeArgs, SpecArgs};
+use cli::{AlignArgs, Cli, Cmd, CsaArgs, DistArgs, DistillArgs, Fp4Args, Fp8Args, MlaArgs, RagArgs, RopeArgs, SpecArgs};
 use autograd::clear_tape;
 use config::Config;
 use data::{
@@ -438,6 +441,9 @@ fn main() {
         Cmd::Speculative { spec } => cmd_speculative(&spec),
         Cmd::Distill { distill } => cmd_distill(&distill),
         Cmd::Fp8 { fp8 } => cmd_fp8(&fp8),
+        Cmd::Fp4 { fp4 } => cmd_fp4(&fp4),
+        Cmd::Csa { csa } => cmd_csa(&csa),
+        Cmd::Mla { mla } => cmd_mla(&mla),
     }
 }
 
@@ -6007,6 +6013,618 @@ fn cmd_fp8(d: &Fp8Args) {
          但要注意这里只量化了**权重**：真实 FP8 训练还要把激活也压到 8 位（前向 E4M3），\n  \
          那是一份额外误差；而省下的显存（约 3.6 倍）与 tensor core 吞吐（约 2 倍）才是收益。\n  \
          本仓库没有 FP8 kernel，所以这份收益一分也拿不到 —— 别把这里的数字当成性能数据。"
+    );
+
+    runlog::finish();
+}
+
+// ==================== FP4 低精度模拟（fp4 子命令，第 48 课） ====================
+
+/// FP4 低精度模拟（第 48 课）
+///
+/// 三节：
+/// 一、**4 位浮点长什么样**：E2M1 的全部 16 个码列出来（正号侧只有 8 个数，没有 Inf/NaN）
+/// 二、**分块缩放与位宽账本**：块大小 → 精度/字节的权衡，并与 FP8 并排对照
+/// 三、**位宽 vs 验证 loss**：同一个训练好的小模型，权重分别落 FP8 / FP4 后的验证 CE
+fn cmd_fp4(d: &Fp4Args) {
+    let log_path = runlog::start("fp4");
+    println!("运行日志：{log_path}");
+
+    // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
+    assert!(d.rows >= 1 && d.cols >= 1, "演示矩阵尺寸至少为 1");
+    assert!(d.steps >= 1, "训练步数至少为 1（实际 {}）", d.steps);
+    assert!(d.lr > 0.0, "学习率必须为正（实际 {}）", d.lr);
+    assert!(d.batch_size >= 1, "批大小至少为 1（实际 {}）", d.batch_size);
+    assert!(d.block_size >= 4, "上下文长度至少为 4（实际 {}）", d.block_size);
+    assert!(d.n_layer >= 1, "层数至少为 1（实际 {}）", d.n_layer);
+    assert!(
+        d.n_embd >= 4 && d.n_embd % 4 == 0,
+        "n_embd 必须能被 n_head=4 整除且 >= 4（实际 {}）",
+        d.n_embd
+    );
+
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("格式", fp4::FORMAT_NAME.to_string()),
+            (
+                "分块大小",
+                if d.block == 0 {
+                    "整张一个 scale".to_string()
+                } else {
+                    d.block.to_string()
+                },
+            ),
+            ("演示矩阵", format!("{}×{}", d.rows, d.cols)),
+            ("训练步数 / 学习率", format!("{} / {}", d.steps, d.lr)),
+            ("批大小 / 上下文", format!("{} / {}", d.batch_size, d.block_size)),
+            ("小模型", format!("n_embd={} n_layer={}", d.n_embd, d.n_layer)),
+        ],
+    );
+
+    logln!("说明：与 fp8 子命令一样，这是**纯数值模拟**——算子仍跑在 CPU 的 f32 上，");
+    logln!("     编解码只会更慢。真实 FP4 的收益来自 Blackwell 一代的 FP4 tensor core。");
+    logln!("     这里量的是「再省一半位宽要付多少精度」，为将来接真 kernel 留一个对照基准。");
+
+    // ---------- 一、4 位浮点长什么样 ----------
+    logln!("=== 一、4 位浮点 E2M1：全部 16 个码 ===");
+    logln!(
+        "  {}：1 位符号 + {} 位指数 + {} 位尾数｜最大值 {}｜最小正规数 {}｜最小非规格化 {}｜单元素相对精度上界 {}",
+        fp4::FORMAT_NAME,
+        fp4::EXP_BITS,
+        fp4::MANTISSA_BITS,
+        fp4::MAX,
+        fp4::MIN_POSITIVE_NORMAL,
+        fp4::MIN_POSITIVE_SUBNORMAL,
+        fp4::UNIT_ROUNDOFF
+    );
+    logln!("  **既没有 Inf 码也没有 NaN 码**：16 个码全是有限值，溢出与 NaN 只能饱和到 ±6.0。");
+    logln!("  {:<8}{:>10}{:>16}", "码", "解码值", "间距÷上一档");
+    for (i, &v) in fp4::REPRESENTABLE.iter().enumerate() {
+        let prev = if i == 0 { 0.0 } else { fp4::REPRESENTABLE[i - 1] };
+        // 相对间距按「相邻间距 ÷ 上一档」算：上一档是 0 时无定义，标成 —
+        let rel = if prev > 0.0 {
+            format!("{:.1}%", (v - prev) / prev * 100.0)
+        } else {
+            "—".to_string()
+        };
+        logln!("  {:<8}{:>10}{:>16}", format!("0x{i:X}"), v, rel);
+    }
+    logln!(
+        "  读法：相邻两档的相对间距在 [4,6] 段高达 50%（1 位尾数的极限），而 FP8 的 E4M3\n  \
+         在同样位置只有约 6%。**正号侧只有这 8 个数**，所以 FP4 完全靠分块 scale 把小块\n  \
+         整体抬进 [0,6] 才有意义。"
+    );
+    logln!("  代表性数值的往返（都不带分块 scale，裸格式本身）：");
+    logln!(
+        "  {:<10}{:>10}{:>12}{:>10}{:>12}",
+        "数值",
+        "FP4 码",
+        "FP4 解码",
+        "FP8 码",
+        "FP8 解码"
+    );
+    for (label, x) in [
+        ("1.0", 1.0f32),
+        ("1.5", 1.5),
+        ("0.1", 0.1),
+        ("3.9", 3.9),
+        ("5.0", 5.0),
+        ("448", 448.0),
+    ] {
+        let c4 = fp4::encode_e2m1(x);
+        let c8 = fp8::encode(x, fp8::Fp8Format::E4M3);
+        logln!(
+            "  {:<10}{:>10}{:>12.4}{:>10}{:>12.4}",
+            label,
+            format!("0x{c4:X}"),
+            fp4::decode_e2m1(c4),
+            format!("0x{c8:02X}"),
+            fp8::decode(c8, fp8::Fp8Format::E4M3)
+        );
+    }
+    logln!(
+        "  读法：`0.1` 在 FP4 里直接落到 0（非规格化最小档是 0.5）、`3.9` 落到 4.0、\n  \
+         `448` 饱和到 6.0 —— **不带 scale 的裸 FP4 几乎不可用**，这一节就是它的下限。"
+    );
+
+    // ---------- 二、分块缩放与位宽账本 ----------
+    logln!("=== 二、分块缩放：4 位必须靠 scale 才活下来 ===");
+    let mut rng = Rng::new(d.seed);
+    let numel = d.rows * d.cols;
+    let mut w = vec![0f32; numel];
+    for r in 0..d.rows {
+        let amp = 10f32.powf(-6.0 * r as f32 / d.rows.max(2) as f32);
+        for c in 0..d.cols {
+            w[r * d.cols + c] = amp * rng.randn();
+        }
+    }
+    let wt = Tensor::from_vec(w, vec![d.rows, d.cols]);
+    logln!(
+        "  合成权重 [{}×{}]：第 1 行尺度 ~1.0，最后一行 ~1e-6（真实权重不同通道的尺度差异就这么大）",
+        d.rows,
+        d.cols
+    );
+    logln!(
+        "  {:<12}{:>10}{:>14}{:>14}{:>16}{:>12}",
+        "块大小",
+        "SNR(dB)",
+        "平均绝对误差",
+        "最大绝对误差",
+        "占用(f32 的 %)",
+        "bit/元素"
+    );
+    // 0 = 整张一个 scale；其余是每多少个元素一个 scale
+    for &blk in &[0usize, 128, 32, 1] {
+        let b = if blk == 0 { numel } else { blk.min(numel) };
+        let q = fp4::Fp4Tensor::quantize(&wt, b);
+        let e = q.errors(&wt);
+        logln!(
+            "  {:<12}{:>10.1}{:>14.3e}{:>14.3e}{:>15.1}%{:>12.2}",
+            if blk == 0 {
+                "整张".to_string()
+            } else {
+                blk.to_string()
+            },
+            e.snr_db,
+            e.mean_abs,
+            e.max_abs,
+            100.0 * q.bytes() as f64 / (q.elements() * 4) as f64,
+            q.bits_per_element()
+        );
+    }
+    // 同一张权重换成 FP8（E4M3）对照
+    let blk = if d.block == 0 { numel } else { d.block.min(numel) };
+    let q8 = fp8::Fp8Tensor::quantize(&wt, fp8::TRAIN_FORMAT, blk);
+    let e8 = q8.errors(&wt);
+    logln!(
+        "  {:<12}{:>10.1}{:>14.3e}{:>14.3e}{:>15.1}%{:>12.2}",
+        format!("fp8/{blk}"),
+        e8.snr_db,
+        e8.mean_abs,
+        e8.max_abs,
+        100.0 * q8.bytes() as f64 / (numel * 4) as f64,
+        (8.0 * q8.elements() as f64 + 32.0 * q8.blocks() as f64) / q8.elements().max(1) as f64
+    );
+    logln!(
+        "  读法：每 32 个元素一个 scale 时 FP4 是 5 bit/元素（对 f32 是 6.4 倍压缩），FP8\n  \
+         是 9 bit/元素（3.56 倍）—— **省下接近一半的位宽，代价是 SNR 掉十几个 dB**。\n  \
+         特别注意「块大小 1」那一行：每个元素配一个 f32 scale（36 bit/元素），比 f32 还费 ——\n  \
+         收益与开销必须一起看，这是量化最容易自欺的地方。"
+    );
+
+    // ---------- 三、位宽 vs 验证 loss ----------
+    logln!("=== 三、位宽 vs 验证 loss：f32 / FP8 / FP4 ===");
+    let tokenizer = Tokenizer::char(CORPUS);
+    let vocab = tokenizer.vocab_size();
+    let ids = tokenizer.encode(CORPUS);
+    let split = ids.len() * 4 / 5;
+    let (train_ids, val_ids) = (ids[..split].to_vec(), ids[split..].to_vec());
+
+    let model = Transformer::new(
+        TransformerConfig {
+            n_embd: d.n_embd,
+            n_head: 4,
+            n_layer: d.n_layer,
+            block_size: d.block_size,
+            dropout: 0.0,
+            ..TransformerConfig::tiny(vocab)
+        },
+        &mut Rng::new(d.seed),
+    );
+    let params = model.parameters();
+    let p_total: usize = params.iter().map(|p| p.numel()).sum();
+
+    // 先正常训几步：全随机权重下 loss 对扰动不敏感，看不出量化到底伤了什么
+    let mut opt = AdamW::new(d.lr, params.clone(), 0.0);
+    let mut trng = Rng::new(d.seed + 1);
+    let mut first = f32::NAN;
+    let mut last = f32::NAN;
+    for step in 0..d.steps {
+        let (x, y) = corpus_windows(&train_ids, d.block_size, d.batch_size, &mut trng);
+        opt.zero_grad();
+        let logits = model.forward(&x, d.batch_size, d.block_size, None, true);
+        let l = loss::cross_entropy_loss_masked(&logits, &y, None);
+        if step == 0 {
+            first = l.item();
+        }
+        last = l.item();
+        l.backward();
+        opt.step();
+    }
+    logln!(
+        "  小模型 n_embd={} n_layer={}（{} 参数），训练 {} 步：交叉熵 {:.4} → {:.4}（困惑度 {:.2} → {:.2}）",
+        d.n_embd,
+        d.n_layer,
+        p_total,
+        d.steps,
+        first,
+        last,
+        first.exp(),
+        last.exp()
+    );
+
+    // 验证集（训练未见过）
+    let (vx, vy) = corpus_windows(&val_ids, d.block_size, d.batch_size, &mut Rng::new(d.seed + 7));
+    let eval_ce = || -> f32 {
+        tensor::no_grad(|| {
+            let logits = model.forward(&vx, d.batch_size, d.block_size, None, false);
+            loss::cross_entropy_loss_masked(&logits, &vy, None).item()
+        })
+    };
+    let before = eval_ce();
+
+    // 备份全部参数：量化是原地写回，换格式重来前必须还原
+    let backup: Vec<Vec<f32>> = params.iter().map(|p| p.decode().to_vec()).collect();
+    let restore = |src: &[Vec<f32>]| {
+        for (p, s) in params.iter().zip(src.iter()) {
+            let sr: &[f32] = s;
+            p.decode_mut().copy_from_slice(sr);
+        }
+    };
+
+    // FP8（E4M3 + 每 32 元素一个 scale）
+    restore(&backup);
+    let (_, ne8, by8) = fp8::roundtrip_params_in_place(&params, fp8::TRAIN_FORMAT, fp8::TRAIN_BLOCK);
+    let ce8 = eval_ce();
+    restore(&backup);
+    let bits8 = 8.0 * by8 as f64 / ne8.max(1) as f64;
+
+    // FP4（E2M1 + 每 32 元素一个 scale）
+    restore(&backup);
+    let (_, ne4, by4) = fp4::roundtrip_params_in_place(&params, fp4::TRAIN_BLOCK);
+    let ce4 = eval_ce();
+    restore(&backup);
+    let bits4 = 8.0 * by4 as f64 / ne4.max(1) as f64;
+
+    logln!(
+        "  评测集：{} 个窗口 × {} 个位置（训练时未见过）。同一个模型，唯一变化是权重的存储精度：",
+        d.batch_size,
+        d.block_size
+    );
+    logln!(
+        "  {:<14}{:>12}{:>12}{:>14}{:>12}{:>12}",
+        "权重要求",
+        "验证 CE",
+        "困惑度",
+        "相对变化",
+        "bit/元素",
+        "压缩比"
+    );
+    for (label, after, bits) in [
+        (format!("fp8/e4m3/{}", fp8::TRAIN_BLOCK), ce8, bits8),
+        (format!("fp4/e2m1/{}", fp4::TRAIN_BLOCK), ce4, bits4),
+    ] {
+        let rel = (after - before) as f64 / before.max(1e-6) as f64;
+        logln!(
+            "  {:<14}{:>12.4}{:>12.3}{:>13.2}%{:>12.2}{:>11.2}x",
+            label,
+            after,
+            after.exp(),
+            rel * 100.0,
+            bits,
+            32.0 / bits
+        );
+    }
+    logln!(
+        "  {:<14}{:>12.4}{:>12.3}{:>13.2}%{:>12}{:>11}",
+        "f32（原始）",
+        before,
+        before.exp(),
+        0.0,
+        "32.00",
+        "1.00x"
+    );
+
+    let rel8 = (ce8 - before) as f64 / before.max(1e-6) as f64 * 100.0;
+    let rel4 = (ce4 - before) as f64 / before.max(1e-6) as f64 * 100.0;
+    runlog::append(&format!(
+        "[对比] f32 CE={before:.4} ｜ fp8 CE={ce8:.4}（{rel8:+.2}%，{bits8:.2} bit/元素）\
+         ｜ fp4 CE={ce4:.4}（{rel4:+.2}%，{bits4:.2} bit/元素）"
+    ));
+    assert!(
+        ce8.is_finite() && ce8 > 0.0,
+        "FP8 量化后的验证 CE 应为正有限值，实际 {ce8}"
+    );
+    assert!(
+        ce4.is_finite() && ce4 > 0.0,
+        "FP4 量化后的验证 CE 应为正有限值（NaN 说明饱和/打包有问题），实际 {ce4}"
+    );
+    assert!(
+        (bits4 - 5.0).abs() < 0.05 && (bits8 - 9.0).abs() < 0.05,
+        "位宽账本不对：FP4/{} 应为 5 bit/元素、FP8/{} 应为 9 bit/元素（实际 {bits4:.2} / {bits8:.2}）",
+        fp4::TRAIN_BLOCK,
+        fp8::TRAIN_BLOCK
+    );
+    logln!(
+        "  读法：把这节的 CE 差与上节的位宽一起看 —— FP4 用「一半的位宽」换来明显更大的\n  \
+         loss 恶化，这就是 bf16 → FP8 → FP4 这条路上每一档的真实标价。工程上的结论通常是：\n  \
+         **FP4 更适合权重（对舍入不敏感），激活与梯度留在 8 位以上**。\n  \
+         再说一遍：本仓库没有 FP4 kernel，这里一个字节的显存、一次乘加的速度都没省下 ——\n  \
+         别把这张表当成性能数据。"
+    );
+
+    runlog::finish();
+}
+
+// ==================== CSA + HCA 混合注意力账本（csa 子命令，第 49 课） ====================
+
+/// CSA + HCA 混合注意力账本（第 49 课）
+///
+/// 三节：
+/// 一、**覆盖不变式**：三分支可见位置的并集必须恰好是 `[0, i]`（不丢历史、不漏未来）
+/// 二、**KV 字节账本**：压缩缓存（最近 m 个原始位置 + 压缩块）相对全量缓存的压缩率
+/// 三、**top-k 稀疏算力账本**：每个 query 实际参与打分的槽位数，对照全量 `T`
+fn cmd_csa(d: &CsaArgs) {
+    let log_path = runlog::start("csa");
+    println!("运行日志：{log_path}");
+
+    assert!(d.t >= 8, "上下文长度至少 8（实际 {}）", d.t);
+    assert!(d.n_kv_head >= 1 && d.d >= 1, "KV 头数与 head_dim 至少为 1");
+    assert!(
+        d.hca == 0 || d.hca >= 2,
+        "HCA 倍率要么 0（关闭）要么 >= 2（实际 {}）",
+        d.hca
+    );
+
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("上下文 T", d.t.to_string()),
+            ("KV 头数 × head_dim", format!("{} × {}", d.n_kv_head, d.d)),
+            (
+                "HCA 倍率",
+                if d.hca < 2 { "关闭".to_string() } else { d.hca.to_string() },
+            ),
+            (
+                "top-k",
+                if d.top_k == 0 { "稠密（全部已完成块）".to_string() } else { d.top_k.to_string() },
+            ),
+        ],
+    );
+
+    logln!("说明：本子命令是**纯解析账本**（不训练、不建模型）。把「因果覆盖 / KV 字节 /");
+    logln!("     稀疏算力」三件事用整数算清楚，看清 m 与 top-k 各自换来了什么。");
+
+    // ---------- 一、覆盖不变式 ----------
+    logln!("=== 一、三分支覆盖不变式：可见位置的并集必须恰好是 [0, i] ===");
+    logln!("  关键判据：一个压缩块只有在**块末位置 ≤ i** 时才可见。若用「块起点 ≤ i」当判据，");
+    logln!("  就会把块内尚未生成的 token 平均进来 —— 那是训练时的信息泄漏，loss 会虚假地变好。");
+    logln!("  {:<6}{:<8}{:>14}{:>24}", "m", "HCA", "检查 query 数", "结论");
+    for m in [2usize, 4, 8, 16] {
+        for h in [0usize, d.hca.max(2)] {
+            let mut bad: Option<usize> = None;
+            for i in 0..d.t {
+                if crate::csa::covered_positions(i, m, h) != (0..=i).collect::<Vec<usize>>() {
+                    bad = Some(i);
+                    break;
+                }
+            }
+            logln!(
+                "  {:<6}{:<8}{:>14}{:>24}",
+                m,
+                if h == 0 { "关闭" } else { "开" },
+                d.t,
+                match bad {
+                    None => "并集 == [0,i] ✓".to_string(),
+                    Some(i) => format!("失败 @i={i} ✗"),
+                }
+            );
+            assert!(bad.is_none(), "m={m} HCA={h} 覆盖不变式被破坏（@i={bad:?}）");
+        }
+    }
+    logln!("  读法：局部窗口补上「最近 m 个位置」，细压缩补上「[0, B_i·m) 的全部已完成块」，");
+    logln!("  二者相接（B_i·m > i+1-m）；粗压缩只是把已成块的区间再平均一遍，不引入新位置。");
+
+    // ---------- 二、KV 字节账本 ----------
+    let full = crate::csa::full_cache_bytes(d.t, d.n_kv_head, d.d);
+    logln!("=== 二、KV 字节账本（f32，K + V 两份）===");
+    logln!(
+        "  上下文 T={} ｜ KV 头 {} × head_dim {} ｜ 全量缓存 {:.2} MB",
+        d.t,
+        d.n_kv_head,
+        d.d,
+        full as f64 / 1048576.0
+    );
+    logln!("  {:<8}{:>18}{:>18}{:>12}", "块宽 m", "全量字节", "压缩后字节", "压缩比");
+    let mut best = (0usize, 0.0f64);
+    for m in [2usize, 4, 8, 16, 32, 64] {
+        if m > d.t {
+            continue;
+        }
+        let c = crate::csa::csa_cache_bytes(d.t, d.n_kv_head, d.d, m);
+        let ratio = full as f64 / c.max(1) as f64;
+        if ratio > best.1 {
+            best = (m, ratio);
+        }
+        logln!("  {:<8}{:>18}{:>18}{:>11.2}x", m, full, c, ratio);
+    }
+    logln!(
+        "  压缩缓存 = 最近 m 个原始位置 + floor(T/m) 个压缩块 ⇒ 长度约 m + T/m，",
+    );
+    logln!(
+        "  在 m ≈ √T 处取最小（本题最优 m ≈ √{} ≈ {}，实测最优 m = {}，压缩 {:.2}x）。",
+        d.t,
+        (d.t as f64).sqrt().round() as usize,
+        best.0,
+        best.1
+    );
+    logln!("  这是**存储口径**的收益：同样 T 个历史，缓存从 T 行降到 m + T/m 行。");
+
+    // ---------- 三、top-k 稀疏算力账本 ----------
+    let full_f = crate::csa::attn_flops_per_query(d.t, d.d);
+    logln!("=== 三、top-k 稀疏算力账本（每个 query 参与打分的槽位数）===");
+    logln!("  槽位 = 局部 m + 细压缩保留 k + 粗压缩块数 floor(T/(m·HCA))，");
+    logln!("  每槽 4·head_dim 次浮点（打点积 + 加权求和各 2·head_dim）。");
+    logln!(
+        "  {:<6}{:<8}{:>8}{:>10}{:>10}{:>12}{:>12}{:>12}",
+        "m",
+        "top-k",
+        "局部",
+        "细压缩",
+        "粗压缩",
+        "总槽位",
+        "稀疏度",
+        "算力比"
+    );
+    for m in [4usize, 8, 16, 32] {
+        if m > d.t {
+            continue;
+        }
+        let nb = d.t / m;
+        let k = if d.top_k == 0 { nb } else { d.top_k.min(nb) };
+        let nb2 = if d.hca >= 2 { nb / d.hca } else { 0 };
+        let slots = m + k + nb2;
+        let csa_f = crate::csa::attn_flops_per_query(slots, d.d);
+        logln!(
+            "  {:<6}{:<8}{:>8}{:>10}{:>10}{:>12}{:>11.3}{:>11.3}x",
+            m,
+            if d.top_k == 0 { "稠密".to_string() } else { d.top_k.to_string() },
+            m,
+            k,
+            nb2,
+            slots,
+            slots as f64 / d.t as f64,
+            full_f as f64 / csa_f.max(1) as f64
+        );
+    }
+    logln!("  读法：把 m 调大能省细节、但局部窗口变长；把 top-k 调小能省算力、但更依赖块均值");
+    logln!("  是否选得准。两者都要与「覆盖不变式」一起看：省下来的槽位必须真的落在 [0, i] 内。");
+
+    runlog::append(&format!(
+        "[账本] T={} 全量 KV {:.2} MB ｜ 最优 m={} 压缩 {:.2}x ｜ 全量每 query {} FLOPs",
+        d.t,
+        full as f64 / 1048576.0,
+        best.0,
+        best.1,
+        full_f
+    ));
+    logln!(
+        "  诚实声明：本仓库没有为 CSA 写融合 kernel，这里的字节与 FLOPs 都是**解析账本**，\n  \
+         真实收益取决于算子融合与内存带宽 —— 别把这张表当成实测性能。\n  \
+         能实测到的是正确性（覆盖不变式、无未来泄漏、梯度有限差分）与 loss 账本。"
+    );
+    logln!(
+        "  用法：把 `model.csa_block`（≥2 开启）/ `csa_top_k` / `hca_block` 写进 config.json，\n  \
+         即可让训练与预填前向改走 CSA+HCA 混合注意力（默认 0 = 关闭，逐位不变）。"
+    );
+
+    runlog::finish();
+}
+
+// ==================== MLA 解耦 RoPE + 权重吸收账本（mla 子命令，第 50 课） ====================
+
+/// MLA 解耦 RoPE + 权重吸收账本（第 50 课）
+///
+/// 三节：
+/// 一、**增量缓存字节账本**：`(r + n_head·hd_rope)` 相对全量 `2·n_head·head_dim` 的压缩比
+/// 二、**权重吸收的解码算力账本**：吸收把"物化 K/V 再点积"换成"直接在 latent 空间点积"
+/// 三、**解耦约束自检**：把"配置写错会 panic"的那几条约束列清楚，并给出开关用法
+fn cmd_mla(d: &MlaArgs) {
+    let log_path = runlog::start("mla");
+    println!("运行日志：{log_path}");
+
+    assert!(d.n_head >= 1 && d.hd_nope >= 1, "头数与 hd_nope 至少为 1");
+    assert!(d.hd_rope >= 2 && d.hd_rope % 2 == 0, "解耦 RoPE 维必须是不小于 2 的偶数（实际 {}）", d.hd_rope);
+    assert!(d.r >= 1, "latent 维度 r 至少为 1");
+    assert!(d.t >= 1 && d.n_layer >= 1, "上下文 T 与层数至少为 1");
+
+    let head_dim = d.hd_nope + d.hd_rope;
+    runlog::fields(
+        "本次运行参数",
+        &[
+            ("头数 n_head", d.n_head.to_string()),
+            (
+                "head_dim = hd_nope + hd_rope",
+                format!("{} = {} + {}", head_dim, d.hd_nope, d.hd_rope),
+            ),
+            ("latent 维 r", d.r.to_string()),
+            ("上下文 T", d.t.to_string()),
+            ("层数", d.n_layer.to_string()),
+        ],
+    );
+
+    logln!("说明：本子命令是**纯解析账本**（不训练、不建模型）。把「解耦 MLA 的增量缓存」");
+    logln!("     与「权重吸收省下的物化算力」两笔账用整数算清楚。");
+
+    // ---------- 一、增量缓存字节 ----------
+    let full_pt = crate::attention::full_kv_cache_bytes_per_token(d.n_head, head_dim);
+    let mla_pt = crate::attention::mla_cache_bytes_per_token(d.r, d.n_head, d.hd_rope);
+    logln!("=== 一、每层每 token 的增量缓存字节（f32，K + V 两份）===");
+    logln!(
+        "  当前 r={}：MLA {} 字节（= ({r} + {h}·{hr})·4）｜ 全量 K/V {} 字节（= 2·{h}·{hd}·4）｜ 压缩 {:.2}x",
+        d.r,
+        mla_pt,
+        full_pt,
+        full_pt as f64 / mla_pt.max(1) as f64,
+        r = d.r,
+        h = d.n_head,
+        hr = d.hd_rope,
+        hd = head_dim
+    );
+    logln!(
+        "  放大到 T={} × {} 层：MLA {:.2} GB ｜ 全量 {:.2} GB",
+        d.t,
+        d.n_layer,
+        mla_pt as f64 * d.t as f64 * d.n_layer as f64 / 1073741824.0,
+        full_pt as f64 * d.t as f64 * d.n_layer as f64 / 1073741824.0
+    );
+    logln!("  {:<10}{:>16}{:>16}{:>12}", "latent r", "MLA 字节", "全量字节", "压缩比");
+    for r in [64usize, 128, 256, 512, 1024, 2048] {
+        let m = crate::attention::mla_cache_bytes_per_token(r, d.n_head, d.hd_rope);
+        logln!(
+            "  {:<10}{:>16}{:>16}{:>11.2}x",
+            r,
+            m,
+            full_pt,
+            full_pt as f64 / m.max(1) as f64
+        );
+    }
+    logln!("  读法：r 越小缓存越省、但低秩容量越低（压缩得越狠，越要靠训练把信息压进 latent）。");
+    logln!("  与普通 GQA 的差别在**只存一份共享 latent**，而不是每个头各存一份 K/V。");
+
+    // ---------- 二、权重吸收的解码算力账本 ----------
+    logln!("=== 二、权重吸收的解码算力账本（每层、全历史 T 的乘加次数）===");
+    logln!("  朴素路径：先把每个 latent 物化成 K 与 V，再打分/加权；");
+    logln!("  吸收路径：把 W_UK 折进 query，直接在 r 维 latent 上打分/加权，**从不物化 K/V**。");
+    logln!("  {:<10}{:>20}{:>20}{:>12}", "T", "朴素 MACs", "吸收 MACs", "算力比");
+    for t in [128usize, 512, 2048, 8192] {
+        let a = crate::attention::naive_mla_macs(t, d.n_head, d.hd_nope, d.r);
+        let b = crate::attention::absorbed_mla_macs(t, d.n_head, d.hd_nope, d.r);
+        logln!("  {:<10}{:>20}{:>20}{:>11.2}x", t, a, b, a as f64 / b.max(1) as f64);
+    }
+    logln!("  读法：朴素路径的 T 项系数是 2·n_head·r·hd_nope，吸收路径是 2·n_head·r，");
+    logln!("  比值趋近 **hd_nope**（本题 {}）——T 越长省得越多。", d.hd_nope);
+    logln!("  代价：吸收只在**无梯度推理**里可用（本仓库 `mla_absorb` 仅在 `!grad_enabled()` 时生效），");
+    logln!("  且与 QK-Norm 不兼容——RMSNorm 的逐头缩放无法被线性吸收。");
+
+    // ---------- 三、解耦约束自检 ----------
+    logln!("=== 三、解耦 RoPE 的约束自检 ===");
+    logln!("  · head_dim 拆成 hd_nope + hd_rope，只有**后** hd_rope 维旋转（hd_rope 必须为偶数）；");
+    logln!("  · q_rope / k_rope 由输入**直接投影**（c_qr / c_kr），与压缩 latent 解耦——这是吸收成立的前提；");
+    logln!("  · 解耦要求 n_kv_head ∈ {{0 (=n_head), n_head}}，不允许真正的 GQA 头分组；");
+    logln!("  · mla_absorb 与 qk_norm 互斥；mla_rope_dim == 0 时 mla_absorb 必须为 false。");
+
+    runlog::append(&format!(
+        "[账本] n_head={} head_dim={} r={} T={} ｜ 缓存 {} vs {} 字节 ({:.2}x) ｜ 吸收算力比 ≈ hd_nope={}",
+        d.n_head,
+        head_dim,
+        d.r,
+        d.t,
+        mla_pt,
+        full_pt,
+        full_pt as f64 / mla_pt.max(1) as f64,
+        d.hd_nope
+    ));
+    logln!(
+        "  诚实声明：本仓库没有为 MLA 吸收写融合 kernel，这里的字节与乘加数都是**解析账本**，\n  \
+         真实收益取决于算子融合与内存带宽 —— 别把这张表当成实测性能。\n  \
+         能实测到的是正确性：吸收与朴素路径数值等价、解耦缓存与全量重算逐 token 一致（见单测）。"
+    );
+    logln!(
+        "  用法：把 `model.mla_rope_dim`（>0 开启，典型 = head_dim 的 1/3 量级）与\n  \
+         `model.mla_absorb`（true，且只在无梯度解码时走吸收）写进 config.json；\n  \
+         默认 `mla_rope_dim = 0` 时 MLA 仍走原低秩路径，前向**逐位不变**。"
     );
 
     runlog::finish();

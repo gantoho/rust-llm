@@ -66,6 +66,15 @@ pub struct TrainConfig {
     /// GPU 的 FP8 tensor core。这里只做数值模拟，用来量出"权重掉到 8 位后模型损失多少精度"。
     /// 详见 [`crate::fp8`]。
     pub fp8: bool,
+    /// FP4 权重存储**模拟**开关：开启后每步参数更新完，把所有二维权重矩阵按
+    /// E2M1（4 位：1 符号 + 2 指数 + 1 尾数）+ 每 32 个元素一个 scale 往返量化一次。
+    ///
+    /// ⚠️ 与 [`TrainConfig::fp8`] 一样**不会快任何一点**，纯数值模拟。FP4 的位宽只有 FP8
+    /// 的一半（5 bit/元素 vs 9 bit/元素，对 f32 是 6.4 倍压缩），但精度也差得多——
+    /// 量出"再省一半显存要付多少 loss"是本开关的用途。详见 [`crate::fp4`]。
+    ///
+    /// 与 `fp8` 同时开启时**以 FP4 为准**（两步回写依次执行，后执行的 FP4 覆盖前一步）。
+    pub fp4: bool,
     /// 学习率调度曲线（见 [`crate::train::LRScheduler`]）：
     /// - `"cosine"`（默认）：warmup → cosine 衰减，行为与加 WSD 之前**逐位一致**；
     /// - `"wsd"`：warmup → 恒定（stable）→ 末段线性退火（decay）。
@@ -266,6 +275,7 @@ impl Default for TrainConfig {
             amp_growth_interval: 2000,
             bf16: false,
             fp8: false,
+            fp4: false,
             lr_schedule: "cosine".to_string(),
             wsd_decay_frac: 0.1,
             optimizer: "adamw".to_string(),
@@ -392,6 +402,42 @@ impl Config {
                 "model.kv_lora_rank（{}）必须小于 K/V 的完整维度（{} = n_kv_head × head_dim）",
                 m.kv_lora_rank,
                 kv_dim
+            );
+        }
+        // MLA 解耦 RoPE + 权重吸收（DeepSeek-V2/V3）：见 TransformerConfig::mla_rope_dim
+        if m.mla_rope_dim > 0 {
+            assert!(
+                m.kv_lora_rank > 0,
+                "model.mla_rope_dim > 0 要求 model.kv_lora_rank > 0（解耦 RoPE 是 MLA 的一部分）"
+            );
+            assert!(
+                m.n_kv_head == 0 || m.n_kv_head == m.n_head,
+                "model.mla_rope_dim > 0 要求 n_kv_head 为 0 或等于 n_head（{}），实际 {}",
+                m.n_head,
+                m.n_kv_head
+            );
+            let head_dim = m.n_embd / m.n_head;
+            assert!(
+                m.mla_rope_dim < head_dim,
+                "model.mla_rope_dim（{}）必须小于 head_dim（{}）",
+                m.mla_rope_dim,
+                head_dim
+            );
+            assert!(
+                m.mla_rope_dim % 2 == 0,
+                "model.mla_rope_dim（{}）必须为偶数（RoPE 两两配对旋转）",
+                m.mla_rope_dim
+            );
+            if m.mla_absorb {
+                assert!(
+                    !m.qk_norm,
+                    "model.mla_absorb 与 model.qk_norm 不兼容：RMSNorm 无法被吸收进线性投影"
+                );
+            }
+        } else {
+            assert!(
+                !m.mla_absorb,
+                "model.mla_absorb 需要先开启 model.mla_rope_dim（吸收依赖解耦 RoPE）"
             );
         }
         // LoRA

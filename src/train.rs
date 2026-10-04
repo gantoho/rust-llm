@@ -539,6 +539,18 @@ pub fn train_transformer(
         );
     }
 
+    // FP4 权重存储模拟（第 48 课）：与 FP8 同理，位宽再砍一半，只做数值模拟
+    if cfg.fp4 {
+        logln!(
+            "FP4 权重存储模拟：每步更新后按 {} + 每 {} 个元素一个 scale 往返量化二维权重（仅数值模拟，无加速）",
+            crate::fp4::FORMAT_NAME,
+            crate::fp4::TRAIN_BLOCK
+        );
+        if cfg.fp8 {
+            logln!("  ⚠️ fp8 与 fp4 同时开启：两步回写依次执行，最终生效的是 FP4");
+        }
+    }
+
     // 优化器提示：Muon 与 AdamW 的"等效步长"口径不同，混用学习率是最容易踩的坑。
     if cfg.optimizer == "muon" {
         logln!(
@@ -779,6 +791,12 @@ pub fn train_transformer(
                             crate::fp8::TRAIN_FORMAT,
                             crate::fp8::TRAIN_BLOCK,
                         );
+                    }
+
+                    // 7c. FP4 权重存储模拟（第 48 课）：E2M1 + 每 32 元素一个 scale，
+                    // 5 bit/元素（对 f32 是 6.4 倍压缩）。与 fp8 同时开启时本步最后生效。
+                    if cfg.fp4 {
+                        crate::fp4::roundtrip_params_in_place(&params, crate::fp4::TRAIN_BLOCK);
                     }
 
                     // 8. 清零梯度
@@ -1387,6 +1405,69 @@ mod tests {
         assert!(
             (on - off).abs() > 1e-9,
             "开启偏置均衡后 loss 应与关闭不同，说明它没接进训练循环（{off} vs {on}）"
+        );
+    }
+
+    /// 同种子对照：mHC 把单条残差流拓宽成 `n_stream` 条并行流，流间混合矩阵经 Sinkhorn
+    /// 投影到**双随机**（保范、保均值），读出 / 写入各有一份可学门控。
+    ///
+    /// 两条要求——都训得出有限 loss（Sinkhorn 的广播除法与新增参数没把训练推成 NaN），
+    /// 且同种子 loss **确实不同**（否则说明 `n_stream` 只写在配置里、没接进前向）。
+    /// `HyperConnection::new` 是确定性初始化、不消耗随机数，所以两次运行的初始化随机数
+    /// 序列完全一致，差异只能归因于结构本身。验收只看"接进去了、没训坏"，
+    /// 不比较谁更优——12 步的极小模型上谁赢是噪声。
+    #[test]
+    fn test_mhc_changes_training_same_seed() {
+        let single = run_tiny_ablation(TransformerConfig::tiny(0), tiny_train_cfg());
+        let multi = run_tiny_ablation(
+            TransformerConfig {
+                n_stream: 2,
+                ..TransformerConfig::tiny(0)
+            },
+            tiny_train_cfg(),
+        );
+        assert!(
+            single.is_finite() && single > 0.0,
+            "单残差流的 loss 应为正有限值，实际 {single}"
+        );
+        assert!(
+            multi.is_finite() && multi > 0.0,
+            "双残差流的 loss 应为正有限值（NaN 说明 Sinkhorn 归一化有问题），实际 {multi}"
+        );
+        assert_ne!(
+            single, multi,
+            "开了 mHC 却没有改变训练结果，说明它没接进前向（{single} vs {multi}）"
+        );
+    }
+
+    /// 同种子对照：FP4 权重存储模拟（E2M1 + 每 32 个元素一个 scale）开启后，每步参数更新完
+    /// 会把二维权重往返量化回写，同种子 loss 必然与关闭时不同。
+    ///
+    /// 断言「都有限且不相等」——有限说明 4 位格式的饱和 / nibble 打包链路没把参数推成 NaN，
+    /// 不相等说明 `train.fp4` 真的接进了训练步（而不只是配置里多了个字段）。
+    /// 这里**不比较谁更优**：12 步的极小模型上"FP4 更差"这件事本身也是噪声（见第 48 课）。
+    #[test]
+    fn test_fp4_changes_training_same_seed() {
+        assert!(!TrainConfig::default().fp4, "fp4 必须默认关闭");
+        let base = run_tiny_ablation(TransformerConfig::tiny(0), tiny_train_cfg());
+        let fp4 = run_tiny_ablation(
+            TransformerConfig::tiny(0),
+            TrainConfig {
+                fp4: true,
+                ..tiny_train_cfg()
+            },
+        );
+        assert!(
+            base.is_finite() && base > 0.0,
+            "未开 FP4 的 loss 应为正有限值，实际 {base}"
+        );
+        assert!(
+            fp4.is_finite() && fp4 > 0.0,
+            "开启 FP4 的 loss 应为正有限值（NaN 说明饱和/打包有问题），实际 {fp4}"
+        );
+        assert_ne!(
+            base, fp4,
+            "开了 FP4 却没有改变训练结果，说明它没接进训练循环（{base} vs {fp4}）"
         );
     }
 

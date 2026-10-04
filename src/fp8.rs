@@ -162,7 +162,10 @@ impl Fp8Format {
 }
 
 /// `2^e`（`e` 落在 f32 正规数范围内时精确）
-fn exp2(e: i32) -> f32 {
+///
+/// `pub(crate)`：FP4（[`crate::fp4`]）的指数字段更窄，但编码/解码的骨架与本模块一致，
+/// 位运算工具共用一份，免得两处实现悄悄跑偏。
+pub(crate) fn exp2(e: i32) -> f32 {
     f32::from_bits(((e + 127) as u32) << 23)
 }
 
@@ -170,7 +173,9 @@ fn exp2(e: i32) -> f32 {
 ///
 /// 硬件做浮点舍入用的就是这个规则；手写是为了不依赖 `f32::round_ties_even`
 /// 的版本门槛，也让"奇偶往哪边靠"这件事在代码里看得见。
-fn round_ties_even(v: f32) -> f32 {
+///
+/// `pub(crate)`：FP4 的编码走同一套"先算尾数整数再舍入"的流程，共用本函数。
+pub(crate) fn round_ties_even(v: f32) -> f32 {
     let f = v.floor();
     let d = v - f;
     if d > 0.5 {

@@ -546,6 +546,24 @@ pub enum Cmd {
         #[command(flatten)]
         fp8: Fp8Args,
     },
+    /// FP4 低精度模拟（第 48 课）：E2M1 的 16 个码 + 分块缩放的位宽/精度账本
+    /// + 「位宽 vs 验证 loss」三方对照（f32 / FP8 / FP4，纯数值模拟，无加速）
+    Fp4 {
+        #[command(flatten)]
+        fp4: Fp4Args,
+    },
+    /// CSA + HCA 混合注意力账本（第 49 课，DeepSeek-V4 长上下文压缩注意力）：
+    /// 三分支覆盖不变式核对 + KV 字节压缩账本 + top-k 稀疏算力账本（纯解析账本，无训练）
+    Csa {
+        #[command(flatten)]
+        csa: CsaArgs,
+    },
+    /// MLA 解耦 RoPE + 权重吸收账本（第 50 课，DeepSeek-V2/V3 的 KV 低秩压缩升级）：
+    /// 增量缓存字节压缩比 + 权重吸收省下的物化算力（纯解析账本，无训练）
+    Mla {
+        #[command(flatten)]
+        mla: MlaArgs,
+    },
 }
 
 /// 知识蒸馏实验的参数（第 42 课）。
@@ -636,6 +654,95 @@ pub struct Fp8Args {
     /// 随机种子
     #[arg(long, default_value_t = 42)]
     pub seed: u64,
+}
+
+/// FP4 低精度模拟的参数（第 48 课）。
+///
+/// 与 [`Fp8Args`] 同构，只是没有"选哪种格式"这一项——E2M1 是 4 位浮点在工业界
+/// 唯一被广泛采用的格式（OCP MXFP4）。`block` 决定每个 f32 scale 服务多少元素：
+/// 32 是 MXFP4 的默认值，正好给出 5 bit/元素、对 f32 6.4 倍压缩。
+#[derive(Args, Debug, Clone)]
+pub struct Fp4Args {
+    /// 分块缩放大小：每多少个元素共享一个 scale（0 = 整张共用一个）
+    #[arg(long, default_value_t = 32)]
+    pub block: usize,
+    /// 演示用的随机权重行数
+    #[arg(long, default_value_t = 256)]
+    pub rows: usize,
+    /// 演示用的随机权重列数
+    #[arg(long, default_value_t = 256)]
+    pub cols: usize,
+    /// 训练几步（先让权重进入"有结构"的状态，再对比量化前后的 loss）
+    #[arg(long, default_value_t = 300)]
+    pub steps: usize,
+    /// 学习率
+    #[arg(long, default_value_t = 5e-3)]
+    pub lr: f32,
+    /// 批大小
+    #[arg(long, default_value_t = 8)]
+    pub batch_size: usize,
+    /// 上下文长度
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+    /// 小模型宽度（需能被 4 整除）
+    #[arg(long, default_value_t = 32)]
+    pub n_embd: usize,
+    /// 小模型层数
+    #[arg(long, default_value_t = 2)]
+    pub n_layer: usize,
+    /// 随机种子
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+}
+
+/// CSA + HCA 混合注意力的账本参数（第 49 课）。
+///
+/// 这是**纯解析账本**（不训练、不建大模型）：把"覆盖不变式 / KV 字节 / 稀疏算力"
+/// 三件事用整数算清楚，让你直观看到 `m`（压缩块宽）与 `top_k`（保留块数）分别换来了什么。
+#[derive(Args, Debug, Clone)]
+pub struct CsaArgs {
+    /// 参照的上下文长度 T（KV 字节与算力账本都按它算）
+    #[arg(long, default_value_t = 512)]
+    pub t: usize,
+    /// KV 头数（GQA 的 KV 头，账本里 KV 缓存的份数）
+    #[arg(long, default_value_t = 8)]
+    pub n_kv_head: usize,
+    /// 每头维度 head_dim
+    #[arg(long, default_value_t = 64)]
+    pub d: usize,
+    /// 粗压缩倍率（HCA，在细压缩之上再压这么多倍）；< 2 = 不算 HCA 分支
+    #[arg(long, default_value_t = 4)]
+    pub hca: usize,
+    /// 细压缩保留块数 top-k（0 = 稠密，不稀疏）
+    #[arg(long, default_value_t = 8)]
+    pub top_k: usize,
+}
+
+/// MLA 解耦 RoPE + 权重吸收的账本参数（第 50 课）。
+///
+/// 这是**纯解析账本**（不训练、不建模型）：把"增量缓存字节"与"权重吸收省下的物化算力"
+/// 两笔账用整数算清楚。默认值取 DeepSeek-V3 的量级（`n_head=128`、`head_dim=192=128+64`、
+/// `r=512`、`T=4096`），改 `--r` / `--hd-nope` 可以直观看到各旋钮换来什么。
+#[derive(Args, Debug, Clone)]
+pub struct MlaArgs {
+    /// 参照的上下文长度 T（缓存总量与算力账本都按它算）
+    #[arg(long, default_value_t = 4096)]
+    pub t: usize,
+    /// 注意力头数 n_head
+    #[arg(long, default_value_t = 128)]
+    pub n_head: usize,
+    /// 解耦后"不带 RoPE"的头维 hd_nope
+    #[arg(long, default_value_t = 128)]
+    pub hd_nope: usize,
+    /// 解耦 RoPE 的旋转维 hd_rope（必须为偶数）
+    #[arg(long, default_value_t = 64)]
+    pub hd_rope: usize,
+    /// KV 低秩 latent 维度 r（kv_lora_rank）
+    #[arg(long, default_value_t = 512)]
+    pub r: usize,
+    /// 参照的层数（只用来把每层账本放大到全模型）
+    #[arg(long, default_value_t = 60)]
+    pub n_layer: usize,
 }
 
 /// 检索增强生成（RAG）实验的参数（第 37 课）。

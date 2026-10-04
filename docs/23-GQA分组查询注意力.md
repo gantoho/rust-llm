@@ -176,11 +176,15 @@ DeepSeek-V2：`kv_lora_rank = 512`，对比 `n_kv_head × head_dim = 128 × 192`
 ### 8.4 本实现的取舍（教学版）
 
 - **保留论文的核心**：KV 联合低秩压缩 + 缓存只存 latent。
-- **省略论文的 decoupled RoPE**：论文把 Q/K 的 rope 子维单独拎出来只对那部分旋转，
-  让压缩后的 latent 不必带位置信息。本实现让 RoPE 作用在完整的 `head_dim` 上，
-  因此缓存里的 latent 是**未旋转**的，靠 `KVCache::positions` 每步按各自绝对位置补旋
+- **decoupled RoPE 单独成课**：论文把 Q/K 的 rope 子维单独拎出来只对那部分旋转，
+  让压缩后的 latent 不必带位置信息。本课（第 23 课）的 MLA 是**最简形态**——让 RoPE 作用在完整的
+  `head_dim` 上，因此缓存里的 latent 是**未旋转**的，靠 `KVCache::positions` 每步按各自绝对位置补旋
   （滑动窗口丢行后位置并不连续，所以必须存每个位置的绝对下标）。
   效果上的差别：压缩率略低、每步多一次旋转（`T` 行的 `O(T·d)` 计算，与升维同量级）。
+  **论文式的完整版（decoupled RoPE + `W_UK`/`W_UV` 权重吸收）已在第 50 课落地**：
+  开 `model.mla_rope_dim > 0`（`head_dim = hd_nope + hd_rope`，只转后 `hd_rope` 维、
+  `k_rope` 由输入直接投影）与 `model.mla_absorb = true`（解码在 `r + n_head·hd_rope` 维 latent 空间完成、
+  K/V 不物化），详见 [第 50 课](50-MLA解耦RoPE与权重吸收.md)。
 
 ### 8.5 配置与约束
 

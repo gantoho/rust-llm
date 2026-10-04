@@ -55,6 +55,23 @@ pub struct TransformerConfig {
     /// 0 = 关闭（默认），行为与加 MLA 之前逐位一致。
     /// 参考量级：DeepSeek-V2 用 512，对照 `128 头 × 192 维`。
     pub kv_lora_rank: usize,
+    /// **MLA 解耦 RoPE 的旋转维度** `hd_rope`（decoupled RoPE，DeepSeek-V2/V3）：
+    /// 把每个头的 `head_dim` 拆成 `hd_nope + hd_rope`，只对后 `hd_rope` 维做 RoPE。
+    /// RoPE 的 key 由**输入直接投影**（`c_kr`）而非从 latent 升维，因此位置信息与压缩
+    /// latent 解耦——这正是 W_UK/W_UV **吸收**（[`Self::mla_absorb`]）成立的前提。
+    ///
+    /// `> 0` 要求 `kv_lora_rank > 0`、`hd_rope < head_dim`、`hd_rope` 为偶数，且
+    /// `n_kv_head` 为 0 或等于 `n_head`（解耦 K 头与 Q 头一一对应）。
+    /// `0` = 关闭（默认，行为与加解耦 RoPE 之前**逐位一致**）。
+    pub mla_rope_dim: usize,
+    /// **MLA 权重吸收**开关（W_UK/W_UV absorption）：仅当 `mla_rope_dim > 0` 时有意义。
+    ///
+    /// 开启后，**无梯度推理**走吸收路径：把 `W_UK` 吸进查询（`qa = q_nope·W_UKᵀ`），
+    /// 注意力在 `r + hd_rope` 维的 latent 空间里完成，**全程不物化 K/V**；代价是
+    /// 每步读缓存 `T·(r + hd_rope)` 而非材料化的 `2·T·n_head·hd_nope`。
+    /// 与 QK-Norm 不兼容（RMSNorm 无法被线性吸收），开启它要求 `qk_norm = false`。
+    /// `false` = 关闭（默认，走朴素解耦路径）。
+    pub mla_absorb: bool,
     /// 是否使用 RMSNorm（true = LLaMA 风格，false = 经典风格 LayerNorm）
     pub use_rmsnorm: bool,
     /// **QK-Norm**：在每个注意力层的 Q/K 投影之后、RoPE 之前，对**每个头**的
@@ -101,6 +118,35 @@ pub struct TransformerConfig {
     /// （多个专家重复学同一批常见模式）。代价是这部分参数**没有稀疏性可言**，
     /// 每 token 都要算，会按比例吃掉 MoE 省下的 FLOPs（见 [`crate::moe::SparseStats`]）。
     pub moe_shared_experts: usize,
+    // ---- mHC 流形约束超连接（第 47 课）----
+    /// **并行残差流数量**（mHC / Hyper-Connections，DeepSeek-V4）。`1` = 普通单流残差
+    /// （默认，**逐位不变**：既不构造 [`crate::mhc`] 参数，也不消耗任何随机数）。
+    ///
+    /// `≥ 2` 时把残差流拓宽成 `n_stream` 条，层间用一份经 **Sinkhorn 投影到双随机矩阵**
+    /// 的混合矩阵耦合（`‖A‖₂ = 1`，信号既不放也不缩），以稳定层间信息传播。
+    /// 每个子层新增 `2n + n²` 个参数（α、β 各 n 个 + 深度矩阵 n² 个），相对主干可忽略。
+    ///
+    /// ⚠️ 与 LoRA / 权重量化 / GPU 常驻快路都正交但**不联动**：mHC 走逐算子前向路径。
+    pub n_stream: usize,
+    /// mHC 的 Sinkhorn 迭代次数（默认 20）。迭代越多混合矩阵越接近严格双随机；
+    /// 每次迭代只对 `n×n` 小矩阵做归一化，开销可忽略。只对 `n_stream > 1` 生效。
+    pub mhc_sinkhorn_iters: usize,
+    // ---- CSA + HCA 混合注意力（第 49 课，DeepSeek-V4 长上下文压缩注意力）----
+    /// **压缩块大小 m**（同时是局部全分辨率窗口宽度）。`< 2` = 关闭
+    /// （默认，行为与加 CSA 之前**逐位一致**，直接走 `flash_attention`）。
+    ///
+    /// `≥ 2` 时注意力把可见 key 拆成三层拼进同一次 softmax：
+    /// ① 最近 m 个位置的局部窗口；② 已完成的 m 长块做均值压缩后的 top-k 稀疏选择（CSA）；
+    /// ③ 在 ② 之上再压 `hca_block` 倍的稠密粗分支（HCA）。详见 [`crate::csa`]。
+    ///
+    /// ⚠️ 只在**无 KV cache 的全量前向**（训练 / 预填）生效；带 cache 的逐步解码
+    /// 仍走原路径（见 `docs/49`）。
+    pub csa_block: usize,
+    /// 细压缩保留的块数（top-k 稀疏）。`0` = 不稀疏，对全部已完成块做稠密注意力。
+    /// 只对 `csa_block >= 2` 生效。
+    pub csa_top_k: usize,
+    /// 粗压缩倍率（HCA，在细压缩之上再压这么多倍）。`0` / `< 2` = 不启用。
+    pub hca_block: usize,
     /// **aux-loss-free 均衡偏置**开关（DeepSeek-V3 式）。false = 关闭（默认，逐位不变）。
     ///
     /// 开启后每个专家多一个**只用于选路**的偏置 `b_i`：Top-K 选择看 `logits + b`，
@@ -157,6 +203,8 @@ impl Default for TransformerConfig {
             block_size: 32,
             n_kv_head: 0,
             kv_lora_rank: 0,
+            mla_rope_dim: 0,
+            mla_absorb: false,
             use_rmsnorm: true,
             qk_norm: false,
             use_swiglu: true,
@@ -168,6 +216,11 @@ impl Default for TransformerConfig {
             moe_z_loss_coef: 0.0,
             moe_switch_gate: false,
             moe_shared_experts: 0,
+            n_stream: 1,
+            mhc_sinkhorn_iters: 20,
+            csa_block: 0,
+            csa_top_k: 0,
+            hca_block: 0,
             moe_bias_balance: false,
             moe_bias_lr: 0.001,
             rope_base: rope::ROPE_BASE,
@@ -325,6 +378,10 @@ pub(crate) struct TransformerBlock {
     ln2: NormLayer,
     ffn: Ffn,
     dropout: f32,
+    /// 注意力子层的超连接（mHC，第 47 课）。`None` = `n_stream = 1`（默认，走普通残差）。
+    hc_attn: Option<crate::mhc::HyperConnection>,
+    /// 前馈子层的超连接（与注意力各持一份，互不共享）
+    hc_mlp: Option<crate::mhc::HyperConnection>,
     /// 最近一次前向里 MoE 子层的均衡辅助损失（稠密配置恒为 `None`）。
     /// `forward` 只拿到 `&self`，所以用 `Shared`（内部 `Mutex`）；训练循环在 `forward` 之后把它取走。
     aux: Shared<Option<Tensor>>,
@@ -339,9 +396,8 @@ impl TransformerBlock {
         } else {
             Ffn::Dense(MLPEnum::new_gelu(cfg.n_embd, rng))
         };
-        TransformerBlock {
-            ln1: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
-            attn: MultiHeadAttention::new(
+        let attn = {
+            let mut a = MultiHeadAttention::new(
                 cfg.n_embd,
                 cfg.n_head,
                 cfg.n_kv_head,
@@ -349,11 +405,26 @@ impl TransformerBlock {
                 cfg.qk_norm,
                 // 训练窗口取 block_size：YaRN 的分段边界与 NTK 的 factor 都是相对它而言
                 cfg.rope_spec(),
+                cfg.mla_rope_dim,
+                cfg.mla_absorb,
                 rng,
-            ),
+            );
+            // CSA（第 49 课）：纯数据开关，不构造参数、不消耗随机数；
+            // `csa_block < 2` 时保持 `Default`（全 0），注意力走原 flash 路径、逐位不变。
+            a.csa = crate::csa::CsaOpts::from(cfg);
+            a
+        };
+        TransformerBlock {
+            ln1: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
+            attn,
             ln2: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
             ffn,
             dropout: cfg.dropout,
+            // mHC：仅在 n_stream > 1 时构造（`n_stream = 1` 走普通残差，逐位不变、不耗随机数）
+            hc_attn: (cfg.n_stream > 1)
+                .then(|| crate::mhc::HyperConnection::new(cfg.n_stream, cfg.mhc_sinkhorn_iters)),
+            hc_mlp: (cfg.n_stream > 1)
+                .then(|| crate::mhc::HyperConnection::new(cfg.n_stream, cfg.mhc_sinkhorn_iters)),
             aux: Shared::new(None),
         }
     }
@@ -372,7 +443,54 @@ impl TransformerBlock {
         ps.extend(self.attn.named_parameters(&format!("{prefix}.attn")));
         ps.extend(self.ln2.named_parameters(&format!("{prefix}.ln2")));
         ps.extend(self.ffn.named_parameters(prefix));
+        if let Some(hc) = &self.hc_attn {
+            ps.extend(hc.named_parameters(&format!("{prefix}.hc_attn")));
+        }
+        if let Some(hc) = &self.hc_mlp {
+            ps.extend(hc.named_parameters(&format!("{prefix}.hc_mlp")));
+        }
         ps
+    }
+
+    /// mHC 流式前向（第 47 课）：`streams` 是 `[n_stream, b·t·d]` 的并行残差流。
+    ///
+    /// 每个子层的结构是"读出 → 子层 → 写入"（见 [`crate::mhc`]）：
+    /// 注意力与朴素路径**完全一样**（同一个 `ln1`/`attn`），只是读写的对象换成了多条流。
+    /// 只在 `n_stream > 1` 时被调用（[`Transformer::forward_core`] 里分流），
+    /// 因此不影响默认单流路径的逐位一致性。
+    ///
+    /// 不走 GPU 常驻快路：那条路径直接读写单流缓冲，与多流语义不兼容，这里显式回退逐算子。
+    pub(crate) fn forward_streams(
+        &self,
+        streams: &Tensor,
+        b: usize,
+        t: usize,
+        d: usize,
+        mask: Option<&Tensor>,
+        kv_cache: Option<&mut KVCache>,
+        base: usize,
+        training: bool,
+    ) -> Tensor {
+        let hc_a = self
+            .hc_attn
+            .as_ref()
+            .expect("n_stream > 1 的 Block 必须带 hc_attn");
+        let h = hc_a.read(streams, b, t, d);
+        let ln1_out = self.ln1.forward(&h);
+        let y = self.attn.forward(&ln1_out, mask, kv_cache, base);
+        let y = if self.dropout > 0.0 { y.dropout(self.dropout, training) } else { y };
+        let streams = hc_a.write(streams, &y);
+
+        let hc_m = self
+            .hc_mlp
+            .as_ref()
+            .expect("n_stream > 1 的 Block 必须带 hc_mlp");
+        let h2 = hc_m.read(&streams, b, t, d);
+        let ln2_out = self.ln2.forward(&h2);
+        let (y2, aux) = self.ffn.forward_with_aux(&ln2_out);
+        *self.aux.borrow_mut() = aux;
+        let y2 = if self.dropout > 0.0 { y2.dropout(self.dropout, training) } else { y2 };
+        hc_m.write(&streams, &y2)
     }
 
     pub(crate) fn forward(
@@ -697,6 +815,12 @@ impl Module for TransformerBlock {
         ps.extend(self.attn.parameters());
         ps.extend(self.ln2.parameters());
         ps.extend(self.ffn.parameters());
+        if let Some(hc) = &self.hc_attn {
+            ps.extend(hc.parameters());
+        }
+        if let Some(hc) = &self.hc_mlp {
+            ps.extend(hc.parameters());
+        }
         ps
     }
 }
@@ -715,6 +839,9 @@ pub struct Transformer {
     /// 视觉塔（`cfg.vision = Some` 时构造）：把 `[b·P, 3·S²]` 的像素变成
     /// `[b·P, n_embd]` 的 patch 特征，由 [`Transformer::forward_mm`] 注入文本序列。
     vision: Option<crate::vision::VisionEncoder>,
+    /// mHC 的收敛/宽度连接权重 `γ`（softmax → 单纯形，见 [`crate::mhc::collapse_streams`]）。
+    /// `None` = `n_stream = 1`（默认，不构造、不耗随机数）。只在多流模型里存在一份。
+    hc_collapse: Option<Tensor>,
     /// 最近一次部署量化的记录（[`Transformer::quantize_weights`] 写入，checkpoint 头读出/写入）。
     ///
     /// 它只记**参数**（位宽 / 算法 / 字节口径），不记整数码：存档里的权重始终是 f32
@@ -781,6 +908,10 @@ impl Transformer {
             dropout: cfg.dropout,
             lora: None,
             vision,
+            // mHC：只在多流时构造收敛权重（n_stream = 1 走单流残差，逐位不变、不耗随机数）
+            hc_collapse: (cfg.n_stream > 1).then(|| {
+                Tensor::param(crate::mhc::concentrated_logits(cfg.n_stream), vec![cfg.n_stream])
+            }),
             quant: None,
         }
     }
@@ -1646,7 +1777,11 @@ impl Transformer {
         //    不满足就只回退那一个。想复现对照实验或追求吞吐时设环境变量
         //    `LLM_GPU_STACK`（**只要设置了就生效**，值本身不参与判断，`is_some`）。
         #[cfg(feature = "gpu")]
-        if kv_cache.is_none() && base == 0 && std::env::var_os("LLM_GPU_STACK").is_some() {
+        if kv_cache.is_none()
+            && base == 0
+            && self.cfg.n_stream == 1
+            && std::env::var_os("LLM_GPU_STACK").is_some()
+        {
             if let Some(out) = self.blocks_resident(&x, mask.as_ref(), b, t, training) {
                 return self.ln_f.forward(&out).reshape(vec![b * t, d]);
             }
@@ -1654,9 +1789,25 @@ impl Transformer {
 
         // 5. 逐层过 Transformer Block
         let mut x = x;
-        for (i, block) in self.blocks.iter().enumerate() {
-            let cache = kv_cache.as_mut().map(|c| &mut c[i]);
-            x = block.forward(&x, mask.as_ref(), cache, base, training);
+        if self.cfg.n_stream > 1 {
+            // mHC（第 47 课）：把单条残差流扩成 n_stream 条并行流，层间用双随机矩阵耦合。
+            // 默认 `n_stream = 1`，此分支整段不执行，单流前向与加 mHC 之前逐位一致。
+            let n = self.cfg.n_stream;
+            let mut streams = crate::mhc::expand_streams(&x, n);
+            for (i, block) in self.blocks.iter().enumerate() {
+                let cache = kv_cache.as_mut().map(|c| &mut c[i]);
+                streams = block.forward_streams(&streams, b, t, d, mask.as_ref(), cache, base, training);
+            }
+            let gamma = self
+                .hc_collapse
+                .as_ref()
+                .expect("n_stream > 1 的模型必须带收敛权重 hc_collapse");
+            x = crate::mhc::collapse_streams(&streams, gamma, n, b, t, d);
+        } else {
+            for (i, block) in self.blocks.iter().enumerate() {
+                let cache = kv_cache.as_mut().map(|c| &mut c[i]);
+                x = block.forward(&x, mask.as_ref(), cache, base, training);
+            }
         }
 
         // 6. 最终归一化（输出头由 forward / 常驻显存路径各自完成）
@@ -1710,6 +1861,9 @@ impl Transformer {
             ps.extend(block.named_parameters(&format!("blocks.{i}")));
         }
         ps.extend(self.ln_f.named_parameters("ln_f"));
+        if let Some(g) = &self.hc_collapse {
+            ps.push(("hc_collapse".to_string(), g.clone()));
+        }
         if let Some(v) = &self.vision {
             ps.extend(v.named_parameters());
         }
@@ -1724,6 +1878,9 @@ impl Module for Transformer {
             ps.extend(block.parameters());
         }
         ps.extend(self.ln_f.parameters());
+        if let Some(g) = &self.hc_collapse {
+            ps.push(g.clone());
+        }
         if let Some(v) = &self.vision {
             ps.extend(v.named_parameters().into_iter().map(|(_, t)| t));
         }
@@ -2500,5 +2657,128 @@ mod tests {
         assert_eq!(hess_codes.len(), rtn_codes.len());
         assert_eq!(hess_codes, rtn_codes, "对角 Hessian 下 Hessian 量化应与 RTN 逐位一致");
         assert_eq!(rtn.len(), hess_codes.len());
+    }
+
+    /// mHC 的**默认关闭不变式**（第 47 课）：`n_stream = 1` 时既不构造超连接参数、
+    /// 也不消耗任何随机数——参数表与"完全没有 mHC 的模型"逐项同名、同种子下输出逐位相同。
+    #[test]
+    fn test_mhc_n_stream_one_is_bitwise_identical() {
+        let mut r1 = Rng::new(123);
+        let plain = Transformer::new(TransformerConfig::tiny(64), &mut r1);
+
+        let mut r2 = Rng::new(123);
+        let cfg = TransformerConfig {
+            n_stream: 1,
+            ..TransformerConfig::tiny(64)
+        };
+        let with_switch = Transformer::new(cfg, &mut r2);
+
+        let np = plain.named_parameters();
+        let nw = with_switch.named_parameters();
+        assert_eq!(np.len(), nw.len(), "n_stream=1 不应新增任何参数");
+        for ((a, _), (b, _)) in np.iter().zip(nw.iter()) {
+            assert_eq!(a, b, "参数名不一致，说明随机数消耗顺序被改变了");
+        }
+        assert!(
+            !nw.iter().any(|(n, _)| n.contains("hc_")),
+            "n_stream=1 不应出现 hc_* 参数"
+        );
+
+        let idx = [3usize, 5, 7, 11];
+        assert_eq!(
+            plain.forward(&idx, 1, idx.len(), None, false).data(),
+            with_switch.forward(&idx, 1, idx.len(), None, false).data(),
+            "n_stream=1 的前向必须逐位相同"
+        );
+    }
+
+    /// 同种子、同数据下 `n_stream = 2` 改变前向，且 mHC 参数确实拿到梯度——
+    /// 证明多流路径不是摆设（既有结构差异，也能被训练）。
+    #[test]
+    fn test_mhc_two_streams_changes_forward_and_receives_grad() {
+        let build = |n_stream: usize| {
+            // 同一颗种子：HC 初始化是确定性的（不消耗随机数），
+            // 所以两个模型除残差结构外**所有其它参数逐位相同**，唯一变量就是 mHC。
+            let mut rng = Rng::new(2026);
+            Transformer::new(
+                TransformerConfig {
+                    n_stream,
+                    ..TransformerConfig::tiny(64)
+                },
+                &mut rng,
+            )
+        };
+        let single = build(1);
+        let multi = build(2);
+
+        let idx = [3usize, 5, 7, 11, 13, 17];
+        let (b, t) = (1usize, idx.len());
+        assert_ne!(
+            single.forward(&idx, b, t, None, false).data(),
+            multi.forward(&idx, b, t, None, false).data(),
+            "n_stream=2 的前向应与单流不同"
+        );
+
+        zero_grad_all(&multi);
+        let targets = [5usize, 7, 11, 13, 17, 3];
+        let loss = cross_entropy_loss(&multi.forward(&idx, b, t, None, false), &targets);
+        assert!(loss.item().is_finite());
+        loss.backward();
+
+        let hc_grads: Vec<(String, bool)> = multi
+            .named_parameters()
+            .into_iter()
+            .filter(|(n, _)| n.contains(".hc_"))
+            .map(|(n, p)| {
+                let g = p.grad();
+                (n, g.iter().any(|x| x.abs() > 1e-9))
+            })
+            .collect();
+        assert!(!hc_grads.is_empty(), "没找到任何 hc_* 参数");
+        let missing: Vec<String> = hc_grads
+            .iter()
+            .filter(|(_, has)| !*has)
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(missing.is_empty(), "这些 mHC 参数没收到梯度：{missing:?}");
+    }
+
+    /// CSA+HCA 开关：同种子下开启后前向改变，但**不新增任何参数**（纯数据开关），
+    /// 从而保证 `csa_block < 2`（默认关闭）时逐位不变。
+    #[test]
+    fn test_csa_changes_training_same_seed() {
+        let build = |csa_block: usize, csa_top_k: usize, hca_block: usize| {
+            // 同一颗种子：CSA 只写 CsaOpts（纯数据、不消耗随机数），
+            // 所以两个模型除注意力可见范围外所有参数逐位相同。
+            let mut rng = Rng::new(4242);
+            Transformer::new(
+                TransformerConfig {
+                    csa_block,
+                    csa_top_k,
+                    hca_block,
+                    ..TransformerConfig::tiny(64)
+                },
+                &mut rng,
+            )
+        };
+        let plain = build(0, 0, 0);
+        let csa = build(4, 1, 2);
+
+        let np = plain.named_parameters();
+        let nc = csa.named_parameters();
+        assert_eq!(np.len(), nc.len(), "CSA 不应新增任何参数");
+        for ((a, _), (b, _)) in np.iter().zip(nc.iter()) {
+            assert_eq!(a, b, "参数名不一致，说明随机数消耗顺序被改变了");
+        }
+
+        let idx = [3usize, 5, 7, 11, 13, 17, 19, 23];
+        let (b, t) = (1usize, idx.len());
+        let out = csa.forward(&idx, b, t, None, false);
+        assert_ne!(
+            plain.forward(&idx, b, t, None, false).data(),
+            out.data(),
+            "开启 CSA 后前向应与 flash 路径不同"
+        );
+        assert!(out.data().iter().all(|x| x.is_finite()), "CSA 前向出现非有限值");
     }
 }
