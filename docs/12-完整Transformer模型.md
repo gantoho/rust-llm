@@ -329,7 +329,7 @@ pub fn tiny(vocab_size: usize) -> Self {
 
 1. **手推数据流**：设 `vocab=50, b=2, t=3`，用 tiny 配置，写出 `Transformer::forward` 里每一步张量的形状（从 `idx` 到 `logits`），对照第 4.3 节的表检查。
 2. **改配置**：自己加一个 `TransformerConfig::small`，比如 `n_embd=128, n_head=8, n_layer=4, block_size=64`。注意 `head_dim = 128/8 = 16` 仍成立；再按 5.2 节的表估一下参数量。
-3. **验证 logits 形状**：在 `main.rs` 演示 3 里，`model.forward(...)` 之后加一行打印 `logits.shape()`，确认是 `[B*T, V]`。
+3. **验证 logits 形状**：在 `cmd/experiments.rs` 演示 3 里，`model.forward(...)` 之后加一行打印 `logits.shape()`，确认是 `[B*T, V]`。
 4. **看 Block 内部分工**：把 MLP 的隐藏维改成 `2 * cfg.n_embd`（2 倍而不是 4 倍；GELU MLP 的隐藏维在 `MLPEnum::new_gelu` 里由 `MLP_RATIO` 决定，`src/layers.rs:270`），训练看 loss 变化——体会 MLP 宽度对模型能力的影响。
 5. **思考**：我们的输出头就是 `tok_emb.table` 的转置（权重绑定）。为什么可以这样做？相比"独立的 lm_head"省了多少参数？（提示：`[V, D]` 和 `[D, V]` 互为转置，`lm_head` 的参数量 `64×V+V` 恰好被省掉了。）
 

@@ -3,7 +3,7 @@
 > **本课已落地为可运行代码**：[`src/attention.rs`](../src/attention.rs) 的
 > `forward_mla_decoupled` / `absorb_attention`（解耦 RoPE 与 W_UK/W_UV 吸收），
 > 接入 [`src/model.rs`](../src/model.rs) 的 `TransformerConfig` 与 [`src/config.rs`](../src/config.rs) 的校验，
-> 演示命令 [`src/main.rs`](../src/main.rs) 的 `cmd_mla`。
+> 演示命令 [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) 的 `cmd_mla`。
 > 配置开关：`model.mla_rope_dim` / `model.mla_absorb`（默认 `0` / `false` = 关闭）/ 命令 `cargo run -- mla`。
 >
 > 与第 23 课（MLA 低秩压缩 KV cache）的关系：第 23 课的 MLA **只做了低秩压缩**——
@@ -165,7 +165,7 @@ V 侧同理，利用"加权求和是线性"：
 | [`src/attention.rs`](../src/attention.rs) 账本函数 | `full_kv_cache_bytes_per_token` / `mla_cache_bytes_per_token` / `naive_mla_macs` / `absorbed_mla_macs` |
 | [`src/model.rs`](../src/model.rs) | `TransformerConfig` 新增 `mla_rope_dim` / `mla_absorb` |
 | [`src/config.rs`](../src/config.rs) | 校验：`r > 0`、`n_kv_head ∈ {0, n_head}`、`hd_rope < head_dim` 且为偶数、`mla_absorb ⇒ !qk_norm` |
-| [`src/main.rs`](../src/main.rs) `cmd_mla` | `mla` 子命令：缓存字节账本 → 吸收算力账本 → 约束自检 |
+| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) `cmd_mla` | `mla` 子命令：缓存字节账本 → 吸收算力账本 → 约束自检 |
 
 **两个实现细节**：
 
@@ -279,7 +279,7 @@ cargo run --release -- mla
 | [`src/attention.rs`](../src/attention.rs) | `forward_mla_decoupled`（朴素可求导）/ `absorb_attention`（无梯度吸收）/ 6 个辅助函数 / 4 个账本函数 |
 | [`src/model.rs`](../src/model.rs) | `TransformerConfig` 的 `mla_rope_dim` / `mla_absorb` |
 | [`src/config.rs`](../src/config.rs) | 解耦与吸收的约束校验 |
-| [`src/main.rs`](../src/main.rs) | `cmd_mla` 三节账本 |
+| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) | `cmd_mla` 三节账本 |
 | [`docs/23-GQA分组查询注意力.md`](23-GQA分组查询注意力.md) | MLA 低秩压缩的基础（第 23 课延伸） |
 
 拓展方向：

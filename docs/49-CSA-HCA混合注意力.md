@@ -2,7 +2,7 @@
 
 > **本课已落地为可运行代码**：[`src/csa.rs`](../src/csa.rs)（三层覆盖 + 覆盖不变式 + 解析账本），
 > 接入 [`src/attention.rs`](../src/attention.rs) 的注意力分派与 [`src/model.rs`](../src/model.rs) 的 `TransformerBlock`，
-> 演示命令 [`src/main.rs`](../src/main.rs) 的 `cmd_csa`。
+> 演示命令 [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) 的 `cmd_csa`。
 > 配置开关：`model.csa_block` / `csa_top_k` / `hca_block`（默认全 `0` = 关闭）/ 命令 `cargo run -- csa`。
 >
 > 与第 23 课（MLA）/ 第 25 课（Flash Attention）的关系：Flash Attention 解决的是**怎么把
@@ -153,7 +153,7 @@ HCA（Hierarchical Compressed Attention）在细块之上**再平均 `hca_block`
 | [`src/csa.rs`](../src/csa.rs) `attention` | 三层前向：局部窗口 → 块均值 → top-k → HCA → `concat_last` 拼分数 → 一次 `masked_softmax` → 加权值 |
 | [`src/attention.rs`](../src/attention.rs) | `MultiHeadAttention` 新增 `csa: CsaOpts` 字段；`attend` 按 `use_csa` 分派到 `crate::csa::attention` 或原 `Tensor::flash_attention` |
 | [`src/model.rs`](../src/model.rs) | `TransformerConfig` 新增 `csa_block` / `csa_top_k` / `hca_block`；`TransformerBlock::new` 把配置写进 `a.csa` |
-| [`src/main.rs`](../src/main.rs) `cmd_csa` | `csa` 子命令：覆盖不变式 → KV 字节账本 → top-k 稀疏算力账本 |
+| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) `cmd_csa` | `csa` 子命令：覆盖不变式 → KV 字节账本 → top-k 稀疏算力账本 |
 
 **两个实现细节**：
 
@@ -287,7 +287,7 @@ cargo run --release -- csa
 | [`src/csa.rs`](../src/csa.rs) | `CsaOpts`、因果判据（`fine_blocks` / `coarse_blocks` / `covered_positions`）、`select_topk`、张量辅助、三层 `attention`、字节 / 算力账本 |
 | [`src/attention.rs`](../src/attention.rs) | `attend` 里按 `use_csa` 在 CSA 与 `flash_attention` 之间分派 |
 | [`src/model.rs`](../src/model.rs) | `TransformerConfig` 的三个开关字段与 `TransformerBlock` 的接线 |
-| [`src/main.rs`](../src/main.rs) | `cmd_csa` 的三节账本打印 |
+| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) | `cmd_csa` 的三节账本打印 |
 
 拓展方向：
 

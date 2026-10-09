@@ -34,6 +34,20 @@ use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 7] = b"LLMCP2\n";
 
+/// checkpoint 头部 schema 版本（当前实现写出的值）。
+///
+/// 版本号解决的是「逐字段 `serde(default)` 演进」兜不住的问题：字段**语义**变了
+/// （重命名、单位变化、默认值含义变化）时，旧档读进来字段齐全但含义错了，
+/// 静默误读比解析失败更危险。规则：
+/// - 旧档没有该字段 → 按 0（版本号引入前的历史格式）读入，读取路径不变；
+/// - 读到比当前更新的版本 → 直接拒绝（新版程序写的档，旧版程序没有能力正确解释）。
+const SCHEMA_VERSION: u32 = 1;
+
+/// `schema_version` 缺失时的默认值：版本号引入之前的所有历史档统称 v0。
+fn legacy_schema_version() -> u32 {
+    0
+}
+
 /// checkpoint 头（JSON 部分）：只放标量和元信息，张量数据一律走后面的二进制块
 #[derive(Serialize, Deserialize)]
 struct CkptHeader {
@@ -65,6 +79,10 @@ struct CkptHeader {
     /// `serde(default)` 让三段式旧档（没有这个字段）按 `false` 照常读入。
     #[serde(default)]
     weights_only: bool,
+    /// 头部格式版本；缺失（旧档）按 0 读入，写出恒为 [`SCHEMA_VERSION`]。
+    /// 语义与校验规则见 [`SCHEMA_VERSION`]。
+    #[serde(default = "legacy_schema_version")]
+    schema_version: u32,
 }
 
 /// 单个参数的元信息
@@ -165,6 +183,7 @@ fn make_header(
         lora: model.lora.clone(),
         quant: model.quant_meta(),
         weights_only,
+        schema_version: SCHEMA_VERSION,
     }
 }
 
@@ -332,6 +351,13 @@ fn read_head(f: &mut File, path: &str) -> (CkptHeader, usize) {
         .unwrap_or_else(|e| panic!("读取 {path} JSON 头失败（文件过短或损坏）: {e}"));
     let header: CkptHeader = serde_json::from_slice(&json)
         .unwrap_or_else(|e| panic!("解析 checkpoint 头失败: {e}"));
+    // 拒绝比当前实现更新的格式：新版可能改了字段语义，静默按旧语义误读比报错更危险
+    assert!(
+        header.schema_version <= SCHEMA_VERSION,
+        "checkpoint schema v{} 比当前实现（v{SCHEMA_VERSION}）更新：{path} 由新版程序写出，\
+         请用新版程序加载",
+        header.schema_version
+    );
     (header, json_len)
 }
 

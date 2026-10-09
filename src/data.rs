@@ -635,6 +635,9 @@ pub struct SftLoader {
     block_size: usize,
     batch_size: usize,
     val_start: usize,
+    /// 是否只把回答段计入 loss（默认 true = 对齐 SFT 训练口径）。
+    /// 置 false 时采样不带掩码（整段对话全 token 计 loss），供 eval 作诊断口径。
+    mask_response: bool,
 }
 
 impl SftLoader {
@@ -676,7 +679,15 @@ impl SftLoader {
             block_size,
             batch_size,
             val_start,
+            mask_response: true,
         }
+    }
+
+    /// 关掉「只计回答段」的掩码：采样返回无掩码批次，整段对话全 token 计 loss。
+    /// 仅供 eval 的诊断口径（看模型对提问/角色标记这些非监督位置的建模情况）；
+    /// **训练必须保持默认开启**，否则优化目标和 SFT 的监督口径就对不上了。
+    pub fn set_mask_response(&mut self, on: bool) {
+        self.mask_response = on;
     }
 
     pub fn num_conversations(&self) -> usize {
@@ -722,7 +733,9 @@ impl SftLoader {
             }
             mask.extend(window_mask(&self.sup, start, self.block_size));
         }
-        (x, y, Some(mask))
+        // 关掉掩码时返回 None：全 token 计 loss（eval 的诊断口径，见 set_mask_response）
+        let mask = self.mask_response.then_some(mask);
+        (x, y, mask)
     }
 }
 
@@ -1234,6 +1247,7 @@ mod tests {
             block_size: 4,
             batch_size: 2,
             val_start: n / 2,
+            mask_response: true,
         };
         let mut rng = Rng::new(42);
         let mut saw_sup = false;
@@ -1263,6 +1277,7 @@ mod tests {
             block_size,
             batch_size: 3,
             val_start,
+            mask_response: true,
         };
         let mut rng = Rng::new(1);
         let (x, y, mask) = loader.eval_batch(&mut rng);

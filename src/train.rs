@@ -26,12 +26,13 @@ use crate::config::TrainConfig;
 use crate::data::BatchSource;
 use crate::loss::cross_entropy_loss_masked;
 use crate::model::Transformer;
-use crate::module::{Module, zero_grad_all};
+use crate::module::Module;
 use crate::optim::{AdamW, Muon, OptimizerState};
 use crate::rng::Rng;
 use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
 use crate::{checkpoint, checkpoint::Checkpoint};
+use rayon::prelude::*;
 
 /// 混合精度训练（Automatic Mixed Precision，AMP）的损失缩放机制
 ///
@@ -92,17 +93,16 @@ impl MixedPrecision {
     /// 返回 true = 无溢出，可以更新参数；false = 有溢出，跳过本步。
     /// 如果无溢出，还会尝试增长 scale。
     pub fn check_and_update(&mut self, params: &[Tensor]) -> bool {
-        // 检查所有参数的梯度是否有 NaN/Inf
-        for p in params {
+        // 检查所有参数的梯度是否有 NaN/Inf（参数间并行短路，找到一个坏值即停）
+        let overflow = params.par_iter().any(|p| {
             let g = p.grad.borrow();
-            for &v in g.iter() {
-                if v.is_nan() || v.is_infinite() {
-                    // 溢出：scale 减半，重置计数
-                    self.scale = (self.scale * 0.5).max(self.min_scale);
-                    self.growth_steps = 0;
-                    return false;
-                }
-            }
+            g.iter().any(|v| v.is_nan() || v.is_infinite())
+        });
+        if overflow {
+            // 溢出：scale 减半，重置计数
+            self.scale = (self.scale * 0.5).max(self.min_scale);
+            self.growth_steps = 0;
+            return false;
         }
         // 无溢出：计数 +1，达到阈值时 scale 翻倍
         self.growth_steps += 1;
@@ -123,11 +123,12 @@ impl MixedPrecision {
     /// - 进度日志里的梯度范数是假的，看不出真实量级，梯度异常时无法察觉。
     pub fn unscale_gradients(&self, params: &[Tensor]) {
         let inv_scale = 1.0 / self.scale;
+        // 参数间串行、参数内按元素并行（与 optim 的更新循环同一风格）
         for p in params {
-            let mut g = p.grad.borrow_mut();
-            for v in g.iter_mut() {
-                *v *= inv_scale;
-            }
+            p.grad
+                .borrow_mut()
+                .par_iter_mut()
+                .for_each(|v| *v *= inv_scale);
         }
     }
 }
@@ -278,18 +279,23 @@ pub fn lr_scheduler(cfg: &TrainConfig, total_steps: usize) -> LRScheduler {
 /// 梯度裁剪：如果所有参数梯度的总范数超过 max_norm，就整体等比缩放。
 /// 防止个别大梯度把参数"推飞"，这是训练 LLM 的标准防爆措施。
 pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
-    let mut total = 0.0f32;
-    for p in params {
-        let g = p.grad.borrow();
-        total += g.iter().map(|v| v * v).sum::<f32>();
-    }
+    // 范数按参数并行归约（每个参数一个独立 sum，闭包内自行 borrow）
+    let total: f32 = params
+        .par_iter()
+        .map(|p| {
+            let g = p.grad.borrow();
+            g.iter().map(|v| v * v).sum::<f32>()
+        })
+        .sum();
     let norm = total.sqrt();
     if norm > max_norm {
         let scale = max_norm / norm;
+        // 参数间串行、参数内按元素并行（与 optim 的更新循环同一风格）
         for p in params {
-            for v in p.grad.borrow_mut().iter_mut() {
-                *v *= scale;
-            }
+            p.grad
+                .borrow_mut()
+                .par_iter_mut()
+                .for_each(|v| *v *= scale);
         }
     }
 }
@@ -298,7 +304,9 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
 ///
 /// `eval_iters` 批的平均，调用方用固定种子的 Rng 可保证结果可复现。
 pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usize, rng: &mut Rng) -> f32 {
-    zero_grad_all(model); // 评估前清零梯度，避免残留影响
+    // 注意：这里**不能**清零梯度——评估点 (step+1)%eval_every==0 与梯度累积边界
+    // (step+1)%accum==0 是独立条件，accum>1 时中途清零会静默丢掉半个累积窗口的梯度。
+    // 评估本身是 no_grad 前向，不会写入梯度，残留梯度也不影响前向结果。
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
         let (x, y, mask, pixels) = loader.eval_batch_mm(rng);

@@ -1,6 +1,6 @@
 # 第 16 课：训练小 Transformer —— 看 loss 从 1.30 降到 0.16
 
-> 代码位置：[src/main.rs](../src/main.rs)（`demo_transformer`）
+> 代码位置：[src/cmd/experiments.rs](../src/cmd/experiments.rs)（`demo_transformer`）
 > 代码位置：[src/train.rs](../src/train.rs)（`train_transformer` / `LRScheduler` / `clip_grad_norm`）
 > 代码位置：[src/data.rs](../src/data.rs)（`CORPUS` / `DataLoader`）
 > 代码位置：[src/sample.rs](../src/sample.rs)（`generate` / `sample_token`）
@@ -19,7 +19,7 @@
 
 ## 2. 训练全景：demo_transformer 做了什么
 
-`src/main.rs` 的演示 3（第 12-21 课）是本节的主角：
+`src/cmd/experiments.rs` 的演示 3（第 12-21 课）是本节的主角：
 
 ```rust
 fn demo_transformer() {

@@ -220,13 +220,15 @@ cargo run --release -- train [参数]
 ```text
 魔数 "LLMCP2\n"（7 字节）
 u32 小端：JSON 头长度
-JSON 头：step、best_val_loss、模型配置、优化器步数 opt_t、参数元信息（名字 + 形状）
+JSON 头：schema_version、step、best_val_loss、模型配置、优化器步数 opt_t、参数元信息（名字 + 形状）
 参数数据块：按参数顺序拼接的 f32 小端
 一阶动量 m 数据块：与参数同样的顺序与形状（续训用）
 二阶动量 v 数据块：与参数同样的顺序与形状（续训用）
 ```
 
 三段数据块等长（都是「参数总元素数 × 4」字节），所以**文件大小只由模型结构决定、与数值无关**。JSON 头里只有标量和元信息，占比极小——例如 144 万参数的模型，17.3MB 的存档里 JSON 头只有 1961 字节。
+
+**头部版本 `schema_version`**：写出恒为当前版本（现为 1）；**旧档缺失该字段按 0 读入**，读取路径不变；读到比当前实现更新的版本则**直接报错拒绝加载**——新版可能改了字段语义，静默按旧语义误读比报错更危险。
 
 注意 `.ckpt` 只是文件后缀，不代表内部格式。旧版（`LLMCP1`）的内容是「魔数 + **51.3MB JSON 文本头** + 7.4MB 二进制参数块」：**参数本来就是二进制**，被文本编码撑大的是**优化器状态**——`m` / `v` 当时是 JSON 头里的两个字段，一个 f32 平均要 13~14 字节（二进制只要 4 字节）。同一个 184 万参数的模型（`config/config.json`），58.6MB 的存档里 87% 都花在这上面，把 `m` / `v` 也改成数据块后降到 22.1MB。文本还有个隐患：JSON 没有 `NaN` / `Infinity` 字面量，`serde_json` 会把它写成 `null`，读回时直接反序列化失败——训练一发散，存档就变成读不回来的废文件。
 
@@ -320,6 +322,9 @@ cargo run --release -- eval [参数]
 | `--ckpt <路径>` | string | 无（缺省用 `{out_dir}/latest.ckpt`） | checkpoint 文件路径 |
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--merge-lora` | flag | 关 | 推理前把 LoRA 增量就地并进主干权重（数值不变，省掉每层两次小矩阵乘）；基座无适配层时只打一行警告 |
+| `--template <text\|sft>` | 枚举 | `text` | 评估口径：`text` = 纯文本验证集（预训练模型）；`sft` = 对话语料按 SFT 模板解析（**SFT / LoRA 对话模型必须用这个**，否则拿文本口径评估对话模型，loss 跨口径不可比） |
+| `--sft-file <路径>` | string | config 的 `train.sft_file` | SFT 语料路径（仅 `--template sft` 时读取），逗号分隔，每项可为文件、目录或含 `*` 的路径 |
+| `--mask-response` | flag | 关 | 只把回答段计入 loss（仅 `--template sft` 有意义）。不给此项则整段对话全 token 计 loss，作诊断口径；**对齐训练口径时应带上** |
 
 **评估指标**：
 - `val_loss` —— 验证集上的交叉熵损失
@@ -350,6 +355,12 @@ cargo run --release -- eval --config config/config.json --ckpt /path/to/my_model
 # 仓库里只有 config/config.json，其余配置要先 `preset` 生成，例如：
 cargo run --release -- preset --name large --output config/config_large.json
 cargo run --release -- eval --config config/config_large.json --ckpt checkpoints/latest.ckpt
+
+# ── 对话模型按训练口径评估（SFT / LoRA 模型必用，否则 loss 与训练不可比）──
+# sft 模板解析语料 + 只对回答段计 loss，与 SFT 训练时的 loss 口径完全一致
+cargo run --release -- eval --ckpt checkpoints/zh-sft/best.ckpt --template sft --mask-response
+# 整段对话全 token 计 loss（诊断口径：看模型对模板本身熟不熟）
+cargo run --release -- eval --ckpt checkpoints/zh-sft/best.ckpt --template sft
 
 # ── GPU 加速评估 ──
 cargo run --release --features gpu -- eval --config config/config.json
@@ -938,7 +949,7 @@ B: 吃了
 **EOS 特殊 token**：它可训练、每段回答都拿它当监督目标，模型学到的是明确的"说完了"，
 不再依赖任何字符组合——所以模板是 `用户：` / `助手：` + EOS，而不是 `### 用户：` 这种
 Markdown 风格标记，也不再需要 `。。`（它只对老分词器训出来的权重有意义，见
-[`SFT_STOP`](file:///d:/Code/Rust/llm_from_scratch/src/main.rs) 的兜底注释）。
+[`SFT_STOP`](file:///d:/Code/Rust/rust-llm/src/prompt.rs#L18) 的兜底注释）。
 
 **示例**：
 
@@ -1437,9 +1448,10 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-默认构建运行 **361 个单元测试**（零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
+默认构建运行 **368 个测试**（366 个单元测试 + 2 个集成冒烟测试 `tests/smoke.rs`：启动真实二进制跑
+`--help` 与 `preset`；零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒）；
 加 `--features gpu` 再跑 9 个 GPU 一致性 / 标定测试（`src/gpu.rs`），
-合计 370 个。GPU 用例会真实创建 wgpu 设备并逐个形状比对
+合计 377 个。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
 
@@ -1576,6 +1588,17 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `test_restore_tolerates_extra_vision_params` | checkpoint 只带主干参数时仍能恢复（视觉塔参数另存 / 多出参数容忍） |
 | `b64encode_matches_rfc4648_vectors` | 手写 base64：RFC 4648 标准向量 + 多字节 UTF-8 |
 | `generated_image_uri_decodes_full_segment` | 生成图 data URI：完整码本段 → PNG → base64；没出图 / 没配 VQ-VAE 返回 None |
+| `reachable_prune_keeps_cold_branch` | backward 可达集裁剪：没参与损失的冷分支不回传、条目留在 tape 上，等它自己的根 backward 时再执行（懒回收语义） |
+| `interleaved_graphs_backward_independently` | 交错 micro-batch 语义：两张图登记到同一 tape 各自独立 backward，先反 A 不动 B 的条目与梯度 |
+| `clear_tape_discards_pending_entries` | `clear_tape` 丢弃全部挂起条目后 backward 算不出梯度；之后新登记的图照常工作 |
+| `finite_difference_matches_analytic` | 中心差分数值梯度 vs 解析梯度对拍（matmul / tanh / mul / sum 四段链式法则） |
+
+集成冒烟测试（`tests/smoke.rs`，启动真实二进制，区别于上面的进程内单元测试）：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `help_lists_subcommands` | `--help` 正常退出且列出 train / eval / generate / serve / preset 等子命令 |
+| `preset_writes_config_file` | `preset --output` 落盘的配置是合法 JSON 且含 `model` / `train` / `n_embd` 字段 |
 
 `--features gpu` 额外 9 个（都在 `src/gpu.rs`）：
 
@@ -1966,6 +1989,7 @@ SwiGLU 就足以让整条路径放弃）。
 llm_from_scratch/
 ├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / tiny_http / image（仅编解码）/ windows-sys + 可选 wgpu / pollster
 ├── README.md           # 本文件
+├── .cargo/config.toml  # 编译配置：target-cpu=native（AVX2+FMA 向量化）+ /STACK:64MB（MSVC 主线程默认栈仅 1MB，debug 下 clap 解析超大子命令枚举会栈溢出）
 ├── config/             # 配置文件目录
 │   ├── config.json     #   默认训练配置（模型超参 + 训练参数）
 │   └── vlm.json        #   多模态训练配置（vision + vq + vlm_file / vq_steps）
@@ -1982,8 +2006,12 @@ llm_from_scratch/
 │                       #      corpus_perf/（性能测试用节选）、sft/（SFT 问答语料 zh_qa.txt）
 │                       #      vlm/（多模态：360 张 64×64 合成图 img/ + 720 条图文 vlm.jsonl）、vlm_train.txt（VLM BPE 语料）
 ├── src/
-│   ├── main.rs         # CLI 入口：train / eval / generate / chat / serve / sft / finetune / preset / demo / bench
-│   │                   #           scaling / moe / quant / distributed / align / rag / speculative / distill / fp8 / fp4 / csa / mla
+│   ├── main.rs         # CLI 入口：模块声明 + 解析参数后分发到 src/cmd/ 各实现
+│   ├── cmd/            # 子命令实现（原 main.rs 6500 余行按职责拆分）
+│   │   ├── mod.rs      #   公共 helper：配置/分词器加载、指标格式化、LoRA/量化装载等 15 个
+│   │   ├── core.rs     #   train / eval / generate / sft / finetune / preset / bench / quant
+│   │   ├── deploy.rs   #   chat / serve
+│   │   └── experiments.rs # scaling / moe / distributed / align / rag / speculative / distill / fp8 / fp4 / csa / mla / demo
 │   ├── cli.rs          # 命令行定义（clap）
 │   ├── config.rs       # 配置加载（serde）+ 目录约定常量（config/、checkpoints/、logs/）+ 超参校验（含 MLA kv_lora_rank / mla_rope_dim / mla_absorb、lr_schedule / optimizer / wsd_decay_frac / muon_* 约束）
 │   ├── runlog.rs       # 运行日志：每次训练 / 推理自动写 logs/{操作}_{时间戳}.log（命令行 + 完整配置 + 过程输出）
@@ -2019,6 +2047,8 @@ llm_from_scratch/
 │   ├── mhc.rs          # mHC 流形约束超连接：多条并行残差流的读出 / 写入 + Sinkhorn–Knopp 投影到双随机矩阵（第 47 课）
 │   ├── fp4.rs          # FP4 低精度**模拟**：E2M1 编解码 + nibble 打包 + 分块缩放往返误差（第 48 课）
 │   └── csa.rs          # CSA + HCA 混合注意力：块均值压缩 + top-k 稀疏 + 分层密集覆盖，三层并入一次 softmax（第 49 课）
+├── tests/
+│   └── smoke.rs        # 集成冒烟测试：启动真实二进制验证 --help 子命令齐全、preset 写出合法 JSON 配置
 ├── openapi/           # OpenAPI 接口规范静态版（serve 启动时自动写出，与端点同源，删了会重建）
 │   ├── openapi.json   #   OpenAPI 3.1，JSON（缩进输出），可导入 Postman / Apifox / Swagger UI
 │   └── openapi.yaml   #   同一份规范的 YAML 格式
@@ -2073,7 +2103,7 @@ llm_from_scratch/
 
 ## 代码验证状态
 
-- **361 个单元测试全部通过**（`cargo test --bin llm_from_scratch` → `361 passed; 0 failed`；
+- **368 个测试全部通过**（`cargo test` → 单元 `366 passed; 0 failed` + 集成 smoke `2 passed; 0 failed`；
   GPU 用例需 `--features gpu`，另计）（详见 [§14 `cargo test`](#14-cargo-test--单元测试)）
 - **`cargo check --tests` 零警告**（含单测的编译无任何 warning）；**`cargo build` 与 `cargo build --features gpu` 编译通过、无 error**：
   非测试构建剩余的是 `dead_code` 警告，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
@@ -2085,7 +2115,8 @@ llm_from_scratch/
   `Gelu::gelu_weights` 的调用点全在 GPU 常驻路径，`Tensor::neg` 则是逐元素算子集里的一员。
   后一类已按调用条件标了 `#[allow(dead_code)]` / `#[cfg_attr(not(feature = "gpu"), allow(dead_code))]` 并在注释里写明，
   不带 gpu feature 编译时不会混进 `never used` 噪声
-- 测试覆盖：自动微分、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
+- 测试覆盖：**自动微分 tape（可达集裁剪冷分支不回传、交错 micro-batch 独立反向、clear_tape 作用域、
+  finite-difference 与解析梯度对拍）**、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
   RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛、
   重复惩罚、checkpoint 二进制往返（含 NaN/±Inf）、**SFT 对话解析 / loss 掩码对齐 / 批次形状**、
   **LoRA（零初始化前向不变、冻结主干无梯度、可训练集合、挂载位置生效、合并前后前向等价、续训保留旧数值、存档往返）**、
@@ -2102,7 +2133,8 @@ llm_from_scratch/
   `vq.ckpt` 存取往返、VQ 预训练 smoke、`<|image|>` 展开与存档存活 / 特殊 token 校验、
   `forward_mm` 注入视觉且纯文本路径逐位一致、VlmLoader pad / 像素携带 / 恰好一个图片字面量、
   生成序列切换混批、图片段状态机与掩码、`with_pixels` 注入与滑窗回退、checkpoint 容忍视觉参数、
-  base64 RFC 4648 向量、`generated_image_uri` 整段解码）**
+  base64 RFC 4648 向量、`generated_image_uri` 整段解码）、
+  **CLI 进程级冒烟（`--help` 子命令齐全、`preset` 写出合法 JSON 配置）**
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、Transformer 训练 loss 1.30→0.16、文本生成正常
 - **工程化功能已全部集成**：监督微调（`sft`，带 loss 掩码，默认输出到 `{out_dir}-sft`，不覆盖预训练权重）、
   LoRA 微调（`finetune`，冻结主干只训适配层，实测可训练参数 1.32%，可选挂载位置 / 链式续训 / 推理合并，默认输出到 `{out_dir}-lora`）、

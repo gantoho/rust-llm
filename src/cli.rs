@@ -108,6 +108,17 @@ pub enum Cmd {
         /// 推理前把 LoRA 增量合并进主干权重（省掉每层两次小矩阵乘，数值不受影响）
         #[arg(long)]
         merge_lora: bool,
+        /// 评估口径：text = 纯文本验证集（预训练模型）；sft = 对话语料按 SFT 模板
+        /// 解析（SFT/LoRA 模型必须用这个，否则拿文本口径评估对话模型，loss 跨口径不可比）
+        #[arg(long, value_parser = ["text", "sft"], default_value = "text")]
+        template: String,
+        /// SFT 语料路径（仅 --template sft 时使用；缺省取 config 的 train.sft_file）
+        #[arg(long)]
+        sft_file: Option<String>,
+        /// 只把回答段计入 loss（仅 --template sft 有意义）。不给此项则整段对话
+        /// 全 token 计 loss，作诊断口径；对齐训练口径时应带上
+        #[arg(long)]
+        mask_response: bool,
     },
     /// 用训练好的模型生成文本
     Generate {

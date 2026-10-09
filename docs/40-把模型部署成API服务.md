@@ -1,6 +1,6 @@
 # 第 40 课：把模型部署成 API 服务 —— 从"自己跑"到"给别人调"
 
-> 代码位置：`src/serve.rs`（约 1300 行）、`src/cli.rs`（`serve` 子命令）、`src/main.rs`（`cmd_serve`）、`src/sample.rs`（Generator 状态机）
+> 代码位置：`src/serve.rs`（约 1300 行）、`src/cli.rs`（`serve` 子命令）、`src/cmd/deploy.rs`（`cmd_serve`）、`src/sample.rs`（Generator 状态机）
 >
 > 本课无新算法，讲的是**部署**：如何把前 39 课训练出来的模型包装成一个
 > 和主流大模型厂商（OpenAI / DeepSeek / 智谱…）接口形状一致的 HTTP API，
@@ -70,7 +70,7 @@ src/serve.rs
 
 ### 3.2 加载链路复用 `cmd_chat`
 
-`cmd_serve`（[main.rs](../src/main.rs)）的前半段和 `cmd_chat` 一模一样：
+`cmd_serve`（[cmd/deploy.rs](../src/cmd/deploy.rs)）的前半段和 `cmd_chat` 一模一样：
 配置 → 分词器 → checkpoint → LoRA 合并 → RoPE 覆盖。区别只在最后一步：不进
 REPL，而是把模型和默认采样参数打包成 `ServeCfg` 交给 `serve::run`。这样
 **chat 和 serve 永远不会跑出两套不同的加载逻辑**（RoPE 覆盖顺序、LoRA 合并

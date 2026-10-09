@@ -168,7 +168,7 @@ impl MoELayer {
 ## 本项目实现
 
 核心代码在 [`src/moe.rs`](../src/moe.rs)，接线在 [`src/model.rs`](../src/model.rs)，
-演示命令是 `cargo run --release -- moe`（[`src/main.rs`](../src/main.rs) 的 `cmd_moe`）。
+演示命令是 `cargo run --release -- moe`（[`src/cmd/experiments.rs`](../src/cmd/experiments.rs) 的 `cmd_moe`）。
 18 个单测全部与 CPU 参考实现对齐（其中 4 个专测 aux-loss-free 均衡偏置与共享专家）。
 
 ### 公开 API

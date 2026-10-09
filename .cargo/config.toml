@@ -6,5 +6,11 @@
 #
 # 注意：target-cpu=native 产出的二进制只能在同类 CPU 上跑（本机训练无妨）。
 # 若要分发给别人，改成 rustflags = ["-C", "target-feature=+avx2,+fma"]。
+#
+# /STACK:67108864（2026-10-09 新增）：MSVC 默认主线程栈仅 1MB，debug 构建下
+# clap derive 解析超大 Cmd 枚举的栈帧总和超过 1MB，导致 `cargo test --test smoke`
+# 里二进制一启动（Cli::parse_args）就 0xC00000FD 栈溢出；release 帧小所以不触发。
+# RUST_MIN_STACK 只作用于 spawn 出的线程，改不了主线程，必须在链接期指定 /STACK。
+# 该 flag 只对 windows-msvc 链接器有效，其它 target 请去掉此行。
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=/STACK:67108864"]
