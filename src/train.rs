@@ -303,6 +303,9 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
 /// 在验证集上评估：平均 loss（perplexity = e^loss）
 ///
 /// `eval_iters` 批的平均，调用方用固定种子的 Rng 可保证结果可复现。
+/// 前向与交叉熵走训练同款 GPU 常驻路径（整叠 + 融合输出头）：no_grad 下
+/// 常驻反向闭包不登记进图（见 [`Tensor::external_scalar_loss`]），只回读一个标量，
+/// 逐算子的 580 次提交因此收敛到每批 2 次；带 SFT 掩码时输出头自动回落逐算子。
 pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usize, rng: &mut Rng) -> f32 {
     // 注意：这里**不能**清零梯度——评估点 (step+1)%eval_every==0 与梯度累积边界
     // (step+1)%accum==0 是独立条件，accum>1 时中途清零会静默丢掉半个累积窗口的梯度。
@@ -310,17 +313,25 @@ pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usiz
     let mut total = 0.0f32;
     for _ in 0..eval_iters {
         let (x, y, mask, pixels) = loader.eval_batch_mm(rng);
-        // 评估只做前向，无需建图：no_grad 下省掉整张计算图
+        // 评估只做前向，无需建图：no_grad 下省掉整张计算图；
+        // 不经过 forward_mm 的输出头 matmul，改由常驻输出头与 CE 融合算完
         let loss = crate::tensor::no_grad(|| {
-            let logits = model.forward_mm(
+            let hidden = model.forward_hidden_mm(
                 &x,
                 loader.batch_size(),
                 loader.block_size(),
                 pixels.as_deref(),
-                None,
                 false,
             );
-            cross_entropy_loss_masked(&logits, &y, mask.as_deref())
+            cross_entropy_with_head(
+                model,
+                &hidden,
+                &y,
+                mask.as_deref(),
+                loader.batch_size(),
+                loader.block_size(),
+                1,
+            )
         });
         total += loss.item();
     }
@@ -414,7 +425,9 @@ fn cross_entropy_with_head(
     let hidden = hidden.clone();
 
     #[cfg(feature = "gpu")]
-    if mask.is_none() && crate::tensor::grad_enabled() {
+    // 评估（no_grad）也走常驻路径：融合核只算前向、回读每行 CE 与标量 loss，
+    // 反向闭包由 `Tensor::external_scalar_loss` 的 grad 守卫拦下、不进计算图
+    if mask.is_none() {
         let rows = batch_size * block_size;
         let d = hidden.shape()[1];
         let vocab = head.shape()[0];

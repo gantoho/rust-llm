@@ -673,8 +673,7 @@ impl MLPEnum {
         }
     }
 
-    /// GELU 分支的 `(W₁, b₁, W₂, b₂)`；SwiGLU 分支返回 None
-    /// （GPU 常驻显存路径目前只实现了经典风格的 GELU MLP）
+    /// GELU 分支的 `(W₁, b₁, W₂, b₂)`；SwiGLU 分支返回 None（走 [`MLPEnum::swiglu_weights`]）
     ///
     /// 同 [`NormLayer::norm_params`]：调用点只在 gpu feature 下，不带时是"死代码"，别删。
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
@@ -687,6 +686,25 @@ impl MLPEnum {
                 &linear2.bias,
             )),
             MLPEnum::SwiGLU(_) => None,
+        }
+    }
+
+    /// SwiGLU 分支的 `(W_gate, b_gate, W_up, b_up, W_down, b_down)`；
+    /// GELU 分支返回 None（走 [`MLPEnum::gelu_weights`]）
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub fn swiglu_weights(
+        &self,
+    ) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
+        match self {
+            MLPEnum::SwiGLU(s) => Some((
+                &s.w_gate.weight,
+                &s.w_gate.bias,
+                &s.w_up.weight,
+                &s.w_up.bias,
+                &s.w_down.weight,
+                &s.w_down.bias,
+            )),
+            MLPEnum::GELU { .. } => None,
         }
     }
 

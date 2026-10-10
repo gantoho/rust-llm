@@ -1609,7 +1609,7 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `gpu_lm_head_ce_matches_loop_reference` | 输出头融合 CE 的前向 loss + 反向 `d_hidden` / `d_weight` vs 纯循环参考 |
 | `gpu_mlp_resident_matches_loop_reference` | 前馈常驻链路（含 dropout）前向输出 + 7 项梯度（第 2 组跨 256 归约边界） |
 | `gpu_attn_layer_resident_matches_loop_reference` | 注意力常驻链路前向 + 11 项边界梯度 |
-| `gpu_stack_resident_matches_sublayer_reference` | 整叠常驻路径前向 + `dx` + 每层 16 项参数梯度 vs 逐子层常驻路径 |
+| `gpu_stack_resident_matches_sublayer_reference` | 整叠常驻路径前向 + `dx` + 每层 16/18 项参数梯度（GELU/SwiGLU，含 3 个 SwiGLU case）vs 逐子层常驻路径 |
 | `gpu_matmul_small_tile_matches_big_tile_bits` | 4 形状 × 4 转置组合下，64×64 与 128×128 两个 matmul 内核输出**逐位相同** |
 | `matmul_throughput_probe`（`#[ignore]`） | 单次提交内连跑同一 matmul，测**纯内核**吞吐（排除回读造成的假象） |
 | `mm_tile_ab_probe`（`#[ignore]`） | 同进程内按「大 → 小」交替各 3 轮，标定两种 tile 的 ms 与 GFLOP/s |
@@ -1671,24 +1671,29 @@ cargo run --features gpu -- demo
 |------|------|---------|--------------|
 | 输出头融合 CE | `gpu::lm_head_ce` | matmul → log_softmax → CE → dlogits | 2 项（d_hidden / d_weight） |
 | 注意力子层 | `gpu::attn_layer_forward` | ln1 → QKV → RoPE → attn → c_proj → dropout → 残差 | 11 项 |
-| 前馈子层 | `gpu::mlp_forward` | ln2 → linear1 → GELU → linear2 → dropout → 残差 | 7 项 |
-| 整叠 Block | `gpu::stack_forward` | 上述两条链路 × n_layer，子层边界也留在显存 | 每层 16 项 |
+| 前馈子层 | `gpu::mlp_forward` | ln2 → linear1 → GELU/SwiGLU → linear2 → dropout → 残差 | GELU 7 项 / SwiGLU 9 项 |
+| 整叠 Block | `gpu::stack_forward` | 上述两条链路 × n_layer，子层边界也留在显存 | 每层 16 项（SwiGLU 18 项） |
 
 走常驻路径时中间张量**全部留在显存不回读**，反向由 `Tensor::accumulate_grad` 把边界梯度注回计算图。
 效果最直观的是输出头：logits 有 4096×8192 = 3355 万个数，逐算子版一步来回 **268MB（实测 355ms）**，
 融合后只回读每行一个 f32 的 row_loss（约 16KB）。
 
-常驻路径的**适用条件**（任一不满足就自动回退逐算子 → CPU）：训练模式（无 KV cache、`base = 0`）、
-经典风格的 GELU MLP（SwiGLU 由调用方让路）、形状与规模够大。
+常驻路径的**适用条件**（任一不满足就自动回退逐算子 → CPU）：无 KV cache、`base = 0`（**评估的 no_grad 前向同样走这里**）、GELU 或 SwiGLU MLP（`SwiGLUMLP` 经 `mlp_swiglu_forward` 走常驻分支，前向融合 SiLU(gate)·up 内核，反向回读 9 项）、形状与规模够大。
+
+评估（`no_grad`）此前走逐算子路径，一次 20-iter 评估要打 580 次 run()、回读 134MB 的 logits；
+现在 `Tensor::external` / `external_scalar_loss` 的 record 按 `grad_enabled()` 守卫，no_grad 下只取前向值、
+不把反向闭包登记进图（闭包捕获的显存随对象释放，不泄漏），于是评估也走常驻输出头。同机短程 bench 实测：
+**0.42 → 0.31 s/步（-26%）**、总时长 21s → 15s、eval 段的逐算子 matmul 分流 **580 → 0**，
+`val 8.5975` 与逐算子版 `8.5977` 数值一致。
 
 归一化用 LayerNorm 还是 RMSNorm、K/V 是不是 GQA 的头数，都**不需要让路**——两者在参数层面
 就被抹平了：RMSNorm 与 LayerNorm 共用同一套归约内核，只靠一个模式位切换（RMSNorm 是
 "μ≡0、无 β"的特例）；GQA 则把 K/V 的**参数**按 `repeat_kv` 的同一套头顺序展开成 `n_head` 份
 （`expand_kv_head`）、反向再把梯度按组折回（`fold_kv_head_grad`），展开后与标准 MHA 同形，
 常驻路径一行内核都不用改。整叠路径默认**关闭**，用 `LLM_GPU_STACK` 打开——它与逐子层路径数值
-逐位一致，实测还**更快**（同配置 ABBA 两轮：0.59/0.60 s/步 vs 0.67/0.70 s/步，约快 12%）；
-默认关闭只是因为它的准入条件更严（要求所有层都是 GELU MLP——各层共用同一份配置，所以一个
-SwiGLU 就足以让整条路径放弃）。
+逐位一致，实测还**更快**（SwiGLU 配置同机对照：0.44 s/步 vs 0.53 s/步，约快 17%）；GELU 与
+SwiGLU 都已支持（每层分别回注 16/18 项参数梯度，默认关闭只剩准入条件更严——单流 +
+无 KV cache——以及整叠中间量同时驻留显存、峰值更高）。
 详见 [docs/27-GPU加速.md](docs/27-GPU加速.md) 的 §4 与 §8。
 
 **环境变量**：
@@ -2283,6 +2288,8 @@ cargo run --release -- bench --steps 30
 所有「要不要建图」的判断改走 `req()`（no_grad 模式下恒为 false）；
 `generate` / `beam_search` / `eval_loss` 的前向包进 `no_grad`。
 语义与 PyTorch 的 `torch.no_grad()` 一致，用 RAII 守卫恢复状态。
+`Tensor::external` / `external_scalar_loss` 的 `record` 也按 `grad_enabled()` 守卫，
+no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输出头（见 [§15 GPU 章节](#15-gpu-加速可选-feature)）。
 
 **收益**：推理 1.9~3.9×，且**训练路径完全不受影响**（已验证）。
 
@@ -2306,9 +2313,9 @@ cargo run --release -- bench --steps 30
   反向工作集是 **O(T²)**：长上下文时瓶颈已从前向转到反向
 - GPU 注意力常驻链路的 `col_sum` / 共享内存树形归约与 CPU 求和顺序不同，
   只做到相对误差 < 1e-3，未与 CPU 逐位对齐（其余 GPU 路径都是逐位一致）
-- 整叠常驻路径（`LLM_GPU_STACK=1`）虽然比逐子层常驻快约 12%，但默认关闭：
-  它的准入条件更严（要求所有层都是 LayerNorm + GELU MLP，任一层不满足就整条放弃），
-  且整叠中间量同时驻留显存，显存峰值更高
+- 整叠常驻路径（`LLM_GPU_STACK=1`）比逐子层常驻更快（SwiGLU 配置实测 0.44 vs 0.53 s/步），
+  但默认关闭：准入条件更严（单流 + 无 KV cache），且整叠中间量同时驻留显存，
+  显存峰值更高
 - `KVCache::append` 已改为在 `Vec<f32>` 上就地 `extend`（不再每步重拼整段历史），
   但 `k()` / `v()` 每步仍会克隆一次整段缓存（打分算子需要一个拥有所有权的 `Tensor`），可改为借用视图
 - Beam Search（`sample::beam_search`）已启用 KV cache：先对 prompt 做一次 prefill，

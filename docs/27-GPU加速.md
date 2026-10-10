@@ -126,8 +126,8 @@ matmul / scale / add / relu / 掩码 softmax 都走它，`tensor.rs` 里按 FLOP
 |------|------|---------|--------------|
 | 输出头融合 CE | `gpu::lm_head_ce` | matmul → log_softmax → CE → dlogits | 2 项（d_hidden / d_weight） |
 | 注意力子层 | `gpu::attn_layer_forward` | ln1 → QKV → RoPE → attn → c_proj → dropout → 残差 | 11 项 |
-| 前馈子层 | `gpu::mlp_forward` | ln2 → linear1 → GELU → linear2 → dropout → 残差 | 7 项 |
-| 整叠 Block | `gpu::stack_forward` | 上述两条链路 × n_layer，子层边界也留在显存 | 每层 16 项 |
+| 前馈子层 | `gpu::mlp_forward` | ln2 → linear1 → GELU/SwiGLU → linear2 → dropout → 残差 | GELU 7 项 / SwiGLU 9 项 |
+| 整叠 Block | `gpu::stack_forward` | 上述两条链路 × n_layer，子层边界也留在显存 | 每层 16 项（SwiGLU 18 项） |
 
 效果最直观的是输出头：logits 有 4096×8192 = 3355 万个数，逐算子版一步来回 **268MB（两次回读实测 355ms）**，
 融合后只回读每行一个 f32 的 `row_loss`（约 16KB）。
@@ -135,8 +135,14 @@ matmul / scale / add / relu / 掩码 softmax 都走它，`tensor.rs` 里按 FLOP
 **关键点：`attn_layer_forward` / `mlp_forward` 只替换「子层」**，调用方拿到结果后**必须继续往下走**
 （注意力子层的结果要作为前馈子层的输入）。这一点曾经写错过，代价很大，见 [§9](#9-踩坑记录)。
 
-**适用条件**（任一不满足就自动回退逐算子 → CPU）：训练模式（无 KV cache、`base = 0`）、
-经典风格的 GELU MLP（SwiGLU 由调用方让路）、形状与规模够大。
+**适用条件**（任一不满足就自动回退逐算子 → CPU）：无 KV cache、`base = 0`（**训练与评估的
+no_grad 前向都走这里**）、GELU 或 SwiGLU MLP、形状与规模够大。
+
+**评估也走常驻路径**：`Tensor::external` / `Tensor::external_scalar_loss` 原先无条件 `record`，
+no_grad 下会把永不 backward 的条目登进 tape，所以 eval 只能走逐算子。给这两处的 record 加上
+`grad_enabled()` 守卫（与普通算子的 `req()` 同口径）后，评估的前向与融合 CE 也进常驻链路。
+同机短程 bench：**0.42 → 0.31 s/步**、总时长 21s → 15s、eval 的逐算子 matmul 分流 **580 → 0**、
+`val 8.5975 ≈ 8.5977`（逐算子版）；训练步 fwd/bwd 67/173ms 无回归。
 
 归一化用 LayerNorm 还是 RMSNorm、K/V 是不是 GQA 的头数，都**不需要让路**——两者在参数层面
 就被抹平了：
@@ -157,9 +163,10 @@ matmul / scale / add / relu / 掩码 softmax 都走它，`tensor.rs` 里按 FLOP
 整叠把整叠的前向、反向各压成一次提交——省掉的是每次提交之后的 poll + 回读等待
 （本机实测：逐子层约 `20.7ms/次 × 多次/步`，整叠一次提交 66~96ms 覆盖所有层）。
 
-默认仍关闭，因为它的**准入条件更严**：整叠要求所有 Block 都满足常驻条件
-（GELU MLP——各层共用同一份配置，所以一个 SwiGLU 就足以让整条路径放弃），
-而逐子层是"哪个子层不满足就只回退那一个"。
+默认仍关闭，因为它的**准入条件更严**：整叠要求所有 Block 都满足常驻条件、整个模型走同一条
+链路（单流 + 无 KV cache，训练与 no_grad 评估都可走），而逐子层是"哪个子层不满足就只回退那一个"。
+GELU 与 SwiGLU 现在都已支持（每层分别回注 16/18 项参数梯度）——SwiGLU 配置同机对照实测
+整叠 `0.44 s/步` vs 逐子层 `0.53 s/步`，约快 17%。
 想复现对照实验或追求吞吐时设 `LLM_GPU_STACK=1`。
 
 ---

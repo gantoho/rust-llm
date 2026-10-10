@@ -1297,7 +1297,12 @@ impl Tensor {
             grad,
             requires_grad: Arc::new(AtomicBool::new(true)),
         };
-        record(&result, parents, Arc::from(f));
+        // 与普通算子的 `req()` 守卫同口径：no_grad（评估/推理）下只取前向值、不建图。
+        // 不守卫的话 tape 会登记一条永不 backward 的条目（评估不会调 backward），
+        // 闭包捕获的显存句柄要等整张 tape 释放才归还。
+        if grad_enabled() {
+            record(&result, parents, Arc::from(f));
+        }
         result
     }
 
@@ -1330,7 +1335,11 @@ impl Tensor {
             grad,
             requires_grad: Arc::new(AtomicBool::new(true)),
         };
-        record(&result, parents, Arc::from(f));
+        // 守卫理由同 [`Tensor::external_scalar_loss`]：no_grad 下不建图，
+        // f 被丢弃时闭包捕获的常驻显存句柄随之释放，不进 tape 也不泄漏。
+        if grad_enabled() {
+            record(&result, parents, Arc::from(f));
+        }
         result
     }
 

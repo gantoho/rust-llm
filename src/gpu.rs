@@ -122,9 +122,9 @@ static RECORDER_DIAG_LOG: Mutex<Vec<RecorderDiag>> = Mutex::new(Vec::new());
 
 /// 诊断：`device.create_buffer` 的次数与累计耗时。
 ///
-/// 常驻录制路径的中间张量全部走 `make_buf` **新建**显存对象，submit 后随句柄释放；
-/// 显存池只服务逐算子路径。若"录制"那一段的 CPU 时间主要花在这里，
-/// 说明瓶颈是显存对象的创建/销毁，而不是绑定与编码。
+/// 常驻录制路径的中间张量已全部改走 `take_buf` 复用池（P1-1），句柄析构后经
+/// [`PENDING`] 暂存、poll 之后入池。稳态下本计数应趋近 0（只剩首步预热）；
+/// 若仍持续增长，说明池键（size class × 用途）漏了某类形状，值得排查。
 static BUF_NEW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BUF_NEW_US: AtomicU64 = AtomicU64::new(0);
 /// 上次打印时的 (次数, 微秒)，用于报告增量
@@ -135,11 +135,11 @@ static BUF_NEW_LAST: Mutex<(usize, u64)> = Mutex::new((0, 0));
 /// 类别在 `batch_dispatch` 里**按管线对象识别**（`std::ptr::eq`），而不是让十几个调用点
 /// 各自传标签——调用点太多，漏一个就会静默记错账。
 pub mod opk {
-    pub const N: usize = 18;
+    pub const N: usize = 21;
     pub const NAMES: [&str; N] = [
         "matmul", "softmax_fwd", "softmax_bwd", "lm_ce", "ln_fwd", "ln_bwd_x", "ln_bwd_gb",
         "gelu_fwd", "gelu_bwd", "bias_drop_res", "dropout_bwd", "col_sum", "heads_split",
-        "heads_join", "add", "scale", "relu", "other",
+        "heads_join", "add", "scale", "relu", "swiglu_fwd", "swiglu_bwd", "add_bias", "other",
     ];
     pub const MATMUL: u8 = 0;
     pub const SOFTMAX_FWD: u8 = 1;
@@ -158,7 +158,10 @@ pub mod opk {
     pub const ADD: u8 = 14;
     pub const SCALE: u8 = 15;
     pub const RELU: u8 = 16;
-    pub const OTHER: u8 = 17;
+    pub const SWIGLU_FWD: u8 = 17;
+    pub const SWIGLU_BWD: u8 = 18;
+    pub const ADD_BIAS: u8 = 19;
+    pub const OTHER: u8 = 20;
 }
 
 /// 消融实验：让某一类算子只计数、不录制 dispatch，用「步时差」反推它的真实 GPU 耗时。
@@ -1444,6 +1447,51 @@ fn gelu_bwd_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     eo[i] = ea[i] * dy_dx;
 }
 
+/// 广播加偏置：eo[i] = a[i] + b[i % cols]。
+/// SwiGLU 的 up 支路先融偏置，SwiGLU 前向内核的三个只读绑定才装得下
+/// gate 输出 + gate 偏置 + up 激活（绑定上限 3 只读）。
+/// p0=元素数, p1=偏置长度；绑定：0=线性层输出, 1=偏置, 4=输出
+@compute @workgroup_size(256, 1, 1)
+fn add_bias_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let len = params.p0;
+    let cols = params.p1;
+    let i = gid.x;
+    if (i >= len) { return; }
+    eo[i] = ea[i] + eb[i % cols];
+}
+
+/// SwiGLU 前向 + gate 偏置融合：z = a + b_gate，eo = SiLU(z) ⊙ u，ep = z（反向要用；
+/// 存下来比在反向重算一次线性投影便宜得多）。
+/// p0=元素数, p1=偏置长度；绑定：0=gate 投影, 1=gate 偏置, 2=up 激活, 4=输出, 5=z
+@compute @workgroup_size(256, 1, 1)
+fn swiglu_fwd_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let len = params.p0;
+    let cols = params.p1;
+    let i = gid.x;
+    if (i >= len) { return; }
+    let z = ea[i] + eb[i % cols];
+    let sig = 1.0 / (1.0 + exp(-z));
+    eo[i] = (z * sig) * ec[i];
+    ep[i] = z;
+}
+
+/// SwiGLU 反向：eo = (dact·u)·dsig（gate 支路），ep = dact·SiLU(z)（up 支路），
+/// 其中 sig = σ(z)，dsig = sig·(1 + z·(1 - sig)) = d/dz[SiLU(z)]。
+/// p0=元素数；绑定：0=上游梯度, 1=前向存下的 z, 2=up 激活, 4=dz, 5=du
+@compute @workgroup_size(256, 1, 1)
+fn swiglu_bwd_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let len = params.p0;
+    let i = gid.x;
+    if (i >= len) { return; }
+    let z = eb[i];
+    let u = ec[i];
+    let sig = 1.0 / (1.0 + exp(-z));
+    let silu = z * sig;
+    let dsig = sig * (1.0 + z * (1.0 - sig));
+    eo[i] = (ea[i] * u) * dsig;
+    ep[i] = ea[i] * silu;
+}
+
 /// 线性层偏置 + dropout + 残差，三个逐元素算子融成一个：
 ///   eo[i] = ec[i] + drop_scale(i)·(ea[i] + b₂[i % p1])   （ec 是残差输入 x）
 /// p0=元素数, p1=偏置长度, p2=p(bitcast), p3=dropout 种子, p4=是否训练
@@ -1606,6 +1654,11 @@ pub struct GpuContext {
     ln_bwd_gb_pipe: wgpu::ComputePipeline,
     gelu_fwd_pipe: wgpu::ComputePipeline,
     gelu_bwd_pipe: wgpu::ComputePipeline,
+    /// SwiGLU 前向（gate 偏置融合 + SiLU(gate)·up）与反向（dz/du 两路）
+    swiglu_fwd_pipe: wgpu::ComputePipeline,
+    swiglu_bwd_pipe: wgpu::ComputePipeline,
+    /// 广播加偏置（SwiGLU up 支路融偏置）
+    add_bias_pipe: wgpu::ComputePipeline,
     /// 偏置 + dropout + 残差（三个逐元素算子融合）
     bdr_pipe: wgpu::ComputePipeline,
     dropout_bwd_pipe: wgpu::ComputePipeline,
@@ -1628,7 +1681,7 @@ pub struct GpuContext {
     fma_pipe: wgpu::ComputePipeline,
     /// 复用的参数 uniform buffer（24 字节，每次 write_buffer 覆盖）
     params_buf: wgpu::Buffer,
-    /// 存储/读回 buffer 池：键 = (字节数, 用途)，按需取还，避免每算子新建 GPU 对象
+    /// 存储/读回 buffer 池：键 = (size class 字节数, 用途)，按需取还，避免每算子新建 GPU 对象
     /// （用 Mutex 保证 GpuContext 可放进静态 OnceLock）
     pool: Mutex<HashMap<(u64, u8), Vec<wgpu::Buffer>>>,
 }
@@ -1989,6 +2042,9 @@ fn create() -> Option<GpuContext> {
     let ln_bwd_gb_pipe = make_elem(&device, &pl_b, "ln_bwd_gb_main");
     let gelu_fwd_pipe = make_elem(&device, &pl_c, "gelu_fwd_bias_main");
     let gelu_bwd_pipe = make_elem(&device, &pl_d, "gelu_bwd_main");
+    let swiglu_fwd_pipe = make_elem(&device, &pl_b, "swiglu_fwd_main");
+    let swiglu_bwd_pipe = make_elem(&device, &pl_b, "swiglu_bwd_main");
+    let add_bias_pipe = make_elem(&device, &pl_d, "add_bias_main");
     let bdr_pipe = make_elem(&device, &pl_a, "bias_dropout_residual_main");
     let dropout_bwd_pipe = make_elem(&device, &pl_e, "dropout_bwd_main");
     let col_sum_pipe = make_elem(&device, &pl_e, "col_sum_main");
@@ -2024,6 +2080,9 @@ fn create() -> Option<GpuContext> {
         ln_bwd_gb_pipe,
         gelu_fwd_pipe,
         gelu_bwd_pipe,
+        swiglu_fwd_pipe,
+        swiglu_bwd_pipe,
+        add_bias_pipe,
         bdr_pipe,
         dropout_bwd_pipe,
         col_sum_pipe,
@@ -2265,10 +2324,10 @@ impl GpuContext {
         r
     }
 
-    /// 从池中取一个 buffer（没有就新建）。池按 (字节数, 用途) 键控，
+    /// 从池中取一个 buffer（没有就新建）。池按 (size class, 用途) 键控，
     /// 训练中形状反复出现（QKV/MLP 都是 [B*T,D]×[D,D]），命中率很高。
     fn take_buf(&self, len: usize, kind: u8) -> wgpu::Buffer {
-        let key = ((len * 4) as u64, kind);
+        let key = (size_class((len * 4) as u64), kind);
         self.pool
             .lock()
             .unwrap()
@@ -2279,8 +2338,17 @@ impl GpuContext {
 
     /// 归还 buffer 回池。调用点都保证 GPU 已同步完成（poll wait 之后），可安全复用。
     fn put_buf(&self, buf: wgpu::Buffer) {
-        let key = (buf.size(), kind_of(&buf));
+        let key = (size_class(buf.size()), kind_of(&buf));
         self.pool.lock().unwrap().entry(key).or_default().push(buf);
+    }
+
+    /// 把已析构显存句柄的暂存区批量入池（见 [`PENDING`]）。
+    /// **只能在 poll(Wait) 之后调用**：彼时 GPU 已空闲，入池 buffer 才可被再次取用。
+    fn drain_pending(&self) {
+        let pending: Vec<wgpu::Buffer> = std::mem::take(&mut *PENDING.lock().unwrap());
+        for buf in pending {
+            self.put_buf(buf);
+        }
     }
 
     fn make_buf(&self, len: usize, kind: u8) -> wgpu::Buffer {
@@ -2295,7 +2363,7 @@ impl GpuContext {
         let t = std::time::Instant::now();
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pooled"),
-            size: (len * 4) as u64,
+            size: size_class((len * 4) as u64),
             usage,
             mapped_at_creation: false,
         });
@@ -2396,6 +2464,7 @@ impl GpuContext {
         drop(view);
         readback.unmap();
         self.put_buf(readback);
+        self.drain_pending();
         if diag_dump {
             let total = diag_t.elapsed();
             // 这里的"同步"只覆盖 map+poll+拷回三段，不含随后的 unmap/归还 buffer
@@ -2429,6 +2498,29 @@ fn kind_of(buf: &wgpu::Buffer) -> u8 {
         KIND_IN
     }
 }
+
+/// 把字节数上取整到 size class：≤64 KiB 按 4 KiB 粒度，>64 KiB 按 64 KiB 粒度。
+///
+/// 为什么需要（P1-2）：池若按精确字节数键控，`[8,512,128]` 与 `[8,512,120]` 这类
+/// 只差一个头/尾张量的形状互相看不见，命中率骤降。模型维度全是 2 的幂，
+/// 上取整后物理大小不变（浪费 ≈ 0）；唯一的例外是 24 字节 uniform → 4096，
+/// 远低于 64 KiB 的 uniform binding 上限，且内核只按参数读前 24 字节。
+fn size_class(bytes: u64) -> u64 {
+    const SMALL: u64 = 4 * 1024;
+    const BIG: u64 = 64 * 1024;
+    if bytes <= BIG {
+        bytes.div_ceil(SMALL) * SMALL
+    } else {
+        bytes.div_ceil(BIG) * BIG
+    }
+}
+
+/// 已析构显存句柄（[`GpuHandle`]）的 buffer 暂存区。
+///
+/// 为什么不直接回池（P1-1）：句柄可能在**录制中途**析构（encoder 里还引用着它的 buffer），
+/// 立刻回池会立刻被同一次录制的 `take_buf` 取走并写入 → 同一次提交内读写竞态，静默算错。
+/// 因此析构只先进这里；每个 poll(Wait) 之后（GPU 已空闲）由 [`GpuContext::drain_pending`] 批量入池。
+static PENDING: Mutex<Vec<wgpu::Buffer>> = Mutex::new(Vec::new());
 
 /// 把任意 POD 数据当作字节切片（f32/u32 均为 4 字节小端）
 fn bytemuck_bytes<T: Sized>(v: &[T]) -> &[u8] {
@@ -2504,6 +2596,12 @@ impl GpuContext {
             SCALE
         } else if eq(&self.relu_pipe) {
             RELU
+        } else if eq(&self.swiglu_fwd_pipe) {
+            SWIGLU_FWD
+        } else if eq(&self.swiglu_bwd_pipe) {
+            SWIGLU_BWD
+        } else if eq(&self.add_bias_pipe) {
+            ADD_BIAS
         } else {
             OTHER
         }
@@ -2633,9 +2731,9 @@ impl GpuContext {
         // GPU 已跑完，bind group 可以丢；buffer 归还池供后续回读/复用
         drop(keep_groups);
         for buf in keep_bufs.drain(..) {
-            let key = (buf.size(), kind_of(&buf));
-            self.pool.lock().unwrap().entry(key).or_default().push(buf);
+            self.put_buf(buf);
         }
+        self.drain_pending();
     }
 }
 
@@ -2656,6 +2754,7 @@ impl GpuContext {
 // 1. 每个 dispatch 用独立的参数 uniform（由 `batch_dispatch` 保证）；
 // 2. 显存句柄不能在 `submit` 之前析构（encoder 里还引用着它的 buffer）——
 //    中间结果用 `GpuRecorder::keep` 交给录制器保活，输出句柄由调用方持有到 submit 之后；
+//    （P1-1 之后即便提前析构也不会算错：buffer 只挂进 `PENDING`，poll 之后才回池复用）
 // 3. 同一块 buffer 在一次提交内不能被写两次（`write_buffer` 的写入全部在提交开头生效）。
 
 /// 显存常驻张量句柄：一段 GPU buffer + 元素个数。
@@ -2674,7 +2773,18 @@ impl GpuHandle {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("read") });
         let rb = Readback::record(ctx, &mut enc, &[self])?;
         ctx.queue.submit([enc.finish()]);
-        rb.collect()?.into_iter().next()
+        let out = rb.collect()?;
+        ctx.drain_pending();
+        out.into_iter().next()
+    }
+}
+
+impl Drop for GpuHandle {
+    /// 析构时不直接回池，只挂到 [`PENDING`]；入池由每个 poll(Wait) 之后的
+    /// [`GpuContext::drain_pending`] 统一完成（保证复用时 GPU 已不再引用这块 buffer）。
+    /// 不能 move 字段，故克隆引用计数句柄（开销可忽略）。
+    fn drop(&mut self) {
+        PENDING.lock().unwrap().push(self.buf.clone());
     }
 }
 
@@ -2700,7 +2810,7 @@ impl Readback {
             spans.push((total, h.len));
             total += h.len;
         }
-        let staging = ctx.make_buf(total.max(1), KIND_READ);
+        let staging = ctx.take_buf(total.max(1), KIND_READ);
         let mut off = 0u64;
         for h in handles {
             let bytes = (h.len * 4) as u64;
@@ -2726,6 +2836,8 @@ impl Readback {
         let out = spans.iter().map(|&(o, n)| all[o..o + n].to_vec()).collect();
         drop(view);
         staging.unmap();
+        // 归池：collect 内部已 poll(Wait)，GPU 空闲，可安全复用（P1-1：staging 不再逐步新建）
+        ctx.put_buf(staging);
         Some(out)
     }
 }
@@ -2762,7 +2874,7 @@ impl GpuRecorder {
     /// 上传 CPU 数据到显存，得到常驻句柄
     pub fn upload(&mut self, data: &[f32]) -> GpuHandle {
         // 用 KIND_OUT（含 COPY_SRC）：上传上去的也可能被回读（如反向里的 Q'/K/V）
-        let buf = self.ctx.make_buf(data.len().max(1), KIND_OUT);
+        let buf = self.ctx.take_buf(data.len().max(1), KIND_OUT);
         if !data.is_empty() {
             self.ctx.queue.write_buffer(&buf, 0, bytemuck_bytes(data));
             self.upload_bytes += data.len() * 4;
@@ -2789,7 +2901,7 @@ impl GpuRecorder {
         bs: usize,
     ) -> GpuHandle {
         let len = bs * m * n;
-        let out = GpuHandle { buf: self.ctx.make_buf(len.max(1), KIND_OUT), len };
+        let out = GpuHandle { buf: self.ctx.take_buf(len.max(1), KIND_OUT), len };
         self.ctx
             .batch_matmul(&mut self.batch, &a.buf, &b.buf, &out.buf, m, k, n, bs, a_t, b_t);
         out
@@ -2805,7 +2917,7 @@ impl GpuRecorder {
         mask_numel: usize,
     ) -> GpuHandle {
         let len = rows * d;
-        let out = GpuHandle { buf: self.ctx.make_buf(len.max(1), KIND_OUT), len };
+        let out = GpuHandle { buf: self.ctx.take_buf(len.max(1), KIND_OUT), len };
         self.ctx.batch_dispatch(
             &mut self.batch,
             &self.ctx.softmax_fwd_pipe,
@@ -2828,7 +2940,7 @@ impl GpuRecorder {
         d: usize,
     ) -> GpuHandle {
         let len = rows * d;
-        let out = GpuHandle { buf: self.ctx.make_buf(len.max(1), KIND_OUT), len };
+        let out = GpuHandle { buf: self.ctx.take_buf(len.max(1), KIND_OUT), len };
         self.ctx.batch_dispatch(
             &mut self.batch,
             &self.ctx.softmax_bwd_pipe,
@@ -2873,7 +2985,7 @@ impl GpuRecorder {
 
     /// 分配一块内容未初始化的显存（内核会全部覆写它）
     fn empty(&mut self, len: usize, kind: u8) -> GpuHandle {
-        GpuHandle { buf: self.ctx.make_buf(len.max(1), kind), len }
+        GpuHandle { buf: self.ctx.take_buf(len.max(1), kind), len }
     }
 
     /// 录制归一化前向（LayerNorm / RMSNorm 由 `is_rms` 切换，见 `ln_fwd_main`）；
@@ -2998,6 +3110,77 @@ impl GpuRecorder {
             &self.ctx.gelu_bwd_pipe,
             &self.ctx.elem_d_layout,
             &[(&dy.buf, 0), (&z.buf, 1), (&dx.buf, 4)],
+            [len as u32, 0, 0, 0, 0, 0],
+            n_workgroups(len),
+            1,
+            1,
+        );
+    }
+
+    /// 录制广播加偏置：`out[i] = a[i] + bias[i % cols]`（SwiGLU up 支路先融偏置）
+    fn add_bias(&mut self, a: &GpuHandle, bias: &GpuHandle, out: &GpuHandle, len: usize, cols: usize) {
+        self.ctx.batch_dispatch(
+            &mut self.batch,
+            &self.ctx.add_bias_pipe,
+            &self.ctx.elem_d_layout,
+            &[(&a.buf, 0), (&bias.buf, 1), (&out.buf, 4)],
+            [len as u32, cols as u32, 0, 0, 0, 0],
+            n_workgroups(len),
+            1,
+            1,
+        );
+    }
+
+    /// 录制 SwiGLU 前向 + gate 偏置融合：`out = SiLU(a + bias) ⊙ u`，`z` 存下 SiLU 前的 gate 输入
+    fn swiglu_fwd(
+        &mut self,
+        y_gate: &GpuHandle,
+        b_gate: &GpuHandle,
+        u: &GpuHandle,
+        out: &GpuHandle,
+        z: &GpuHandle,
+        len: usize,
+        cols: usize,
+    ) {
+        self.ctx.batch_dispatch(
+            &mut self.batch,
+            &self.ctx.swiglu_fwd_pipe,
+            &self.ctx.elem_b_layout,
+            &[
+                (&y_gate.buf, 0),
+                (&b_gate.buf, 1),
+                (&u.buf, 2),
+                (&out.buf, 4),
+                (&z.buf, 5),
+            ],
+            [len as u32, cols as u32, 0, 0, 0, 0],
+            n_workgroups(len),
+            1,
+            1,
+        );
+    }
+
+    /// 录制 SwiGLU 反向：`dz = (dact·u)·dsig`，`du = dact·SiLU(z)`
+    fn swiglu_bwd(
+        &mut self,
+        dact: &GpuHandle,
+        z: &GpuHandle,
+        u: &GpuHandle,
+        dz: &GpuHandle,
+        du: &GpuHandle,
+        len: usize,
+    ) {
+        self.ctx.batch_dispatch(
+            &mut self.batch,
+            &self.ctx.swiglu_bwd_pipe,
+            &self.ctx.elem_b_layout,
+            &[
+                (&dact.buf, 0),
+                (&z.buf, 1),
+                (&u.buf, 2),
+                (&dz.buf, 4),
+                (&du.buf, 5),
+            ],
             [len as u32, 0, 0, 0, 0, 0],
             n_workgroups(len),
             1,
@@ -3151,7 +3334,7 @@ impl GpuRecorder {
 
     /// 上传 u32 数据（如 targets 下标）
     fn upload_u32(&mut self, data: &[u32]) -> GpuHandle {
-        let buf = self.ctx.make_buf(data.len().max(1), KIND_OUT);
+        let buf = self.ctx.take_buf(data.len().max(1), KIND_OUT);
         if !data.is_empty() {
             self.ctx.queue.write_buffer(&buf, 0, bytemuck_bytes(data));
             self.upload_bytes += data.len() * 4;
@@ -3192,10 +3375,11 @@ impl GpuRecorder {
         // GPU 已跑完：bind group 可以丢，池化 buffer 归还，中间句柄在此释放
         drop(keep_groups);
         for buf in keep_bufs.drain(..) {
-            let key = (buf.size(), kind_of(&buf));
-            ctx.pool.lock().unwrap().entry(key).or_default().push(buf);
+            ctx.put_buf(buf);
         }
         drop(keep);
+        // 中间句柄析构后先挂 PENDING，此刻（poll 之后）统一入池
+        ctx.drain_pending();
         result
     }
 }
@@ -3763,14 +3947,15 @@ pub fn lm_head_ce(
 // ==================== MLP 子层常驻显存（前向 / 反向各一次提交） ====================
 //
 // 子层结构（经典风格）：x → LayerNorm/RMSNorm → Linear₁ → GELU → Linear₂ → dropout → 残差 +
+// SwiGLU 变体：x → LN/RMSNorm → Linear_gate/Linear_up → SiLU(gate)·up → Linear_down → dropout → 残差 +
 //
 // 逐算子版这一段要付的代价：
-// - 前向：LN 在 CPU（逐元素 + rayon）、两次线性投影各自一次「提交 + 轮询」往返、
-//   GELU 在 CPU（[rows, hid] 个 tanh）、dropout 在 CPU、残差加法在 CPU；
-// - 反向：四次矩阵乘反向又是一轮往返，再加 LN / GELU / dropout 的 CPU 反向。
+// - 前向：LN 在 CPU（逐元素 + rayon）、两次（SwiGLU 三次）线性投影各自一次「提交 + 轮询」往返、
+//   GELU/SwiGLU 激活在 CPU、dropout 在 CPU、残差加法在 CPU；
+// - 反向：四次（SwiGLU 六次）矩阵乘反向又是一轮往返，再加 LN / 激活 / dropout 的 CPU 反向。
 // 每层每步约 6 次「提交 + 轮询」，而每次往返的固定开销在这类入门独显上高达数毫秒。
 //
-// 这里把整段录进**两次提交**（前向一次、反向一次）：中间量（LN 输出、GELU 前后、
+// 这里把整段录进**两次提交**（前向一次、反向一次）：中间量（LN 输出、激活前后、
 // 线性层中间结果）全部留在显存，CPU 只付「上传 x / 回读输出」与回读边界梯度。
 // dropout 掩码连存都不用存 —— 它是 (种子, 下标) 的确定性函数，反向重算即可。
 
@@ -3786,14 +3971,18 @@ pub struct MlpResident {
     x: GpuHandle,
     /// 归一化输出 [rows, d]
     xn: GpuHandle,
-    /// Linear₁ 输出 + b₁（GELU 的输入）[rows, hid]
+    /// Linear₁ 输出 + b₁（GELU 的输入；SwiGLU 时是 gate 支路融偏置后的 z）[rows, hid]
     z: GpuHandle,
-    /// GELU 输出 [rows, hid]
+    /// 激活输出（GELU 输出 / SwiGLU 的 SiLU(z)·u）[rows, hid]
     act: GpuHandle,
     /// 归一化每行的 (mean, 1/σ)，[rows*2]（RMSNorm 时 mean 槽位是 0）
     stats: GpuHandle,
     w1: GpuHandle,
     w2: GpuHandle,
+    /// SwiGLU 独有的第三投影：up 权重 [d, hid]（GELU 时为 None）
+    w3: Option<GpuHandle>,
+    /// SwiGLU 独有的 up 支路融偏置激活 [rows, hid]（反向 dW₃/dB₃ 要用；GELU 时为 None）
+    u: Option<GpuHandle>,
     /// γ 在反向还要用（dγ 的输出以及 dx 的权重）；β 不复用，故不在此保存
     gamma: GpuHandle,
     rows: usize,
@@ -3818,11 +4007,16 @@ pub struct MlpGrads {
     pub dgamma: Vec<f32>,
     /// RMSNorm 下没有 β，这一项是 `Σ_r dy` 的残值，**无意义，调用方忽略**
     pub dbeta: Vec<f32>,
+    /// SwiGLU 独有的 up 投影梯度（GELU 时为 None）
+    pub dw3: Option<Vec<f32>>,
+    /// SwiGLU 独有的 up 偏置梯度（GELU 时为 None）
+    pub db3: Option<Vec<f32>>,
 }
 
 impl MlpResident {
-    /// 反向：10 个算子录进一次提交，只回读边界梯度
-    /// （dx 2MB + dW₁/dW₂ 各 256KB + dγ/dβ/db₁/db₂ 共 4KB）。
+    /// 反向：GELU 10 个算子 / SwiGLU 14 个算子录进一次提交，只回读边界梯度
+    /// （GELU 7 项：dx 2MB + dW₁/dW₂ 各 256KB + dγ/dβ/db₁/db₂ 共 4KB；
+    /// SwiGLU 多回读 dW₃ 256KB + db₃ 共 128 项）。
     pub fn backward(&self, dout: &[f32]) -> Option<MlpGrads> {
         if dout.len() != self.rows * self.d {
             return None;
@@ -3836,26 +4030,55 @@ impl MlpResident {
         // 2) db₂ = Σ_r dypre[r,j]
         let db2 = rec.empty(d, KIND_OUT);
         rec.col_sum(&dypre, &db2, rows, d);
-        // 3) dact = dypre·W₂ᵀ，dW₂ = actᵀ·dypre
+        // 3) dact = dypre·W₂ᵀ，dW₂ = actᵀ·dypre（SwiGLU 的 W₂ 就是 down 投影）
         let dact = rec.matmul(&dypre, false, &self.w2, true, rows, d, hid, 1);
         let dw2 = rec.matmul(&self.act, true, &dypre, false, hid, rows, d, 1);
-        // 4) GELU 反向：dz = dact ⊙ gelu'(z)
+        // 4) 激活反向分叉：GELU 单路 dz；SwiGLU 同时算 gate 支路 dz 与 up 支路 du
         let dz = rec.empty(rows * hid, KIND_OUT);
-        rec.gelu_bwd(&dact, &self.z, &dz, rows * hid);
-        // 5) db₁ = Σ_r dz[r,j]
+        let du = match &self.u {
+            Some(u) => {
+                let du = rec.empty(rows * hid, KIND_OUT);
+                rec.swiglu_bwd(&dact, &self.z, u, &dz, &du, rows * hid);
+                Some(du)
+            }
+            None => {
+                rec.gelu_bwd(&dact, &self.z, &dz, rows * hid);
+                None
+            }
+        };
+        // 5) db₁ = Σ_r dz[r,j]（SwiGLU 是 gate 偏置的梯度）
         let db1 = rec.empty(hid, KIND_OUT);
         rec.col_sum(&dz, &db1, rows, hid);
-        // 6) dxn = dz·W₁ᵀ，dW₁ = xnᵀ·dz
-        let dxn = rec.matmul(&dz, false, &self.w1, true, rows, hid, d, 1);
+        // 6) dxn(gate) = dz·W₁ᵀ，dW₁ = xnᵀ·dz
+        let dxn_gate = rec.matmul(&dz, false, &self.w1, true, rows, hid, d, 1);
         let dw1 = rec.matmul(&self.xn, true, &dz, false, d, rows, hid, 1);
-        // 7) 归一化反向（LayerNorm / RMSNorm 同一套内核）：对输入的 dx 与对 γ/β 的梯度
+        // 7) up 支路（仅 SwiGLU）：dB₃ = Σ_r du，dW₃ = xnᵀ·du，dXn += du·W₃ᵀ
+        let (dxn, dw3, db3) = match (&self.w3, &du) {
+            (Some(w3), Some(du)) => {
+                let db3 = rec.empty(hid, KIND_OUT);
+                rec.col_sum(du, &db3, rows, hid);
+                let dw3 = rec.matmul(&self.xn, true, du, false, d, rows, hid, 1);
+                let dxn_up = rec.matmul(du, false, w3, true, rows, hid, d, 1);
+                let dxn = rec.empty(rows * d, KIND_OUT);
+                rec.add(&dxn_gate, &dxn_up, &dxn, rows * d);
+                (dxn, Some(dw3), Some(db3))
+            }
+            _ => (dxn_gate, None, None),
+        };
+        // 8) 归一化反向（LayerNorm / RMSNorm 同一套内核）：对输入的 dx 与对 γ/β 的梯度
         let dxln = rec.empty(rows * d, KIND_OUT);
         rec.ln_bwd_x(&dxn, &self.x, &self.stats, &dxln, &self.gamma, rows, d, self.is_rms);
         let dgamma = rec.empty(d, KIND_OUT);
         let dbeta = rec.empty(d, KIND_OUT);
         rec.ln_bwd_gb(&dxn, &self.x, &self.stats, &dgamma, &dbeta, rows, d);
-        let outs = rec.submit_and_read(&[&dxln, &dw1, &db1, &dw2, &db2, &dgamma, &dbeta])?;
-        let mut it = outs.into_iter();
+        // 9) 回读边界梯度：GELU 7 项，SwiGLU 在尾部追加 dW₃/dB₃ 共 9 项
+        let mut outs: Vec<&GpuHandle> = vec![&dxln, &dw1, &db1, &dw2, &db2, &dgamma, &dbeta];
+        if let (Some(w), Some(b)) = (&dw3, &db3) {
+            outs.push(w);
+            outs.push(b);
+        }
+        let read = rec.submit_and_read(&outs)?;
+        let mut it = read.into_iter();
         let dxln = it.next()?;
         let dw1 = it.next()?;
         let db1 = it.next()?;
@@ -3863,9 +4086,12 @@ impl MlpResident {
         let db2 = it.next()?;
         let dgamma = it.next()?;
         let dbeta = it.next()?;
+        let has3 = dw3.is_some();
+        let dw3 = if has3 { Some(it.next()?) } else { None };
+        let db3 = if has3 { Some(it.next()?) } else { None };
         // 残差直通：∂out/∂x 的那一份就是 dout 本身，与 LayerNorm 回传的那份相加
         let dx: Vec<f32> = dxln.iter().zip(dout).map(|(a, b)| a + b).collect();
-        Some(MlpGrads { dx, dw1, db1, dw2, db2, dgamma, dbeta })
+        Some(MlpGrads { dx, dw1, db1, dw2, db2, dgamma, dbeta, dw3, db3 })
     }
 }
 
@@ -3875,7 +4101,7 @@ impl MlpResident {
 /// `w1` `[d, hid]`、`b1` `[hid]`、`w2` `[hid, d]`、`b2` `[d]`。
 ///
 /// `is_rms` 切换归一化模式（RMSNorm 时 `beta` 的内容被内核丢弃，只需长度合法）。
-/// 只覆盖经典风格的 GELU MLP（SwiGLU 由调用方让路）；
+/// 只覆盖经典风格的 GELU MLP（SwiGLU 走 [`mlp_swiglu_forward`]）；
 /// 形状/规模不合适或 GPU 不可用时返回 None，调用方回退逐算子路径，数值行为不变。
 #[allow(clippy::too_many_arguments)]
 pub fn mlp_forward(
@@ -3952,6 +4178,115 @@ pub fn mlp_forward(
         stats,
         w1: hw1,
         w2: hw2,
+        w3: None,
+        u: None,
+        gamma: hg,
+        rows,
+        d,
+        hid,
+        seed,
+        dropout,
+        training,
+        is_rms,
+    })
+}
+
+/// 常驻显存版的 SwiGLU MLP 子层前向（[`mlp_forward`] 的三投影变体）。
+///
+/// 结构：`x → LN/RMSNorm → [gate = xn·W_gate+b_gate, up = xn·W_up+b_up]
+/// → act = SiLU(gate) ⊙ up → down = act·W_down+b_down → dropout → 残差 +`。
+/// 激活分两个内核录：先 `add_bias` 融 up 偏置，再 `swiglu_fwd` 融 gate 偏置并算
+/// SiLU(gate)·up（只读绑定上限 3，装不下四个输入）。
+///
+/// 入参：`x` `[rows, d]`、`gamma`/`beta` `[d]`、`w_gate`/`w_up` `[d, hid]`、
+/// `b_gate`/`b_up` `[hid]`、`w_down` `[hid, d]`、`b_down` `[d]`。
+/// 形状/规模不合适或 GPU 不可用时返回 None，调用方回退逐算子路径，数值行为不变。
+#[allow(clippy::too_many_arguments)]
+pub fn mlp_swiglu_forward(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    w_gate: &[f32],
+    b_gate: &[f32],
+    w_up: &[f32],
+    b_up: &[f32],
+    w_down: &[f32],
+    b_down: &[f32],
+    rows: usize,
+    d: usize,
+    hid: usize,
+    eps: f32,
+    is_rms: bool,
+    dropout: f32,
+    training: bool,
+) -> Option<MlpResident> {
+    if rows == 0 || d == 0 || hid == 0 {
+        return None;
+    }
+    if x.len() != rows * d
+        || gamma.len() != d
+        || beta.len() != d
+        || w_gate.len() != d * hid
+        || b_gate.len() != hid
+        || w_up.len() != d * hid
+        || b_up.len() != hid
+        || w_down.len() != hid * d
+        || b_down.len() != d
+    {
+        return None;
+    }
+    if rows > 65535 || d > 65535 || hid > 65535 {
+        return None;
+    }
+    if rows * d > 65535 * ELEM_WG || rows * hid > 65535 * ELEM_WG {
+        return None;
+    }
+    // 三次投影合计 6·rows·d·hid FLOPs（与逐算子路径同一口径）
+    let flops = 6u128 * rows as u128 * d as u128 * hid as u128;
+    if flops < MATMUL_MIN_FLOPS.load(Ordering::Relaxed) as u128 {
+        return None;
+    }
+
+    let mut rec = recorder()?;
+    let hx = rec.upload(x);
+    let hg = rec.upload(gamma);
+    let hb = rec.upload(beta);
+    let hw_gate = rec.upload(w_gate);
+    let hb_gate = rec.upload(b_gate);
+    let hw_up = rec.upload(w_up);
+    let hb_up = rec.upload(b_up);
+    let hw_down = rec.upload(w_down);
+    let hb_down = rec.upload(b_down);
+    // 归一化（顺带把每行统计量存进显存给反向复用）
+    let xn = rec.empty(rows * d, KIND_OUT);
+    let stats = rec.empty(rows * 2, KIND_OUT);
+    rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps, is_rms);
+    // Linear_gate / Linear_up 两次投影
+    let y_gate = rec.matmul(&xn, false, &hw_gate, false, rows, d, hid, 1);
+    let y_up = rec.matmul(&xn, false, &hw_up, false, rows, d, hid, 1);
+    // up 支路先融偏置，gate 支路的偏置融进 SwiGLU 激活内核；z 存 gate 偏置后的值供反向用
+    let u = rec.empty(rows * hid, KIND_OUT);
+    rec.add_bias(&y_up, &hb_up, &u, rows * hid, hid);
+    let act = rec.empty(rows * hid, KIND_OUT);
+    let z = rec.empty(rows * hid, KIND_OUT);
+    rec.swiglu_fwd(&y_gate, &hb_gate, &u, &act, &z, rows * hid, hid);
+    // Linear_down + 偏置 + dropout + 残差
+    let y2 = rec.matmul(&act, false, &hw_down, false, rows, hid, d, 1);
+    let out = rec.empty(rows * d, KIND_OUT);
+    let seed = DROPOUT_SEED.fetch_add(1, Ordering::Relaxed) as u32 ^ 0x9e37_79b9;
+    rec.bias_dropout_residual(&y2, &hb_down, &hx, &out, rows * d, d, dropout, seed, training);
+    let out_host = rec.submit_and_read(&[&out])?.into_iter().next()?;
+    Some(MlpResident {
+        out: out_host,
+        x: hx,
+        xn,
+        z,
+        act,
+        stats,
+        w1: hw_gate,
+        w2: hw_down,
+        w3: Some(hw_up),
+        u: Some(u),
         gamma: hg,
         rows,
         d,
@@ -3980,10 +4315,15 @@ pub fn mlp_forward(
 //     回读的只有「整叠输入梯度 + 各层参数梯度」。
 // 于是每步的 submit 从 ~18 次降到 2 次，子层边界的 PCIe 往返基本清零。
 
-/// 每层 Block 的参数个数。
+/// 每层 Block 的参数个数（GELU 模式）。
 /// [`StackLayerArgs`] 的字段顺序 = 参数顺序 = [`StackGrads::grads`] 里每层的顺序：
 /// γ₁, β₁, Wq, bq, Wk, bk, Wv, bv, Wproj, bproj, γ₂, β₂, W₁, b₁, W₂, b₂
 pub const STACK_PARAMS_PER_LAYER: usize = 16;
+
+/// 每层 Block 的参数个数（SwiGLU 模式）：前馈多出 up 投影一对，
+/// 追加在尾部 → γ₁, β₁, Wq, bq, Wk, bk, Wv, bv, Wproj, bproj, γ₂, β₂,
+/// W_gate, b_gate, W_down, b_down, W_up, b_up（前 16 个槽位与 GELU 模式同义）
+pub const STACK_PARAMS_PER_LAYER_SWIGLU: usize = 18;
 
 /// 一层 Block 的全部权重/偏置（都是 CPU 上的借用，不复制）
 pub struct StackLayerArgs<'a> {
@@ -4003,11 +4343,15 @@ pub struct StackLayerArgs<'a> {
     /// 前馈子层 LayerNorm 的 γ/β
     pub gamma2: &'a [f32],
     pub beta2: &'a [f32],
-    /// 前馈两层线性：W₁ [d, hid]、b₁ [hid]、W₂ [hid, d]、b₂ [d]
+    /// 前馈线性：GELU 时是 W₁ [d, hid] / b₁ [hid]、W₂ [hid, d] / b₂ [d]；
+    /// SwiGLU 时 w1/b1 = gate 投影、w2/b2 = down 投影
     pub w1: &'a [f32],
     pub b1: &'a [f32],
     pub w2: &'a [f32],
     pub b2: &'a [f32],
+    /// SwiGLU 独有的第三投影：up 权重 [d, hid] 与偏置 [hid]（GELU 时为 `&[]`）
+    pub w3: &'a [f32],
+    pub b3: &'a [f32],
 }
 
 /// 整叠 Block 常驻显存前向的入参（都是 CPU 上的数据）
@@ -4025,6 +4369,8 @@ pub struct StackArgs<'a> {
     pub eps: f32,
     /// 归一化是否为 RMSNorm（各层共用同一份模型配置，故整叠一个开关）
     pub is_rms: bool,
+    /// 前馈是否为 SwiGLU（同理整叠一个开关：true 时各层走 gate/up/down 三投影）
+    pub swiglu: bool,
     pub dropout: f32,
     pub training: bool,
 }
@@ -4059,13 +4405,17 @@ struct MlpSublayer {
     x: GpuHandle,
     /// 归一化输出
     xn: GpuHandle,
-    /// Linear₁ 输出 + b₁（GELU 的输入）
+    /// Linear₁ 输出 + b₁（GELU 的输入；SwiGLU 时是 gate 支路融偏置后的 z）
     z: GpuHandle,
-    /// GELU 输出
+    /// 激活输出（GELU 输出 / SwiGLU 的 SiLU(z)·u）
     act: GpuHandle,
     stats: GpuHandle,
     w1: GpuHandle,
     w2: GpuHandle,
+    /// SwiGLU 独有的 up 权重 [d, hid]（GELU 时为 None）
+    w3: Option<GpuHandle>,
+    /// SwiGLU 独有的 up 支路融偏置激活 [rows, hid]（反向 dW₃/dB₃/dXn 要用）
+    u: Option<GpuHandle>,
     gamma: GpuHandle,
     seed: u32,
     /// 归一化是否为 RMSNorm（反向切同一个模式位）
@@ -4091,8 +4441,9 @@ pub struct StackResident {
 pub struct StackGrads {
     /// 对整叠输入 x 的梯度 [b*t, d]
     pub dx: Vec<f32>,
-    /// 逐层的 [`STACK_PARAMS_PER_LAYER`] 项参数梯度，按层顺序平铺
-    /// （顺序与 [`StackLayerArgs`] 的字段顺序一致）
+    /// 逐层的参数梯度，按层顺序平铺（顺序与 [`StackLayerArgs`] 的字段顺序一致）：
+    /// GELU 每层 [`STACK_PARAMS_PER_LAYER`]（16）项，SwiGLU 每层
+    /// [`STACK_PARAMS_PER_LAYER_SWIGLU`]（18）项（尾部追加 dW₃, db₃）
     pub grads: Vec<Vec<f32>>,
 }
 
@@ -4157,6 +4508,9 @@ fn record_attn_sublayer_fwd(
 }
 
 /// 把一个前馈子层的前向录进 `rec`（不提交），返回反向要复用的句柄与子层输出句柄。
+///
+/// `swiglu = true` 时前馈换成 gate/up/down 三投影：Linear_gate 与 Linear_up 两次投影，
+/// up 支路先融偏置、gate 偏置融进 SwiGLU 激活内核（与 [`mlp_swiglu_forward`] 同一套拼法）。
 #[allow(clippy::too_many_arguments)]
 fn record_mlp_sublayer_fwd(
     rec: &mut GpuRecorder,
@@ -4170,6 +4524,7 @@ fn record_mlp_sublayer_fwd(
     is_rms: bool,
     dropout: f32,
     training: bool,
+    swiglu: bool,
 ) -> (MlpSublayer, GpuHandle) {
     let rows = b * t;
     let hg = rec.upload(la.gamma2);
@@ -4178,14 +4533,29 @@ fn record_mlp_sublayer_fwd(
     let hb1 = rec.upload(la.b1);
     let hw2 = rec.upload(la.w2);
     let hb2 = rec.upload(la.b2);
+    let hw3 = swiglu.then(|| rec.upload(la.w3));
+    let hb3 = swiglu.then(|| rec.upload(la.b3));
     let xn = rec.empty(rows * d, KIND_OUT);
     let stats = rec.empty(rows * 2, KIND_OUT);
     rec.ln_fwd(&hx, &hg, &hb, &xn, &stats, rows, d, eps, is_rms);
-    // Linear₁ + GELU：偏置融进 GELU 内核，同时存下 GELU 前的 z 供反向用
+    // GELU：Linear₁ + GELU（偏置融进 GELU 内核）；
+    // SwiGLU：Linear_gate / Linear_up 两次投影 → up 融偏置 → SiLU(gate+b)·u
     let y1 = rec.matmul(&xn, false, &hw1, false, rows, d, hid, 1);
     let act = rec.empty(rows * hid, KIND_OUT);
     let z = rec.empty(rows * hid, KIND_OUT);
-    rec.gelu_fwd_bias(&y1, &hb1, &act, &z, rows * hid, hid);
+    let (act, z, u) = if swiglu {
+        let y_up = rec.matmul(&xn, false, hw3.as_ref().unwrap(), false, rows, d, hid, 1);
+        let u = rec.empty(rows * hid, KIND_OUT);
+        rec.add_bias(&y_up, hb3.as_ref().unwrap(), &u, rows * hid, hid);
+        rec.swiglu_fwd(&y1, &hb1, &u, &act, &z, rows * hid, hid);
+        for h in [y_up] {
+            rec.keep(h);
+        }
+        (act, z, Some(u))
+    } else {
+        rec.gelu_fwd_bias(&y1, &hb1, &act, &z, rows * hid, hid);
+        (act, z, None)
+    };
     // Linear₂ + 偏置 + dropout + 残差
     let y2 = rec.matmul(&act, false, &hw2, false, rows, hid, d, 1);
     let out = rec.empty(rows * d, KIND_OUT);
@@ -4194,7 +4564,10 @@ fn record_mlp_sublayer_fwd(
     for h in [hb, hb1, hb2, y1, y2] {
         rec.keep(h);
     }
-    (MlpSublayer { x: hx, xn, z, act, stats, w1: hw1, w2: hw2, gamma: hg, seed, is_rms }, out)
+    if let Some(h) = hb3 {
+        rec.keep(h);
+    }
+    (MlpSublayer { x: hx, xn, z, act, stats, w1: hw1, w2: hw2, w3: hw3, u, gamma: hg, seed, is_rms }, out)
 }
 
 /// 整叠 Block 常驻显存前向：所有子层录进**一次提交**，只有整叠输出回读。
@@ -4202,7 +4575,7 @@ fn record_mlp_sublayer_fwd(
 /// 不适用时返回 None，调用方回退逐 Block 路径（数值行为不变）：
 /// 形状/规模不满足、各层形状不一致、GPU 不可用。
 pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
-    let StackArgs { x, mask, layers, b, t, d, n_head, eps, is_rms, dropout, training } = *a;
+    let StackArgs { x, mask, layers, b, t, d, n_head, eps, is_rms, swiglu, dropout, training } = *a;
     if layers.is_empty() || b == 0 || t == 0 || d == 0 || n_head == 0 || d % n_head != 0 {
         return None;
     }
@@ -4243,6 +4616,8 @@ pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
             || la.w2.len() != la.b1.len() * d
             || la.b2.len() != d
             || la.w1.len() != d * la.b1.len()
+            // SwiGLU 的第三投影：up 权重 [d, hid] + 偏置 [hid]
+            || (swiglu && (la.w3.len() != la.b1.len() * d || la.b3.len() != la.b1.len()))
         {
             return None;
         }
@@ -4251,7 +4626,8 @@ pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
             return None;
         }
         hid = la.b1.len();
-        let mlp_flops = 4u128 * rows as u128 * d as u128 * hid as u128;
+        // SwiGLU 前馈三次投影，口径与 `mlp_swiglu_forward` 一致（6·rows·d·hid）
+        let mlp_flops = (if swiglu { 6 } else { 4 }) * rows as u128 * d as u128 * hid as u128;
         if mlp_flops < MATMUL_MIN_FLOPS.load(Ordering::Relaxed) as u128 {
             return None;
         }
@@ -4270,8 +4646,9 @@ pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
             &mut rec, hx, la, &hmask, (b, t, d, n_head), eps, is_rms, dropout, training,
         );
         attn.push(ah);
-        let (mh, m_out) =
-            record_mlp_sublayer_fwd(&mut rec, a_out, la, b, t, d, hid, eps, is_rms, dropout, training);
+        let (mh, m_out) = record_mlp_sublayer_fwd(
+            &mut rec, a_out, la, b, t, d, hid, eps, is_rms, dropout, training, swiglu,
+        );
         mlp.push(mh);
         hx = m_out;
     }
@@ -4363,8 +4740,9 @@ fn record_attn_sublayer_bwd(
 
 /// 把一个前馈子层的反向录进 `rec`（不提交）。
 ///
-/// `dout` 是上游梯度句柄；返回（对子层输入的梯度句柄, 6 项参数梯度句柄），
-/// 参数梯度顺序：dγ₂, dβ₂, dW₁, db₁, dW₂, db₂。
+/// `dout` 是上游梯度句柄；返回（对子层输入的梯度句柄, 参数梯度句柄列表）。
+/// 参数梯度顺序：GELU 6 项 dγ₂, dβ₂, dW₁, db₁, dW₂, db₂；
+/// SwiGLU（`h.u` 为 Some）时尾部追加 dW₃, db₃ 共 8 项，与每层参数槽位 12..18 对齐。
 #[allow(clippy::too_many_arguments)]
 fn record_mlp_sublayer_bwd(
     rec: &mut GpuRecorder,
@@ -4387,26 +4765,60 @@ fn record_mlp_sublayer_bwd(
     // 3) dact = dypre·W₂ᵀ，dW₂ = actᵀ·dypre
     let dact = rec.matmul(&dypre, false, &h.w2, true, rows, d, hid, 1);
     let dw2 = rec.matmul(&h.act, true, &dypre, false, hid, rows, d, 1);
-    // 4) GELU 反向；5) db₁ = Σ_r dz[r,j]；6) dxn = dz·W₁ᵀ，dW₁ = xnᵀ·dz
+    // 4) 激活反向分叉：GELU 单路 dz；SwiGLU 同时算 gate 支路 dz 与 up 支路 du
     let dz = rec.empty(rows * hid, KIND_OUT);
-    rec.gelu_bwd(&dact, &h.z, &dz, rows * hid);
+    let du = match &h.u {
+        Some(u) => {
+            let du = rec.empty(rows * hid, KIND_OUT);
+            rec.swiglu_bwd(&dact, &h.z, u, &dz, &du, rows * hid);
+            Some(du)
+        }
+        None => {
+            rec.gelu_bwd(&dact, &h.z, &dz, rows * hid);
+            None
+        }
+    };
+    // 5) db₁ = Σ_r dz[r,j]（SwiGLU 是 gate 偏置的梯度）
     let db1 = rec.empty(hid, KIND_OUT);
     rec.col_sum(&dz, &db1, rows, hid);
-    let dxn = rec.matmul(&dz, false, &h.w1, true, rows, hid, d, 1);
+    // 6) dxn(gate) = dz·W₁ᵀ，dW₁ = xnᵀ·dz
+    let dxn_gate = rec.matmul(&dz, false, &h.w1, true, rows, hid, d, 1);
     let dw1 = rec.matmul(&h.xn, true, &dz, false, d, rows, hid, 1);
-    // 7) 归一化反向（LayerNorm / RMSNorm 同一套内核）
+    // 7) up 支路（仅 SwiGLU）：db₃ = Σ_r du，dW₃ = xnᵀ·du，dxn = dxn_gate + du·W₃ᵀ
+    let (dxn, dw3, db3) = match (&h.w3, &du) {
+        (Some(w3), Some(du)) => {
+            let db3 = rec.empty(hid, KIND_OUT);
+            rec.col_sum(du, &db3, rows, hid);
+            let dw3 = rec.matmul(&h.xn, true, du, false, d, rows, hid, 1);
+            let dxn_up = rec.matmul(du, false, w3, true, rows, hid, d, 1);
+            let dxn = rec.empty(rows * d, KIND_OUT);
+            rec.add(&dxn_gate, &dxn_up, &dxn, rows * d);
+            rec.keep(dxn_up);
+            (dxn, Some(dw3), Some(db3))
+        }
+        _ => (dxn_gate, None, None),
+    };
+    // 8) 归一化反向（LayerNorm / RMSNorm 同一套内核）
     let dxln = rec.empty(rows * d, KIND_OUT);
     rec.ln_bwd_x(&dxn, &h.x, &h.stats, &dxln, &h.gamma, rows, d, h.is_rms);
     let dgamma = rec.empty(d, KIND_OUT);
     let dbeta = rec.empty(d, KIND_OUT);
     rec.ln_bwd_gb(&dxn, &h.x, &h.stats, &dgamma, &dbeta, rows, d);
-    // 8) 残差直通在显存里相加
+    // 9) 残差直通在显存里相加
     let dx = rec.empty(rows * d, KIND_OUT);
     rec.add(&dxln, dout, &dx, rows * d);
     for h in [dypre, dact, dz, dxn, dxln] {
         rec.keep(h);
     }
-    (dx, vec![dgamma, dbeta, dw1, db1, dw2, db2])
+    if let Some(du) = du {
+        rec.keep(du);
+    }
+    let mut g = vec![dgamma, dbeta, dw1, db1, dw2, db2];
+    if let (Some(w), Some(b)) = (dw3, db3) {
+        g.push(w);
+        g.push(b);
+    }
+    (dx, g)
 }
 
 impl StackResident {
@@ -4443,14 +4855,24 @@ impl StackResident {
             // 上一棒的两个上游梯度句柄前向已用尽：保活到 submit
             rec.keep(dcur);
             rec.keep(d_mlp_in);
-            let mut per = Vec::with_capacity(STACK_PARAMS_PER_LAYER);
+            let swiglu = self.mlp[i].u.is_some();
+            let mut per = Vec::with_capacity(if swiglu {
+                STACK_PARAMS_PER_LAYER_SWIGLU
+            } else {
+                STACK_PARAMS_PER_LAYER
+            });
             per.extend(g_attn); // 10 项：γ₁, β₁, Wq, bq, Wk, bk, Wv, bv, Wproj, bproj
-            per.extend(g_mlp); // 6 项：γ₂, β₂, W₁, b₁, W₂, b₂
+            per.extend(g_mlp); // GELU 6 项 γ₂, β₂, W₁, b₁, W₂, b₂；SwiGLU 尾部再 +dW₃, db₃
             per_layer[i] = Some(per);
             dcur = d_prev;
         }
-        // 回读顺序：[整叠输入梯度, 第 0 层 16 项, 第 1 层 16 项, ...]
-        let mut flat: Vec<&GpuHandle> = Vec::with_capacity(1 + per_layer.len() * STACK_PARAMS_PER_LAYER);
+        // 回读顺序：[整叠输入梯度, 第 0 层 16/18 项, 第 1 层 16/18 项, ...]
+        let pp = if self.mlp[0].u.is_some() {
+            STACK_PARAMS_PER_LAYER_SWIGLU
+        } else {
+            STACK_PARAMS_PER_LAYER
+        };
+        let mut flat: Vec<&GpuHandle> = Vec::with_capacity(1 + per_layer.len() * pp);
         flat.push(&dcur);
         for slot in &per_layer {
             for h in slot.as_ref()? {
@@ -5116,6 +5538,159 @@ mod tests {
         }
     }
 
+    /// 常驻 SwiGLU MLP 子层的前向与全部 9 项边界梯度 vs 纯循环参考。
+    ///
+    /// 与 [`gpu_mlp_resident_matches_loop_reference`] 同两组形状 × LayerNorm/RMSNorm，
+    /// 只是激活换成 SiLU(gate)·up、投影从两个变三个（多出 dW₃/dB₃ 两项边界梯度）。
+    #[test]
+    fn gpu_mlp_swiglu_resident_matches_loop_reference() {
+        init();
+        if !is_available() {
+            return;
+        }
+        MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
+        let cases: Vec<(usize, usize, usize, bool)> =
+            [(48usize, 32usize, 64usize), (40, 300, 260)]
+                .into_iter()
+                .flat_map(|(r, d, h)| [(r, d, h, false), (r, d, h, true)])
+                .collect();
+        for &(rows, d, hid, is_rms) in &cases {
+            let (dropout, eps) = (0.1f32, 1e-5f32);
+            let x: Vec<f32> = (0..rows * d).map(|i| ((i % 37) as f32 * 0.021).sin()).collect();
+            let gamma: Vec<f32> = (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos()).collect();
+            let beta: Vec<f32> = (0..d).map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin()).collect();
+            let w_gate: Vec<f32> = (0..d * hid).map(|i| ((i % 53) as f32 * 0.017).sin() * 0.3).collect();
+            let b_gate: Vec<f32> = (0..hid).map(|j| 0.02 * ((j % 7) as f32 * 0.5).cos()).collect();
+            let w_up: Vec<f32> = (0..d * hid).map(|i| ((i % 47) as f32 * 0.019).cos() * 0.2).collect();
+            let b_up: Vec<f32> = (0..hid).map(|j| 0.03 * ((j % 5) as f32 * 0.7).sin()).collect();
+            let w_down: Vec<f32> = (0..d * hid).map(|i| ((i % 41) as f32 * 0.023).sin() * 0.25).collect();
+            let b_down: Vec<f32> = (0..d).map(|j| 0.01 * ((j % 5) as f32 * 0.7).sin()).collect();
+            let dout: Vec<f32> = (0..rows * d).map(|i| ((i % 29) as f32 * 0.023).sin()).collect();
+
+            let res = mlp_swiglu_forward(
+                &x, &gamma, &beta, &w_gate, &b_gate, &w_up, &b_up, &w_down, &b_down,
+                rows, d, hid, eps, is_rms, dropout, true,
+            )
+            .expect("该形状应走常驻显存路径");
+            let seed = res.seed;
+
+            // ---- 前向参考：LN/RMSNorm → [gate, up] → SiLU(gate)·up → down → dropout → 残差 ----
+            let mut xn = vec![0.0f32; rows * d];
+            for r in 0..rows {
+                let base = r * d;
+                let mean = if is_rms {
+                    0.0
+                } else {
+                    x[base..base + d].iter().sum::<f32>() / d as f32
+                };
+                let var = x[base..base + d]
+                    .iter()
+                    .map(|&v| (v - mean) * (v - mean))
+                    .sum::<f32>()
+                    / d as f32;
+                let istd = 1.0 / (var + eps).sqrt();
+                for j in 0..d {
+                    let aff = if is_rms { 0.0 } else { beta[j] };
+                    xn[base + j] = (x[base + j] - mean) * istd * gamma[j] + aff;
+                }
+            }
+            let y_gate = cpu_matmul(&xn, &w_gate, rows, d, hid, 1, false, false);
+            let y_up = cpu_matmul(&xn, &w_up, rows, d, hid, 1, false, false);
+            let mut z = vec![0.0f32; rows * hid];
+            let mut u = vec![0.0f32; rows * hid];
+            let mut act = vec![0.0f32; rows * hid];
+            for i in 0..rows * hid {
+                z[i] = y_gate[i] + b_gate[i % hid];
+                u[i] = y_up[i] + b_up[i % hid];
+                let sig = 1.0 / (1.0 + (-z[i]).exp());
+                act[i] = (z[i] * sig) * u[i];
+            }
+            let y2 = cpu_matmul(&act, &w_down, rows, hid, d, 1, false, false);
+            let out_ref: Vec<f32> = (0..rows * d)
+                .map(|i| x[i] + ref_drop_scale(i, dropout, seed, true) * (y2[i] + b_down[i % d]))
+                .collect();
+            assert_close(&format!("swiglu out({rows},{d},{hid},rms={is_rms})"), &res.out, &out_ref);
+
+            // ---- 反向参考 ----
+            let dypre: Vec<f32> = (0..rows * d)
+                .map(|i| dout[i] * ref_drop_scale(i, dropout, seed, true))
+                .collect();
+            let db2_ref = ref_col_sum(&dypre, rows, d);
+            let dact = cpu_matmul(&dypre, &w_down, rows, d, hid, 1, false, true);
+            let dw2_ref = cpu_matmul(&act, &dypre, hid, rows, d, 1, true, false);
+            // 激活反向：dz = (dact·u)·σ'(SiLU)(z)，du = dact·SiLU(z)
+            let mut dz = vec![0.0f32; rows * hid];
+            let mut du = vec![0.0f32; rows * hid];
+            for i in 0..rows * hid {
+                let sig = 1.0 / (1.0 + (-z[i]).exp());
+                let silu = z[i] * sig;
+                let dsig = sig * (1.0 + z[i] * (1.0 - sig));
+                dz[i] = (dact[i] * u[i]) * dsig;
+                du[i] = dact[i] * silu;
+            }
+            let db1_ref = ref_col_sum(&dz, rows, hid);
+            let dxn_gate = cpu_matmul(&dz, &w_gate, rows, hid, d, 1, false, true);
+            let dw1_ref = cpu_matmul(&xn, &dz, d, rows, hid, 1, true, false);
+            let db3_ref = ref_col_sum(&du, rows, hid);
+            let dw3_ref = cpu_matmul(&xn, &du, d, rows, hid, 1, true, false);
+            let dxn_up = cpu_matmul(&du, &w_up, rows, hid, d, 1, false, true);
+            let dxn: Vec<f32> = dxn_gate.iter().zip(&dxn_up).map(|(a, b)| a + b).collect();
+            // 归一化反向（与 GELU 测试同一段参考）：dx = istd·(dy·γ − m1 − m2·x̂)
+            let mut dxln = vec![0.0f32; rows * d];
+            let mut dgamma_ref = vec![0.0f32; d];
+            let mut dbeta_ref = vec![0.0f32; d];
+            for r in 0..rows {
+                let base = r * d;
+                let mean = if is_rms {
+                    0.0
+                } else {
+                    x[base..base + d].iter().sum::<f32>() / d as f32
+                };
+                let var = x[base..base + d]
+                    .iter()
+                    .map(|&v| (v - mean) * (v - mean))
+                    .sum::<f32>()
+                    / d as f32;
+                let istd = 1.0 / (var + eps).sqrt();
+                let (mut m1, mut m2) = (0.0f32, 0.0f32);
+                for j in 0..d {
+                    let xh = (x[base + j] - mean) * istd;
+                    let dyg = dxn[base + j] * gamma[j];
+                    m1 += dyg;
+                    m2 += dyg * xh;
+                    dgamma_ref[j] += dxn[base + j] * xh;
+                    if !is_rms {
+                        dbeta_ref[j] += dxn[base + j];
+                    }
+                }
+                m1 = if is_rms { 0.0 } else { m1 / d as f32 };
+                m2 /= d as f32;
+                for j in 0..d {
+                    let xh = (x[base + j] - mean) * istd;
+                    dxln[base + j] = istd * (dxn[base + j] * gamma[j] - m1 - m2 * xh);
+                }
+            }
+            let dx_ref: Vec<f32> = dxln.iter().zip(&dout).map(|(a, b)| a + b).collect();
+
+            let g = res.backward(&dout).expect("常驻反向应成功");
+            let tag = |n: &str| format!("swiglu {n}({rows},{d},{hid},rms={is_rms})");
+            assert_close(&tag("dx"), &g.dx, &dx_ref);
+            assert_close(&tag("dw1(gate)"), &g.dw1, &dw1_ref);
+            assert_close(&tag("db1(gate)"), &g.db1, &db1_ref);
+            assert_close(&tag("dw2(down)"), &g.dw2, &dw2_ref);
+            assert_close(&tag("db2(down)"), &g.db2, &db2_ref);
+            assert_close(&tag("dgamma"), &g.dgamma, &dgamma_ref);
+            if !is_rms {
+                assert_close(&tag("dbeta"), &g.dbeta, &dbeta_ref);
+            }
+            // SwiGLU 独有的 up 投影梯度：必须是 Some，且与参考一致
+            let dw3 = g.dw3.as_deref().expect("SwiGLU 反向应产出 dW₃");
+            let db3 = g.db3.as_deref().expect("SwiGLU 反向应产出 dB₃");
+            assert_close(&tag("dw3(up)"), dw3, &dw3_ref);
+            assert_close(&tag("db3(up)"), db3, &db3_ref);
+        }
+    }
+
     /// 与 WGSL `heads_split_main` / `heads_join_main` 同式的 RoPE 角度（位置取序列内下标）
     fn ref_rope_theta(r: usize, p: usize, hd: usize) -> f32 {
         let freq = 10000f32.powf((2 * p) as f32 / hd as f32);
@@ -5743,18 +6318,34 @@ mod tests {
     ///
     /// 参照物就是把 `attn_layer_forward` / `mlp_forward` 串起来跑 —— 这两条路径各自
     /// 已有 vs 纯循环参考的数值测试，串联即可当作整叠路径的独立参照。
-    /// 要比的是前向输出、整叠输入梯度、以及每层 16 项参数梯度，一项都不能错位
+    /// 要比的是前向输出、整叠输入梯度、以及每层 16/18 项参数梯度，一项都不能错位
     /// （两条路径的拼接顺序不同，参数梯度的排列顺序最容易在这里出岔子）。
     ///
     /// dropout 一律关掉（`training = false`）：两条路径各自抽自己的种子，
     /// 掩码不可能逐位一致，开着就没法比对。
     ///
     /// `is_rms = true` 时归一化切到 RMSNorm 模式：两条路径共用同一套内核，
-    /// 因此 16 个槽位仍可逐一比对（含 RMSNorm 下无意义的 `dβ` 残值——两边算的一样）。
-    fn stack_case(n_layer: usize, b: usize, t: usize, d: usize, n_head: usize, is_rms: bool) {
-        let tag = |n: &str| format!("{n}[L{n_layer},{b},{t},{d},{n_head},rms={is_rms}]");
+    /// 因此槽位仍可逐一比对（含 RMSNorm 下无意义的 `dβ` 残值——两边算的一样）。
+    /// `swiglu = true` 时前馈切三投影（每层 18 项，尾部多 dW₃/db₃）。
+    fn stack_case(
+        n_layer: usize,
+        b: usize,
+        t: usize,
+        d: usize,
+        n_head: usize,
+        is_rms: bool,
+        swiglu: bool,
+    ) {
+        let tag = |n: &str| {
+            format!("{n}[L{n_layer},{b},{t},{d},{n_head},rms={is_rms},swiglu={swiglu}]")
+        };
         let (rows, eps, hid) = (b * t, 1e-5f32, 4 * d);
-        // 每层 16 个参数，顺序与 `StackLayerArgs` 一致
+        // 每层 16/18 个参数，顺序与 `StackLayerArgs` 一致
+        let pp = if swiglu {
+            STACK_PARAMS_PER_LAYER_SWIGLU
+        } else {
+            STACK_PARAMS_PER_LAYER
+        };
         let layers_w: Vec<Vec<Vec<f32>>> = (0..n_layer)
             .map(|li| {
                 let o = li as f32 * 0.37;
@@ -5774,10 +6365,19 @@ mod tests {
                     (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3 + o).cos()).collect();
                 let g2: Vec<f32> =
                     (0..d).map(|j| 1.0 + 0.1 * ((j % 11) as f32 * 0.2 + o).cos()).collect();
-                vec![
+                let mut vs = vec![
                     g1, mk_b(0.5), mk_w(1.0), mk_b(1.0), mk_w(1.3), mk_b(1.7), mk_w(0.7),
                     mk_b(2.3), mk_w(1.1), mk_b(0.9), g2, mk_b(0.6), w1, b1, w2, b2,
-                ]
+                ];
+                if swiglu {
+                    // 尾部追加 up 投影一对（槽 16/17），与 StackLayerArgs 的 w3/b3 对齐
+                    let w3: Vec<f32> =
+                        (0..d * hid).map(|i| ((i % 43) as f32 * 0.023 + o).sin() * 0.25).collect();
+                    let b3: Vec<f32> = (0..hid).map(|j| 0.02 * ((j % 6) as f32 + o).cos()).collect();
+                    vs.push(w3);
+                    vs.push(b3);
+                }
+                vs
             })
             .collect();
         // 因果掩码：允许看 j <= r
@@ -5821,10 +6421,18 @@ mod tests {
             })
             .expect("参考路径：注意力子层应走常驻显存");
             let xa = a.out.clone();
-            let m = mlp_forward(
-                &xa, &w[10], &w[11], &w[12], &w[13], &w[14], &w[15], rows, d, hid, eps, is_rms, 0.0,
-                false,
-            )
+            let m = if swiglu {
+                // 槽位：12=w_gate 13=b_gate 14=w_down 15=b_down 16=w_up 17=b_up
+                mlp_swiglu_forward(
+                    &xa, &w[10], &w[11], &w[12], &w[13], &w[16], &w[17], &w[14], &w[15], rows, d,
+                    hid, eps, is_rms, 0.0, false,
+                )
+            } else {
+                mlp_forward(
+                    &xa, &w[10], &w[11], &w[12], &w[13], &w[14], &w[15], rows, d, hid, eps, is_rms,
+                    0.0, false,
+                )
+            }
             .expect("参考路径：MLP 子层应走常驻显存");
             xr = m.out.clone();
             attn_ref.push(a);
@@ -5835,10 +6443,15 @@ mod tests {
         for i in (0..n_layer).rev() {
             let gm = mlp_ref[i].backward(&dcur).expect("参考 MLP 反向");
             let ga = attn_ref[i].backward(&gm.dx).expect("参考注意力反向");
-            want[i] = vec![
+            let mut wi = vec![
                 ga.dgamma, ga.dbeta, ga.dwq, ga.dbq, ga.dwk, ga.dbk, ga.dwv, ga.dbv, ga.dwproj,
                 ga.dbproj, gm.dgamma, gm.dbeta, gm.dw1, gm.db1, gm.dw2, gm.db2,
             ];
+            if swiglu {
+                wi.push(gm.dw3.expect("SwiGLU 参考应产出 dW₃"));
+                wi.push(gm.db3.expect("SwiGLU 参考应产出 db₃"));
+            }
+            want[i] = wi;
             dcur = ga.dx;
         }
 
@@ -5863,6 +6476,8 @@ mod tests {
                     b1: &w[13],
                     w2: &w[14],
                     b2: &w[15],
+                    w3: if swiglu { &w[16][..] } else { &[] },
+                    b3: if swiglu { &w[17][..] } else { &[] },
                 }
             })
             .collect();
@@ -5876,6 +6491,7 @@ mod tests {
             n_head,
             eps,
             is_rms,
+            swiglu,
             dropout: 0.0,
             training: false,
         })
@@ -5885,13 +6501,14 @@ mod tests {
         let g = res.backward(&dout).expect("整叠常驻反向应成功");
         assert_close(&tag("stack.dx"), &g.dx, &dcur);
         for i in 0..n_layer {
-            for k in 0..STACK_PARAMS_PER_LAYER {
+            for k in 0..pp {
                 assert_close(
                     &tag(&format!("stack.L{i}.p{k}")),
-                    &g.grads[i * STACK_PARAMS_PER_LAYER + k],
+                    &g.grads[i * pp + k],
                     &want[i][k],
                 );
             }
+            assert_eq!(want[i].len(), pp, "第 {i} 层参考梯度项数不对");
         }
     }
 
@@ -5903,10 +6520,14 @@ mod tests {
         }
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
         // 小配置；再来一个 d=128、t=300 的形状，跨过 workgroup_size(256) 的多轮归约边界
-        stack_case(2, 4, 128, 32, 4, false);
-        stack_case(2, 2, 300, 128, 4, false);
+        stack_case(2, 4, 128, 32, 4, false, false);
+        stack_case(2, 2, 300, 128, 4, false, false);
         // RMSNorm 模式（整叠一个开关，各层共用）
-        stack_case(2, 4, 128, 32, 4, true);
-        stack_case(2, 2, 300, 128, 4, true);
+        stack_case(2, 4, 128, 32, 4, true, false);
+        stack_case(2, 2, 300, 128, 4, true, false);
+        // SwiGLU 前馈（每层 18 项：尾部多 dW₃/db₃）
+        stack_case(2, 4, 128, 32, 4, false, true);
+        stack_case(2, 2, 300, 128, 4, false, true);
+        stack_case(2, 4, 128, 32, 4, true, true);
     }
 }

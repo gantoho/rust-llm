@@ -339,11 +339,23 @@ impl Ffn {
         }
     }
 
-    /// 只有稠密 GELU 分支能走 GPU 常驻显存路径（SwiGLU 与 MoE 都返回 None → 逐算子回退）
+    /// 稠密分支的 GELU 四元组可走 GPU 常驻显存路径（SwiGLU 走 [`Ffn::swiglu_weights`]，MoE 返回 None）
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn gelu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             Ffn::Dense(m) => m.gelu_weights(),
+            Ffn::Moe(_) => None,
+        }
+    }
+
+    /// 稠密 SwiGLU 分支的六元组（gate/up/down 三个投影的权重与偏置），
+    /// 供 GPU 常驻显存路径用；GELU 分支与 MoE 返回 None。
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    fn swiglu_weights(
+        &self,
+    ) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
+        match self {
+            Ffn::Dense(m) => m.swiglu_weights(),
             Ffn::Moe(_) => None,
         }
     }
@@ -503,7 +515,8 @@ impl TransformerBlock {
     ) -> Tensor {
         // 注意力子层 + 残差连接：优先走 GPU 常驻显存路径
         // （ln1 → QKV 投影 → RoPE → attn → c_proj → dropout → 残差 整段录进一次提交）
-        // 只在训练（无 KV cache、base=0）时可用 —— RoPE 的位置直接取序列内下标
+        // 只在无 KV cache、base=0 时可用 —— RoPE 的位置直接取序列内下标
+        // （评估的 no_grad 前向同样走这里：常驻路径只取前向值、不建图）
         //
         // 注意：常驻路径只替换**注意力子层**，不能在这里提前 return —— 后面还有前馈子层，
         // 提前返回会把整叠 Block 的 MLP 全部丢掉。
@@ -558,8 +571,8 @@ impl TransformerBlock {
     ///   展开后与标准 MHA 同形，常驻路径整段原样复用；反向再把梯度折回去
     ///   （[`fold_kv_head_grad`]）。
     ///
-    /// 不适用时返回 None，调用方回退逐算子路径：推理模式、形状或规模不合适、
-    /// GPU 不可用、SwiGLU 前馈，以及**本层挂了 LoRA 或被量化**（见下）。
+    /// 不适用时返回 None，调用方回退逐算子路径：形状或规模不合适、
+    /// GPU 不可用，以及**本层挂了 LoRA 或被量化**（见下）。
     ///
     /// 挂了 LoRA 必须整体让路：这条路径直接读 `c_q/c_k/c_v` 的 `weight.data` 显存，
     /// 不走 [`Linear::forward`]，适配器的增量会被静默丢掉——前向照跑、loss 照降，
@@ -573,7 +586,7 @@ impl TransformerBlock {
     fn attn_resident(&self, x: &Tensor, mask: Option<&Tensor>, training: bool) -> Option<Tensor> {
         use crate::attention::{expand_kv_head, fold_kv_head_grad};
 
-        if !crate::tensor::grad_enabled() || self.attn.has_lora() || self.attn.has_quant() {
+        if self.attn.has_lora() || self.attn.has_quant() {
             return None;
         }
         // MLA 整段让路：这条路径假设 `c_k/c_v` 直接吃 `d` 维输入（内核按 x @ Wkᵀ 算 K/V），
@@ -726,23 +739,24 @@ impl TransformerBlock {
         ))
     }
 
-    /// 前馈子层的 GPU 常驻显存前向（见 [`crate::gpu::mlp_forward`]）。
+    /// 前馈子层的 GPU 常驻显存前向（GELU 走 [`crate::gpu::mlp_forward`]，
+    /// SwiGLU 走 [`crate::gpu::mlp_swiglu_forward`]）。
     ///
     /// 返回的张量前向数据已在显存里算好，反向闭包直接调 `MlpResident::backward`，
-    /// 把 7 项边界梯度（对 x、两个线性层、LayerNorm 的 γ/β）注回计算图 ——
-    /// 于是这一段不必再建一张「LN + 两次矩阵乘 + GELU + dropout + 残差」的计算图，
-    /// 中间量（LN 输出、GELU 前后、两层投影结果）也不会流回 CPU。
+    /// 把边界梯度（对 x、两个（SwiGLU 三个）线性层、LayerNorm 的 γ/β，共 7 / 9 项）
+    /// 注回计算图 —— 于是这一段不必再建一张「LN + 矩阵乘 + 激活 + dropout + 残差」
+    /// 的计算图，中间量（LN 输出、激活前后、各层投影结果）也不会流回 CPU。
     ///
     /// 归一化用 LayerNorm 还是 RMSNorm 在这里同样被抹平：RMSNorm 没有 β，
     /// 给内核喂一块零张量占住 β 槽位（值会被内核丢弃），反向回传的 `dβ` 也无人接收。
     ///
-    /// 不适用时返回 None，调用方回退逐算子路径：SwiGLU 配置、推理模式
-    /// （`no_grad`）、形状或规模不合适、GPU 不可用，以及**本 MLP 挂了 LoRA 或被量化**
+    /// 不适用时返回 None，调用方回退逐算子路径：MoE 分支、
+    /// 形状或规模不合适、GPU 不可用，以及**本 MLP 挂了 LoRA 或被量化**
     /// （理由同 [`TransformerBlock::attn_resident`]：这条路径直接读权重显存，绕过
     /// [`Linear::forward`]，适配器增量会被静默丢掉、量化也会被绕过）。
     #[cfg(feature = "gpu")]
     fn mlp_resident(&self, x: &Tensor, training: bool) -> Option<Tensor> {
-        if !crate::tensor::grad_enabled() || self.ffn.has_lora() || self.ffn.has_quant() {
+        if self.ffn.has_lora() || self.ffn.has_quant() {
             return None;
         }
         let shape = x.shape();
@@ -760,24 +774,51 @@ impl TransformerBlock {
                 &zero_beta
             }
         };
-        let (w1, b1, w2, b2) = self.ffn.gelu_weights()?;
-        let hid = w1.shape()[1];
-        let res = crate::gpu::mlp_forward(
-            &x.decode(),
-            &gamma.decode(),
-            &beta.decode(),
-            &w1.decode(),
-            &b1.decode(),
-            &w2.decode(),
-            &b2.decode(),
-            b * t,
-            d,
-            hid,
-            eps,
-            is_rms,
-            self.dropout,
-            training,
-        )?;
+        // 权重分流：SwiGLU 三投影走 mlp_swiglu_forward，GELU 两投影走 mlp_forward；
+        // w3_bwd 是 SwiGLU 独有的 up 投影（反向要单独接收 dW₃/dB₃），GELU 分支为 None。
+        let (res, (w1, b1, w2, b2), w3_bwd) =
+            if let Some((wg, bg, wu, bu, wd, bd)) = self.ffn.swiglu_weights() {
+                let hid = wg.shape()[1];
+                let r = crate::gpu::mlp_swiglu_forward(
+                    &x.decode(),
+                    &gamma.decode(),
+                    &beta.decode(),
+                    &wg.decode(),
+                    &bg.decode(),
+                    &wu.decode(),
+                    &bu.decode(),
+                    &wd.decode(),
+                    &bd.decode(),
+                    b * t,
+                    d,
+                    hid,
+                    eps,
+                    is_rms,
+                    self.dropout,
+                    training,
+                )?;
+                (r, (wg, bg, wd, bd), Some((Tensor::clone(wu), Tensor::clone(bu))))
+            } else {
+                let (w1, b1, w2, b2) = self.ffn.gelu_weights()?;
+                let hid = w1.shape()[1];
+                let r = crate::gpu::mlp_forward(
+                    &x.decode(),
+                    &gamma.decode(),
+                    &beta.decode(),
+                    &w1.decode(),
+                    &b1.decode(),
+                    &w2.decode(),
+                    &b2.decode(),
+                    b * t,
+                    d,
+                    hid,
+                    eps,
+                    is_rms,
+                    self.dropout,
+                    training,
+                )?;
+                (r, (w1, b1, w2, b2), None)
+            };
         let out_data = res.out.clone();
         let x_bwd = x.clone();
         let gamma_bwd = Tensor::clone(gamma);
@@ -802,6 +843,13 @@ impl TransformerBlock {
                     gamma_bwd.accumulate_grad(&g.dgamma, 1.0);
                     if let Some(bb) = &beta_bwd {
                         bb.accumulate_grad(&g.dbeta, 1.0);
+                    }
+                    // SwiGLU 独有的 up 投影梯度（GELU 分支下 w3_bwd 与 g.dw3 都是 None）
+                    if let (Some((w3, b3)), Some(dw3), Some(db3)) =
+                        (&w3_bwd, &g.dw3, &g.db3)
+                    {
+                        w3.accumulate_grad(dw3, 1.0);
+                        b3.accumulate_grad(db3, 1.0);
                     }
                 })
             },
@@ -1508,9 +1556,10 @@ impl Transformer {
         training: bool,
     ) -> Option<Tensor> {
         use crate::attention::{expand_kv_head, fold_kv_head_grad};
-        use crate::gpu::{STACK_PARAMS_PER_LAYER, StackArgs, StackLayerArgs};
-        if !crate::tensor::grad_enabled()
-            || self.blocks.is_empty()
+        use crate::gpu::{
+            StackArgs, StackLayerArgs, STACK_PARAMS_PER_LAYER, STACK_PARAMS_PER_LAYER_SWIGLU,
+        };
+        if self.blocks.is_empty()
             || self.has_lora()
             || self.has_quant()
             // MLA 整段让路（理由同 `TransformerBlock::attn_resident`）
@@ -1528,16 +1577,36 @@ impl Transformer {
         let n_kv = self.blocks[0].attn.n_kv_head;
         let n_rep = n_head / n_kv;
         let hd = d / n_head;
-        // 每层的 16 个参数张量，顺序必须与 `StackLayerArgs` 的字段顺序一致
+        // 前馈模式整叠一个开关：SwiGLU 每层 18 个参数（尾部多 up 投影一对），GELU 16 个
+        // （以第 0 层判定；其余层由 gelu_weights/swiglu_weights 的 `?` 兜底一致性）
+        let (swiglu, pp) = if self.blocks[0].ffn.swiglu_weights().is_some() {
+            (true, STACK_PARAMS_PER_LAYER_SWIGLU)
+        } else {
+            (false, STACK_PARAMS_PER_LAYER)
+        };
+        // 每层的 pp 个参数张量，顺序必须与 `StackLayerArgs` 的字段顺序一致
         // （`gpu::StackGrads::grads` 也按这个顺序回来）
-        let mut params: Vec<Tensor> =
-            Vec::with_capacity(STACK_PARAMS_PER_LAYER * self.blocks.len());
+        let mut params: Vec<Tensor> = Vec::with_capacity(pp * self.blocks.len());
         // GQA 展开后的 K/V 参数（顺序 Wk, bk, Wv, bv），按层对齐；n_rep == 1 时为空
         let mut kv_expanded: Vec<[Vec<f32>; 4]> = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             let (gamma1, beta1_opt, _, _) = block.ln1.norm_params();
             let (gamma2, beta2_opt, _, _) = block.ln2.norm_params();
-            let (w1, b1, w2, b2) = block.ffn.gelu_weights()?;
+            // 前馈三/四元组：SwiGLU 拿 gate/up/down 六元组（MoE 等拿不到 → `?` 整段回退）
+            let ffn_w: Vec<Tensor> = if swiglu {
+                let (wg, bg, wu, bu, wd, bd) = block.ffn.swiglu_weights()?;
+                vec![
+                    wg.clone(),
+                    bg.clone(),
+                    wd.clone(),
+                    bd.clone(),
+                    wu.clone(),
+                    bu.clone(),
+                ]
+            } else {
+                let (w1, b1, w2, b2) = block.ffn.gelu_weights()?;
+                vec![w1.clone(), b1.clone(), w2.clone(), b2.clone()]
+            };
             let (cq, ck, cv, cp) = (
                 &block.attn.c_q,
                 &block.attn.c_k,
@@ -1559,11 +1628,9 @@ impl Transformer {
                 cp.bias.clone(),
                 gamma2.clone(),
                 beta2_opt.cloned().unwrap_or_else(zero_beta),
-                w1.clone(),
-                b1.clone(),
-                w2.clone(),
-                b2.clone(),
             ]);
+            // 前馈槽位：GELU 是 W₁,b₁,W₂,b₂；SwiGLU 尾部再 +W_up,b_up（16/18 槽对齐）
+            params.extend(ffn_w);
             if n_rep > 1 {
                 let (wk, bk) = (ck.weight.decode(), ck.bias.decode());
                 let (wv, bv) = (cv.weight.decode(), cv.bias.decode());
@@ -1582,7 +1649,7 @@ impl Transformer {
                 params.iter().map(|p| p.decode()).collect();
             let layers: Vec<StackLayerArgs> = (0..self.blocks.len())
                 .map(|i| {
-                    let s = &guards[i * STACK_PARAMS_PER_LAYER..][..STACK_PARAMS_PER_LAYER];
+                    let s = &guards[i * pp..][..pp];
                     // GQA 时 K/V 用展开后的参数，其余槽位一律取原始张量
                     let (wk, bk, wv, bv): (&[f32], &[f32], &[f32], &[f32]) = if n_rep > 1 {
                         let e = &kv_expanded[i];
@@ -1607,6 +1674,8 @@ impl Transformer {
                         b1: &s[13][..],
                         w2: &s[14][..],
                         b2: &s[15][..],
+                        w3: if swiglu { &s[16][..] } else { &[] },
+                        b3: if swiglu { &s[17][..] } else { &[] },
                     }
                 })
                 .collect();
@@ -1632,6 +1701,7 @@ impl Transformer {
                 n_head,
                 eps,
                 is_rms,
+                swiglu,
                 dropout: self.dropout,
                 training,
             })?
@@ -1650,7 +1720,7 @@ impl Transformer {
                     x_bwd.accumulate_grad(&g.dx, 1.0);
                     // 参数张量不在 parents 里，autograd 不会为它们建图反向 → 由闭包手动注入
                     for (k, pg) in g.grads.iter().enumerate() {
-                        let slot = k % STACK_PARAMS_PER_LAYER;
+                        let slot = k % pp;
                         // RMSNorm 没有 β：写回的 dβ 是「Σ dy」的残值，无人接收
                         if is_rms && (slot == 1 || slot == 11) {
                             continue;
@@ -1745,8 +1815,9 @@ impl Transformer {
 
         // 3. 因果掩码（条件物化）：CPU 分块核在核内屏蔽（query i 只算
         //    j <= visible_before + i），逐算子 CPU 路径同样不必物化 —— 只有
-        //    GPU 常驻/整叠/probe 路径要真实 [T, T_total] buffer，且只在训练态
-        //    （无 KV cache、base=0，此时 t_total = t）才走，这时才物化一次供全栈共享；
+        //    GPU 常驻/整叠/probe 路径要真实 [T, T_total] buffer，且只在
+        //    无 KV cache、base=0（此时 t_total = t，评估的 no_grad 前向也在此列）
+        //    才走，这时才物化一次供全栈共享；
         //    attn_resident / blocks_resident 收到 None 时还会各自兜底物化。
         assert!(
             window == 0 || t <= window,
@@ -1773,7 +1844,7 @@ impl Transformer {
         //    整叠把每步压成 2 次提交，省掉的是每次提交后的 poll + 回读等待。
         //
         //    仍然默认关闭：整叠的准入条件更严——要求**所有** Block 都满足常驻条件
-        //    （LayerNorm + GELU MLP），任一层不满足就整条路径放弃；逐子层则是哪个子层
+        //    （LayerNorm + GELU/SwiGLU MLP），任一层不满足就整条路径放弃；逐子层则是哪个子层
         //    不满足就只回退那一个。想复现对照实验或追求吞吐时设环境变量
         //    `LLM_GPU_STACK`（**只要设置了就生效**，值本身不参与判断，`is_some`）。
         #[cfg(feature = "gpu")]
