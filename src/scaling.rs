@@ -192,6 +192,21 @@ pub fn flops_train(n_params: f64, n_tokens: f64) -> f64 {
 }
 
 /// 一层 Transformer Block 的参数量（不含嵌入与最终归一化）
+///
+/// 全部按 `cfg` 的**真实开关**算，不再假设历史默认形态：
+/// - 每个头的宽度取 [`TransformerConfig::head_dim()`]（`head_dim = 0` 才是 `n_embd / n_head`）；
+/// - FFN 隐层宽度取 [`TransformerConfig::ffn_hidden()`]（`0` = 默认公式，HF 的
+///   `intermediate_size` 从这里进来）；
+/// - `qkv_bias` / `o_bias` / `mlp_bias` 决定各投影是否多一条 bias——HF 的 LLaMA / Qwen
+///   全系列都不带 bias，按历史默认公式会把参数量算多。
+///
+/// ⚠️ **已知未覆盖**（这些配置下本公式会偏离实测，勿当成"公式已完整"）：
+/// - 解耦 RoPE（`mla_rope_dim > 0`）：`c_qr` / `c_kr` 两个旋转投影没算，且 `c_q` 的
+///   输出维从 `n_embd` 变成 `n_head × (head_dim − mla_rope_dim)`；
+/// - MoE（`n_expert > 1`）：仍按**一个**稠密 FFN 算，`n_expert` 个专家与共享专家都没计入；
+/// - mHC（`n_stream > 1`）：`hc_attn` / `hc_mlp` / `hc_collapse` 的超连接参数没算。
+///
+/// 默认配置（`head_dim = 0`、`ffn_hidden = 0`、三个 bias 全 `true`）下结果与改动前**逐位相同**。
 pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
     let d = cfg.n_embd;
     let n_kv = if cfg.n_kv_head == 0 {
@@ -199,11 +214,16 @@ pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
     } else {
         cfg.n_kv_head
     };
-    let hd = d / cfg.n_head;
+    // head_dim = 0 时由 n_embd/n_head 推出（历史默认，逐位不变）；显式给出时以配置为准
+    let hd = cfg.head_dim();
     let kv_dim = n_kv * hd;
     // 两个归一化子层：LayerNorm 有 γ/β，RMSNorm 只有 γ
     let norm = if cfg.use_rmsnorm { d } else { 2 * d };
-    // 注意力四个投影：权重 [in, out] + 长度 out 的 bias。
+    // bias 开关在算术上就是"多 0 或多一条长度 = 输出维"。默认全 true ⇒ 与旧公式逐位相同
+    let b_qkv = cfg.qkv_bias as usize;
+    let b_o = cfg.o_bias as usize;
+    let b_mlp = cfg.mlp_bias as usize;
+    // 注意力四个投影：权重 [in, out] + 是否带长度 out 的 bias。
     // GQA 下 K/V 只投影到 n_kv 个头，参数量随之下降。
     //
     // MLA（`kv_lora_rank > 0`）多一个把输入压到低秩 latent 的 `c_kv`（d → r），
@@ -212,21 +232,24 @@ pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
     // 与"latent 缓存省显存"是两个独立的收益（见 [`crate::attention`] 的 MLA 说明）。
     let attn = if cfg.kv_lora_rank > 0 {
         let r = cfg.kv_lora_rank;
-        (d * d + d)                    // c_q
-            + (d * r + r)              // c_kv（低秩压缩）
-            + 2 * (r * kv_dim + kv_dim) // c_k, c_v（从 latent 升维）
-            + (d * d + d)              // c_proj
+        (d * d + b_qkv * d)                        // c_q
+            + (d * r + b_qkv * r)                  // c_kv（低秩压缩）
+            + 2 * (r * kv_dim + b_qkv * kv_dim)    // c_k, c_v（从 latent 升维）
+            + (d * d + b_o * d)                    // c_proj
     } else {
-        (d * d + d)                          // c_q
-            + 2 * (d * kv_dim + kv_dim)      // c_k, c_v
-            + (d * d + d)                    // c_proj
+        (d * d + b_qkv * d)                        // c_q
+            + 2 * (d * kv_dim + b_qkv * kv_dim)    // c_k, c_v
+            + (d * d + b_o * d)                    // c_proj
     };
-    // MLP：GELU 两个投影（隐层 4d），SwiGLU 三个投影（隐层 ≈ 2.67d）
+    // MLP：GELU 两个投影（默认隐层 4d）、SwiGLU 三个投影（默认隐层 ≈ 2.67d）；
+    // 隐层宽度统一取 `cfg.ffn_hidden()`，与 `TransformerBlock::new` 建层用的是同一个口径
+    let h = cfg.ffn_hidden();
     let mlp = if cfg.use_swiglu {
-        let h = crate::layers::swiglu_hidden(d);
-        3 * d * h + 2 * h + d // w_gate / w_up: d×h + h；w_down: h×d + d
+        // w_gate / w_up: d×h（各带 h 的 bias）；w_down: h×d（带 d 的 bias）
+        2 * (d * h + b_mlp * h) + (h * d + b_mlp * d)
     } else {
-        (d * 4 * d + 4 * d) + (4 * d * d + d)
+        // linear1: d×h；linear2: h×d
+        (d * h + b_mlp * h) + (h * d + b_mlp * d)
     };
     // QK-Norm（`qk_norm = true`）：Q、K 各一个 RMSNorm，归一化的是**每个头**的 head_dim 方向，
     // 所以每个 `gamma` 长 `head_dim` 而不是 `d`；GQA 下 K 侧也只有一套（各 KV 头共用）。
@@ -244,9 +267,15 @@ pub fn params_non_embedding(cfg: &TransformerConfig) -> usize {
     cfg.n_layer * params_per_layer(cfg) + final_norm
 }
 
-/// 全部参数量（含词嵌入）。本项目输出头与词嵌入**共享同一张表**，所以只算一份。
+/// 全部参数量（含词嵌入与输出头）。
+///
+/// `tie_embeddings = true`（默认）时输出头与词嵌入**共享同一张表**，只算一份；
+/// `tie_embeddings = false`（HF 的 LLaMA-3 / Qwen2 口径）时 checkpoint 里多一份独立的
+/// `head.weight`（`[vocab, n_embd]`），必须算两份，否则 `params_scan` 的实测断言会先炸。
 pub fn params_total(cfg: &TransformerConfig) -> usize {
-    params_non_embedding(cfg) + cfg.vocab_size * cfg.n_embd
+    // 绑定 ⇒ 只有词嵌入表；不绑定 ⇒ 词嵌入表 + 独立输出头，各 `vocab × n_embd`
+    let tables = if cfg.tie_embeddings { 1 } else { 2 };
+    params_non_embedding(cfg) + tables * cfg.vocab_size * cfg.n_embd
 }
 
 // ==================== Chinchilla 最优配比 ====================
@@ -614,7 +643,7 @@ pub fn params_scan(
             sc.batch_size * sc.block_size,
             sc.tokens_per_point(sc.steps) / 1e6,
         );
-        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng);
+        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng, None);
         points.push(ScanPoint {
             label: format!("{n_layer}x{n_embd}"),
             n_layer,
@@ -660,7 +689,7 @@ pub fn tokens_scan(
             sc.tokens_per_point(steps) / 1e6,
             params_non_embedding(cfg),
         );
-        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng);
+        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng, None);
         points.push(ScanPoint {
             label: format!("x{k}"),
             n_layer: cfg.n_layer,
@@ -961,13 +990,20 @@ mod tests {
 
     /// 实测扫描：更大的模型在同一 token 预算下必须拿到更低的 loss，
     /// 且拟合出的幂律指数为正、不可约损失低于所有实测点。
+    ///
+    /// **语料必须足够大**（这里 4 句 ×120 ≈ 42KB）：扫描的 token 预算是固定的
+    /// `steps × batch × block = 150×4×32 ≈ 19k`。语料只有几 KB 时，三个规模都会在 150 步内
+    /// 把语料**背下来**（val ppl ≈ 1.2），此时的 loss 排序由"谁的优化更快"决定，
+    /// 参数量更大的点反而可能略差（欠训练）——"更大更低"只在**欠训练**区间成立，
+    /// 而那正是 scaling law 的前提。早期用 `repeat(12)`（≈4KB）跑 19k token ≈ 4.5 个 epoch，
+    /// 等于在记忆化区间里比噪声：任何改动数值的修正（例如 RoPE 逐头频率表）都会把排序抖反。
     #[test]
     fn test_params_scan_larger_models_reach_lower_loss() {
         let corpus = "the quick brown fox jumps over the lazy dog. \
                       a fast brown fox leaps across the sleepy hound. \
                       the lazy dog sleeps while the quick fox runs away. \
                       quick foxes and lazy dogs are friends in this little tale. "
-            .repeat(12);
+            .repeat(120);
         let tokenizer = Tokenizer::char(&corpus);
         let sc = ScanConfig {
             steps: 150,
@@ -1092,6 +1128,118 @@ mod tests {
                 actual,
                 params_total(&cfg),
                 "参数量公式与实际模型不符（n_kv_head={n_kv}, kv_lora_rank={lora_rank}, qk_norm={qk_norm}）"
+            );
+        }
+    }
+
+    /// 改动前 `params_per_layer` 的**原样拷贝**，只服务"默认形态"的配置
+    /// （`head_dim` / `ffn_hidden` 取默认、q/k/v/o 与 MLP 的 bias 全在）。
+    /// 留在测试里当对照物：新公式在默认形态下必须与它给出同一个数。
+    fn legacy_params_per_layer(cfg: &TransformerConfig) -> usize {
+        let d = cfg.n_embd;
+        let n_kv = if cfg.n_kv_head == 0 {
+            cfg.n_head
+        } else {
+            cfg.n_kv_head
+        };
+        let hd = d / cfg.n_head;
+        let kv_dim = n_kv * hd;
+        let norm = if cfg.use_rmsnorm { d } else { 2 * d };
+        let attn = if cfg.kv_lora_rank > 0 {
+            let r = cfg.kv_lora_rank;
+            (d * d + d) + (d * r + r) + 2 * (r * kv_dim + kv_dim) + (d * d + d)
+        } else {
+            (d * d + d) + 2 * (d * kv_dim + kv_dim) + (d * d + d)
+        };
+        let mlp = if cfg.use_swiglu {
+            let h = crate::layers::swiglu_hidden(d);
+            3 * d * h + 2 * h + d
+        } else {
+            (d * 4 * d + 4 * d) + (4 * d * d + d)
+        };
+        let qk = if cfg.qk_norm { 2 * hd } else { 0 };
+        2 * norm + attn + mlp + qk
+    }
+
+    /// 默认形态配置下，新公式（按 `cfg` 开关算）与**旧公式**必须逐位相同——
+    /// 否则历史上 `scaling` 报告/文档里的参数量与幂律数字会整体漂移。
+    #[test]
+    fn test_params_per_layer_matches_legacy_formula_in_default_shape() {
+        // (n_kv_head, kv_lora_rank, qk_norm, use_swiglu)
+        let variants = [
+            (0usize, 0usize, false, true),
+            (0, 0, false, false),
+            (2, 0, true, false),
+            (2, 8, true, true),
+        ];
+        // 默认配置本身就是最要紧的那条（head_dim/ffn_hidden/bias 全取默认值）
+        let mut cfgs = vec![TransformerConfig::default()];
+        for (n_kv, lora_rank, qk_norm, use_swiglu) in variants {
+            let mut cfg = TransformerConfig::tiny(32);
+            cfg.n_kv_head = n_kv;
+            cfg.kv_lora_rank = lora_rank;
+            cfg.qk_norm = qk_norm;
+            cfg.use_swiglu = use_swiglu;
+            cfgs.push(cfg);
+        }
+        for cfg in &cfgs {
+            assert_eq!(
+                params_per_layer(cfg),
+                legacy_params_per_layer(cfg),
+                "默认形态下公式漂移了（n_embd={}, n_head={}, n_kv_head={}, kv_lora_rank={}, use_swiglu={}）",
+                cfg.n_embd,
+                cfg.n_head,
+                cfg.n_kv_head,
+                cfg.kv_lora_rank,
+                cfg.use_swiglu,
+            );
+        }
+    }
+
+    /// HF 口径（Q/K/V、O、FFN **全无 bias** + 显式 `intermediate_size` + 不绑定输出头）下，
+    /// [`params_per_layer`] 必须与**真实建出来的模型逐张量**对上——旧公式会把 bias 算多。
+    #[test]
+    fn test_params_per_layer_matches_built_model_hf_shape() {
+        use crate::model::Transformer;
+        use crate::rng::Rng;
+
+        // (use_swiglu, ffn_hidden)：显式给一个与默认公式（SwiGLU 256 / GELU 256）不同的宽度
+        for (use_swiglu, ffn_hidden) in [(true, 192usize), (false, 160)] {
+            let mut cfg = TransformerConfig::tiny(32);
+            cfg.n_layer = 2;
+            cfg.qkv_bias = false;
+            cfg.o_bias = false;
+            cfg.mlp_bias = false;
+            cfg.ffn_hidden = ffn_hidden;
+            cfg.use_swiglu = use_swiglu;
+            // HF 的 LLaMA-3 / Qwen2 口径：输出头不绑定，checkpoint 里多一份 head.weight
+            cfg.tie_embeddings = false;
+            let mut rng = Rng::new(3);
+            let model = Transformer::new(cfg.clone(), &mut rng);
+            let named = model.named_parameters();
+
+            // 逐张量数元素：block 的参数全挂在 `blocks.{i}.` 前缀下，逐层都应等于公式
+            let blocks_sum: usize = named
+                .iter()
+                .filter(|(n, _)| n.starts_with("blocks."))
+                .map(|(_, t)| t.numel())
+                .sum();
+            assert_eq!(
+                blocks_sum,
+                cfg.n_layer * params_per_layer(&cfg),
+                "per-layer 公式与逐张量实测不符（use_swiglu={use_swiglu}, ffn_hidden={ffn_hidden}）"
+            );
+
+            // 不绑定时确实存在独立输出头，且整模型参数量（两张嵌入尺度表）也要对上
+            assert!(
+                named.iter().any(|(n, _)| n.as_str() == "head.weight"),
+                "tie_embeddings = false 时应存在独立的 head.weight"
+            );
+            let all: usize = named.iter().map(|(_, t)| t.numel()).sum();
+            assert_eq!(
+                all,
+                params_total(&cfg),
+                "含独立输出头的总参数量不符（use_swiglu={use_swiglu}, ffn_hidden={ffn_hidden}）"
             );
         }
     }

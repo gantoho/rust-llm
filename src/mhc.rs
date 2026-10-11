@@ -299,11 +299,17 @@ impl HyperConnection {
         let ones_row = Tensor::from_vec(vec![1.0; self.n], vec![1, self.n]);
         let ones_col = Tensor::from_vec(vec![1.0; self.n], vec![self.n, 1]);
         let mut a = self.depth_raw.softmax_last_dim();
+        // 除零保护：行 softmax 保证每行至少一个非零项，正常数据下列和/行和恒 > 0；
+        // 但极端 logits 下某一列可能整体下溢到 f32 的 0，`a / 0 = inf` →
+        // 下一轮 `inf / inf = NaN` 会顺着 tape 污染整条反向链。
+        // 加一个远小于数据尺度的 eps 抹掉这个极点：相对扰动 ~1e-12，
+        // 对"行和/列和为 1"的偏离远小于任何测试容差。
+        const SINKHORN_EPS: f32 = 1e-12;
         for _ in 0..self.iters {
             let col = ones_row.matmul(&a); // [1, n] 列和
-            a = a.div(&col);
+            a = a.div(&col.add_scalar(SINKHORN_EPS));
             let row = a.matmul(&ones_col); // [n, 1] 行和
-            a = a.div(&row);
+            a = a.div(&row.add_scalar(SINKHORN_EPS));
         }
         a
     }

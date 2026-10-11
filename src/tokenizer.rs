@@ -114,10 +114,27 @@ impl CharTokenizer {
 /// 3. 重复合并，直到词表达到目标大小
 /// 4. 高频子词（如 "the"、"ing"）逐渐成为独立符号，实现"用更少的 token 表示更多文本"
 pub struct BPETokenizer {
-    /// 合并规则，按下标顺序（越早合并优先级越高）
-    merges: Vec<(u16, u16)>,
+    /// 合并规则，按下标顺序（越早合并优先级越高）。
+    ///
+    /// 三元组是 `(左 id, 右 id, 合并后的 id)`——**合并结果 id 必须显式存**：
+    /// 自研训练时它恰好是 `256 + 合并序号`，但 HF 的词表把特殊 token 排在前面
+    /// （LLaMA-2 的 `<unk>/<s></s>` 占 0/1/2），"合并结果 = 256+序号"从此不成立。
+    /// 老存档里的二元组按 `256 + 序号` 还原（见 [`Self::from_json`]），行为逐位不变。
+    merges: Vec<(u32, u32, u32)>,
     /// token id -> 它代表的字节序列
     vocab: Vec<Vec<u8>>,
+    /// 每个**单字节**对应的初始 token id（长度 256）。
+    ///
+    /// 自研训练时恒为 `byte_id[b] = b`（字节 token 就是 0..256），但 HF 的词表常把
+    /// 特殊 token 排在前面（LLaMA-2 的 `<unk>/<s>/</s>` 占 0/1/2，字节 token 从 3 开始），
+    /// 那时"字节 b 的 id"必须查表。老存档没有这个字段 ⇒ 按恒等映射还原（逐位不变）。
+    byte_id: Vec<u32>,
+    /// 编码前是否先按 **GPT-2 正则**切分（HF 的 `pre_tokenizer: ByteLevel` 口径）。
+    ///
+    /// `false`（默认）= 本仓库自研分词器的历史行为：整段文本一起做 BPE 合并。
+    /// HF 的词表是在"先切分、再逐片合并"的前提下训出来的，不切分就会跨边界合并出
+    /// 词表里不存在的 token 序列，与 HF 的输出对不上，所以导入时必须置 `true`。
+    pretok: bool,
 }
 
 /// 增量调整 pair 频次（delta = ±1），并把新值推进优先队列。
@@ -125,9 +142,9 @@ pub struct BPETokenizer {
 /// 队列里同一 pair 可能积累多个条目，pop 时按 `pair_freq` 当前值校验，
 /// 不一致的视为过期直接丢弃（懒删除）——避免每轮合并后重建整个堆。
 fn bump_pair(
-    pair_freq: &mut HashMap<(u16, u16), usize>,
-    heap: &mut BinaryHeap<(usize, Reverse<(u16, u16)>)>,
-    pair: (u16, u16),
+    pair_freq: &mut HashMap<(u32, u32), usize>,
+    heap: &mut BinaryHeap<(usize, Reverse<(u32, u32)>)>,
+    pair: (u32, u32),
     delta: i32,
 ) {
     let e = pair_freq.entry(pair).or_insert(0);
@@ -150,20 +167,20 @@ impl BPETokenizer {
 
     fn train_bytes(data: &[u8], target_vocab: usize) -> Self {
         assert!(target_vocab >= 256, "BPE 词表至少 256（字节级）");
-        let mut vocab: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
-        let mut merges: Vec<(u16, u16)> = Vec::new();
-        let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
+        let mut vocab: Vec<Vec<u8>> = (0u32..=255).map(|b| vec![b as u8]).collect();
+        let mut merges: Vec<(u32, u32, u32)> = Vec::new();
+        let mut ids: Vec<u32> = data.iter().map(|&b| b as u32).collect();
 
         // pair -> 当前频次：初始扫一遍，之后随每次合并增量增减，
         // 不再像旧实现那样每轮全量重扫语料重建 HashMap（O(merges × corpus) 的主项之一）
-        let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
+        let mut pair_freq: HashMap<(u32, u32), usize> = HashMap::new();
         for w in ids.windows(2) {
             *pair_freq.entry((w[0], w[1])).or_insert(0) += 1;
         }
         // 最大堆：键 (频次, Reverse(pair))，频次最高者在顶、平手取 pair 值小者
         // （确定性 tie-break，与旧实现的 max_by 规则一致）。
         // 频次每次变化都 push 新条目，pop 时按 pair_freq 校验，过期条目直接丢弃（懒删除）。
-        let mut heap: BinaryHeap<(usize, Reverse<(u16, u16)>)> = BinaryHeap::new();
+        let mut heap: BinaryHeap<(usize, Reverse<(u32, u32)>)> = BinaryHeap::new();
         for (&p, &f) in &pair_freq {
             if f > 0 {
                 heap.push((f, Reverse(p)));
@@ -173,7 +190,7 @@ impl BPETokenizer {
         let target_merges = target_vocab - 256;
         let log_interval = if target_merges >= 20 { target_merges / 20 } else { 1 };
         // 双缓冲交替复用：每轮合并结果写进 buf 再 swap，避免逐轮重新分配大 Vec
-        let mut buf: Vec<u16> = Vec::with_capacity(ids.len());
+        let mut buf: Vec<u32> = Vec::with_capacity(ids.len());
 
         'train: while vocab.len() < target_vocab {
             // 弹出所有过期条目，取当前真实最高频 pair；堆空说明没有可合并的 pair
@@ -188,11 +205,11 @@ impl BPETokenizer {
             };
 
             // 创建新 token
-            let new_id = vocab.len() as u16;
+            let new_id = vocab.len() as u32;
             let mut new_bytes = vocab[best.0 as usize].clone();
             new_bytes.extend_from_slice(&vocab[best.1 as usize]);
             vocab.push(new_bytes);
-            merges.push(best);
+            merges.push((best.0, best.1, new_id));
 
             // 单次扫描合并该 pair，同时**增量**更新受影响 pair 的频次。
             // 每处合并只影响三个旧 pair：左邻 (prev, a)、本身 (a, b)、右邻 (b, next)，
@@ -227,7 +244,7 @@ impl BPETokenizer {
         }
         println!("  BPE 训练完成: {} 次合并, 词表 {}", merges.len(), vocab.len());
 
-        BPETokenizer { merges, vocab }
+        BPETokenizer { merges, vocab, byte_id: (0u32..256).collect(), pretok: false }
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -238,11 +255,26 @@ impl BPETokenizer {
     ///
     /// 贪心合并（通行的标准实现）：按优先级从高到低，对每条合并规则在序列上
     /// 做一趟扫描替换。复杂度 O(len × 合并数)，大语料也能秒级完成。
+    ///
+    /// `pretok = true`（HF 口径）时**先按 GPT-2 正则切成片、再逐片合并**：
+    /// HF 的词表就是在切分后的片段上训出来的，整段一起合并会跨词/跨标点边界拼出
+    /// 词表里不存在的序列，与 HF 的分词结果对不上。
     pub fn encode(&self, text: &str) -> Vec<usize> {
-        let mut ids: Vec<u16> = text.as_bytes().iter().map(|&b| b as u16).collect();
-        for (idx, &(a, b)) in self.merges.iter().enumerate() {
-            let new_id = (256 + idx) as u16;
-            let mut out: Vec<u16> = Vec::with_capacity(ids.len());
+        if self.pretok {
+            let mut out = Vec::new();
+            for piece in gpt2_pretokenize(text) {
+                out.extend(self.merge_piece(&piece));
+            }
+            return out;
+        }
+        self.merge_piece(text.as_bytes())
+    }
+
+    /// 对一段字节做 BPE 合并（`encode` 的单片实现，两种口径共用）
+    fn merge_piece(&self, bytes: &[u8]) -> Vec<usize> {
+        let mut ids: Vec<u32> = bytes.iter().map(|&b| self.byte_id[b as usize]).collect();
+        for &(a, b, new_id) in self.merges.iter() {
+            let mut out: Vec<u32> = Vec::with_capacity(ids.len());
             let mut i = 0;
             while i < ids.len() {
                 if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
@@ -298,20 +330,34 @@ impl BPETokenizer {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "bpe",
-            "merges": self.merges.iter().map(|(a, b)| vec![*a, *b]).collect::<Vec<_>>(),
+            "pretok": self.pretok,
+            "byte_ids": self.byte_id,
+            "merges": self.merges.iter().map(|(a, b, r)| vec![*a, *b, *r]).collect::<Vec<_>>(),
             "vocab": self.vocab.iter().map(|v| v.clone()).collect::<Vec<_>>(),
         })
     }
 
-    /// 从已解析的 JSON 值构造
+    /// 从已解析的 JSON 值构造。
+    ///
+    /// `merges` 兼容两种写法：三元组 `[a, b, 结果 id]`（新，HF 导入必须用这种，
+    /// 因为 HF 的合并结果 id 未必等于 `256 + 序号`）与二元组 `[a, b]`
+    /// （旧存档，按 `256 + 序号` 还原——自研训练的口径，逐位不变）。
     pub fn from_json(json: &serde_json::Value) -> Self {
-        let merges: Vec<(u16, u16)> = json["merges"]
+        let merges: Vec<(u32, u32, u32)> = json["merges"]
             .as_array()
             .expect("分词器文件格式错误：缺少 merges 字段")
             .iter()
-            .map(|v| {
+            .enumerate()
+            .map(|(idx, v)| {
                 let arr = v.as_array().expect("merge 应为数组");
-                (arr[0].as_u64().unwrap() as u16, arr[1].as_u64().unwrap() as u16)
+                let a = arr[0].as_u64().unwrap() as u32;
+                let b = arr[1].as_u64().unwrap() as u32;
+                let r = arr
+                    .get(2)
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as u32)
+                    .unwrap_or(256 + idx as u32);
+                (a, b, r)
             })
             .collect();
         let vocab: Vec<Vec<u8>> = json["vocab"]
@@ -326,7 +372,340 @@ impl BPETokenizer {
                     .collect()
             })
             .collect();
-        BPETokenizer { merges, vocab }
+        let pretok = json["pretok"].as_bool().unwrap_or(false);
+        // 老存档没有 byte_ids ⇒ 恒等映射（自研训练的口径，逐位不变）
+        let byte_id: Vec<u32> = match json["byte_ids"].as_array() {
+            Some(a) => a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect(),
+            None => (0u32..256).collect(),
+        };
+        assert_eq!(byte_id.len(), 256, "byte_ids 必须恰好 256 项");
+        BPETokenizer { merges, vocab, byte_id, pretok }
+    }
+}
+
+/// GPT-2 的**预切分正则**（HF `pre_tokenizer: ByteLevel` 的实际口径）的手写实现。
+///
+/// 原正则（HuggingFace / OpenAI GPT-2 用的那一版）：
+/// ```text
+/// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+/// ```
+/// 本仓库刻意不引 `regex` 依赖（依赖表保持精简），所以按分支手写。各分支的优先级
+/// 就是正则里从左到右的顺序，且**最先匹配者胜**（这是 `|` 的语义）。
+///
+/// 为什么要它：HF 的字节级 BPE 是"先切分、再逐片合并"。片段边界上永远不会有 token 跨越，
+/// 所以"the" 与 "  the" 是不同的 token、数字最多按 3 位一组切、标点自成一类。
+/// 少了这一步，`encode` 会在边界处拼出 HF 词表里不存在的序列，输出与 HF 不一致。
+pub fn gpt2_pretokenize(text: &str) -> Vec<Vec<u8>> {
+    let b = text.as_bytes();
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0usize;
+    // 判断某个字节是否算"字母"：以 ASCII 字母 + 任何非 ASCII 字节（≈ Unicode 字母）近似。
+    // 与 `\p{L}` 的差别只出现在非 ASCII 的标点/数字上，而那些字符的字节都在 0x80 以上，
+    // 会落进"非空白非字母数字"分支——对本仓库支持的模型（LLaMA/Qwen 的中英混合语料）
+    // 结果一致；真要严格对齐需要 `regex` 的 Unicode 属性支持（见模块测试的说明）。
+    let is_letter = |c: u8| c.is_ascii_alphabetic() || c >= 0x80;
+    let is_num = |c: u8| c.is_ascii_digit();
+    let is_space = |c: u8| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c;
+    while i < b.len() {
+        let start = i;
+        // 分支 1：英文缩写后缀（'s / 't / 're / 've / 'm / 'll / 'd）
+        if b[i] == b'\'' && i + 1 < b.len() {
+            let rest = &b[i + 1..];
+            let hit = [
+                (b"s".as_slice(), 1usize),
+                (b"t".as_slice(), 1),
+                (b"re".as_slice(), 2),
+                (b"ve".as_slice(), 2),
+                (b"m".as_slice(), 1),
+                (b"ll".as_slice(), 2),
+                (b"d".as_slice(), 1),
+            ]
+            .into_iter()
+            .find(|(s, n)| rest.len() >= *n && &rest[..*n] == *s);
+            if let Some((_, n)) = hit {
+                i += 1 + n;
+                out.push(b[start..i].to_vec());
+                continue;
+            }
+        }
+        // 分支 2/3：可选的**单个前导空格** + 一串字母（或数字）
+        let mut j = i;
+        if b[j] == b' ' && j + 1 < b.len() && (is_letter(b[j + 1]) || is_num(b[j + 1])) {
+            j += 1;
+        }
+        if j < b.len() && is_letter(b[j]) {
+            while j < b.len() && is_letter(b[j]) {
+                j += 1;
+            }
+            i = j;
+            out.push(b[start..i].to_vec());
+            continue;
+        }
+        if j < b.len() && is_num(b[j]) {
+            // 数字：原正则用 `\p{N}+`（≥1 位连续）。这里按连续 ASCII 数字切，
+            // 与 LLaMA/Qwen 词表的实际训练口径一致（它们的分词器把数字整串交给 BPE）。
+            while j < b.len() && is_num(b[j]) {
+                j += 1;
+            }
+            i = j;
+            out.push(b[start..i].to_vec());
+            continue;
+        }
+        // 分支 4：可选的单个前导空格 + 一串标点/符号（非空白、非字母、非数字）
+        let mut j = i;
+        if b[j] == b' ' && j + 1 < b.len() && !is_space(b[j + 1]) && !is_letter(b[j + 1]) && !is_num(b[j + 1]) {
+            j += 1;
+        }
+        if j < b.len() && !is_space(b[j]) && !is_letter(b[j]) && !is_num(b[j]) {
+            while j < b.len() && !is_space(b[j]) && !is_letter(b[j]) && !is_num(b[j]) {
+                j += 1;
+            }
+            i = j;
+            out.push(b[start..i].to_vec());
+            continue;
+        }
+        // 分支 5：空白串（原正则的 `\s+(?!\S)` / `\s+`）。
+        // 关键细节：**末尾那个空白要留给下一个词**（`\s+(?!\S)` 的负向前瞻会让贪婪匹配
+        // 回退一格），于是 "  x" 切成 `" "` + `" x"` 而不是 `"  "` + `"x"`。
+        if is_space(b[i]) {
+            let mut e = i;
+            while e < b.len() && is_space(b[e]) {
+                e += 1;
+            }
+            // 后面还有内容 ⇒ 只吃到倒数第二个空白；到末尾 ⇒ 整段收下
+            let cut = if e < b.len() { (e - 1).max(i + 1) } else { e };
+            i = cut;
+            out.push(b[start..i].to_vec());
+            continue;
+        }
+        // 兜底：单个字节（正常情况下走不到这里）
+        i += 1;
+        out.push(b[start..i].to_vec());
+    }
+    out
+}
+
+/// GPT-2 的**字节 ↔ Unicode** 映射反查表（char → 原始字节）。
+///
+/// HF 的 `ByteLevel` 预处理器先把 256 个任意字节装进可打印 Unicode 码位
+/// （`!`..`~`、`¡`..`¬`、`®`..`ÿ` 原样保留，其余 68 个映射到 `U+0100` 起），
+/// 这样词表在 JSON 里就是合法字符串。导入时要把它**反查回字节**，
+/// 否则 `vocab` 里存的是码位而不是原始字节，decode 会输出乱码。
+fn gpt2_byte_decoder() -> HashMap<char, u8> {
+    let mut direct: Vec<u32> = (b'!' as u32..=b'~' as u32).collect();
+    direct.extend(0xA1u32..=0xAC);
+    direct.extend(0xAEu32..=0xFF);
+    let mut map = HashMap::new();
+    for &c in &direct {
+        map.insert(char::from_u32(c).expect("可打印区码位必合法"), c as u8);
+    }
+    let mut n = 0u32;
+    for b in 0u32..256 {
+        if !direct.contains(&b) {
+            map.insert(
+                char::from_u32(256 + n).expect("U+0100 起连续码位必合法"),
+                b as u8,
+            );
+            n += 1;
+        }
+    }
+    map
+}
+
+impl Tokenizer {
+    /// 从 **HuggingFace 的 `tokenizer.json`** 构造分词器（LLaMA / Qwen2 系的字节级 BPE）。
+    ///
+    /// 转换与校验（每一步都宁可报错，不静默降级）：
+    /// 1. `model.vocab` 的 token 字符串按 GPT-2 字节表还原成字节 → 我们的 `vocab`，
+    ///    并要求 id **稠密**（0..N 无空洞）；
+    /// 2. `model.merges`（`"a b"`）按字符串查 id，**结果 id 取 `a+b` 拼接串的 id**
+    ///    （HF 的合并结果 id 未必是 `256+序号`）；并校验
+    ///    `bytes(a+b) == bytes(a) ++ bytes(b)`——这条能一举抓住字节表反查错、vocab 读错；
+    /// 3. `added_tokens` 参与词表与特殊 token 识别：`<s>`/`<|begin_of_text|>` → BOS，
+    ///    `</s>`/`<|end_of_text|>`/`<|im_end|>` → EOS，其余 `special: true` 的进
+    ///    `extra_literals`（编码时整体命中，不被 BPE 拆开）；
+    /// 4. `pre_tokenizer` 必须是 ByteLevel（GPT-2 正则）口径 ⇒ 打开 `pretok`；
+    ///    非空 `normalizer` 只放行 `NFC`（对已是 NFC 的文本是恒等变换），其余报错。
+    pub fn load_hf(path: &str) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("读不到 {path}: {e}"))?;
+        let j: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("解析 {path} 失败: {e}"))?;
+        let model = j
+            .get("model")
+            .ok_or_else(|| "tokenizer.json 缺 model 字段".to_string())?;
+        let mtype = model.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        if mtype != "BPE" {
+            return Err(format!(
+                "只支持字节级 BPE 分词器（HF 的 model.type = `{mtype}`）：\
+                 SentencePiece / WordPiece / Unigram 需要另做转换"
+            ));
+        }
+        if let Some(nrm) = j.get("normalizer") {
+            if !nrm.is_null() {
+                // 只放行 **NFC**：Qwen2.5 系列带 `{"type":"NFC"}`（Qwen2 是 null，所以以前能过）。
+                // NFC = Unicode 规范合成（`e` + U+0301 → `é`），对**已经处于 NFC 的文本是
+                // 恒等变换**——中文、常规英文、正常输入的文本都已是 NFC，分词结果与 HF
+                // 完全一致；只有"组合字符序列"这类输入才会不同，所以这里放行并打印提示。
+                // 其余归一化形式（NFD / NFKC / NFKD / Sequence）会真正改变字节序列，仍然拒绝。
+                let t = nrm.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                if t != "NFC" {
+                    return Err(format!(
+                        "tokenizer.json 带 normalizer（{nrm}）：本仓库只放行 `NFC`\
+                         （对已是 NFC 的文本是恒等变换），`{t}` 会改变字节序列、与 HF 分词结果不一致"
+                    ));
+                }
+                println!(
+                    "  提示：该分词器声明了 NFC 归一化。本仓库不实现 Unicode 归一化，\
+                     对已是 NFC 的文本（中文/常规英文）分词结果与 HF 一致；\
+                     含组合字符序列的输入会有差异（如 `e`+U+0301 不会被合成 `é`）。"
+                );
+            }
+        }
+        let pt = serde_json::to_string(&j["pre_tokenizer"]).unwrap_or_default();
+        if !pt.contains("ByteLevel") {
+            return Err(format!(
+                "pre_tokenizer 不是 ByteLevel 口径（实为 {pt}）：缺了 GPT-2 正则切分，\
+                 分词结果会与 HF 不一致"
+            ));
+        }
+        let enc = gpt2_byte_decoder();
+        let dec = |s: &str| -> Result<Vec<u8>, String> {
+            s.chars()
+                .map(|c| {
+                    enc.get(&c).copied().ok_or_else(|| {
+                        format!("token `{s}` 含无法映射的字符 U+{:04X}", c as u32)
+                    })
+                })
+                .collect()
+        };
+        // 字符串 → id
+        let mut str2id: HashMap<String, u32> = HashMap::new();
+        let vocab_obj = model
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "tokenizer.json 缺 model.vocab".to_string())?;
+        for (tok, id) in vocab_obj {
+            let id = id
+                .as_u64()
+                .ok_or_else(|| format!("model.vocab 的 `{tok}` 不是整数 id"))? as u32;
+            str2id.insert(tok.clone(), id);
+        }
+        let mut specials_raw: Vec<(String, u32)> = Vec::new();
+        if let Some(arr) = j.get("added_tokens").and_then(|x| x.as_array()) {
+            for t in arr {
+                let content = t.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let id = t.get("id").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                if content.is_empty() {
+                    continue;
+                }
+                str2id.entry(content.to_string()).or_insert(id);
+                if t.get("special").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    specials_raw.push((content.to_string(), id));
+                }
+            }
+        }
+        // id → 字节
+        let n = str2id.values().copied().max().map(|m| m as usize + 1).unwrap_or(0);
+        let mut slots: Vec<Option<Vec<u8>>> = vec![None; n];
+        for (tok, id) in &str2id {
+            let bytes = dec(tok)?;
+            match &slots[*id as usize] {
+                Some(prev) if *prev != bytes => {
+                    return Err(format!("词表 id {id} 同时对应两组字节：{prev:?} vs {bytes:?}"))
+                }
+                _ => slots[*id as usize] = Some(bytes),
+            }
+        }
+        let vocab: Vec<Vec<u8>> = slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v.ok_or_else(|| format!("词表 id {i} 没有对应 token（HF 词表应稠密）")))
+            .collect::<Result<_, _>>()?;
+        // 字节 → id
+        let mut byte_id = vec![u32::MAX; 256];
+        for (id, b) in vocab.iter().enumerate() {
+            if b.len() == 1 && byte_id[b[0] as usize] == u32::MAX {
+                byte_id[b[0] as usize] = id as u32;
+            }
+        }
+        if let Some(miss) = byte_id.iter().position(|x| *x == u32::MAX) {
+            return Err(format!(
+                "词表里找不到字节 {miss} 的单字节 token：不是字节级 BPE 词表，无法导入"
+            ));
+        }
+        // merges
+        let merges_arr = model
+            .get("merges")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| "tokenizer.json 缺 model.merges".to_string())?;
+        let mut merges: Vec<(u32, u32, u32)> = Vec::with_capacity(merges_arr.len());
+        for (idx, m) in merges_arr.iter().enumerate() {
+            // 老导出是 `"a b"` 字符串，新导出也有 `["a","b"]` 数组形式
+            let (sa, sb) = match m {
+                serde_json::Value::String(s) => {
+                    let mut it = s.splitn(2, ' ');
+                    (
+                        it.next().unwrap_or("").to_string(),
+                        it.next().unwrap_or("").to_string(),
+                    )
+                }
+                serde_json::Value::Array(a) if a.len() == 2 => (
+                    a[0].as_str().unwrap_or("").to_string(),
+                    a[1].as_str().unwrap_or("").to_string(),
+                ),
+                _ => return Err(format!("第 {idx} 条 merges 既不是 \"a b\" 也不是二元数组")),
+            };
+            let ia = *str2id
+                .get(&sa)
+                .ok_or_else(|| format!("merge 第 {idx} 条的左半 `{sa}` 不在词表里"))?;
+            let ib = *str2id
+                .get(&sb)
+                .ok_or_else(|| format!("merge 第 {idx} 条的右半 `{sb}` 不在词表里"))?;
+            let joined = format!("{sa}{sb}");
+            let ir = *str2id
+                .get(&joined)
+                .ok_or_else(|| format!("merge 第 {idx} 条的结果 `{joined}` 不在词表里"))?;
+            let mut cat = dec(&sa)?;
+            cat.extend_from_slice(&dec(&sb)?);
+            if cat != dec(&joined)? {
+                return Err(format!(
+                    "merge 第 {idx} 条（`{sa}` + `{sb}`）的字节拼接与结果 token 不一致：{cat:?} vs {:?}",
+                    dec(&joined)?
+                ));
+            }
+            merges.push((ia, ib, ir));
+        }
+        // 特殊 token：按常见写法挑
+        let pick = |cands: &[&str], who: &str| -> Result<usize, String> {
+            cands
+                .iter()
+                .find_map(|c| str2id.get(*c).copied())
+                .map(|x| x as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "找不到 {who}（试过 {cands:?}）：请确认 tokenizer.json 完整（含 added_tokens）"
+                    )
+                })
+        };
+        let bos = pick(&["<s>", "<|begin_of_text|>", "<|im_start|>"], "BOS")?;
+        let eos = pick(
+            &["</s>", "<|end_of_text|>", "<|im_end|>", "<|endoftext|>"],
+            "EOS",
+        )?;
+        let pad = pick(&["<pad>", "<|endoftext|>", "<unk>"], "PAD").unwrap_or(eos);
+        // 额外字面量：所有 special 里除了已认领的 BOS/EOS/PAD 之外的
+        let extra_literals: Vec<(String, usize)> = specials_raw
+            .into_iter()
+            .filter(|(_, id)| (*id as usize) != bos && (*id as usize) != eos && (*id as usize) != pad)
+            .map(|(t, id)| (t, id as usize))
+            .collect();
+        let inner = Inner::Bpe(BPETokenizer { merges, vocab, byte_id, pretok: true });
+        Ok(Tokenizer {
+            inner,
+            specials: Some(SpecialTokens { bos, eos, pad }),
+            image: None,
+            extra_literals,
+        })
     }
 }
 
@@ -517,6 +896,11 @@ pub struct Tokenizer {
     specials: Option<SpecialTokens>,
     /// 图片 token 区间；`None` = 该分词器不支持多模态（旧文件读入的一律为 None）
     image: Option<ImageTokens>,
+    /// **额外**的特殊 token 字面量 `(写法, id)`：HF 导入时从 `added_tokens` 抄过来
+    /// （`<|im_start|>` / `<|endoftext|>` 这类）。自研分词器为空 ⇒ 只认固定的三个字面量，
+    /// 行为逐位不变。`encode` 会先按这些字面量把文本切开、原样映射成对应 id，
+    /// 而不是让 BPE 把它们拆成字节。
+    extra_literals: Vec<(String, usize)>,
 }
 
 impl Tokenizer {
@@ -542,7 +926,7 @@ impl Tokenizer {
     /// 新建分词器都要挂上特殊 token：id 从内容词表的末尾接着排
     fn wrap(inner: Inner) -> Self {
         let specials = Some(SpecialTokens::new(inner.vocab_size()));
-        Tokenizer { inner, specials, image: None }
+        Tokenizer { inner, specials, image: None, extra_literals: Vec::new() }
     }
 
     /// 挂上图片 token 区间（id 紧跟在 PAD 之后），供图片理解/生成使用。
@@ -582,9 +966,19 @@ impl Tokenizer {
 
     /// 完整词表大小 = 内容词表 + 特殊 token 个数 + 图片 token 个数
     pub fn vocab_size(&self) -> usize {
-        self.content_vocab_size()
-            + self.specials.map_or(0, |_| SpecialTokens::COUNT)
-            + self.image.map_or(0, |im| im.len())
+        // 自研分词器：内容词表 + 3 个特殊 token（+ 图片段），特殊 token 紧跟在内容词表之后。
+        // HF 导入的分词器（`pretok = true`）：特殊 token **本来就在内容词表里**
+        // （LLaMA 的 `<unk>/<s></s>` 占 0/1/2），再 +3 就会凭空多出 3 个 id、
+        // 与模型存档里的 `vocab_size` 对不上。
+        let content = self.content_vocab_size();
+        if matches!(&self.inner, Inner::Bpe(b) if b.pretok) {
+            let top = self.specials.map_or(0, |s| s.bos.max(s.eos).max(s.pad) + 1);
+            content.max(top) + self.image.map_or(0, |im| im.len())
+        } else {
+            content
+                + self.specials.map_or(0, |_| SpecialTokens::COUNT)
+                + self.image.map_or(0, |im| im.len())
+        }
     }
 
     pub fn specials(&self) -> Option<SpecialTokens> {
@@ -658,6 +1052,13 @@ impl Tokenizer {
             for (lit, id) in sp.literals() {
                 if let Some(p) = rest.find(lit) {
                     note(p, Hit::Id(id), lit.len(), &mut hit);
+                }
+            }
+            // HF 导入的额外特殊 token（`<|im_start|>` / `<|endoftext|>` …）：
+            // 同样按字面量整体命中，绝不让 BPE 把它们拆成字节
+            for (lit, id) in &self.extra_literals {
+                if let Some(p) = rest.find(lit.as_str()) {
+                    note(p, Hit::Id(*id), lit.len(), &mut hit);
                 }
             }
             if self.image.is_some() {
@@ -808,6 +1209,14 @@ impl Tokenizer {
                 "end": im.end, "cb_first": im.cb_first, "cb_count": im.cb_count,
             });
         }
+        if !self.extra_literals.is_empty() {
+            json["extra_literals"] = serde_json::Value::Array(
+                self.extra_literals
+                    .iter()
+                    .map(|(t, id)| serde_json::json!({"text": t, "id": id}))
+                    .collect(),
+            );
+        }
         write_json(path, &json);
     }
 
@@ -844,14 +1253,32 @@ impl Tokenizer {
                 eos: read("eos"),
                 pad: read("pad"),
             };
-            // 特殊 token 必须紧跟在内容词表之后，否则 id 空间有洞
-            assert_eq!(
-                sp.bos,
-                inner.vocab_size(),
-                "分词器文件损坏：specials.bos（{}）不等于内容词表大小（{}）",
-                sp.bos,
-                inner.vocab_size()
-            );
+            // 特殊 token 必须紧跟在内容词表之后，否则 id 空间有洞。
+            //
+            // ⚠️ 这条只对**自研分词器**成立（它们就是这样构造的）。HF 导入的词表把
+            // `<unk>/<s></s>` 排在 id 0/1/2，字节 token 反而从 3 起——那时 id 空间
+            // 依然稠密，只是特殊 token 不在末尾。判据用 **`pretok`**（HF 档必为 true、
+            // 自研档必为 false，且它是持久化字段）来区分；注意**不能**用
+            // `extra_literals` 是否为空来判断：HF 档可能压根没有额外字面量
+            // （`<unk>/<s></s>` 都被认领成 BOS/EOS/PAD 了），那会让存档往返后改变行为。
+            let hf_style = json["pretok"].as_bool().unwrap_or(false);
+            if hf_style {
+                for (name, id) in [("bos", sp.bos), ("eos", sp.eos), ("pad", sp.pad)] {
+                    assert!(
+                        id < inner.vocab_size(),
+                        "分词器文件损坏：specials.{name}（{id}）越出词表（{}）",
+                        inner.vocab_size()
+                    );
+                }
+            } else {
+                assert_eq!(
+                    sp.bos,
+                    inner.vocab_size(),
+                    "分词器文件损坏：specials.bos（{}）不等于内容词表大小（{}）",
+                    sp.bos,
+                    inner.vocab_size()
+                );
+            }
             Some(sp)
         } else {
             None
@@ -887,7 +1314,21 @@ impl Tokenizer {
         } else {
             None
         };
-        Tokenizer { inner, specials, image }
+        // 额外特殊 token 字面量（HF 导入的存档才有；老存档缺这个字段 ⇒ 空）
+        let extra_literals: Vec<(String, usize)> = json["extra_literals"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| {
+                        (
+                            v["text"].as_str().unwrap_or("").to_string(),
+                            v["id"].as_u64().unwrap_or(0) as usize,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Tokenizer { inner, specials, image, extra_literals }
     }
 }
 
@@ -1192,5 +1633,137 @@ mod tests {
         }));
         assert!(tok.attach_image_tokens(4, 8).is_none());
         assert_eq!(tok.vocab_size(), 2);
+    }
+}
+
+#[cfg(test)]
+mod hf_import_tests {
+    use super::*;
+
+    /// GPT-2 字节 → Unicode 的正向表（与 `gpt2_byte_decoder` 互逆），测试里用来造 token 字符串
+    fn gpt2_byte_encoder() -> Vec<char> {
+        let mut direct: Vec<u32> = (b'!' as u32..=b'~' as u32).collect();
+        direct.extend(0xA1u32..=0xAC);
+        direct.extend(0xAEu32..=0xFF);
+        let mut map: Vec<Option<char>> = vec![None; 256];
+        for &c in &direct {
+            map[c as usize] = Some(char::from_u32(c).unwrap());
+        }
+        let mut n = 0u32;
+        for m in map.iter_mut() {
+            if m.is_none() {
+                *m = Some(char::from_u32(256 + n).unwrap());
+                n += 1;
+            }
+        }
+        map.into_iter().map(|x| x.unwrap()).collect()
+    }
+
+    /// 造一份 HF 口味的 `tokenizer.json`：`<unk>/<s>/</s>` 占 0/1/2（字节 token 从 3 起，
+    /// 这正是"合并结果 ≠ 256+序号"的场景），外加三条合并规则。
+    fn write_hf_tokenizer(path: &str, bad_merge: bool) {
+        let enc = gpt2_byte_encoder();
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("<unk>".into(), serde_json::json!(0));
+        vocab.insert("<s>".into(), serde_json::json!(1));
+        vocab.insert("</s>".into(), serde_json::json!(2));
+        for (b, c) in enc.iter().enumerate() {
+            vocab.insert(c.to_string(), serde_json::json!(3 + b));
+        }
+        vocab.insert("ab".into(), serde_json::json!(259));
+        vocab.insert("abc".into(), serde_json::json!(260));
+        vocab.insert("1a".into(), serde_json::json!(261));
+        let a = enc[b'a' as usize];
+        let b = enc[b'b' as usize];
+        let c = enc[b'c' as usize];
+        let one = enc[b'1' as usize];
+        // bad_merge：结果 token 写成一个字节拼接对不上的串（验证结构性校验）
+        let merges = if bad_merge {
+            serde_json::json!([format!("{a} {c}")])
+        } else {
+            serde_json::json!([format!("{a} {b}"), format!("ab {c}"), format!("{one} {a}")])
+        };
+        let j = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 0, "content": "<unk>", "special": true},
+                {"id": 1, "content": "<s>", "special": true},
+                {"id": 2, "content": "</s>", "special": true},
+                {"id": 262, "content": "<|im_start|>", "special": true},
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true}
+            ]},
+            "model": {"type": "BPE", "unk_token": "<unk>", "vocab": vocab, "merges": merges},
+            "vocab_size": 263,
+        });
+        std::fs::write(path, serde_json::to_string(&j).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_load_hf_tokenizer_and_encode() {
+        let p = std::env::temp_dir().join("rust_llm_tok_hf.json");
+        let ps = p.to_string_lossy().to_string();
+        write_hf_tokenizer(&ps, false);
+        let tok = Tokenizer::load_hf(&ps).expect("应能导入 HF 分词器");
+        // 特殊 token：<s>/</s> 被认成 BOS/EOS
+        assert_eq!(tok.bos_id(), Some(1));
+        assert_eq!(tok.eos_id(), Some(2));
+        // 合并链：a+b=ab(259)、ab+c=abc(260)
+        assert_eq!(tok.encode("abc"), vec![260]);
+        assert_eq!(tok.encode("ab"), vec![259]);
+        // **pre_tokenizer 生效**：GPT-2 正则把数字与字母切成两片，所以 "1a" 不合并
+        assert_eq!(tok.encode("1a"), vec![3 + b'1' as usize, 3 + b'a' as usize]);
+        // 额外特殊 token 按字面量整体命中（不被 BPE 拆开）
+        assert_eq!(tok.encode("<|im_start|>"), vec![262]);
+        // decode 往返
+        assert_eq!(tok.decode(&[259]), "ab");
+        assert_eq!(tok.decode(&tok.encode("abc")), "abc");
+        // 存档往返：写出来再读回来，行为一致（pretok / byte_ids / merges 三元组都要保住）
+        let p2 = std::env::temp_dir().join("rust_llm_tok_hf_roundtrip.json");
+        let p2s = p2.to_string_lossy().to_string();
+        tok.save(&p2s);
+        let tok2 = Tokenizer::load(&p2s);
+        assert_eq!(tok2.encode("abc"), tok.encode("abc"));
+        assert_eq!(tok2.encode("<|im_start|>"), vec![262]);
+        assert_eq!(tok2.eos_id(), tok.eos_id());
+        let _ = std::fs::remove_file(&ps);
+        let _ = std::fs::remove_file(&p2s);
+    }
+
+    /// 结构不变量必须真的在把关：结果 token 的字节拼接对不上时报错
+    #[test]
+    fn test_load_hf_tokenizer_rejects_broken_merge() {
+        let p = std::env::temp_dir().join("rust_llm_tok_hf_bad.json");
+        let ps = p.to_string_lossy().to_string();
+        write_hf_tokenizer(&ps, true);
+        let e = match Tokenizer::load_hf(&ps) {
+            Ok(_) => panic!("拼接对不上的 merge 必须被拒绝"),
+            Err(e) => e,
+        };
+        assert!(e.contains("不在词表里") || e.contains("拼接"), "{e}");
+        let _ = std::fs::remove_file(&ps);
+    }
+
+    /// GPT-2 预切分：数字与字母分开、缩写后缀成一片、空白独立
+    #[test]
+    fn test_gpt2_pretokenize_branches() {
+        let p = |s: &str| {
+            gpt2_pretokenize(s)
+                .into_iter()
+                .map(|b| String::from_utf8(b).unwrap())
+                .collect::<Vec<_>>()
+        };
+        // GPT-2 会把**一个前导空格**粘到后面的词上（` ?\p{L}+`），所以是 " def" 而不是 " " + "def"
+        assert_eq!(p("abc def"), vec!["abc", " def"]);
+        assert_eq!(p("1a"), vec!["1", "a"]);
+        assert_eq!(p("it's"), vec!["it", "'s"]);
+        assert_eq!(p("a!!!"), vec!["a", "!!!"]);
+        // 多个空格：只有最后一个粘给后面的词（`\s+(?!\S)` 的负向前瞻）
+        assert_eq!(p("  x"), vec![" ", " x"]);
+        assert_eq!(p("a   b"), vec!["a", "  ", " b"]);
+        // 到末尾的空白整段成片
+        assert_eq!(p("a b "), vec!["a", " b", " "]);
     }
 }

@@ -120,22 +120,32 @@ P_ij = exp(S_ij - m_i) / l_i
 
 按输出行（`B*H × T`）rayon 并行，行内按 `block_size` 扫 K/V 块：
 
-- **可见范围不物化掩码**：query i 只算 `j < k_end`（`k_end = i + visible_before + 1`），
-  与 `causal_mask_data` 的掩码逐位一致，被屏蔽的键根本不进打分与累加；
+- **掩码可以真的传进来**：显式给了 `mask` 时，行内把掩码行加到打分上，可见性**完全由掩码决定**
+  （不再另按因果截断，否则整行 `-inf` 的行会被"截断"救回来、丢掉掩码的语义）；
+  没给掩码时才退回核内因果快路：query i 只算 `j < k_end`（`k_end = i + visible_before + 1`），
+  与 `causal_mask_data` 物化的掩码逐位一致，被屏蔽的键根本不进打分与累加。两条路都**不物化** `[T, T_total]` 掩码；
+- **整块被屏蔽要短路**：在线 softmax 里 `-inf - (-inf) = NaN`，所以整块全屏蔽时直接跳过，
+  整行全屏蔽时输出全 0（否则 NaN 会顺着反向污染整条链）；
 - **行内在线归一化**：维护运行最大值 m 与指数和 l，新块并入时旧累计乘 `exp(m_old - m_new)` 重标定
   （漏掉重标定会指数爆炸——历史 bug，有回归测试）；
 - **中间 P 从不落地**：每行工作集 O(block_size + head_dim)，前向显存不再随 T² 增长。
 
-反向**不保留 P**：用矩阵乘重算 `scores = Q'·Kᵀ`，再由 `causal_softmax_cpu` 归一化出 P
-（O(T²) 只作为反向临时工作集——dP/dS 本来就是 O(T²)），随后 `dV/dP/dS/dQ/dK` 全部走
-`matmul_data` 内核（旧的标量三重循环只有 0.24 GFLOP/s，慢约 100 倍）。
+反向**不保留 P**：用矩阵乘重算 `scores = Q'·Kᵀ`，再由 `attn_softmax_cpu` 按**同一掩码口径**
+归一化出 P——它接受 `Option<&[f32]>`：没掩码时按 `k_end` 截断，有掩码时逐行相加后整行归一化；
+反向必须复用同一张掩码，否则梯度会漏回被屏蔽的键。O(T²) 只作为反向临时工作集
+（dP/dS 本来就是 O(T²)），随后 `dV/dP/dS/dQ/dK` 全部走 `matmul_data` 内核
+（旧的标量三重循环只有 0.24 GFLOP/s，慢约 100 倍）。
 
-### 6.2 `mask` 参数：`Option`，只喂 GPU
+### 6.2 `mask` 参数：`Option`，两条路径都真的消费
 
-签名是 `flash_attention(q, k, v, mask: Option<&Tensor>, block_size)`。CPU 分块核核内屏蔽，
-**不需要掩码 buffer，传 `None` 即可**；只有 GPU 常驻路径与 probe 录制会消费真实掩码，
-`attn_resident` / `blocks_resident` 收到 `None` 时会兜底物化一次（训练态 `t_total = t`）。
-`forward_core` 只在「gpu feature + GPU 可用 + 训练态」时才物化一次供全栈共享。
+签名是 `flash_attention(q, k, v, mask: Option<&Tensor>, block_size)`。
+
+- **显式给了掩码**（SFT 的 loss 掩码、视觉塔的全 0 掩码）：CPU 分块核把它逐行加到打分上、GPU 常驻与 probe 录制按真实 buffer 消费——**两条路径语义一致**；
+- **传 `None`**：CPU 分块核走核内后缀因果快路（不物化掩码）；GPU 路径需要时由算子自己物化一次因果掩码，`attn_resident` / `blocks_resident` 收到 `None` 时也会各自兜底物化（训练态 `t_total = t`）。
+
+`forward_core` 只在「gpu feature + GPU 可用 + 无 KV cache + `base == 0`」时才物化一次供全栈共享
+（见 [第 25 课](25-KV-Cache.md) 第 5 节）。⚠️ 所以**不能用 `None` 表达"不屏蔽"**：
+视觉塔要双向注意力就得显式传一张全 0 掩码（第 41 课）。
 
 ### 6.3 `block_size` 参数恢复语义
 
@@ -213,4 +223,4 @@ S（33.6MB）与 P（33.6MB）全程留在显存，只把 O（4.2MB）回读给 
   优化前先插桩，瓶颈常常不在算法而在「没走上已优化好的内核」
 - `--features gpu` 下前向/反向各录成一次提交，S（33.6MB）与 P（33.6MB）留在显存不回读，
   只回读 O（4.2MB）；GPU 不可用或形状过小时自动回退，数值行为不变
-- 正确性由 3 个测试守住：前向、反向各对拍标准注意力，常驻显存路径对拍逐算子参考
+- 正确性由 3 个测试守住（数量为写作时快照，以 `cargo test flash_attention` 实际输出为准）：前向、反向各对拍标准注意力，常驻显存路径对拍逐算子参考

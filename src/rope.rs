@@ -94,10 +94,40 @@ impl RopeScaling {
     }
 }
 
-/// RoPE 的全部频率参数：底数 + 缩放方式 + 训练窗口。
+/// RoPE 的**配对方式**：同一套频率、不同的元素配对。
+///
+/// - [`RopeStyle::Interleaved`]（默认）：**相邻配对** `(2i, 2i+1)`。本仓库自研权重用的
+///   就是它，GPT-J / NeoX 以及早期 LLaMA 实现同款；
+/// - [`RopeStyle::Half`]：**`rotate_half`**，`i` 与 `i + head_dim/2` 配对。
+///   HuggingFace 的 LLaMA / Qwen / Mistral 全用这个。
+///
+/// 两者**频率表完全相同**（同一个 `inv_freq`），只是"哪些元素构成一对"不同，
+/// 所以是**不同的旋转、不能互相解释**——它必须随权重一起记录
+/// （`TransformerConfig::rope_style` → 写进 checkpoint 头），运行时不能靠猜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RopeStyle {
+    /// 相邻配对 `(2i, 2i+1)`（默认，本仓库历史口径）
+    #[default]
+    Interleaved,
+    /// `rotate_half`：`i` 与 `i + head_dim/2` 配对（HuggingFace 口径）
+    Half,
+}
+
+impl RopeStyle {
+    /// 一句话描述（回显与日志用）
+    pub fn describe(self) -> &'static str {
+        match self {
+            RopeStyle::Interleaved => "相邻配对 (2i, 2i+1)",
+            RopeStyle::Half => "rotate_half (i, i+h/2)",
+        }
+    }
+}
+
+/// RoPE 的全部频率参数：底数 + 缩放方式 + 训练窗口 + 配对方式。
 ///
 /// 打包成一个结构体传进注意力层，而不是给 `rotary_pair` 再加三个标量参数：
-/// 三者是**同进退**的一组，且 YaRN 的分段边界必须知道训练窗口才知道该从哪个下标起插值。
+/// 它们是**同进退**的一组，且 YaRN 的分段边界必须知道训练窗口才知道该从哪个下标起插值。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RopeSpec {
     /// 频率底数（见 [`ROPE_BASE`]）
@@ -108,6 +138,8 @@ pub struct RopeSpec {
     /// NTK 的 `factor` 也是相对它而言；所以这里必须填训练用的 `block_size`，
     /// 而不是本次推理想跑到多长。
     pub train_ctx: usize,
+    /// 元素配对方式（见 [`RopeStyle`]）。默认相邻配对 = 本仓库历史口径。
+    pub style: RopeStyle,
 }
 
 impl Default for RopeSpec {
@@ -116,51 +148,67 @@ impl Default for RopeSpec {
             base: ROPE_BASE,
             scaling: RopeScaling::None,
             train_ctx: 0,
+            style: RopeStyle::Interleaved,
         }
     }
 }
 
 impl RopeSpec {
+    /// 历史三参数构造：配对方式取默认的 [`RopeStyle::Interleaved`]（逐位不变）。
     pub fn new(base: f32, scaling: RopeScaling, train_ctx: usize) -> Self {
-        RopeSpec { base, scaling, train_ctx }
+        RopeSpec { base, scaling, train_ctx, style: RopeStyle::Interleaved }
     }
 
-    /// 频率表是否与 GPU 内核里写死的式子一致（`base = 10000` 且不缩放）。
+    /// 指定配对方式（builder 风格，避免改掉所有历史调用点）
+    pub fn with_style(mut self, style: RopeStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// 频率表是否与 GPU 内核里写死的式子一致（`base = 10000`、不缩放、相邻配对）。
     /// 不一致时旋转结果必然与常驻显存路径不同，那条快路必须让路。
     ///
     /// 唯一的调用方是 GPU 常驻注意力路径（`model.rs` 的 `attn_resident`），
     /// 不编 `gpu` feature 时它就是一段没人调用的守卫。
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub fn is_plain(&self) -> bool {
-        self.scaling == RopeScaling::None && self.base == ROPE_BASE
+        self.scaling == RopeScaling::None && self.base == ROPE_BASE && self.style == RopeStyle::Interleaved
     }
 }
 
 thread_local! {
-    /// 频率表缓存槽（线程本地单槽）：key = (d, spec) → (逆波长表, YaRN 温度系数)。
+    /// 频率表缓存（线程本地 4 槽）：key = (head_dim, spec) → (逆波长表, YaRN 温度系数)。
     ///
     /// 解码时每个 token 的 positions 都不同，整表缓存必然未命中；但 inv_freqs 的
-    /// D/2 个 powf 与 YaRN 分段边界只跟 (d, spec) 有关、与位置无关，单独缓存后
-    /// 逐 token 都能命中——每步建表从「half 次 powf + 三角」降到只剩三角。
-    static FREQ_SLOT: RefCell<Option<(usize, RopeSpec, Arc<(Vec<f32>, f32)>)>> =
-        RefCell::new(None);
-
-    /// 完整 cos/sin 表缓存槽（线程本地单槽）：key = (d, spec, positions)。
+    /// D/2 个 powf 与 YaRN 分段边界只跟 (head_dim, spec) 有关、与位置无关，
+    /// 单独缓存后逐 token 都能命中——每步建表从「half 次 powf + 三角」降到只剩三角。
     ///
-    /// 一次前向里 6 层注意力的 positions 完全相同，只有第 1 层真正建表，
-    /// 其余各层拿到共享的 Arc 表（零拷贝），省掉 rows×D/2 次三角计算与两次 Vec 分配。
-    static TAB_SLOT: RefCell<Option<(usize, RopeSpec, Vec<usize>, (Arc<Vec<f32>>, Arc<Vec<f32>>))>> =
-        RefCell::new(None);
+    /// 为什么是 4 槽而不是单槽：**多模态模型里视觉塔与主干交替前向**，两者的
+    /// `head_dim` 不同，单槽会被对方顶掉、每层都未命中（纯性能问题）。4 槽足够装下
+    /// 主干 + 视觉塔 + MLA 的 hd_rope 这类常见组合。
+    static FREQ_SLOT: RefCell<Vec<(usize, RopeSpec, Arc<(Vec<f32>, f32)>)>> =
+        RefCell::new(Vec::new());
+
+    /// 完整 cos/sin 表缓存（线程本地 4 槽）：key = (head_dim, spec, positions)。
+    ///
+    /// 一次前向里同一组 positions 会被所有层复用，只有第一层真正建表，
+    /// 其余各层拿到共享的 Arc 表（零拷贝），省掉 rows×head_dim/2 次三角计算与两次分配。
+    static TAB_SLOT: RefCell<Vec<(usize, RopeSpec, Vec<usize>, (Arc<Vec<f32>>, Arc<Vec<f32>>))>> =
+        RefCell::new(Vec::new());
 }
 
-/// (逆波长表, mscale)，按 (d, spec) 记忆化——见 [`FREQ_SLOT`] 的说明。
+/// 线程本地缓存槽数（见 [`FREQ_SLOT`] / [`TAB_SLOT`]）
+const ROPE_CACHE_SLOTS: usize = 4;
+
+/// (逆波长表, mscale)，按 (head_dim, spec) 记忆化——见 [`FREQ_SLOT`] 的说明。
 fn freq_and_mscale(d: usize, spec: &RopeSpec) -> Arc<(Vec<f32>, f32)> {
     FREQ_SLOT.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if let Some((cd, cs, tab)) = slot.as_ref() {
-            if *cd == d && *cs == *spec {
-                return tab.clone();
-            }
+        if let Some(i) = slot.iter().position(|(cd, cs, _)| *cd == d && *cs == *spec) {
+            let hit = slot.remove(i);
+            let tab = hit.2.clone();
+            slot.push(hit); // 最近命中移到末尾（LRU）
+            return tab;
         }
         let freq = inv_freqs(d, spec);
         // YaRN 的温度补偿：cos/sin 同步放大 → 旋转后的 Q/K 模长变大 → 注意力更"尖"
@@ -169,21 +217,29 @@ fn freq_and_mscale(d: usize, spec: &RopeSpec) -> Arc<(Vec<f32>, f32)> {
             _ => 1.0,
         };
         let tab = Arc::new((freq, mscale));
-        *slot = Some((d, *spec, tab.clone()));
+        if slot.len() >= ROPE_CACHE_SLOTS {
+            slot.remove(0); // 淘汰最久未用的那个
+        }
+        slot.push((d, *spec, tab.clone()));
         tab
     })
 }
 
-/// 预计算每个 (位置, 对偶下标) 的 cos/sin 表，长度 rows × (D/2)。
+/// 预计算每个 (位置, 头内对偶下标) 的 cos/sin 表，长度 rows × (head_dim/2)。
 /// 同一批 positions 的三角只算一次：前向、反向、Q/K 复用。
 ///
-/// **记忆化**（线程本地单槽，key = d + spec + positions，见 [`TAB_SLOT`]）：
+/// `head_dim` 是**单个注意力头**的宽度（不是 Q/K 被拍平后的总宽，也不是 n_embd）：
+/// 表只为"一个头"建一套角度，行内每 `head_dim` 个元素重复使用它（见
+/// [`rotate_with_tab`]）。这是主流实现（LLaMA / Qwen / DeepSeek）与 GPU 着色器
+/// （`gpu.rs` 的 `heads_split_main`：`pow(10000, -2p/hd)`）的共同口径。
+///
+/// **记忆化**（线程本地 4 槽，key = head_dim + spec + positions，见 [`TAB_SLOT`]）：
 /// 命中时只做两次 Arc 指针克隆，不再重算三角、不再分配 Vec——同一次前向中
 /// 第 2 层起的注意力全部命中；解码时 positions 逐 token 变化导致整表未命中，
-/// 但频率表缓存（[`FREQ_SLOT`]）仍命中，每 token 只剩 rows×D/2 次三角计算。
+/// 但频率表缓存（[`FREQ_SLOT`]）仍命中，每 token 只剩 rows×head_dim/2 次三角计算。
 /// key 里必须含 spec：[`crate::model::LLM::set_rope`] 会在推理期更换外推方式。
 ///
-/// 关键优化：频率表只与对偶下标有关，先算一遍 D/2 个逆波长，
+/// 关键优化：频率表只与对偶下标有关，先算一遍 head_dim/2 个逆波长，
 /// 再对每个位置做 `theta = pos · inv_freq[i]` 求 cos/sin——
 /// 原来在行内循环里重复计算 powf，rows=2048 时要算 26 万次 powf（约 30ms）。
 fn build_cos_sin_tab(
@@ -193,10 +249,14 @@ fn build_cos_sin_tab(
 ) -> (Arc<Vec<f32>>, Arc<Vec<f32>>) {
     TAB_SLOT.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if let Some((cd, cs, cpos, tab)) = slot.as_ref() {
-            if *cd == d && *cs == *spec && cpos.as_slice() == positions {
-                return (tab.0.clone(), tab.1.clone());
-            }
+        if let Some(i) = slot
+            .iter()
+            .position(|(cd, cs, cpos, _)| *cd == d && *cs == *spec && cpos.as_slice() == positions)
+        {
+            let hit = slot.remove(i);
+            let tab = hit.3.clone();
+            slot.push(hit); // 最近命中移到末尾（LRU）
+            return tab;
         }
         let fm = freq_and_mscale(d, spec);
         let (freq, mscale) = (&fm.0, fm.1);
@@ -213,7 +273,10 @@ fn build_cos_sin_tab(
             }
         }
         let tab = (Arc::new(c_tab), Arc::new(s_tab));
-        *slot = Some((d, *spec, positions.to_vec(), tab.clone()));
+        if slot.len() >= ROPE_CACHE_SLOTS {
+            slot.remove(0); // 淘汰最久未用的那个
+        }
+        slot.push((d, *spec, positions.to_vec(), tab.clone()));
         tab
     })
 }
@@ -299,29 +362,89 @@ fn yarn_mscale(factor: f32, mscale: f32) -> f32 {
     }
 }
 
-/// 用现成的 cos/sin 表旋转一个张量（[rows, D]）。
-/// 反向用旋转矩阵的转置 R(θ)ᵀ 回传梯度，闭包直接查表。
-fn rotate_with_tab(x: &Tensor, c_tab: &Arc<Vec<f32>>, s_tab: &Arc<Vec<f32>>) -> Tensor {
+/// 用现成的 cos/sin 表旋转一个张量（`[rows, D]`，`D` 必须是 `head_dim` 的整数倍）。
+///
+/// 表按 **head_dim** 建（每行 `head_dim/2` 个角度 = 一个头的完整频率谱），
+/// 行内每 `head_dim` 个元素**重复**使用同一套角度——这就是主流实现
+/// （LLaMA / Qwen / DeepSeek）与 GPU 着色器 `heads_split_main` 的口径：
+/// **每个头都拥有完整的频率谱**。
+///
+/// 为什么必须逐头重复，而不是"按整行铺开一套角度"（本文件早期的实现）：
+/// RoPE 保持相对位置性质的前提是**同一个维度下标在 Q 与 K 两侧用同一个角度**。
+/// 只要 `n_kv_head < n_head`（GQA）或 MLA 的 latent 升维让 K 的行比 Q 短，
+/// 两种宽度铺出来的角度就必然不同、相对位置性质随之失效（GQA 更直接：
+/// `Q/K 的 head_dim 必须一致` 的断言当场 panic）。
+/// 逐头重复让"角度只由头内下标决定"，Q/K 宽度不同也永远一致。
+/// 行内第 `e` 对元素的 `(低半下标, 高半下标, 该对查表的列)`。
+///
+/// 两种配对方式**共用同一张频率表**，只有"哪两个元素构成一对"不同——见 [`RopeStyle`]：
+/// - 相邻配对：第 `e` 对就是 `(2e, 2e+1)`，表列 = 行内对下标（每头重复使用同一段表）；
+/// - `rotate_half`：第 `e` 对落在同一个头内的 `(j, j + head_dim/2)`，表列 = 头内对下标 `j`。
+#[inline]
+fn rope_pair_index(e: usize, head_dim: usize, style: RopeStyle) -> (usize, usize, usize) {
+    let half = head_dim / 2;
+    match style {
+        RopeStyle::Interleaved => (2 * e, 2 * e + 1, e % half),
+        RopeStyle::Half => {
+            let h = e / half; // 第几个头
+            let j = e % half; // 头内第几对
+            (h * head_dim + j, h * head_dim + j + half, j)
+        }
+    }
+}
+
+/// 按 [`RopeStyle::Half`]（HuggingFace 的 `rotate_half`）旋转一个头的**参考实现**，
+/// 只用于测试做独立对拍：把向量劈成前后两半，前半 `x*cos - y*sin`、后半 `x*sin + y*cos`。
+#[cfg(test)]
+fn rotate_half_reference(x: &[f32], head_dim: usize, c: &[f32], s: &[f32]) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = vec![0.0f32; head_dim];
+    for j in 0..half {
+        let (a, b) = (x[j], x[j + half]);
+        out[j] = a * c[j] - b * s[j];
+        out[j + half] = a * s[j] + b * c[j];
+    }
+    out
+}
+
+fn rotate_with_tab(
+    x: &Tensor,
+    c_tab: &Arc<Vec<f32>>,
+    s_tab: &Arc<Vec<f32>>,
+    head_dim: usize,
+    style: RopeStyle,
+) -> Tensor {
     let (rows, d) = (x.shape[0], x.shape[1]);
+    assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "head_dim 必须是正偶数（RoPE 按对旋转），当前 {head_dim}"
+    );
+    assert_eq!(
+        d % head_dim,
+        0,
+        "最后一维 {d} 必须是 head_dim {head_dim} 的整数倍（否则有半个头）"
+    );
     let sd = x.decode();
     let sd_ref: &[f32] = &sd;
     // 表句柄先解引用成只读切片再进并行闭包（&[f32] 是 Sync，切片最轻量）
     let ct_f: &[f32] = c_tab;
     let st_f: &[f32] = s_tab;
     let mut out_data = vec![0.0f32; rows * d];
-    let half = d / 2;
+    let half = head_dim / 2; // 表每行的长度 = 头内对数
+    let pairs = d / 2; // 一行里的对数（跨多个头）
     // 并行：每行旋转独立，行间无依赖
     out_data
         .par_chunks_mut(d)
         .enumerate()
         .for_each(|(r, out_row)| {
             let base = r * d;
-            let ct_base = r * half;
-            for i in 0..half {
+            let ct_base = r * half; // 表按行建：第 r 行占 [r*half, (r+1)*half)
+            for e in 0..pairs {
+                let (lo, hi, i) = rope_pair_index(e, head_dim, style);
                 let (c, s) = (ct_f[ct_base + i], st_f[ct_base + i]);
-                let (a, b) = (sd_ref[base + 2 * i], sd_ref[base + 2 * i + 1]);
-                out_row[2 * i] = a * c - b * s;
-                out_row[2 * i + 1] = a * s + b * c;
+                let (a, b) = (sd_ref[base + lo], sd_ref[base + hi]);
+                out_row[lo] = a * c - b * s;
+                out_row[hi] = a * s + b * c;
             }
         });
     drop(sd);
@@ -346,13 +469,14 @@ fn rotate_with_tab(x: &Tensor, c_tab: &Arc<Vec<f32>>, s_tab: &Arc<Vec<f32>>) -> 
                 .enumerate()
                 .for_each(|(r, sgm_row)| {
                     let g_base = r * d;
-                    let ct_base = r * (d / 2);
-                    for i in 0..d / 2 {
+                    let ct_base = r * half;
+                    for e in 0..pairs {
+                        let (lo, hi, i) = rope_pair_index(e, head_dim, style);
                         let (c, s) = (ct_ref[ct_base + i], st_ref[ct_base + i]);
-                        let (ga, gb) = (g_ref[g_base + 2 * i], g_ref[g_base + 2 * i + 1]);
+                        let (ga, gb) = (g_ref[g_base + lo], g_ref[g_base + hi]);
                         // 反向 = 前向旋转矩阵的转置 R(θ)ᵀ：grad = (ga·c + gb·s, -ga·s + gb·c)
-                        sgm_row[2 * i] += ga * c + gb * s;
-                        sgm_row[2 * i + 1] += -ga * s + gb * c;
+                        sgm_row[lo] += ga * c + gb * s;
+                        sgm_row[hi] += -ga * s + gb * c;
                     }
                 });
         }));
@@ -363,11 +487,13 @@ fn rotate_with_tab(x: &Tensor, c_tab: &Arc<Vec<f32>>, s_tab: &Arc<Vec<f32>>) -> 
 impl Tensor {
     /// RoPE 旋转位置编码：把位置信息揉进向量的每一对相邻元素。
     ///
-    /// 输入：`[rows, D]`（D 必须为偶数），`positions` 长度 = rows
+    /// 输入：`[rows, D]`（`D` 必须是 `head_dim` 的整数倍），`positions` 长度 = rows。
+    /// `head_dim` 是**单个头**的宽度；`D` 可以是多个头拼接（每 `head_dim` 个元素
+    /// 重复使用同一套头内角度，见 [`rotate_with_tab`]）。
     ///
     /// 前向（每对 a, b → a', b'）：
     /// ```text
-    /// θ = pos / 10000^(2i/D)
+    /// θ = pos / 10000^(2i/head_dim)      i = 头内对偶下标 0..head_dim/2
     /// a' = a·cos(θ) - b·sin(θ)
     /// b' = a·sin(θ) + b·cos(θ)
     /// ```
@@ -378,32 +504,48 @@ impl Tensor {
     /// grad_b = -ga·sin(θ) + gb·cos(θ)
     /// ```
     /// 频率表由 `spec` 决定：`scaling = None` 时就是原版 RoPE，其余见 [`RopeScaling`]。
-    /// 仅供测试使用；生产代码（attention）用 `rotary_pair` 一次旋转 Q/K。
+    /// 生产代码（attention）用 [`Self::rotary_pair`] 一次旋转 Q/K。
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn rotary(&self, positions: &[usize], spec: &RopeSpec) -> Tensor {
+    pub fn rotary(&self, positions: &[usize], head_dim: usize, spec: &RopeSpec) -> Tensor {
         assert_eq!(self.rank(), 2, "rotary 输入应为 [rows, D]");
         assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
-        let d = self.shape[1];
-        assert_eq!(d % 2, 0, "最后一维必须为偶数才能两两配对旋转");
-        let (c_tab, s_tab) = build_cos_sin_tab(positions, d, spec);
-        rotate_with_tab(self, &c_tab, &s_tab)
+        assert_eq!(self.shape[1] % head_dim, 0, "最后一维必须是 head_dim 的整数倍");
+        let (c_tab, s_tab) = build_cos_sin_tab(positions, head_dim, spec);
+        rotate_with_tab(self, &c_tab, &s_tab, head_dim, spec.style)
     }
 
-    /// 一次建表同时旋转 Q 和 K（两者 positions 相同，三角函数只算一遍）。
+    /// 一次建表同时旋转 Q 和 K（两者 positions 相同、三角函数只算一遍）。
     /// 返回 `(rotated_q, rotated_k)`。
+    ///
+    /// `head_dim` 由调用方给出（两侧必须相同），**允许 Q/K 的总宽不同**：
+    /// GQA 下 `n_kv_head < n_head`，K 只有 `n_kv_head·head_dim` 宽；MLA 的 latent
+    /// 升维同理。只要角度只由头内下标决定，两种宽度就能共用同一张表——
+    /// 这正是 [`rotate_with_tab`] 的逐头重复写法要保证的事。
     pub fn rotary_pair(
         &self,
         other: &Tensor,
         positions: &[usize],
+        head_dim: usize,
         spec: &RopeSpec,
     ) -> (Tensor, Tensor) {
         debug_assert_eq!(self.shape[0], other.shape[0], "Q/K 行数必须一致");
-        assert_eq!(self.shape[1], other.shape[1], "Q/K 的 head_dim 必须一致");
-        let d = self.shape[1];
-        let (c_tab, s_tab) = build_cos_sin_tab(positions, d, spec);
+        assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
+        assert_eq!(
+            self.shape[1] % head_dim,
+            0,
+            "Q 的最后一维 {} 必须是 head_dim {head_dim} 的整数倍",
+            self.shape[1]
+        );
+        assert_eq!(
+            other.shape[1] % head_dim,
+            0,
+            "K 的最后一维 {} 必须是 head_dim {head_dim} 的整数倍（GQA 下 K 更窄是正常的）",
+            other.shape[1]
+        );
+        let (c_tab, s_tab) = build_cos_sin_tab(positions, head_dim, spec);
         (
-            rotate_with_tab(self, &c_tab, &s_tab),
-            rotate_with_tab(other, &c_tab, &s_tab),
+            rotate_with_tab(self, &c_tab, &s_tab, head_dim, spec.style),
+            rotate_with_tab(other, &c_tab, &s_tab, head_dim, spec.style),
         )
     }
 }
@@ -421,7 +563,7 @@ mod tests {
     fn test_rotary() {
         // 1. 旋转是正交变换：范数不变
         let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 6]);
-        let r = x.rotary(&[3], &plain());
+        let r = x.rotary(&[3], 6, &plain());
         let orig_norm: f32 = x.data().iter().map(|v| v * v).sum();
         let rot_norm: f32 = r.data().iter().map(|v| v * v).sum();
         assert!(
@@ -433,13 +575,13 @@ mod tests {
 
         // 2. pos=0 时所有角度为 0，等于恒等变换
         let x2 = Tensor::param(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]);
-        let r2 = x2.rotary(&[0], &plain());
+        let r2 = x2.rotary(&[0], 4, &plain());
         assert!((r2.data()[0] - 1.0).abs() < 1e-5);
         assert!((r2.data()[3] - 4.0).abs() < 1e-5);
 
         // 3. 梯度：sum 的梯度是单位向量，经正交矩阵回传后范数不变（= 元素数）
         let x3 = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 6]);
-        let loss = x3.rotary(&[2], &plain()).sum();
+        let loss = x3.rotary(&[2], 6, &plain()).sum();
         loss.backward();
         let g: Vec<f32> = x3.grad();
         assert!(
@@ -454,7 +596,7 @@ mod tests {
         // 前向 o_a = a·c - b·s, o_b = a·s + b·c
         // 反向 grad_a = g_a·c + g_b·s, grad_b = -g_a·s + g_b·c
         let x = Tensor::param(vec![1.0, 2.0], vec![1, 2]);
-        let loss = x.rotary(&[1], &plain()).sum();
+        let loss = x.rotary(&[1], 2, &plain()).sum();
         loss.backward();
         let (c, s) = (1f32.cos(), 1f32.sin());
         let (ga, gb) = (c + s, -s + c);
@@ -483,8 +625,8 @@ mod tests {
     fn test_linear_scaling_halves_effective_positions() {
         let p = RopeSpec::new(ROPE_BASE, RopeScaling::Linear { factor: 2.0 }, 512);
         let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![1, 8]);
-        let scaled = x.rotary(&[10], &p);
-        let unscaled = x.rotary(&[5], &plain());
+        let scaled = x.rotary(&[10], 8, &p);
+        let unscaled = x.rotary(&[5], 8, &plain());
         for (a, b) in scaled.data().iter().zip(unscaled.data().iter()) {
             assert!((a - b).abs() < 1e-6, "Linear×2 的 pos=10 应等于未缩放的 pos=5");
         }
@@ -595,13 +737,27 @@ mod tests {
                 64,
             ),
         ];
-        let q = Tensor::param(vec![0.5, -1.0, 2.0, 0.25, -0.75, 1.5, 0.3, -0.2], vec![1, d]);
-        let k = Tensor::param(vec![1.25, 0.5, -1.5, 0.75, 0.1, -0.6, 2.0, 0.9], vec![1, d]);
-        // 表按 positions 逐行建：`rotary_pair(&[m, m+gap], ..)` 把 q 转到 m、k 转到 m+gap
+        let q = Tensor::param(
+            vec![
+                0.5, -1.0, 2.0, 0.25, -0.75, 1.5, 0.3, -0.2, // 行 0 → 位置 m
+                0.4, -0.9, 1.8, 0.35, -0.65, 1.4, 0.25, -0.15,
+            ],
+            vec![2, d],
+        );
+        let k = Tensor::param(
+            vec![
+                1.25, 0.5, -1.5, 0.75, 0.1, -0.6, 2.0, 0.9, // 行 0 → 位置 m
+                1.1, 0.45, -1.35, 0.7, 0.15, -0.55, 1.9, 0.85, // 行 1 → 位置 m + gap
+            ],
+            vec![2, d],
+        );
+        // 表按 positions 逐行建：`rotary_pair(&[m, m+gap], ..)` 把 q 的第 0 行转到 m、
+        // k 的第 1 行转到 m+gap（**positions 必须一行一个**，否则两侧会转到同一位置、
+        // 断言退化成恒真）。点积只应取决于间距 gap。
         let dot = |m: usize, gap: usize, spec: &RopeSpec| -> f32 {
-            let (rq, rk) = q.rotary_pair(&k, &[m, m + gap], spec);
+            let (rq, rk) = q.rotary_pair(&k, &[m, m + gap], d, spec);
             let (qd, kd) = (rq.data(), rk.data());
-            qd.iter().zip(kd.iter()).map(|(a, b)| a * b).sum::<f32>()
+            (0..d).map(|j| qd[j] * kd[d + j]).sum::<f32>() // q 行 0 × k 行 1
         };
         for spec in &specs {
             let base = dot(0, 5, spec);
@@ -627,10 +783,221 @@ mod tests {
             RopeSpec::new(ROPE_BASE, RopeScaling::Linear { factor: 4.0 }, 64),
             RopeSpec::new(ROPE_BASE, RopeScaling::Ntk { factor: 4.0 }, 64),
         ] {
-            let r = x.rotary(&[0], &spec);
+            let r = x.rotary(&[0], 4, &spec);
             for (a, b) in r.data().iter().zip(x.data().iter()) {
                 assert!((a - b).abs() < 1e-6, "pos=0 应为恒等变换（{}）", spec.scaling.describe());
             }
         }
+    }
+
+    /// RoPE 的角度只由**头内**下标决定：D 宽的行里每 head_dim 个元素重复使用同一套角度。
+    /// 这是 GQA / MLA 能共用一张表的前提，也与 GPU 着色器 `heads_split_main`
+    /// （`pow(10000, -2p/hd)`）以及 docs/20 的描述一致。
+    #[test]
+    fn test_rope_schedule_repeats_within_each_head() {
+        let hd = 4usize; // 2 对
+        let rows = 3usize;
+        let mut rng = crate::rng::Rng::new(9);
+        let wide: Vec<f32> = (0..rows * 2 * hd).map(|_| rng.randn()).collect();
+        let head0: Vec<f32> = wide.chunks(2 * hd).flat_map(|r| r[..hd].to_vec()).collect();
+        let head1: Vec<f32> = wide.chunks(2 * hd).flat_map(|r| r[hd..].to_vec()).collect();
+        let pos: Vec<usize> = (0..rows).map(|i| 5 + i).collect();
+
+        let r_wide = Tensor::param(wide, vec![rows, 2 * hd]).rotary(&pos, hd, &plain());
+        let r0 = Tensor::param(head0, vec![rows, hd]).rotary(&pos, hd, &plain());
+        let r1 = Tensor::param(head1, vec![rows, hd]).rotary(&pos, hd, &plain());
+        for r in 0..rows {
+            for j in 0..hd {
+                assert_eq!(
+                    r_wide.data()[r * 2 * hd + j],
+                    r0.data()[r * hd + j],
+                    "第 {r} 行头 0 第 {j} 维应与「单独旋转该头」逐位相同"
+                );
+                assert_eq!(
+                    r_wide.data()[r * 2 * hd + hd + j],
+                    r1.data()[r * hd + j],
+                    "第 {r} 行头 1 第 {j} 维应与「单独旋转该头」逐位相同"
+                );
+            }
+        }
+    }
+
+    /// 逐头频率表必须与 GPU 着色器同一个式子：头内第 p 对的角度 = pos / 10000^(2p/head_dim)。
+    /// 修复前 CPU 侧是「按 Q 的总宽铺一套角度」，与 GPU 内核算的根本不是同一个旋转。
+    #[test]
+    fn test_per_head_schedule_matches_gpu_shader_formula() {
+        let hd = 8usize;
+        let pos = 7usize;
+        let (c_tab, s_tab) = build_cos_sin_tab(&[pos], hd, &plain());
+        assert_eq!(c_tab.len(), hd / 2, "表宽应恰好是一个头（head_dim/2），不含其它头");
+        for p in 0..hd / 2 {
+            let theta = pos as f32 / 10000f32.powf((2 * p) as f32 / hd as f32);
+            assert!((c_tab[p] - theta.cos()).abs() < 1e-6, "cos[{p}]");
+            assert!((s_tab[p] - theta.sin()).abs() < 1e-6, "sin[{p}]");
+        }
+    }
+
+    /// GQA：K 比 Q 窄（`n_kv_head < n_head`）时必须能旋转。
+    /// 修复前这里直接 panic（`Q/K 的 head_dim 必须一致`）——官方 medium/large 预设
+    /// 都带 GQA，于是「预设配置根本训不了」。
+    #[test]
+    fn test_gqa_rotary_pair_accepts_narrower_k() {
+        let hd = 4usize;
+        let (n_head, n_kv, rows) = (3usize, 2usize, 2usize);
+        let mut rng = crate::rng::Rng::new(17);
+        let kv: Vec<f32> = (0..rows * n_kv * hd).map(|_| rng.randn()).collect();
+        // Q 的前 n_kv 个头**直接复制 K 的数据**：这样旋转后必须逐位相同；
+        // 多出来的第 n_kv 个头只是陪衬（GQA 里 Q 的头比 K 多）
+        let mut qv: Vec<f32> = Vec::with_capacity(rows * n_head * hd);
+        for r in 0..rows {
+            qv.extend_from_slice(&kv[r * n_kv * hd..(r + 1) * n_kv * hd]);
+            for _ in 0..hd {
+                qv.push(rng.randn());
+            }
+        }
+        let q = Tensor::param(qv, vec![rows, n_head * hd]);
+        let k = Tensor::param(kv, vec![rows, n_kv * hd]);
+        let pos: Vec<usize> = (0..rows).map(|i| 3 + i).collect();
+
+        let (rq, rk) = q.rotary_pair(&k, &pos, hd, &plain());
+        // K 的旋转与「单独旋转 K」逐位一致：角度只由头内下标决定
+        let k_alone = k.rotary(&pos, hd, &plain());
+        assert_eq!(rk.data(), k_alone.data(), "GQA 下 K 的旋转应与单独旋转 K 逐位一致");
+        // 同一份数据在 Q 的前 n_kv 个头里与 K 逐位一致（角度只由头内下标决定）
+        for r in 0..rows {
+            for j in 0..n_kv * hd {
+                assert_eq!(
+                    rq.data()[r * n_head * hd + j],
+                    rk.data()[r * n_kv * hd + j],
+                    "第 {r} 行第 {j} 维（前 {n_kv} 个头）应与 K 逐位一致"
+                );
+            }
+        }
+    }
+
+    /// GQA 下相对位置性质必须仍然成立：**跨头的**点积只取决于位置差。
+    /// 修复前 Q/K 各按自己的宽度铺频率，同一个下标在两侧角度不同 ⇒ 这条不成立
+    /// （那才是真正的「静默算错」，比 panic 更危险）。
+    #[test]
+    fn test_gqa_relative_position_invariance_across_heads() {
+        let hd = 4usize;
+        let (n_head, n_kv) = (3usize, 2usize);
+        let mut rng = crate::rng::Rng::new(23);
+        // 各 2 行：行 0 → 位置 m，行 1 → 位置 m + gap（positions 必须一行一个）
+        let qv: Vec<f32> = (0..2 * n_head * hd).map(|_| rng.randn()).collect();
+        let kv: Vec<f32> = (0..2 * n_kv * hd).map(|_| rng.randn()).collect();
+        let q = Tensor::param(qv, vec![2, n_head * hd]);
+        let k = Tensor::param(kv, vec![2, n_kv * hd]);
+        let dot = |g: usize, h: usize, m: usize, gap: usize| -> f32 {
+            let (rq, rk) = q.rotary_pair(&k, &[m, m + gap], hd, &plain());
+            let (qd, kd) = (rq.data(), rk.data());
+            // q 的行 0（位置 m）与 k 的行 1（位置 m+gap）在同一维度上点积
+            (0..hd).map(|j| qd[g * hd + j] * kd[n_kv * hd + h * hd + j]).sum()
+        };
+        for g in 0..n_head {
+            for h in 0..n_kv {
+                let base = dot(g, h, 0, 5);
+                for m in [1usize, 9, 77, 300] {
+                    let got = dot(g, h, m, 5);
+                    assert!(
+                        (got - base).abs() <= base.abs() * 1e-3 + 1e-5,
+                        "Q头 {g} × K头 {h}：间距 5 的点积应与起点无关（m={m} 时 {got} vs {base}）"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `rotate_half` 口径必须与**独立实现的公式**一致（HuggingFace 的 LLaMA / Qwen 用这个）。
+    /// 参考实现走的是"把向量劈成前后两半、各自线性组合"，与 `rotate_with_tab` 的索引
+    /// 写法完全不同路径，所以能真正验证配对下标没写反。
+    #[test]
+    fn test_half_style_matches_rotate_half_reference() {
+        let hd = 4usize;
+        let rows = 3usize;
+        let mut rng = crate::rng::Rng::new(31);
+        let x: Vec<f32> = (0..rows * hd).map(|_| rng.randn()).collect();
+        let spec = plain().with_style(RopeStyle::Half);
+        let pos: Vec<usize> = (0..rows).map(|i| i * 7 + 5).collect();
+        let got = Tensor::param(x.clone(), vec![rows, hd]).rotary(&pos, hd, &spec);
+        for r in 0..rows {
+            // 独立算 cos/sin（只依赖 head_dim 与位置，与 rope.rs 的表无关）
+            let theta = |j: usize| pos[r] as f32 / 10000f32.powf((2 * j) as f32 / hd as f32);
+            let c: Vec<f32> = (0..hd / 2).map(|j| theta(j).cos()).collect();
+            let s: Vec<f32> = (0..hd / 2).map(|j| theta(j).sin()).collect();
+            let want = rotate_half_reference(&x[r * hd..(r + 1) * hd], hd, &c, &s);
+            for j in 0..hd {
+                assert!(
+                    (got.data()[r * hd + j] - want[j]).abs() < 1e-6,
+                    "行 {r} 第 {j} 维：{} vs {}",
+                    got.data()[r * hd + j],
+                    want[j]
+                );
+            }
+        }
+    }
+
+    /// 两种配对方式必须**真的不同**（否则 style 开关形同虚设），但都是正交变换（保范数），
+    /// 且都满足相对位置不变性——这两条性质与配对方式无关。
+    #[test]
+    fn test_styles_differ_but_both_orthogonal_and_relative() {
+        let hd = 8usize;
+        let mut rng = crate::rng::Rng::new(37);
+        let x: Vec<f32> = (0..hd).map(|_| rng.randn()).collect();
+        let a = Tensor::param(x.clone(), vec![1, hd]).rotary(&[9], hd, &plain());
+        let b = Tensor::param(x.clone(), vec![1, hd]).rotary(&[9], hd, &plain().with_style(RopeStyle::Half));
+        assert_ne!(a.data(), b.data(), "两种配对方式应给出不同结果");
+        let n0: f32 = x.iter().map(|v| v * v).sum();
+        for t in [&a, &b] {
+            let n: f32 = t.data().iter().map(|v| v * v).sum();
+            assert!((n - n0).abs() < 1e-5, "旋转应保持范数：{n} vs {n0}");
+        }
+        // 相对位置性质：q 行 0（位置 m）与 k 行 1（位置 m+gap）的点积只取决于 gap
+        for style in [RopeStyle::Interleaved, RopeStyle::Half] {
+            let sp = plain().with_style(style);
+            let qv: Vec<f32> = (0..2 * hd).map(|_| rng.randn()).collect();
+            let kv: Vec<f32> = (0..2 * hd).map(|_| rng.randn()).collect();
+            let q = Tensor::param(qv, vec![2, hd]);
+            let k = Tensor::param(kv, vec![2, hd]);
+            let dot = |m: usize, gap: usize| -> f32 {
+                let (rq, rk) = q.rotary_pair(&k, &[m, m + gap], hd, &sp);
+                (0..hd).map(|j| rq.data()[j] * rk.data()[hd + j]).sum()
+            };
+            let base = dot(0, 5);
+            for m in [1usize, 13, 97] {
+                let got = dot(m, 5);
+                assert!(
+                    (got - base).abs() <= base.abs() * 1e-3 + 1e-5,
+                    "{:?}：m={m} 时 {got} vs {base}",
+                    style
+                );
+            }
+        }
+    }
+
+    /// `rotate_half` 同样必须**逐头**（GQA 下 K 比 Q 窄也要能共用一张表）；
+    /// 同时确认它会让 GPU 常驻快路让路——着色器里写死的是相邻配对。
+    #[test]
+    fn test_half_style_is_per_head_and_not_plain() {
+        let hd = 4usize;
+        let rows = 2usize;
+        let mut rng = crate::rng::Rng::new(41);
+        let wide: Vec<f32> = (0..rows * 2 * hd).map(|_| rng.randn()).collect();
+        let head1: Vec<f32> = wide.chunks(2 * hd).flat_map(|r| r[hd..].to_vec()).collect();
+        let pos: Vec<usize> = (0..rows).map(|i| 3 + i).collect();
+        let spec = plain().with_style(RopeStyle::Half);
+        let r_wide = Tensor::param(wide, vec![rows, 2 * hd]).rotary(&pos, hd, &spec);
+        let r1 = Tensor::param(head1, vec![rows, hd]).rotary(&pos, hd, &spec);
+        for r in 0..rows {
+            for j in 0..hd {
+                assert_eq!(
+                    r_wide.data()[r * 2 * hd + hd + j],
+                    r1.data()[r * hd + j],
+                    "第 {r} 行头 1 第 {j} 维应逐位相同"
+                );
+            }
+        }
+        assert!(!spec.is_plain(), "rotate_half 不是 GPU 内核写死的口径，必须让它让路");
+        assert!(plain().is_plain(), "默认口径（相邻配对）仍应与内核一致");
     }
 }

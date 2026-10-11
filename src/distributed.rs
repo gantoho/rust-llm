@@ -25,8 +25,11 @@
 //!    [`Schedule::one_forward_one_backward`]（micro-batch 与激活驻留）
 //! 6. **3D 并行**：[`DistConfig`]（dp × tp × pp 正交切分与 rank 分工报告）
 
+use crate::comm::CommGroup;
 use crate::layers::Linear;
+use crate::model::Transformer;
 use crate::optim::{AdamW, Optimizer};
+use crate::rng::Rng;
 use crate::tensor::Tensor;
 
 // ==================== 1. 集合通信 ====================
@@ -79,7 +82,7 @@ pub fn chunk_range(i: usize, len: usize, n: usize) -> (usize, usize) {
 
 /// 环形下标：把可能为负的 `a` 折回 `[0, n)`。环上"左邻居"就是 `-1`，
 /// 直接写 `(r - 1) % n` 在 usize 上会向下溢出 panic。
-fn wrap(a: isize, n: usize) -> usize {
+pub(crate) fn wrap(a: isize, n: usize) -> usize {
     (((a % n as isize) + n as isize) as usize) % n
 }
 
@@ -154,7 +157,7 @@ fn ring_round(
 /// 注意**长度必须按目标块下标取**：`len` 不能被 N 整除时各块大小不等，
 /// 拼接缓冲里的第 `r` 段长度是块 `(r+1) mod N` 的大小（7、6 这样的差别），
 /// 而不是第 `r` 块的大小。用错下标会让 `copy_from_slice` 长度不匹配直接 panic。
-fn rotate_chunks(gathered: &[f32], n: usize) -> Vec<f32> {
+pub(crate) fn rotate_chunks(gathered: &[f32], n: usize) -> Vec<f32> {
     let len = gathered.len();
     let mut out = vec![0.0f32; len];
     let mut src_off = 0usize;
@@ -518,6 +521,117 @@ impl DataParallel {
             write_grads(params, &summed[r], scale);
         }
     }
+}
+
+// ==================== 2b. 真实多进程 DP：数据分片与同步点 ====================
+//
+// 上面第 2 节是**单进程模拟**（所有副本的参数都在一个地址空间里）。这一节处理
+// 真起 N 个进程时的三件事：各副本怎么吃到**不同的**数据、梯度怎么对齐、
+// 以及哪些"只在 rank 0 做"的副作用不能把别的 rank 带偏。
+
+/// splitmix64 的 finalizer：把任意 64 位整数搅拌成统计上无关的一个新值。
+///
+/// 选它是因为它**便宜且无状态**（一次混合就是几步位运算），而且对"输入只差 1"
+/// 这种相邻种子给出的输出完全不相关——这正是把一个种子派生成 N 个互不相同的
+/// 数据流所需要的性质。
+fn splitmix64(seed: u64) -> u64 {
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// DP 数据分片：把**训练用**的 rng 状态扰动到与 `dp_rank` 相关的轨道上。
+///
+/// 同一份语料、同一个种子，N 个副本若都从同一个 rng 状态开始采样，它们每一步都
+/// 会抽到**完全相同**的批次：梯度平均出来等于单卡那一批的梯度，DP 只是把同一份
+/// 计算重复了 N 遍。所以"数据并行"真正要做的事就是这个扰动——让每个副本走
+/// 随机数序列的**不同轨道**（等价于各副本自己 shuffle 了数据）。
+///
+/// `dp_rank == 0` 时**原样不动**。这条不是优化而是正确性要求：单进程训练与
+/// "分布式里的 0 号副本"必须逐位一致，否则所有"单卡参照 vs DP"的对拍都失去基准。
+///
+/// ⚠️ 只扰动训练用的 rng。评估用的 rng（`train_transformer` 里那个固定种子的
+/// `eval_rng`）绝不能扰动：各副本必须在**同一批**验证数据上评估，否则
+/// val_loss 不同 → 早停判据分叉 → 有人退出有人继续 → 集合通信挂死。
+pub fn mix_dp_rank(rng: &mut Rng, dp_rank: usize) {
+    if dp_rank == 0 {
+        return;
+    }
+    let seed = rng
+        .state()
+        .wrapping_add((dp_rank as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    rng.set_state(splitmix64(seed));
+}
+
+/// DP 组内同步一次参数梯度：拼接成**一条**缓冲做环形 allreduce，再按组大小平均写回。
+///
+/// 三个顺序/形态上的约束，每一个都能单独把训练搞坏：
+///
+/// - **一次拼接**：集合通信只认连续内存。逐参数各发一次会把"每参数一次往返"的
+///   RTT 叠加起来（真实网络里这是 DP 同步的主要开销，各家框架的 gradient
+///   bucketing 就是为它做的）。拼接顺序由 `params` 的枚举顺序决定，
+///   各 rank 必须一致——见 [`flatten_grads`]。
+/// - **在 AMP 反缩放之后**：平均的必须是真实尺度的梯度。若在反缩放之前平均，
+///   一旦各副本的 scale 分了叉，平均出来的既不是"和的平均"也不是别的什么有意义的量，
+///   而且不会报错。
+/// - **在梯度裁剪之前**：裁剪阈值要作用在同步后的**全局**梯度上，才与单卡口径一致；
+///   先裁剪再平均等于每个副本各自按局部范数缩放，全局范数会偏小。
+///
+/// `local_scale` 的语义同 [`DataParallel::sync_gradients`]：本地攒了 k 个 micro-step
+/// 就传 `1/k`，把"和"还原成"平均"。
+pub fn allreduce_mean_grads(group: &CommGroup<'_>, params: &[Tensor], local_scale: f32) {
+    let n = group.size();
+    if n == 1 {
+        return; // 单副本：allreduce 是恒等操作，连拼接都省掉
+    }
+    let flat = flatten_grads(params);
+    let summed = group.all_reduce_sum(&flat);
+    write_grads(params, &summed, local_scale / n as f32);
+}
+
+/// 把"本副本是否梯度溢出"汇总成**全体一致**的标志：任一副本溢出 ⇒ 全体按溢出处理。
+///
+/// 为什么不能各判各的：AMP 的 `scale` 是**跨副本共享的状态**（各副本必须用同一个
+/// 反缩放系数，见 [`crate::train::MixedPrecision`]）。各自 check 的话，"谁的梯度溢出"
+/// 会让 scale 分叉，于是同一份 allreduce 出来的梯度在不同副本上被除以不同的数——
+/// 参数更新分叉，训练悄悄变成 N 份不同的模型（而且 loss 曲线看起来完全正常）。
+///
+/// 用 allreduce 求和而不是广播 rank 0 的判断：两者都能得到一致标志，但求和不需要
+/// 假设"谁是裁判"，也不会因为 rank 0 恰好没溢出就把别人的坏梯度放过去。
+pub fn sync_overflow(group: &CommGroup<'_>, local: bool) -> bool {
+    if group.size() == 1 {
+        return local;
+    }
+    let flag = [if local { 1.0f32 } else { 0.0f32 }];
+    group.all_reduce_sum(&flag)[0] > 0.0
+}
+
+/// DP 组内同步 MoE 的 aux-loss-free 均衡偏置：取各副本的**平均**后写回，
+/// 返回同步的 MoE 层数（`0` = 本模型没有启用该偏置，全程不做任何通信）。
+///
+/// 偏置**不是参数**，不在梯度 allreduce 里；但它参与**下一次前向的硬路由**。
+/// 各副本只看自己那份数据的负载，偏置必然分叉，而后果不止是精度：
+/// 同一份参数、不同的前向输出 ⇒ 各副本算出的 val_loss 不同 ⇒ 最优/早停判据分叉
+/// ⇒ 一部分 rank 继续跑、另一部分 rank 已经退出循环，下一轮的集合通信直接挂死
+/// （而且要等到 `DIST_RECV_TIMEOUT_SECS` 才报超时，现场看起来就是"卡住了"）。
+///
+/// 层数（即扁平缓冲的长度）由模型结构决定、各 rank 完全相同，所以
+/// "要不要通信"这件事在所有副本上取值一致——集合通信的参与方不会少人。
+pub fn allreduce_mean_moe_bias(group: &CommGroup<'_>, model: &Transformer) -> usize {
+    let flat = model.moe_balance_flat();
+    if flat.is_empty() {
+        return 0; // 非 MoE / 未开偏置均衡：所有 rank 都在这里返回
+    }
+    let layers = model.moe_bias_layer_count();
+    let n = group.size();
+    if n > 1 {
+        let summed = group.all_reduce_sum(&flat);
+        let mean: Vec<f32> = summed.iter().map(|v| v / n as f32).collect();
+        let wrote = model.set_moe_balance_flat(&mean);
+        debug_assert_eq!(wrote, layers, "写回的 MoE 层数与收集时不一致");
+    }
+    layers
 }
 
 // ==================== 3. ZeRO：切分优化器状态与梯度 ====================
@@ -1390,6 +1504,42 @@ impl DistConfig {
         DistConfig { dp, tp, pp }
     }
 
+    /// 从环境变量读三维切分：`WORLD_SIZE` / `DIST_TP` / `DIST_PP`（`DIST_DP` 可选）。
+    ///
+    /// 语义与 torch 的启动器约定一致：**`WORLD_SIZE` 是权威**，dp 由它推出来。
+    /// `DIST_TP` / `DIST_PP` 缺省为 1，于是"只给 `WORLD_SIZE`"就等于纯数据并行。
+    ///
+    /// **先断言后除法**：dp 是 `world / (tp·pp)`，除之前必须先确认整除。顺序反过来的话，
+    /// 除不尽只会在 usize 上被静默取整，`dp·tp·pp ≠ world` 的错误要等到第一次集合通信
+    /// 才暴露——而且表现不是报错而是**挂死**（有 rank 永远等不到队友），
+    /// 排查成本远高于起跑前 panic。
+    ///
+    /// `DIST_DP` 若显式给出，只用于交叉校验（两个来源不一致说明启动器与 CLI 参数没对上）。
+    pub fn from_env() -> Self {
+        let get = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+        let world = get("WORLD_SIZE").unwrap_or(1);
+        let tp = get("DIST_TP").unwrap_or(1);
+        let pp = get("DIST_PP").unwrap_or(1);
+        assert!(world > 0, "WORLD_SIZE 必须为正（0 个进程的通信域没有意义）");
+        assert!(tp > 0 && pp > 0, "DIST_TP / DIST_PP 必须为正");
+        assert_eq!(
+            world % (tp * pp),
+            0,
+            "WORLD_SIZE={world} 不能被 DIST_TP×DIST_PP={} 整除：多出来的 rank 没有坐标，\
+             TP/PP 的组划分会整体错位（改成能整除的组合，或只给 WORLD_SIZE 让 dp 自动推导）",
+            tp * pp
+        );
+        let dp = world / (tp * pp);
+        if let Some(d) = get("DIST_DP") {
+            assert_eq!(
+                d, dp,
+                "DIST_DP={d} 与 WORLD_SIZE/(DIST_TP×DIST_PP)={dp} 不一致——\
+                 启动器传的 env 和进程拿到的切分配置不是同一套"
+            );
+        }
+        DistConfig::new(dp, tp, pp)
+    }
+
     pub fn world_size(&self) -> usize {
         self.dp * self.tp * self.pp
     }
@@ -1427,6 +1577,13 @@ impl DistConfig {
     pub fn dp_group(&self, rank: usize) -> Vec<usize> {
         let c = self.coord(rank);
         (0..self.dp).map(|dp| self.rank_of(RankCoord { dp, ..c })).collect()
+    }
+
+    /// 与本 rank 同属一个 PP 组的 rank：tp/dp 坐标相同、pp 坐标走满一圈。
+    /// **stage 间只传边界激活**（点对点），这一组圈出的是同一条流水线上的邻居。
+    pub fn pp_group(&self, rank: usize) -> Vec<usize> {
+        let c = self.coord(rank);
+        (0..self.pp).map(|pp| self.rank_of(RankCoord { pp, ..c })).collect()
     }
 
     /// 本 rank 流水线里的上游 stage（`None` = 第一段，输入直接来自数据）
@@ -2367,5 +2524,174 @@ mod tests {
                 assert!(s.contains(&format!("样本 [{}, {})", plan.batch.0, plan.batch.1)), "{s}");
             }
         }
+    }
+
+    // ---------- 多进程 DP：环境变量与数据分片 ----------
+
+    /// 环境变量是**进程级全局状态**，而测试默认并行跑：改 env 的测试必须串行化，
+    /// 并且无论断言成功与否都要把原值还回去（否则会污染同一进程里的其它测试）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 在给定环境变量下执行 `f`，结束后（含 panic 展开）原样还原。
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(String, Option<String>)> =
+            vars.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
+        for (k, v) in vars {
+            match v {
+                // edition 2024：set_var/remove_var 会影响同进程的其它线程，必须 unsafe
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, v) in &saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// `DistConfig::from_env`：`WORLD_SIZE` 是权威、dp 由它推出来，`DIST_DP` 只作交叉校验。
+    #[test]
+    fn test_dist_config_from_env_reads_world_and_axes() {
+        // 什么环境变量都没有 = 单进程（普通训练路径）
+        with_env(
+            &[("WORLD_SIZE", None), ("DIST_TP", None), ("DIST_PP", None), ("DIST_DP", None)],
+            || assert_eq!(DistConfig::from_env(), DistConfig::new(1, 1, 1)),
+        );
+        // 只给 WORLD_SIZE：纯数据并行（dp = world）
+        with_env(
+            &[("WORLD_SIZE", Some("3")), ("DIST_TP", None), ("DIST_PP", None), ("DIST_DP", None)],
+            || assert_eq!(DistConfig::from_env(), DistConfig::new(3, 1, 1)),
+        );
+        // tp、pp 由启动器给出，dp 自动推导
+        with_env(
+            &[
+                ("WORLD_SIZE", Some("6")),
+                ("DIST_TP", Some("2")),
+                ("DIST_PP", Some("3")),
+                ("DIST_DP", None),
+            ],
+            || {
+                let c = DistConfig::from_env();
+                assert_eq!((c.dp, c.tp, c.pp), (1, 2, 3));
+                assert_eq!(c.world_size(), 6);
+            },
+        );
+        with_env(
+            &[
+                ("WORLD_SIZE", Some("8")),
+                ("DIST_TP", Some("2")),
+                ("DIST_PP", Some("2")),
+                ("DIST_DP", None),
+            ],
+            || assert_eq!(DistConfig::from_env(), DistConfig::new(2, 2, 2)),
+        );
+        // DIST_DP 与推导值一致：放行
+        with_env(
+            &[
+                ("WORLD_SIZE", Some("4")),
+                ("DIST_TP", Some("2")),
+                ("DIST_PP", Some("1")),
+                ("DIST_DP", Some("2")),
+            ],
+            || assert_eq!(DistConfig::from_env(), DistConfig::new(2, 2, 1)),
+        );
+    }
+
+    /// 除不尽必须**当场**拒绝。静默取整会让 `dp·tp·pp ≠ world`，而这个错误不会在
+    /// 起跑时报出来——它要拖到第一次集合通信才以"挂死"的形式暴露。
+    #[test]
+    #[should_panic(expected = "不能被 DIST_TP×DIST_PP")]
+    fn test_dist_config_from_env_asserts_before_dividing() {
+        with_env(
+            &[
+                ("WORLD_SIZE", Some("6")),
+                ("DIST_TP", Some("4")),
+                ("DIST_PP", Some("1")),
+                ("DIST_DP", None),
+            ],
+            || {
+                DistConfig::from_env();
+            },
+        );
+    }
+
+    /// `DIST_DP` 与推导值不一致（启动器传的 env 和进程拿到的切分配置不是同一套）必须拒绝。
+    #[test]
+    #[should_panic(expected = "不一致")]
+    fn test_dist_config_from_env_rejects_mismatched_dp() {
+        with_env(
+            &[
+                ("WORLD_SIZE", Some("4")),
+                ("DIST_TP", Some("2")),
+                ("DIST_PP", Some("1")),
+                ("DIST_DP", Some("3")),
+            ],
+            || {
+                DistConfig::from_env();
+            },
+        );
+    }
+
+    /// DP 数据分片：dp_rank = 0 逐位不变（单进程基准），各副本落在互不相同的轨道，
+    /// 同一 dp_rank 可复现。
+    #[test]
+    fn test_mix_dp_rank_keeps_rank0_and_separates_replicas() {
+        let untouched = Rng::new(1234);
+        let mut rank0 = Rng::new(1234);
+        mix_dp_rank(&mut rank0, 0);
+        assert_eq!(rank0.state(), untouched.state(), "dp_rank = 0 不该扰动 rng 状态");
+
+        // 各副本必须落到不同轨道：撞在一起就意味着它们吃的是同一批数据，
+        // 梯度平均等于单卡那批的梯度，数据并行白跑 N 遍。
+        let mut states = std::collections::BTreeSet::new();
+        for dp in 0..8usize {
+            let mut r = Rng::new(1234);
+            mix_dp_rank(&mut r, dp);
+            assert!(states.insert(r.state()), "dp_rank {dp} 与前面的副本撞到了同一个 rng 状态");
+        }
+        assert_eq!(states.len(), 8);
+
+        // 可复现：同一 dp_rank 反复得到同一状态
+        let (mut a, mut b) = (Rng::new(1234), Rng::new(1234));
+        mix_dp_rank(&mut a, 5);
+        mix_dp_rank(&mut b, 5);
+        assert_eq!(a.state(), b.state());
+
+        // 端到端确认扰动真的作用到了采样上（不只是"状态值不同"）
+        let (mut r1, mut r2) = (Rng::new(1234), Rng::new(1234));
+        mix_dp_rank(&mut r1, 1);
+        mix_dp_rank(&mut r2, 2);
+        assert_ne!(r1.next_u64(), r2.next_u64(), "两个副本的第一次采样不该相同");
+    }
+
+    /// 单副本（`group.size() == 1`）时三个 DP 同步点都必须是**恒等操作**：
+    /// 不拼接、不通信、不改梯度。这条分支正是"普通单进程训练逐位不变"的保证——
+    /// 若哪天把它写成"照发一遍再除 1"，单进程结果会因为浮点累加顺序而悄悄变掉。
+    #[test]
+    fn test_dp_sync_helpers_single_rank_are_identity() {
+        // world = 1 的 Comm 不起任何连接（见 Comm::new 的 world > 1 判断）
+        let comm = crate::comm::Comm::new(0, 1, "127.0.0.1", 0);
+        let g = comm.group(crate::comm::GROUP_DP, vec![0]);
+        assert_eq!(g.size(), 1);
+
+        let p = Tensor::param(vec![0.0, 0.0], vec![2]);
+        *p.grad.borrow_mut() = vec![3.0, -4.0];
+        allreduce_mean_grads(&g, std::slice::from_ref(&p), 1.0);
+        assert_eq!(*p.grad.borrow(), vec![3.0, -4.0], "单副本时梯度应原样保留");
+
+        assert!(!sync_overflow(&g, false));
+        assert!(sync_overflow(&g, true), "单副本时本地判断就是全体判断");
+
+        // 稠密模型没有均衡偏置要同步：直接返回 0，不碰通信
+        let model = tiny_transformer(24, 3);
+        assert!(model.moe_balance_flat().is_empty());
+        assert_eq!(allreduce_mean_moe_bias(&g, &model), 0);
     }
 }

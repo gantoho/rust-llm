@@ -550,6 +550,9 @@ impl MultiHeadAttention {
     /// `qk_norm = false` 同样逐位不变：RMSNorm 的 `gamma` 初始化为全 1，不消耗随机数，
     /// 所以老配置（`config.json` 里没有这个字段、serde 取默认值 `false`）训出来的权重
     /// 与加了 QK-Norm 之前的代码完全一致。
+    /// 历史 9 参数构造：`head_dim = 0`（按 `n_embd/n_head` 推）、Q/K/V 与输出投影**都带 bias**
+    /// ——即本仓库自研权重的口径，逐位不变。HF 导入走 [`Self::new_full`]。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         n_embd: usize,
         n_head: usize,
@@ -561,9 +564,43 @@ impl MultiHeadAttention {
         mla_absorb: bool,
         rng: &mut Rng,
     ) -> Self {
+        Self::new_full(
+            n_embd, n_head, n_kv_head, kv_lora_rank, qk_norm, rope, mla_rope_dim, mla_absorb, 0, true,
+            true, rng,
+        )
+    }
+
+    /// 完整构造：额外给出 `head_dim`（0 = 自动）、Q/K/V 的 bias 开关、输出投影的 bias 开关
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        n_embd: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        kv_lora_rank: usize,
+        qk_norm: bool,
+        rope: RopeSpec,
+        mla_rope_dim: usize,
+        mla_absorb: bool,
+        head_dim_cfg: usize,
+        qkv_bias: bool,
+        o_bias: bool,
+        rng: &mut Rng,
+    ) -> Self {
         let n_kv = if n_kv_head == 0 { n_head } else { n_kv_head };
         assert!(n_head % n_kv == 0, "n_head 必须能被 n_kv_head 整除");
-        let head_dim = n_embd / n_head;
+        // `head_dim_cfg = 0` = 由 `n_embd / n_head` 推出（历史默认，逐位不变）；
+        // HF 的部分配置会显式给 head_dim，此时必须满足 `n_head × head_dim == n_embd`，
+        // 否则 Q/K/V 的宽度与残差流维度对不上（残差加法会在前向里炸）。
+        let head_dim = if head_dim_cfg > 0 {
+            assert_eq!(
+                head_dim_cfg * n_head,
+                n_embd,
+                "显式 head_dim（{head_dim_cfg}）× n_head（{n_head}）必须等于 n_embd（{n_embd}）"
+            );
+            head_dim_cfg
+        } else {
+            n_embd / n_head
+        };
         // 解耦 RoPE（decoupled RoPE）：head_dim = hd_nope + hd_rope，只旋转后 hd_rope 维。
         let decoupled = mla_rope_dim > 0;
         let hd_rope = mla_rope_dim;
@@ -589,35 +626,35 @@ impl MultiHeadAttention {
         // `kv_lora_rank = 0` 时不消耗任何额外随机数，老配置的初始化逐位不变。
         // 解耦模式只改变 c_q/c_k/c_v 的输出维与新增 c_qr/c_kr，`mla_rope_dim = 0` 时一模不差。
         let c_q = if decoupled {
-            Linear::new(n_embd, n_head * hd_nope, rng)
+            Linear::new_with_bias(n_embd, n_head * hd_nope, qkv_bias, rng)
         } else {
-            Linear::new(n_embd, n_embd, rng)
+            Linear::new_with_bias(n_embd, n_embd, qkv_bias, rng)
         };
         let (c_k, c_v) = if kv_lora_rank > 0 {
             if decoupled {
                 (
-                    Linear::new(kv_lora_rank, n_kv * hd_nope, rng),
-                    Linear::new(kv_lora_rank, n_kv * hd_nope, rng),
+                    Linear::new_with_bias(kv_lora_rank, n_kv * hd_nope, qkv_bias, rng),
+                    Linear::new_with_bias(kv_lora_rank, n_kv * hd_nope, qkv_bias, rng),
                 )
             } else {
                 (
-                    Linear::new(kv_lora_rank, kv_dim, rng),
-                    Linear::new(kv_lora_rank, kv_dim, rng),
+                    Linear::new_with_bias(kv_lora_rank, kv_dim, qkv_bias, rng),
+                    Linear::new_with_bias(kv_lora_rank, kv_dim, qkv_bias, rng),
                 )
             }
         } else {
             (
-                Linear::new(n_embd, kv_dim, rng),
-                Linear::new(n_embd, kv_dim, rng),
+                Linear::new_with_bias(n_embd, kv_dim, qkv_bias, rng),
+                Linear::new_with_bias(n_embd, kv_dim, qkv_bias, rng),
             )
         };
-        let c_proj = Linear::new(n_embd, n_embd, rng);
-        let c_kv = (kv_lora_rank > 0).then(|| Linear::new(n_embd, kv_lora_rank, rng));
+        let c_proj = Linear::new_with_bias(n_embd, n_embd, o_bias, rng);
+        let c_kv = (kv_lora_rank > 0).then(|| Linear::new_with_bias(n_embd, kv_lora_rank, qkv_bias, rng));
         // 解耦 RoPE 的两条旋转投影：**最后构造**，`mla_rope_dim = 0` 时不消耗随机数。
         let (c_qr, c_kr) = if decoupled {
             (
-                Some(Linear::new(n_embd, n_head * hd_rope, rng)),
-                Some(Linear::new(n_embd, n_head * hd_rope, rng)),
+                Some(Linear::new_with_bias(n_embd, n_head * hd_rope, qkv_bias, rng)),
+                Some(Linear::new_with_bias(n_embd, n_head * hd_rope, qkv_bias, rng)),
             )
         } else {
             (None, None)
@@ -655,8 +692,10 @@ impl MultiHeadAttention {
 
     /// 前向
     /// - x: [B, T, D]
-    /// - mask: 可选的 `[T, T_total]` 后缀因果掩码；CPU 分块核在核内屏蔽不需要它，
-    ///   传 `None` 即可；只有 GPU 常驻 / probe 录制路径会消费真实掩码 buffer
+    /// - mask: 可选的 `[T, T_total]` **加性**掩码（0 = 可见、`-inf` = 屏蔽）。
+    ///   传 `None` 时 CPU 分块核走**核内后缀因果**快路（`k_end = i + visible_before + 1`，
+    ///   与因果掩码等价）；传 `Some` 时 CPU 分块核与 GPU 常驻 / probe 录制路径**都真的
+    ///   消费这张掩码**，可见性完全由它决定（视觉塔的双向注意力正是靠一张全 0 掩码拿到）
     /// - kv_cache: Some(缓存) 时走推理模式（只算新 token）
     /// - base: RoPE 的绝对位置基准（训练时 = 0，KV cache 推理时 = 缓存已见位置总数）
     pub fn forward(
@@ -687,14 +726,15 @@ impl MultiHeadAttention {
         let q = self.apply_qk_norm(q, &self.q_norm, self.n_head);
         let k = self.apply_qk_norm(k, &self.k_norm, self.n_kv_head);
 
-        // 2. RoPE：Q/K 按 head_dim 旋转（GQA 时 K 只有 n_kv_head 个头）
+        // 2. RoPE：Q/K 按 **head_dim** 旋转（GQA 时 K 只有 n_kv_head 个头，
+        //    所以两侧总宽可以不同——角度只由头内下标决定，见 `rope::rotate_with_tab`）
         let mut positions = Vec::with_capacity(b * t);
         for _ in 0..b {
             positions.extend(base..base + t);
         }
         let (q, k) = q
             .reshape(vec![b * t, d])
-            .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions, &self.rope);
+            .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions, head_dim, &self.rope);
         let (q, k) = (
             q.reshape(vec![b, t, d]),
             k.reshape(vec![b, t, kv_dim]),
@@ -772,10 +812,13 @@ impl MultiHeadAttention {
 
         // 4. RoPE：Q 用本次新 token 的绝对位置；K 用它自己每一行的绝对位置
         let q_pos: Vec<usize> = (0..b).flat_map(|_| base..base + t).collect();
-        let q = q.reshape(vec![b * t, d]).rotary(&q_pos, &self.rope).reshape(vec![b, t, d]);
+        let q = q
+            .reshape(vec![b * t, d])
+            .rotary(&q_pos, head_dim, &self.rope)
+            .reshape(vec![b, t, d]);
         let k = k
             .reshape(vec![b * tk, kv_dim])
-            .rotary(&k_pos, &self.rope)
+            .rotary(&k_pos, head_dim, &self.rope)
             .reshape(vec![b, tk, kv_dim]);
 
         self.attend(&q, &k, &v, mask, b, t, false)
@@ -825,14 +868,14 @@ impl MultiHeadAttention {
         let q_rope = c_qr
             .forward(x)
             .reshape(vec![b * t * n_head, hd_rope])
-            .rotary(&head_pos, &self.rope)
+            .rotary(&head_pos, hd_rope, &self.rope)
             .reshape(vec![b, t, n_head * hd_rope]);
 
         // 2. K 的旋转部分：直接由输入投影，按绝对位置旋转（旋转后进缓存，历史不再补旋）
         let k_rope_new = c_kr
             .forward(x)
             .reshape(vec![b * t * n_head, hd_rope])
-            .rotary(&head_pos, &self.rope)
+            .rotary(&head_pos, hd_rope, &self.rope)
             .reshape(vec![b, t, n_head * hd_rope]);
 
         // 3. latent 压缩投影

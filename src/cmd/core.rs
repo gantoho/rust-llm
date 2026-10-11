@@ -1,6 +1,7 @@
 //! core：核心命令实现（train / eval / quant / generate / sft / finetune / preset / bench）。
 
 use crate::cli::RopeArgs;
+use crate::comm::DistRuntime;
 use crate::config::Config;
 use crate::data::{BatchSource, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, VlmLoader, load_documents, load_text, load_texts};
 use crate::model::{Transformer, TransformerConfig};
@@ -55,8 +56,7 @@ fn bool_from_name(flag: &str, name: &str) -> bool {
 
 /// 训练：`train --config config/config.json [--resume ckpt]`
 pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
-    let log_path = runlog::start("train");
-    println!("运行日志：{log_path}");
+    runlog::announce("train");
     runlog::fields(
         "本次运行参数",
         &[
@@ -67,6 +67,41 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
+
+    // ---- 多进程（DP 接线）----
+    // env 里有 `WORLD_SIZE > 1` 就按 torch 约定组网（起进程的命令见
+    // `docs/38-分布式训练.md` 的「启动多进程训练」一节）。
+    // 单进程时是 `None`，下面所有 `dist` 分支都不进，训练路径与接分布式之前逐位一致。
+    // `from_env` 会**建 TCP 全连接**，所以必须在任何集合通信之前建好：建连本身是
+    // 同步的（小 rank 拨大 rank），各进程在这里互相等对方监听就绪。
+    let dist = DistRuntime::from_env_if_distributed();
+    // 只有 rank 0 负责落盘（分词器 / 指标 / checkpoint），见 `train_transformer`。
+    let primary = dist.as_ref().map_or(true, |d| d.is_primary());
+    if let Some(d) = dist.as_ref() {
+        let rank = d.comm.rank();
+        let c = d.cfg.coord(rank);
+        // TP / PP 的接线还没做（任务清单 #6 / #7）。这里宁可起跑前拒绝，也不要
+        // 「每个 rank 都拿一份完整模型」跑完——那种结果不报错，只是和切分语义不符。
+        assert!(
+            d.cfg.tp == 1 && d.cfg.pp == 1,
+            "TP/PP 接线尚未完成（任务清单 #6/#7）：当前只支持 DIST_TP=1 且 DIST_PP=1 的纯数据并行，\
+             收到 tp={} pp={}",
+            d.cfg.tp,
+            d.cfg.pp
+        );
+        logln!(
+            "分布式：rank {}/{} ｜ dp {} tp {} pp {} ｜ 本机 local_rank {} ｜ \
+             DP 组 {} 个 rank 做梯度同步（TP/PP 组暂未接线）",
+            rank,
+            d.comm.world(),
+            c.dp,
+            c.tp,
+            c.pp,
+            d.local_rank,
+            d.cfg.dp_group(rank).len(),
+        );
+    }
+
     #[cfg(feature = "gpu")]
     if gpu::is_available() {
         logln!("GPU: {}（{}）", gpu::name(), gpu::backend());
@@ -113,10 +148,15 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
         }
     }
 
-    // 训练完成后保存分词器（out_dir 不存在时 save 会自动创建）
+    // 训练完成后保存分词器（out_dir 不存在时 save 会自动创建）。
+    // 多进程下只有 rank 0 落盘：N 个副本写同一个 tokenizer.json 会互相覆盖，
+    // 更糟的是**边写边被读**——别的 rank 若正在加载就会读到半截 JSON。
+    // 各 rank 手里的分词器仍由同一份语料、同一个种子独立构建，内容逐位相同。
     let tok_path = tcfg.tokenizer_file.clone()
         .unwrap_or_else(|| format!("{}/tokenizer.json", tcfg.out_dir));
-    tokenizer.save(&tok_path);
+    if primary {
+        tokenizer.save(&tok_path);
+    }
     logln!("分词器已保存到 {tok_path}");
 
     if model_cfg.vocab_size == 0 {
@@ -228,6 +268,7 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
         Some(&tcfg.out_dir),
         resume,
         &mut rng,
+        dist.as_ref(),
     );
     runlog::append(&format!("训练结束：best val loss = {best:.4}"));
     runlog::finish();
@@ -243,8 +284,7 @@ pub(crate) fn cmd_eval(
     sft_file: Option<&str>,
     mask_response: bool,
 ) {
-    let log_path = runlog::start("eval");
-    println!("运行日志：{log_path}");
+    runlog::announce("eval");
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
@@ -357,8 +397,7 @@ pub(crate) fn cmd_quant(
     out: Option<&str>,
     do_eval: bool,
 ) {
-    let log_path = runlog::start("quant");
-    println!("运行日志：{log_path}");
+    runlog::announce("quant");
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
@@ -576,8 +615,7 @@ pub(crate) fn cmd_generate(
     length_penalty: f32,
     rope_opt: RopeArgs,
 ) {
-    let log_path = runlog::start("generate");
-    println!("运行日志：{log_path}");
+    runlog::announce("generate");
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
@@ -755,8 +793,7 @@ pub(crate) fn cmd_sft(
     lr: Option<f32>,
     out_dir: Option<&str>,
 ) {
-    let log_path = runlog::start("sft");
-    println!("运行日志：{log_path}");
+    runlog::announce("sft");
     let mut cfg = Config::load(config_path);
 
     // 步数与学习率：CLI 优先，其次配置文件。
@@ -893,6 +930,7 @@ pub(crate) fn cmd_sft(
         Some(&out_dir),
         None,
         &mut rng,
+        None,
     );
 
     // 把分词器一并放进输出目录，这个目录就是自包含的，推理时不必再指回预训练目录
@@ -939,8 +977,7 @@ pub(crate) fn cmd_finetune(
     sft_file: Option<&str>,
     out_dir: Option<&str>,
 ) {
-    let log_path = runlog::start("finetune");
-    println!("运行日志：{log_path}");
+    runlog::announce("finetune");
     let mut cfg = Config::load(config_path);
 
     // 先加载基座：该怎么挂适配层，取决于基座本身是不是 LoRA 存档
@@ -1094,6 +1131,7 @@ pub(crate) fn cmd_finetune(
         Some(&out_dir),
         None,
         &mut rng,
+        None,
     );
 
     // 分词器一并放进输出目录，这个目录就是自包含的，推理时不必再指回预训练目录
@@ -1126,6 +1164,60 @@ pub(crate) fn cmd_preset(name: &str, output: &str) {
         println!("  架构：LLaMA 风格（RMSNorm + SwiGLU + GQA）");
     } else {
         println!("  架构：经典风格（LayerNorm + GELU + MHA）");
+    }
+}
+
+// ==================== HuggingFace 权重导入（import-hf 子命令） ====================
+
+/// 把 HF 模型目录转成本仓库的原生存档（详见 [`crate::hf`] 的模块文档）。
+///
+/// 流程刻意做成"**构造骨架 → 按名字严格灌数据 → 落盘**"三步：
+/// - 骨架由映射出来的 `TransformerConfig` 构造，所以参数名/形状/初始化规则与原生模型**完全同源**；
+/// - 灌数据由 [`crate::hf::assign_named_parameters`] 对账（缺一个、形状不符、多一个都报错）；
+/// - 落盘复用 [`checkpoint::save_weights`]，于是导入产物就是一份普通权重档——
+///   训练、推理、量化、LoRA 全都能直接吃，**没有"HF 专用"的运行时代码**。
+pub(crate) fn cmd_import_hf(
+    model_dir: &str,
+    output: &str,
+    tokenizer: Option<&str>,
+    tokenizer_out: Option<&str>,
+) {
+    println!("导入 HuggingFace 权重：{model_dir}");
+    let hf = crate::hf::load_hf_dir(model_dir).unwrap_or_else(|e| panic!("导入失败：{e}"));
+    for note in &hf.notes {
+        println!("  {note}");
+    }
+    // 骨架：用 0 号种子构造即可——所有参数马上会被导入数据整体覆盖
+    let mut rng = Rng::new(0);
+    let model = Transformer::new(hf.cfg.clone(), &mut rng);
+    let n = crate::hf::assign_named_parameters(&model, &hf.tensors)
+        .unwrap_or_else(|e| panic!("{e}"));
+    checkpoint::save_weights(output, &model, 0, f32::INFINITY);
+    let mb = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
+    println!("  已写出 {n} 个参数 → {output}（{mb:.1} MB，权重 only 档）");
+
+    // 分词器（可选）：HF tokenizer.json → 本仓库格式
+    if let Some(tk) = tokenizer {
+        let out = tokenizer_out.map(|s| s.to_string()).unwrap_or_else(|| {
+            // 缺省与存档同目录，约定名 tokenizer.json
+            let dir = std::path::Path::new(output)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if dir.is_empty() {
+                "tokenizer.json".to_string()
+            } else {
+                format!("{dir}/tokenizer.json")
+            }
+        });
+        let tok = Tokenizer::load_hf(tk).unwrap_or_else(|e| panic!("分词器导入失败：{e}"));
+        tok.save(&out);
+        println!("  分词器 → {out}（词表 {} 个 token，HF 口径）", tok.vocab_size());
+    } else {
+        println!(
+            "  提示：未给 --tokenizer，推理时请自备分词器；\
+             HF 模型的词表口径与本仓库默认的 char/BPE-2048 不同，必须用同一个分词器"
+        );
     }
 }
 
@@ -1175,7 +1267,7 @@ pub(crate) fn cmd_bench(steps: usize, gen_tokens: usize) {
         ..config::TrainConfig::default()
     };
     let t0 = Instant::now();
-    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None);
     let train_secs = t0.elapsed().as_secs_f64();
     let train_tokens = steps * batch * gcfg.block_size;
     println!(

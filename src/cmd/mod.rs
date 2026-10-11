@@ -120,8 +120,16 @@ pub(crate) fn load_model_and_tokenizer(
     let tokenizer = if let Some(path) = tokenizer_path {
         let loaded = Tokenizer::load(path);
         if ckpt.model.vocab_size != 0 {
-            assert_eq!(loaded.vocab_size(), ckpt.model.vocab_size,
-                "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), ckpt.model.vocab_size);
+            // 只要求"分词器的 id 都落在模型词表内"，**不要求两者相等**：
+            // HF 模型常把 `vocab_size` 补到 128 的倍数（Qwen2.5：真实词表 151665、
+            // config 写 151936），多出来的那几行是永不会被采到的占位 id。
+            // 反过来若分词器更大，采样就可能产出越界 id —— 那才是必须拦下的情况。
+            assert!(
+                loaded.vocab_size() <= ckpt.model.vocab_size,
+                "分词器词表（{}）大于 checkpoint 词表（{}）：会采出越界 token",
+                loaded.vocab_size(),
+                ckpt.model.vocab_size
+            );
         }
         logln!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
         loaded

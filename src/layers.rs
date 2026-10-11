@@ -55,6 +55,11 @@ pub fn swiglu_hidden(d: usize) -> usize {
 pub struct Linear {
     pub weight: Tensor,
     pub bias: Tensor,
+    /// 是否真的加偏置。`false` = 这一层没有 bias（LLaMA 全系列、Qwen2 的 o_proj/mlp 都是这样）：
+    /// 前向跳过加法、**参数表里也不列它**（`named_parameters` / `parameters` 都不含
+    /// `{prefix}.bias`），于是存档与 HF 权重一一对应；`bias` 字段本身仍保留一个零张量，
+    /// 好处是量化/LoRA/分布式那些直接读 `.bias` 的代码一行都不用改。
+    pub use_bias: bool,
     pub lora: Option<LoraAdapter>,
     pub quant: Option<QuantWeight>,
     pub capture: Option<Shared<Tensor>>,
@@ -64,6 +69,22 @@ impl Linear {
     /// 创建线性层。
     /// 权重用 Xavier 正态分布初始化（std = √(2/(in+out))，保证前向/反向方差稳定）。
     pub fn new(in_features: usize, out_features: usize, rng: &mut Rng) -> Self {
+        Self::new_with_bias(in_features, out_features, true, rng)
+    }
+
+    /// 创建**不带偏置**的线性层（HF 的 LLaMA / Qwen2 用得上）：
+    /// `bias` 字段留一个零张量占位，但前向不加它、参数表不列它。
+    pub fn new_no_bias(in_features: usize, out_features: usize, rng: &mut Rng) -> Self {
+        Self::new_with_bias(in_features, out_features, false, rng)
+    }
+
+    /// `new` / `new_no_bias` 的公共实现（随机数消耗顺序与是否带 bias 无关，保证可复现）
+    pub fn new_with_bias(
+        in_features: usize,
+        out_features: usize,
+        use_bias: bool,
+        rng: &mut Rng,
+    ) -> Self {
         let std = (2.0 / (in_features + out_features) as f32).sqrt();
         let w: Vec<f32> = (0..in_features * out_features)
             .map(|_| rng.randn() * std)
@@ -71,6 +92,7 @@ impl Linear {
         Linear {
             weight: Tensor::param(w, vec![in_features, out_features]),
             bias: Tensor::param(vec![0.0; out_features], vec![out_features]),
+            use_bias,
             lora: None,
             quant: None,
             capture: None,
@@ -194,7 +216,9 @@ impl Linear {
                 }
             }
         };
-        let mut y = base.add(&self.bias);
+        // 无 bias 的层（HF 的 LLaMA / Qwen2 的 o_proj、mlp 等）跳过这一步：
+        // 不是"加零"而是**根本不做加法**，省掉一次全量广播加法与一个计算图节点。
+        let mut y = if self.use_bias { base.add(&self.bias) } else { base };
         // LoRA 增量：Δy = (α/r)·(x @ Aᵀ) @ Bᵀ。初始 B = 0 时 Δy = 0，前向与普通线性层逐位相同
         if let Some(lora) = &self.lora {
             y = y.add(&lora.forward(&x));
@@ -391,11 +415,14 @@ impl Linear {
 
     /// 带名字的参数（checkpoint 保存/恢复用）：`{prefix}.weight` / `{prefix}.bias`
     /// （挂了 LoRA 时还有 `{prefix}.lora_a` / `{prefix}.lora_b`）
+    /// 带名字的参数（checkpoint 保存/恢复用）：`{prefix}.weight` / `{prefix}.bias`。
+    /// `use_bias = false` 的层**不列 bias**——HF 的 LLaMA 权重里就没有它，
+    /// 列出来会让导入时"少一个张量"变成假报错，也会让存档多出一份全零数据。
     pub fn named_parameters(&self, prefix: &str) -> Vec<(String, Tensor)> {
-        let mut ps = vec![
-            (format!("{prefix}.weight"), self.weight.clone()),
-            (format!("{prefix}.bias"), self.bias.clone()),
-        ];
+        let mut ps = vec![(format!("{prefix}.weight"), self.weight.clone())];
+        if self.use_bias {
+            ps.push((format!("{prefix}.bias"), self.bias.clone()));
+        }
         if let Some(lora) = &self.lora {
             ps.extend(lora.named_parameters(prefix));
         }
@@ -405,7 +432,10 @@ impl Linear {
 
 impl Module for Linear {
     fn parameters(&self) -> Vec<Tensor> {
-        let mut ps = vec![self.weight.clone(), self.bias.clone()];
+        let mut ps = vec![self.weight.clone()];
+        if self.use_bias {
+            ps.push(self.bias.clone());
+        }
         if let Some(lora) = &self.lora {
             ps.extend(lora.parameters());
         }
@@ -569,10 +599,15 @@ pub struct SwiGLUMLP {
 
 impl SwiGLUMLP {
     pub fn new(d: usize, hidden: usize, rng: &mut Rng) -> Self {
+        Self::new_with_bias(d, hidden, true, rng)
+    }
+
+    /// 指定是否有 bias（HF 的 LLaMA / Qwen2 的 FFN 没有 bias）
+    pub fn new_with_bias(d: usize, hidden: usize, use_bias: bool, rng: &mut Rng) -> Self {
         SwiGLUMLP {
-            w_gate: Linear::new(d, hidden, rng),
-            w_up: Linear::new(d, hidden, rng),
-            w_down: Linear::new(hidden, d, rng),
+            w_gate: Linear::new_with_bias(d, hidden, use_bias, rng),
+            w_up: Linear::new_with_bias(d, hidden, use_bias, rng),
+            w_down: Linear::new_with_bias(hidden, d, use_bias, rng),
         }
     }
 
@@ -622,9 +657,14 @@ pub enum MLPEnum {
 
 impl MLPEnum {
     pub fn new_gelu(d: usize, rng: &mut Rng) -> Self {
+        Self::new_gelu_full(d, MLP_RATIO * d, true, rng)
+    }
+
+    /// 指定 FFN 隐藏宽度与是否有 bias 的 GELU 变体（`ffn_hidden` / `mlp_bias` 走这里）
+    pub fn new_gelu_full(d: usize, hidden: usize, use_bias: bool, rng: &mut Rng) -> Self {
         MLPEnum::GELU {
-            linear1: Linear::new(d, MLP_RATIO * d, rng),
-            linear2: Linear::new(MLP_RATIO * d, d, rng),
+            linear1: Linear::new_with_bias(d, hidden, use_bias, rng),
+            linear2: Linear::new_with_bias(hidden, d, use_bias, rng),
         }
     }
 
@@ -632,6 +672,14 @@ impl MLPEnum {
         // SwiGLU hidden_dim = (2/3) * 4d ≈ 2.67d，取 256 的倍数（公式见 [`swiglu_hidden`]）
         let hidden = swiglu_hidden(d);
         MLPEnum::SwiGLU(SwiGLUMLP::new(d, hidden, rng))
+    }
+
+    /// 指定 FFN 隐藏宽度与是否有 bias 的 SwiGLU 变体。
+    ///
+    /// HF 的 LLaMA / Qwen2 的 `intermediate_size` 就是这里的 `hidden`（例如 4096 → 11008），
+    /// 与 [`swiglu_hidden`] 的默认公式**不一定相等**，所以必须能显式给。
+    pub fn new_swiglu_full(d: usize, hidden: usize, use_bias: bool, rng: &mut Rng) -> Self {
+        MLPEnum::SwiGLU(SwiGLUMLP::new_with_bias(d, hidden, use_bias, rng))
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
@@ -910,6 +958,7 @@ mod tests {
         Linear {
             weight: Tensor::param(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]),
             bias: Tensor::param(vec![0.0, 0.0], vec![2]),
+            use_bias: true,
             lora: None,
             quant: None,
             capture: None,

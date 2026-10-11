@@ -5,7 +5,9 @@
 //!   归一化、patchify、整个 ViT 前向/反向都是纯手写，跑在本项目的 Tensor/autograd 上。
 //! - ViT 结构（最朴素的原始版本）：
 //!   `patchify → Linear 打平成 patch embedding → 可学习位置 embedding →
-//!    N 层 Transformer Block（mask=None，**双向**注意力）→ LayerNorm → Linear 投影到主干维度`
+//!    N 层 Transformer Block（显式全 0 掩码 ⇒ patch 两两互相可见的**双向**注意力；
+//!    不能靠 `mask = None`，那会走 CPU 分块核的核内后缀因果快路，见 `attn_mask` 字段）
+//!    → LayerNorm → Linear 投影到主干维度`
 //! - 输出的每个 patch 特征不会进序列做 token，而是在 [`crate::model::Transformer::forward_mm`]
 //!   里**原位覆写**文本序列中的 `<|image|>` 占位符 —— 序列长度不变，KV cache / loss 对齐
 //!   完全不受影响（详见该方法的文档）。
@@ -188,6 +190,14 @@ pub struct VisionEncoder {
     pos: Tensor,
     /// 双向 Transformer Block（复用主干的 [`TransformerBlock`]）
     blocks: Vec<TransformerBlock>,
+    /// **双向注意力的显式全 0 加性掩码** `[P, P]`（0 = 可见）。
+    ///
+    /// 必须显式传一张全 0 掩码，不能靠"`mask = None` 就等于不屏蔽"：
+    /// `flash_attention` 在 `mask = None` 时走的是**核内后缀因果**快路
+    /// （`k_end = i + t_total - t + 1`，两侧等长时即"只能看自己和前面的 patch"）。
+    /// 早期版本正是这样把 ViT 静默算成了因果注意力——注释与文档都写着"双向"，
+    /// 实际 patch 之间信息只能单向流动，而测试只检查形状，掩盖了这个问题。
+    attn_mask: Tensor,
     ln: NormLayer,
     /// 隐藏维度 → 主干 `n_embd`
     proj: Linear,
@@ -218,6 +228,8 @@ impl VisionEncoder {
             // 位置 embedding 用小正态初始化（经典 ViT 做法）
             pos: Tensor::param(normal(p * vcfg.n_embd, 0.02, rng), vec![p, vcfg.n_embd]),
             blocks: (0..vcfg.n_layer).map(|_| TransformerBlock::new(&block_cfg, rng)).collect(),
+            // 全 0 = 所有 patch 互相可见（真正的双向注意力），见字段文档
+            attn_mask: Tensor::from_vec(vec![0.0f32; p * p], vec![p, p]),
             ln: NormLayer::new(vcfg.n_embd, LN_EPS, main_cfg.use_rmsnorm),
             proj: Linear::new(vcfg.n_embd, main_cfg.n_embd, rng),
         }
@@ -254,10 +266,11 @@ impl VisionEncoder {
         let pos = self.pos.gather_rows(&rows).reshape(vec![b, p, vcfg.n_embd]);
         let x = x.add(&pos);
 
-        // 3. 双向注意力：mask=None 且 base=0（无 KV cache），patch 之间互相可见
+        // 3. 双向注意力：显式传全 0 掩码（`mask = None` 会被 CPU 分块核当成因果注意力，
+        //    详见字段 `attn_mask` 的说明），base=0、无 KV cache ⇒ patch 之间完全互相可见
         let mut x = x;
         for block in &self.blocks {
-            x = block.forward(&x, None, None, 0, training);
+            x = block.forward(&x, Some(&self.attn_mask), None, 0, training);
         }
 
         // 4. 归一化 + 投影到主干维度，最后摊平回 [b·P, 主干 n_embd]
@@ -327,5 +340,51 @@ mod tests {
         let pixels = vec![0.0f32; b * 3 * 8 * 8];
         let out = enc.forward(&pixels, b, false);
         assert_eq!(out.shape(), &[b * vcfg.patch_count(), main.n_embd]);
+    }
+
+    /// **视觉塔必须是双向注意力**：改后面的 patch 必须能影响前面的 patch。
+    ///
+    /// 这条测试的直接触发原因：`flash_attention` 在 `mask = None` 时走的是 CPU 核内
+    /// **后缀因果**快路，于是 `VisionEncoder::forward` 里那句"双向注意力"实际被算成了
+    /// 因果注意力——patch 0 的输出只由 patch 0 自己决定，改后面的像素**完全不影响它**。
+    /// 而当时的测试只查形状（`test_vit_output_shape`），把这个语义错误整整盖住了。
+    #[test]
+    fn test_vit_attention_is_bidirectional() {
+        let mut rng = Rng::new(3);
+        let vcfg = VisionConfig {
+            image_size: 8,
+            patch_size: 4,
+            n_embd: 16,
+            n_head: 2,
+            n_layer: 2,
+            dropout: 0.0,
+            ph_first: 10,
+        };
+        let main = TransformerConfig::default();
+        let enc = VisionEncoder::new(&vcfg, &main, &mut rng);
+        let size = vcfg.image_size;
+        let (ps, grid) = (vcfg.patch_size, vcfg.image_size / vcfg.patch_size);
+
+        let base: Vec<f32> = (0..3 * size * size).map(|i| ((i % 7) as f32) / 7.0 - 0.5).collect();
+        // 只在**最后一个 patch**（右下角）上加偏移
+        let mut tweaked = base.clone();
+        for c in 0..3 {
+            for y in 0..ps {
+                for x in 0..ps {
+                    let sy = (grid - 1) * ps + y;
+                    let sx = (grid - 1) * ps + x;
+                    tweaked[c * size * size + sy * size + sx] += 0.5;
+                }
+            }
+        }
+        let oa = enc.forward(&base, 1, false);
+        let ob = enc.forward(&tweaked, 1, false);
+        let d = vcfg.n_embd;
+        // patch 0（左上角）的输出必须随之变化
+        let delta: f32 = (0..d).map(|j| (oa.data()[j] - ob.data()[j]).abs()).sum();
+        assert!(
+            delta > 1e-6,
+            "改最后一个 patch 却完全没影响 patch 0（差 {delta}）——视觉塔被算成了因果注意力"
+        );
     }
 }

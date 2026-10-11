@@ -1,6 +1,6 @@
 # 第 27 课：GPU 加速 —— 手写 WGSL 计算着色器
 
-> 代码位置：[src/gpu.rs](../src/gpu.rs)（约 5800 行）、[src/tensor.rs](../src/tensor.rs)（逐算子分流点）、
+> 代码位置：[src/gpu.rs](../src/gpu.rs)、[src/tensor.rs](../src/tensor.rs)（逐算子分流点）、
 > [src/model.rs](../src/model.rs)（常驻链路接线）、[src/train.rs](../src/train.rs)（稳态诊断）
 >
 > 目标：用 wgpu 计算着色器（WGSL）把最耗时的算子搬到 GPU 上跑，
@@ -23,7 +23,7 @@
 
 ```
 Cargo.toml      wgpu / pollster 为可选依赖（feature = "gpu"）
-src/gpu.rs      GPU 上下文 + 19 个 WGSL 计算入口 + 「逐算子」与「常驻录制」两条路径
+src/gpu.rs      GPU 上下文 + 22 个 WGSL 计算入口 + 「逐算子」与「常驻录制」两条路径
 src/tensor.rs   matmul / scale / add / relu / softmax 的分流点；
                 accumulate_grad / external / external_scalar_loss —— 常驻路径回注梯度的入口
 src/model.rs    TransformerBlock::forward、Transformer::forward_core 里的常驻链路接线
@@ -36,9 +36,10 @@ src/train.rs    第一步打印 dispatch 分解、结尾打印稳态与「matmul
 
 ---
 
-## 3. 19 个 WGSL 计算入口
+## 3. 22 个 WGSL 计算入口
 
-分成 **3 个 ShaderModule**（同一 module 内的 storage 绑定声明是全局的，见 [§9](#9-踩坑记录)）：
+分成 **3 个 ShaderModule**（同一 module 内的 storage 绑定声明是全局的，见 [§9](#9-踩坑记录)）；
+下面的分组与个数是写作时的快照，以 `src/gpu.rs` 里的 `const SHADER*` 实际内容为准：
 
 ### 3.1 `SHADER`（8 个）
 
@@ -59,12 +60,14 @@ src/train.rs    第一步打印 dispatch 分解、结尾打印稳态与「matmul
 |------|------|
 | `lm_ce_main` | 输出头融合交叉熵：`logits → log_softmax → CE → dlogits` 一次算完 |
 
-### 3.3 `SHADER_ELEM`（10 个）
+### 3.3 `SHADER_ELEM`（13 个）
 
 | 入口 | 用途 |
 |------|------|
-| `ln_fwd_main` / `ln_bwd_x_main` / `ln_bwd_gb_main` | LayerNorm 前向、对输入的梯度、对 γ/β 的梯度 |
+| `ln_fwd_main` / `ln_bwd_x_main` / `ln_bwd_gb_main` | LayerNorm 前向、对输入的梯度、对 γ/β 的梯度（RMSNorm 共用同一套内核，靠模式位切换） |
 | `gelu_fwd_bias_main` / `gelu_bwd_main` | GELU（+bias）前向与反向 |
+| `swiglu_fwd_main` / `swiglu_bwd_main` | SwiGLU 门控前向与反向 |
+| `add_bias_main` | 加偏置（`use_bias = false` 的层不调它） |
 | `bias_dropout_residual_main` | `out = c + mask·(x + b)` 三合一 |
 | `dropout_bwd_main` | dropout 反向（用同一 seed **重算**掩码，前向/反向逐位一致） |
 | `col_sum_main` | 按列求和（沿行归约），用于 bias 梯度与 softmax 分母 |
@@ -216,8 +219,13 @@ GELU 与 SwiGLU 现在都已支持（每层分别回注 16/18 项参数梯度）
 
 | 配置 | step 1 loss（GPU） | step 1 loss（CPU） |
 |------|------------------|------------------|
-| GQA 配置（测得时注意力常驻尚不支持 GQA，故该链路未生效） | 4.5354 | 4.5354（**逐位一致**） |
+| GQA 配置（**该行是"注意力常驻尚不支持 GQA"时的历史记录**，故当时该链路未生效） | 4.5354 | 4.5354（**逐位一致**） |
 | MHA 配置（注意力常驻生效） | 4.5075 | 4.5169（差 0.2%） |
+
+> 注意上表第一行的前提已经变了：GQA 现在**能**走注意力常驻路径（K/V 的头复制由调用方
+> 把权重按头展开后喂进内核），所以"GQA ⇒ 本轮常驻链路不生效 ⇒ 逐位一致"不再成立——
+> GQA 形态下会落进 1e-3 相对误差那一档。四种形态（LayerNorm / RMSNorm / GQA / RMSNorm+GQA）
+> 现在都由 `test_gpu_resident_path_matches_loop_path` 按同一门槛守着。
 
 也就是说：**想让 GPU 结果与 CPU 逐位对上，就把常驻链路整体让路**——把
 `LLM_GPU_MATMUL_MIN_FLOPS` 设得比实际形状的 FLOPs 都大即可（见 [§7](#7-环境变量)）。

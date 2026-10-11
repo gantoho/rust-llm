@@ -1,6 +1,6 @@
 # 第 32 课：MoE 混合专家模型（Mixture of Experts）
 
-> **本课已落地为可运行代码**：核心实现在 [`src/moe.rs`](../src/moe.rs)（1395 行，含 18 个单测），
+> **本课已落地为可运行代码**：核心实现在 [`src/moe.rs`](../src/moe.rs)（单测跑 `cargo test moe`，数量以实际输出为准），
 > 接线在 [`src/model.rs`](../src/model.rs)（`TransformerConfig.n_expert` / `moe_top_k` 等 9 个字段 +
 > `Ffn` 枚举二选一），演示在 `cargo run --release -- moe`（见文末「本项目实现」）。
 > 专家网络直接复用 `src/layers.rs` 的 `MLPEnum`（GELU 或 SwiGLU）。
@@ -169,7 +169,7 @@ impl MoELayer {
 
 核心代码在 [`src/moe.rs`](../src/moe.rs)，接线在 [`src/model.rs`](../src/model.rs)，
 演示命令是 `cargo run --release -- moe`（[`src/cmd/experiments.rs`](../src/cmd/experiments.rs) 的 `cmd_moe`）。
-18 个单测全部与 CPU 参考实现对齐（其中 4 个专测 aux-loss-free 均衡偏置与共享专家）。
+`cargo test moe` 的单测全部与 CPU 参考实现对齐（其中若干专测 aux-loss-free 均衡偏置与共享专家）。
 
 ### 公开 API
 

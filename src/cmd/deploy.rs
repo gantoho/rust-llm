@@ -38,8 +38,7 @@ pub(crate) fn cmd_serve(
     prompt_format: &str,
     rope_opt: RopeArgs,
 ) {
-    let log_path = runlog::start("serve");
-    println!("运行日志：{log_path}");
+    runlog::announce("serve");
     // 没给 `--api-key` 就现场生成一个：API 始终有鉴权，随机 key 由启动日志回显，
     // 否则默认「谁都能调」在把端口暴露出去时等于裸奔
     let (api_key, auto_key) = match api_key {
@@ -193,8 +192,7 @@ pub(crate) fn cmd_chat(
     prompt_format: &str,
     rope_opt: RopeArgs,
 ) {
-    let log_path = runlog::start("chat");
-    println!("运行日志：{log_path}");
+    runlog::announce("chat");
     let cfg = Config::load(config_path);
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;

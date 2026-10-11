@@ -46,6 +46,35 @@ pub struct TransformerConfig {
     /// 0 表示与 n_head 相同（标准 Multi-Head Attention）。
     /// LLaMA 2 70B 用 n_head=64, n_kv_head=8；Mistral 7B 用 n_head=32, n_kv_head=8。
     pub n_kv_head: usize,
+    /// **每个注意力头的宽度**。`0` = 由 `n_embd / n_head` 推出（历史默认，逐位不变）。
+    ///
+    /// 为什么要有这个字段：HF 的部分配置会显式写 `head_dim`。填了它就必须满足
+    /// `n_head × head_dim == n_embd`（否则 Q/K/V 宽度与残差流维度对不上，构造时就报错）。
+    pub head_dim: usize,
+    /// **FFN 隐藏宽度**。`0` = 按本仓库默认公式（SwiGLU 走 [`crate::layers::swiglu_hidden`]、
+    /// GELU 走 `4·n_embd`）。
+    ///
+    /// HF 的 `intermediate_size` 就是它（例如 LLaMA-2 的 4096 → 11008），
+    /// 与本仓库默认公式**不一定相等**，导入 HF 权重时必须显式给。
+    pub ffn_hidden: usize,
+    /// Q/K/V 投影是否带 bias。`false` = HF 的 LLaMA 全系列；
+    /// `true`（默认）= 本仓库历史行为与 Qwen2（Qwen2 的 qkv 有 bias）。
+    pub qkv_bias: bool,
+    /// 注意力输出投影（`c_proj`）是否带 bias。默认 `true`（历史行为）；LLaMA / Qwen2 都是 `false`。
+    pub o_bias: bool,
+    /// FFN 各投影是否带 bias。默认 `true`（历史行为）；LLaMA / Qwen2 都是 `false`。
+    pub mlp_bias: bool,
+    /// 归一化的 eps。默认 `1e-5`（[`LN_EPS`]，历史行为）；Qwen2 用 `1e-6`。
+    pub rms_eps: f32,
+    /// 输出头（`lm_head`）是否与词嵌入**共享权重**。默认 `true`（本仓库历史行为，
+    /// 也是 LLaMA-2/TinyLlama 的做法）；LLaMA-3 / Qwen2 多数是 `false`，此时
+    /// checkpoint 里会多一份独立的 `head.weight`（`[vocab, n_embd]`）。
+    pub tie_embeddings: bool,
+    /// RoPE 的元素配对方式（见 [`rope::RopeStyle`]）。默认相邻配对 = 本仓库历史口径；
+    /// HF 的 LLaMA/Qwen 用 `rotate_half`（[`rope::RopeStyle::Half`]）。
+    ///
+    /// ⚠️ 它必须与权重一起记录：两种配对是**不同的旋转**，靠猜会得到静默错误的输出。
+    pub rope_style: rope::RopeStyle,
     /// **MLA 的低秩维**（Multi-head Latent Attention，DeepSeek-V2/V3）：`> 0` 时 K/V 不再
     /// 各自从输入投影，而是先压到 `kv_lora_rank` 维的 latent，再从 latent 升维出 K/V；
     /// 推理缓存里**只存这份 latent**（`T × kv_lora_rank`），而不是 K、V 两份
@@ -202,6 +231,14 @@ impl Default for TransformerConfig {
             n_layer: 2,
             block_size: 32,
             n_kv_head: 0,
+            head_dim: 0,
+            ffn_hidden: 0,
+            qkv_bias: true,
+            o_bias: true,
+            mlp_bias: true,
+            rms_eps: LN_EPS,
+            tie_embeddings: true,
+            rope_style: rope::RopeStyle::Interleaved,
             kv_lora_rank: 0,
             mla_rope_dim: 0,
             mla_absorb: false,
@@ -242,9 +279,30 @@ impl TransformerConfig {
         }
     }
 
-    /// 本配置的完整 RoPE 频率参数
+    /// 本配置的完整 RoPE 频率参数（含**配对方式**：默认相邻配对 = 本仓库历史口径）
     pub fn rope_spec(&self) -> RopeSpec {
         RopeSpec::new(self.rope_base, self.rope_scaling, self.rope_train_ctx())
+            .with_style(self.rope_style)
+    }
+
+    /// 实际的每头宽度：`head_dim = 0` 时按 `n_embd / n_head` 推（历史默认）
+    pub fn head_dim(&self) -> usize {
+        if self.head_dim > 0 {
+            self.head_dim
+        } else {
+            self.n_embd / self.n_head
+        }
+    }
+
+    /// 实际的 FFN 隐藏宽度：0 = 按本仓库默认公式（SwiGLU 的 `swiglu_hidden` / GELU 的 `4d`）
+    pub fn ffn_hidden(&self) -> usize {
+        if self.ffn_hidden > 0 {
+            self.ffn_hidden
+        } else if self.use_swiglu {
+            crate::layers::swiglu_hidden(self.n_embd)
+        } else {
+            4 * self.n_embd
+        }
     }
 
     /// 一个小配置，适合学习演示（其余字段与 Default 一致）
@@ -380,10 +438,15 @@ impl Module for Ffn {
 ///   x -> RMSNorm -> Attention(GQA) -> Dropout -> 残差 +
 ///   x -> RMSNorm -> SwiGLU MLP     -> Dropout -> 残差 +
 ///
-/// 前馈子层还可切换为稀疏 MoE（第 32 课，`cfg.n_expert > 1` 时）。
+/// 前馈子层是 `ffn: Ffn` —— **稠密 / MoE 二选一**（见 [`Ffn`]）：`cfg.n_expert > 1` 时
+/// 换成稀疏 [`crate::moe::MoELayer`]（第 32 课），否则是稠密 [`MLPEnum`]（GELU / SwiGLU）。
+/// 两个分支对外接口一致（`forward` / `parameters` / `named_parameters`），所以残差、
+/// dropout 与 GPU 常驻显存快路都不必区分自己拿的是哪一种。
 ///
-/// `pub(crate)`：[`crate::vision::VisionEncoder`] 复用同一个 Block 实现双向注意力
-/// （`mask = None`），没必要再写一份几乎一样的视觉 Transformer 层。
+/// `pub(crate)`：[`crate::vision::VisionEncoder`] 复用同一个 Block 实现双向注意力——
+/// 它显式传入一张**全 0 加性掩码**（`mask = None` 会被 CPU 分块核当成因果注意力，
+/// 见 [`crate::vision::VisionEncoder`] 里 `attn_mask` 字段的说明），base = 0 且无
+/// KV cache，于是 patch 之间完全互相可见；没必要再写一份几乎一样的视觉 Transformer 层。
 pub(crate) struct TransformerBlock {
     ln1: NormLayer,
     attn: MultiHeadAttention,
@@ -404,12 +467,13 @@ impl TransformerBlock {
         let ffn = if cfg.n_expert > 1 {
             Ffn::Moe(MoELayer::new(cfg, rng))
         } else if cfg.use_swiglu {
-            Ffn::Dense(MLPEnum::new_swiglu(cfg.n_embd, rng))
+            // `ffn_hidden = 0` 时取默认公式（与历史逐位一致）；HF 的 intermediate_size 显式给
+            Ffn::Dense(MLPEnum::new_swiglu_full(cfg.n_embd, cfg.ffn_hidden(), cfg.mlp_bias, rng))
         } else {
-            Ffn::Dense(MLPEnum::new_gelu(cfg.n_embd, rng))
+            Ffn::Dense(MLPEnum::new_gelu_full(cfg.n_embd, cfg.ffn_hidden(), cfg.mlp_bias, rng))
         };
         let attn = {
-            let mut a = MultiHeadAttention::new(
+            let mut a = MultiHeadAttention::new_full(
                 cfg.n_embd,
                 cfg.n_head,
                 cfg.n_kv_head,
@@ -419,6 +483,11 @@ impl TransformerBlock {
                 cfg.rope_spec(),
                 cfg.mla_rope_dim,
                 cfg.mla_absorb,
+                // head_dim = 0 时由 n_embd/n_head 推出（默认，逐位不变）
+                cfg.head_dim,
+                // bias 开关：默认全 true = 历史行为；HF 的 LLaMA 全 false
+                cfg.qkv_bias,
+                cfg.o_bias,
                 rng,
             );
             // CSA（第 49 课）：纯数据开关，不构造参数、不消耗随机数；
@@ -427,9 +496,9 @@ impl TransformerBlock {
             a
         };
         TransformerBlock {
-            ln1: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
+            ln1: NormLayer::new(cfg.n_embd, cfg.rms_eps, cfg.use_rmsnorm),
             attn,
-            ln2: NormLayer::new(cfg.n_embd, LN_EPS, cfg.use_rmsnorm),
+            ln2: NormLayer::new(cfg.n_embd, cfg.rms_eps, cfg.use_rmsnorm),
             ffn,
             dropout: cfg.dropout,
             // mHC：仅在 n_stream > 1 时构造（`n_stream = 1` 走普通残差，逐位不变、不耗随机数）
@@ -877,6 +946,11 @@ impl Module for TransformerBlock {
 pub struct Transformer {
     pub cfg: TransformerConfig,
     tok_emb: Embedding,
+    /// **独立输出头**（`tie_embeddings = false` 时存在）：`[vocab, n_embd]`，与词嵌入同布局。
+    ///
+    /// `None` = 权重绑定（默认，本仓库历史行为）：`lm_head` 复用 `tok_emb.table` 的转置。
+    /// HF 的 LLaMA-3 / Qwen2 多数不绑权重，导入后这里会是一份真实参数（存档名 `head.weight`）。
+    head: Option<Tensor>,
     blocks: Vec<TransformerBlock>,
     ln_f: NormLayer,
     /// Dropout 概率（残差/嵌入层用）
@@ -951,8 +1025,16 @@ impl Transformer {
         Transformer {
             cfg: cfg.clone(),
             tok_emb: Embedding::new(vocab_size, n_embd, rng),
+            // 独立输出头：只有 `tie_embeddings = false` 才构造（默认 true ⇒ 不消耗随机数，
+            // 保证老配置的初始化逐位不变）
+            head: (!cfg.tie_embeddings).then(|| {
+                Tensor::param(
+                    (0..vocab_size * n_embd).map(|_| rng.randn() * 0.02).collect(),
+                    vec![vocab_size, n_embd],
+                )
+            }),
             blocks,
-            ln_f: NormLayer::new(n_embd, LN_EPS, cfg.use_rmsnorm),
+            ln_f: NormLayer::new(n_embd, cfg.rms_eps, cfg.use_rmsnorm),
             dropout: cfg.dropout,
             lora: None,
             vision,
@@ -1101,7 +1183,8 @@ impl Transformer {
     /// 注意分子始终是"不量化会占多少"：量化层的 `weight` 已经被换成占位张量，
     /// 口径必须由 [`Linear::weight_bytes`] 按逻辑维度给出，不能去数实际字节。
     pub fn weight_bytes(&self) -> (usize, usize) {
-        let emb = self.tok_emb.table.numel() * 4;
+        // 独立输出头（`tie_embeddings = false`）也要算进分子分母：它是一份真实参数
+        let emb = (self.tok_emb.table.numel() + self.head.as_ref().map_or(0, |h| h.numel())) * 4;
         let mut orig = emb;
         let mut cur = emb;
         for (_, lin) in self.named_linears() {
@@ -1419,6 +1502,61 @@ impl Transformer {
         any
     }
 
+    /// 启用了 aux-loss-free 均衡偏置的 MoE 层数（非 MoE / 未开该开关时为 0）。
+    ///
+    /// 多进程 DP 下用它判断"要不要做偏置同步"：这个数是**模型结构决定的**，
+    /// 各 rank 必然相同，所以集合通信的参与方不会少人（这是能安全跳过通信的前提）。
+    pub fn moe_bias_layer_count(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|b| matches!(&b.ffn, Ffn::Moe(m) if m.bias_balance_enabled()))
+            .count()
+    }
+
+    /// 把各 MoE 层的均衡偏置按**层序首尾拼接**成一条扁平缓冲；没有启用偏置均衡的层跳过。
+    ///
+    /// 存在的唯一理由是跨 DP 通信：集合通信只认连续内存，所以先把 N 层偏置拼成一条
+    /// 发出去，平均完再原地写回（[`Self::set_moe_balance_flat`]）。
+    /// 拼接顺序由 `blocks` 的遍历顺序决定，各 rank 完全相同。
+    pub fn moe_balance_flat(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        for b in &self.blocks {
+            if let Ffn::Moe(m) = &b.ffn {
+                if m.bias_balance_enabled() {
+                    out.extend_from_slice(&m.balance_bias());
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Self::moe_balance_flat`] 的逆操作：按同样的层序写回，返回写回的层数。
+    ///
+    /// 长度不符直接 panic：偏置错位的后果和参数错位一样隐蔽——训练跑得下去、
+    /// loss 也在动，只是每一层的偏置被安到了别的层上。
+    pub fn set_moe_balance_flat(&self, flat: &[f32]) -> usize {
+        let mut off = 0usize;
+        let mut layers = 0usize;
+        for b in &self.blocks {
+            if let Ffn::Moe(m) = &b.ffn {
+                if !m.bias_balance_enabled() {
+                    continue;
+                }
+                let e = m.n_expert;
+                m.set_balance_bias(&flat[off..off + e]);
+                off += e;
+                layers += 1;
+            }
+        }
+        assert_eq!(
+            off,
+            flat.len(),
+            "扁平均衡偏置长度与模型的 MoE 层不匹配：{} vs {off}",
+            flat.len()
+        );
+        layers
+    }
+
     /// 推理期改写 RoPE 频率参数与上下文长度（第 20 课长度外推），返回改前的窗口。
     ///
     /// 可以直接套在**已加载的权重**上：`rope_base` / `rope_scaling` / `block_size`
@@ -1457,9 +1595,9 @@ impl Transformer {
         kv_cache: Option<&mut Vec<KVCache>>,
         training: bool,
     ) -> Tensor {
-        // 权重绑定：lm_head 复用 tok_emb.table 的转置
+        // 权重绑定：lm_head 复用 tok_emb.table 的转置（`tie_embeddings = false` 时用独立头表）
         self.forward_core(idx, b, t, None, kv_cache, training)
-            .matmul(&self.tok_emb.table.transpose())
+            .matmul(&self.head_table().transpose())
     }
 
     /// 多模态前向：`pixels = Some([b, 3·S·S] 首尾相接的 CHW 像素，取值 [-1,1])`。
@@ -1481,7 +1619,7 @@ impl Transformer {
         training: bool,
     ) -> Tensor {
         self.forward_core(idx, b, t, pixels, kv_cache, training)
-            .matmul(&self.tok_emb.table.transpose())
+            .matmul(&self.head_table().transpose())
     }
 
     /// 是否带视觉塔
@@ -1527,9 +1665,17 @@ impl Transformer {
         self.forward_core(idx, b, t, None, kv_cache, training)
     }
 
-    /// 输出头权重 `[vocab, d]`（与词嵌入共享同一份参数）
+    /// 输出头权重 `[vocab, d]`（默认与词嵌入共享同一份参数；`tie_embeddings = false` 时为独立 `head`）
     pub fn head_weight(&self) -> &Tensor {
-        &self.tok_emb.table
+        self.head_table()
+    }
+
+    /// 输出头权重表 `[vocab, n_embd]`：绑定权重时就是词嵌入表，不绑定时是独立的 `head`。
+    ///
+    /// 所有要用输出头的地方（前向的两个入口、训练里的「输出头常驻显存」路径、
+    /// 量化/字节口径）都必须走这里，别再直接摸 `tok_emb.table`。
+    pub fn head_table(&self) -> &Tensor {
+        self.head.as_ref().unwrap_or(&self.tok_emb.table)
     }
 
     /// 整叠 Transformer Block 的 GPU 常驻显存前向（见 [`crate::gpu::stack_forward`]）。
@@ -1813,9 +1959,10 @@ impl Transformer {
             .unwrap_or((0, 0));
         let base = seen;
 
-        // 3. 因果掩码（条件物化）：CPU 分块核在核内屏蔽（query i 只算
-        //    j <= visible_before + i），逐算子 CPU 路径同样不必物化 —— 只有
-        //    GPU 常驻/整叠/probe 路径要真实 [T, T_total] buffer，且只在
+        // 3. 因果掩码（条件物化）：不传掩码时 CPU 分块核在核内做**后缀因果截断**
+        //    （query i 只算 j <= visible_before + i）；传了掩码则可见性**完全由掩码决定**
+        //    （k_end = t_total），CPU 兜底路径消费的也是同一张掩码，两条口径数值等价。
+        //    所以只有 GPU 常驻/整叠/probe 路径要真实 [T, T_total] buffer，且只在
         //    无 KV cache、base=0（此时 t_total = t，评估的 no_grad 前向也在此列）
         //    才走，这时才物化一次供全栈共享；
         //    attn_resident / blocks_resident 收到 None 时还会各自兜底物化。
@@ -1928,6 +2075,9 @@ impl Transformer {
     /// 结构保持一致（同一层只枚举一次，避免两处手工维护失同步）。
     pub fn named_parameters(&self) -> Vec<(String, Tensor)> {
         let mut ps = self.tok_emb.named_parameters("tok_emb");
+        if let Some(h) = &self.head {
+            ps.push(("head.weight".to_string(), h.clone()));
+        }
         for (i, block) in self.blocks.iter().enumerate() {
             ps.extend(block.named_parameters(&format!("blocks.{i}")));
         }
@@ -1945,6 +2095,9 @@ impl Transformer {
 impl Module for Transformer {
     fn parameters(&self) -> Vec<Tensor> {
         let mut ps = self.tok_emb.parameters();
+        if let Some(h) = &self.head {
+            ps.push(h.clone());
+        }
         for block in &self.blocks {
             ps.extend(block.parameters());
         }
@@ -2851,5 +3004,127 @@ mod tests {
             "开启 CSA 后前向应与 flash 路径不同"
         );
         assert!(out.data().iter().all(|x| x.is_finite()), "CSA 前向出现非有限值");
+    }
+
+    /// **每个 preset 都必须能跑通「前向 + 反向」**。preset 是 README/CLI 的默认入口，
+    /// 它坏了等于项目坏了；这条测试是配置级兜底，覆盖 `n_head / n_kv_head /
+    /// use_rmsnorm / use_swiglu / block_size` 这些"只在配置里换个数字"的组合。
+    ///
+    /// 写入的直接触发原因：GQA（`n_kv_head < n_head`）在 RoPE 里断言失败
+    /// （`Q/K 的 head_dim 必须一致`），于是 **medium / large 两个官方预设根本训不了**，
+    /// 而当时 392 个测试里**没有任何一个跑过 `MultiHeadAttention::forward` 的 GQA 分支**。
+    /// 层数压到 2 只是为了让测试快（结构问题与层数无关）。
+    #[test]
+    fn test_every_preset_runs_forward_and_backward() {
+        for name in ["small", "medium", "large"] {
+            let mut cfg = crate::config::Config::from_preset(name).model;
+            cfg.vocab_size = 64; // 词表大小与结构无关，压小只为跑得快
+            cfg.n_layer = 2;
+            cfg.dropout = 0.0;
+            let mut rng = Rng::new(7);
+            let model = Transformer::new(cfg, &mut rng);
+            let (b, t, v) = (2usize, 8usize, 64usize);
+            let ids: Vec<usize> = (0..b * t).map(|i| (i * 7) % v).collect();
+            let targets: Vec<usize> = (0..b * t).map(|i| (i * 5 + 1) % v).collect();
+
+            let logits = model.forward(&ids, b, t, None, true);
+            let loss = cross_entropy_loss(&logits, &targets);
+            assert!(loss.item().is_finite(), "{name} 预设的 loss 非有限");
+            loss.backward();
+
+            // 梯度必须真的流到参数上：GQA 下 K/V 侧（n_kv_head < n_head）最容易整段漏掉
+            let gnorm: f32 = model
+                .parameters()
+                .iter()
+                .map(|p| p.grad.borrow().iter().map(|g| g * g).sum::<f32>())
+                .sum();
+            assert!(
+                gnorm > 0.0 && gnorm.is_finite(),
+                "{name} 预设反向没有产生有效梯度：{gnorm}"
+            );
+        }
+    }
+
+    /// HF 口径的开关必须**真的改变参数表**：无 bias 的层不出现在参数表里、
+    /// 不绑权重时多出 `head.weight`、FFN 隐藏宽度听 `ffn_hidden`。
+    ///
+    /// 为什么这条重要：存档就是按参数名对上的，开关要是没接进 `named_parameters`/
+    /// `Linear::forward`，导入/导出会在"少一个张量"或"多了个全零 bias"上静默错位。
+    #[test]
+    fn test_bias_head_and_ffn_switches_shape_the_param_table() {
+        // 1) 默认（历史口径）：有 bias、输出头绑定
+        let mut cfg = TransformerConfig::tiny(32);
+        cfg.n_layer = 1;
+        let plain = Transformer::new(cfg, &mut Rng::new(5));
+        let names: Vec<String> = plain.named_parameters().into_iter().map(|(n, _)| n).collect();
+        assert!(
+            names.iter().any(|n| n == "blocks.0.attn.c_q.bias"),
+            "默认配置应带 qkv bias：{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "head.weight"),
+            "默认配置输出头应与词嵌入绑定，不该有独立 head.weight"
+        );
+        assert_eq!(
+            plain.head_table().shape(),
+            plain.tok_emb.table.shape(),
+            "绑定权重时输出头表就是词嵌入表"
+        );
+
+        // 2) HF 口径：全无 bias + 独立输出头 + 自定义 FFN 宽度
+        let mut hf = TransformerConfig::tiny(32);
+        hf.n_layer = 1;
+        hf.n_embd = 16;
+        hf.n_head = 2;
+        hf.qkv_bias = false;
+        hf.o_bias = false;
+        hf.mlp_bias = false;
+        hf.tie_embeddings = false;
+        hf.ffn_hidden = 48;
+        let m = Transformer::new(hf, &mut Rng::new(5));
+        let named = m.named_parameters();
+        let names: Vec<String> = named.iter().map(|(n, _)| n.clone()).collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(".bias")),
+            "HF 口径（LLaMA/Qwen2）不该有任何 bias 参数：{names:?}"
+        );
+        assert!(names.iter().any(|n| n == "head.weight"), "不绑权重时应有 head.weight：{names:?}");
+        let gate = named
+            .iter()
+            .find(|(n, _)| n == "blocks.0.mlp.w_gate.weight")
+            .expect("应有 FFN 门控权重");
+        assert_eq!(
+            gate.1.shape(),
+            &[16, 48],
+            "FFN 隐藏宽度应取 ffn_hidden（不是默认公式）"
+        );
+    }
+
+    /// `rope_style` 必须真的改变前向数值：两种配对是**不同的旋转**，
+    /// 所以风格写错的 checkpoint（例如把 HF 权重当相邻配对跑）会静默出错，
+    /// 这条测试确保开关确实接进了前向。
+    #[test]
+    fn test_rope_style_changes_forward() {
+        let mut base = TransformerConfig::tiny(16);
+        base.n_layer = 1;
+        base.n_embd = 8;
+        base.n_head = 2;
+        let mut half = base.clone();
+        half.rope_style = rope::RopeStyle::Half;
+        // 同种子两次独立构造 ⇒ 权重逐位相同，只有 RoPE 口径不同
+        let a = Transformer::new(base, &mut Rng::new(11));
+        let b = Transformer::new(half, &mut Rng::new(11));
+        let ids = [1usize, 2, 3, 4];
+        let la = a.forward(&ids, 1, 4, None, false);
+        let lb = b.forward(&ids, 1, 4, None, false);
+        assert!(
+            lb.data().iter().all(|v| v.is_finite()),
+            "rotate_half 口径的前向出现了非有限值"
+        );
+        assert_ne!(
+            la.data(),
+            lb.data(),
+            "两种 RoPE 配对方式必须给出不同输出（否则 style 开关没接进前向）"
+        );
     }
 }

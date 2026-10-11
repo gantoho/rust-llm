@@ -1,6 +1,6 @@
 # 第 40 课：把模型部署成 API 服务 —— 从"自己跑"到"给别人调"
 
-> 代码位置：`src/serve.rs`（约 1300 行）、`src/cli.rs`（`serve` 子命令）、`src/cmd/deploy.rs`（`cmd_serve`）、`src/sample.rs`（Generator 状态机）
+> 代码位置：`src/serve.rs`、`src/cli.rs`（`serve` 子命令）、`src/cmd/deploy.rs`（`cmd_serve`）、`src/sample.rs`（Generator 状态机）
 >
 > 本课无新算法，讲的是**部署**：如何把前 39 课训练出来的模型包装成一个
 > 和主流大模型厂商（OpenAI / DeepSeek / 智谱…）接口形状一致的 HTTP API，
@@ -566,7 +566,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 ---
 
-## 10. 单元测试（23 个）
+## 10. 单元测试（28 个）
 
 `src/serve.rs` 底部的 `#[cfg(test)] mod tests`，不启端口、纯函数级：
 
@@ -604,7 +604,8 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 **当前已具备**：流式/非流式、鉴权、CORS、embeddings、请求日志与完整问答记录、队列状态、
 OpenAPI 规范（运行时端点 + `serve` 启动自动写出 `openapi/{openapi.json,openapi.yaml}`）、
 前端测试页（`web/` 随 serve 启动，§7.8，生产加 `--no-web`）、
-断开可中断、OpenAI 兼容错误体、资源上限、240 个测试全绿。
+断开可中断、OpenAI 兼容错误体、资源上限、全量单测（`cargo test serve` 覆盖本课模块，
+总数以实际输出为准）。
 
 **上生产前还要补的**（本课未做，刻意不半成品实现）：
 

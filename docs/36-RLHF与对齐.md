@@ -1,6 +1,6 @@
 # 第 36 课：RLHF 与人类对齐（Alignment）
 
-> **本课已落地为可运行代码**：`src/align.rs`（17 个单测）+ `align` 子命令——奖励模型（Bradley-Terry
+> **本课已落地为可运行代码**：`src/align.rs`（单测跑 `cargo test align`，数量以实际输出为准）+ `align` 子命令——奖励模型（Bradley-Terry
 > 成对损失）、DPO（隐式奖励 + 参考模型 logprob）、GRPO（组内相对优势）、PPO（clip 目标 + KL(k3) 惩罚）。
 > 与已有代码的衔接：SFT 复用 `src/train.rs` 的训练循环与 `src/loss.rs` 的交叉熵；
 > DPO / PPO 都建在 `src/tensor.rs` 现有算子上，`sigmoid` / `softplus` / KL 估计等标量函数写在 `src/align.rs` 里。
@@ -214,8 +214,8 @@ $$
 
 ## 本项目的实际实现
 
-上面的原理已全部落地为可运行代码。核心文件是 [`src/align.rs`](../src/align.rs)（17 个单测），
-CLI 入口是 [`align`](../README.md#13-quant--distributed--align--rag--speculative--distill--fp8--第-33384243-课实验) 子命令。
+上面的原理已全部落地为可运行代码。核心文件是 [`src/align.rs`](../src/align.rs)（单测跑 `cargo test align`，数量以实际输出为准），
+CLI 入口是 [`align`](../README.md) 子命令。
 
 ### 代码结构
 

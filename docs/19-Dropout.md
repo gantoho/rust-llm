@@ -101,7 +101,7 @@ x = Dropout(TokenEmbedding(tokens))
 - 再用 splitmix64 finalizer 把计数器的低位规律性打散，避免相邻种子生成相关序列；
 - 最后跑 xorshift64* 得到 `[0,1)` 的均匀数。
 
-这样同一权重参数的 dropout 在每个训练步拿到的是**不同**的 mask，而不是每步重复同一张（详见 `src/tensor.rs:2548-2549`）。
+这样同一权重参数的 dropout 在每个训练步拿到的是**不同**的 mask，而不是每步重复同一张（详见 `src/tensor.rs` 的 `Tensor::dropout`）。
 
 ### 6.2 训练/推理切换
 

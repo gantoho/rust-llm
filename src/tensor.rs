@@ -530,9 +530,14 @@ fn matmul_data(
 ) -> Vec<f32> {
     #[cfg(feature = "gpu")]
     {
-        let (ga, gb) = (a.to_f32(), b.to_f32());
-        if let Some(v) = crate::gpu::matmul(&ga, &gb, m, k, n, batch, a_t, b_t) {
-            return v;
+        // 只有"这次真有可能走内核"时才为它做 bf16→f32 的整块解码：
+        // GPU 不可用 / 形状太小（低于盈亏平衡点）时解码纯属浪费，
+        // 而 bf16 存储的全部意义就是省访存（判据与内核入口同源，见该函数的说明）。
+        if crate::gpu::matmul_may_use_gpu(m, k, n, batch) {
+            let (ga, gb) = (a.to_f32(), b.to_f32());
+            if let Some(v) = crate::gpu::matmul(&ga, &gb, m, k, n, batch, a_t, b_t) {
+                return v;
+            }
         }
     }
     // CPU 回退。两个转置标志的处理方式不同，由内核的消费模式决定：
@@ -679,6 +684,11 @@ fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize
         for j in 0..d {
             maxv = maxv.max(x[base + j] + mask[mb + j]);
         }
+        // 整行都被屏蔽（maxv 仍是 -inf）时输出全 0：否则 `-inf - (-inf) = NaN`
+        // 会让这个 NaN 顺着 softmax 反向（dS = P ⊙ (dG - ΣdG·P)）污染整条链
+        if maxv == f32::NEG_INFINITY {
+            return;
+        }
         let mut sum = 0.0f32;
         for j in 0..d {
             let e = (x[base + j] + mask[mb + j] - maxv).exp();
@@ -715,8 +725,14 @@ pub fn causal_mask_data(t: usize, t_total: usize) -> Vec<f32> {
 /// Flash Attention 的 CPU 分块前向：按输出行（`B*H × T`）并行，行内按键块扫描 +
 /// 在线 softmax，中间 P 从不落地。
 ///
-/// 可见范围不物化掩码：query i 只算 `j < k_end`（`k_end = i + visible_before + 1`），
-/// 与 `causal_mask_data` 生成的掩码逐位一致，被屏蔽的键根本不进打分与累加。
+/// **无掩码时**（`mask = None`）可见范围不物化掩码：query `i` 只算 `j < k_end`
+/// （`k_end = i + visible_before + 1`），与 `causal_mask_data` 生成的因果掩码逐位一致，
+/// 被屏蔽的键根本不进打分与累加。
+///
+/// **有掩码时**（`mask = Some(m)`）逐行取 `m` 的第 `i = r % t` 行（`[t, t_total]`，
+/// 加性口径：0 = 可见、`-inf` = 屏蔽）加到打分上，`k_end = t_total`。
+/// 这是"传入的掩码必须真的生效"的唯一落点——视觉塔的双向注意力（全 0 掩码）
+/// 与将来的 padding 掩码都靠它；被屏蔽的键 `exp(-inf - m) = 0`，不参与归一化。
 ///
 /// 行内维护运行最大值 m 与指数和 l：新块并入时先 `m ← max(m, m_blk)`，
 /// 旧累计乘 `exp(m_old - m_new)` 重标定，再加新块的 `exp·V`，最后除以 l。
@@ -734,13 +750,19 @@ fn flash_forward_cpu(
     t_total: usize,
     head_dim: usize,
     visible_before: usize,
+    mask: Option<&[f32]>,
     block_size: usize,
 ) -> Vec<f32> {
     let bs = block_size.max(1);
     let mut out = vec![0.0f32; bh * t * head_dim];
     out.par_chunks_mut(head_dim).enumerate().for_each(|(r, ochunk)| {
         let i = r % t;
-        let k_end = (i + visible_before + 1).min(t_total);
+        // 掩码行按 **query 行**取（同一 query 的所有头共用一行掩码）
+        let mrow: Option<&[f32]> = mask.map(|m| &m[i * t_total..(i + 1) * t_total]);
+        let k_end = match mrow {
+            Some(_) => t_total, // 有掩码：可见性完全由掩码决定，不能再按因果截断
+            None => (i + visible_before + 1).min(t_total),
+        };
         // K/V 是 [kv_bh, T_total, HD] 展平：本行 Q 头 hh = r/t 映射到共享 KV 头
         // hh/n_rep（与旧 repeat_kv 的「第 b 个 KV 头复制成 n_rep 份、头序 b*n_rep+r」
         // 互逆；n_rep=1 时退化为按行所属批组起算）
@@ -754,18 +776,28 @@ fn flash_forward_cpu(
         while ks < k_end {
             let ke = (ks + bs).min(k_end);
             let n = ke - ks;
-            // 1) 块内打分 S = Q'·Kᵀ（缩放已在 Q' 里）
+            // 1) 块内打分 S = Q'·Kᵀ（缩放已在 Q' 里）；有掩码时把掩码行加进来
             for jj in 0..n {
                 let krow = &k[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
                 let mut s = 0.0f32;
                 for d in 0..head_dim {
                     s += qrow[d] * krow[d];
                 }
+                if let Some(mr) = mrow {
+                    s += mr[ks + jj];
+                }
                 sbuf[jj] = s;
             }
             // 2) 在线 softmax：运行最大值更新后，旧累计整体乘 exp(m_old - m_new) 重标定
             let blk_max = sbuf[..n].iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let m_new = m.max(blk_max);
+            // 整块都被屏蔽（首块全屏蔽时 m 也仍是 -inf）：本块对 l/acc 贡献恒为 0。
+            // 必须在这里短路——否则 (m - m_new) 与 (sbuf - m_new) 会算成
+            // -inf - (-inf) = NaN，把整行输出污染成 NaN。
+            if m_new == f32::NEG_INFINITY {
+                ks = ke;
+                continue;
+            }
             let f = (m - m_new).exp(); // m = -inf（首块）时为 0，等价于从零开始累加
             l *= f;
             for a in acc.iter_mut() {
@@ -829,37 +861,62 @@ fn fold_repeat_grad(src: &[f32], kv_bh: usize, n_rep: usize) -> Vec<f32> {
     out
 }
 
-/// 反向重算注意力概率 P：`softmax(Q'·Kᵀ)`，行内按后缀因果屏蔽（超出 k_end 的位置为 0）。
+/// 一行打分的数值稳定 softmax：写入 `row[..k_end]`，其余位置保持 0。
 ///
-/// 分块前向不在前后向之间保留 P（O(T²) 不驻留）；反向先用矩阵乘算 scores，
-/// 再在这里归一化——O(T²) 只作为反向的临时工作集存在（dP/dS 本来也是 O(T²)）。
-#[allow(clippy::too_many_arguments)]
-fn causal_softmax_cpu(
+/// 整行都被屏蔽（`mx` 仍是 `-inf`）时**直接返回 0**：否则 `-inf - (-inf) = NaN`
+/// 会顺着 `dS = P ⊙ (dP - ΣdP·P)` 污染整条反向链。
+fn softmax_row_into(row: &mut [f32], srow: &[f32], k_end: usize) {
+    let mut mx = f32::NEG_INFINITY;
+    for j in 0..k_end {
+        mx = mx.max(srow[j]);
+    }
+    if mx == f32::NEG_INFINITY {
+        return; // 全屏蔽行：row 已由调用方清零
+    }
+    let mut sum = 0.0f32;
+    for j in 0..k_end {
+        let e = (srow[j] - mx).exp();
+        row[j] = e;
+        sum += e;
+    }
+    for j in 0..k_end {
+        row[j] /= sum;
+    }
+}
+
+/// 注意力反向重算 P 用的 softmax：**与分块前向 `flash_forward_cpu` 的口径逐位一致**。
+///
+/// - `mask = None`：按**右后缀因果**取可见范围（query `i` 只看 `j ≤ i + visible_before`），
+///   与分块前向的 `k_end` 规则相同，不做任何多余计算；
+/// - `mask = Some(m)`：`m` 是 `[t, t_total]` 的**加性**掩码（0 = 可见、`-inf` = 屏蔽，
+///   与 `softmax(x + mask)` 同口径），逐行加到打分上，`k_end = t_total`。
+///
+/// 为什么必须支持真实的 mask：分块前向早期只在核内做后缀因果、**完全忽略传入的 mask**，
+/// 于是视觉塔的"双向注意力"（`mask = None` + 无 KV cache）被静默算成了因果注意力，
+/// 任何 padding 掩码也会被静默丢弃。
+fn attn_softmax_cpu(
     x: &[f32],
     rows: usize,
     t: usize,
     t_total: usize,
     visible_before: usize,
+    mask: Option<&[f32]>,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * t_total];
     out.par_chunks_mut(t_total).enumerate().for_each(|(r, row)| {
         let i = r % t;
-        let k_end = (i + visible_before + 1).min(t_total);
         let base = r * t_total;
-        let mut mx = f32::NEG_INFINITY;
-        for j in 0..k_end {
-            mx = mx.max(x[base + j]);
+        match mask {
+            None => {
+                let k_end = (i + visible_before + 1).min(t_total);
+                softmax_row_into(row, &x[base..base + t_total], k_end);
+            }
+            Some(m) => {
+                let mrow = &m[i * t_total..(i + 1) * t_total];
+                let srow: Vec<f32> = (0..t_total).map(|j| x[base + j] + mrow[j]).collect();
+                softmax_row_into(row, &srow, t_total);
+            }
         }
-        let mut sum = 0.0f32;
-        for j in 0..k_end {
-            let e = (x[base + j] - mx).exp();
-            row[j] = e;
-            sum += e;
-        }
-        for j in 0..k_end {
-            row[j] /= sum;
-        }
-        // k_end..t_total 保持 0：被屏蔽的位置不参与任何反向累加
     });
     out
 }
@@ -2364,11 +2421,20 @@ impl Tensor {
     // ---------- 归约运算 ----------
 
     /// 求和成标量，梯度均匀传给每个元素
+    ///
+    /// 归约顺序必须**确定**：按固定块求部分和（`collect` 保序）再按块序串行相加，
+    /// 而不是 `par_iter().sum()` —— 后者的合并顺序由 rayon 的线程调度决定，
+    /// 同一份数据前后两次可能差最后几位。多进程 DP 要求"各 rank 算出的
+    /// loss / 梯度逐位相同"，`train::clip_grad_norm` 是同一套处理。
     pub fn sum(&self) -> Tensor {
         // 入口物化：非连续视图先 gather（连续时零开销），下文按缓冲线性求和
         let a = self.contiguous();
-        // 并行归约：各线程算部分和再合并（大张量求和不再占满一个核）
-        let total: f32 = a.decode().par_iter().sum();
+        // 并行归约：各线程按固定块算部分和，合并顺序固定 → 大张量求和不再占满一个核，
+        // 同时保持确定性
+        let data = a.decode();
+        let partials: Vec<f32> = data.par_chunks(4096).map(|c| c.iter().sum::<f32>()).collect();
+        let total: f32 = partials.iter().sum();
+        drop(data); // 先释放解码视图，下面才能把 `a` move 进 new_like
         let result = a.new_like(vec![total], vec![], a.requires_grad.load(Ordering::Relaxed));
         if a.req() {
             let rg = result.grad.clone();
@@ -2445,22 +2511,26 @@ impl Tensor {
             a.shape[a.rank() - 1],
         );
         let sd = a.decode();
+        let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; rows * d];
-        // 先存 softmax 结果（反向需要）
-        for r in 0..rows {
+        // 先存 softmax 结果（反向需要）。
+        // 并行：每行独立；**行内算术顺序与串行版逐字相同**（只是把行分给不同线程），
+        // 所以既拿到多核、又不改变任何数值。它是 MoE 门控与 mHC 门控的热路径。
+        out_data.par_chunks_mut(d).enumerate().for_each(|(r, row)| {
+            let base = r * d;
             let mut maxv = f32::NEG_INFINITY;
             for j in 0..d {
-                maxv = maxv.max(sd[r * d + j]);
+                maxv = maxv.max(sd_ref[base + j]);
             }
             let mut sum = 0.0;
             for j in 0..d {
-                out_data[r * d + j] = (sd[r * d + j] - maxv).exp();
-                sum += out_data[r * d + j];
+                row[j] = (sd_ref[base + j] - maxv).exp();
+                sum += row[j];
             }
             for j in 0..d {
-                out_data[r * d + j] /= sum;
+                row[j] /= sum;
             }
-        }
+        });
         drop(sd);
 
         let result = a.new_like(out_data.clone(), a.shape.clone(), a.requires_grad.load(Ordering::Relaxed));
@@ -2777,25 +2847,30 @@ impl Tensor {
     ///
     /// **CPU 路径（`flash_forward_cpu`）：真正的分块 + 在线 softmax**。
     /// 按输出行（`B*H × T`）rayon 并行，行内按 `block_size` 个 K/V 为一块串行扫描：
-    /// - 打分只对可见键计算（query i 只看 `j <= i + visible_before`），**不物化**
-    ///   `[T, T_total]` 掩码——原先每次前向都要 O(T×T_total) 的分配与填充；
+    /// - 打分只对可见键计算，**不物化** `[T, T_total]` 掩码——原先每次前向都要
+    ///   O(T×T_total) 的分配与填充。可见范围有两种口径：传 `mask = None` 时按核内
+    ///   **后缀因果**截断（query `i` 只看 `j <= i + visible_before`）；传了掩码
+    ///   （`mask: Option<&[f32]>`）时可见性**完全由掩码决定**（`k_end = T_total`），
+    ///   逐行把掩码加到打分上，与 `attn_softmax_cpu` 的反向口径逐位一致；
     /// - 行内在线 softmax：维护运行最大值 m 与指数和 l，新块并入时旧累计乘
     ///   `exp(m_old - m_new)` 重标定，最终除以 l。中间 P **从不落地**，
     ///   每行工作集只有 O(block_size + head_dim)，而不是 O(T_total)；
     /// - `block_size` 是真实的分块参数（钳到 ≥ 1），控制每次读入的 K/V 块宽。
     ///
     /// **反向不保留 P**：前后向之间 CPU 侧不留 O(T²)；反向时矩阵乘重算 scores、
-    /// `causal_softmax_cpu` 归一化出 P，再走既有的
+    /// `attn_softmax_cpu` 按**同一掩码口径**归一化出 P（`mask = None` 时按核内后缀
+    /// 因果截断，`Some` 时逐行加掩码并扫满 `T_total`），再走既有的
     /// dV = Pᵀ·dO、dP = dO·Vᵀ、dS = P⊙(dP - ΣdP·P)、dQ = dS·K·scale、dK = dSᵀ·Q'。
     ///
-    /// **GPU 常驻路径不变**（`gpu::attn_forward`）：S/P 留在显存、反向一次提交；
-    /// 它与 `LLM_GPU_PROBE` 的逐算子录制按真实掩码 buffer 消费——只有走这两条路时
-    /// 才物化掩码（[`causal_mask_data`]）。GPU 掩码与核内屏蔽同为后缀因果，逐位一致。
+    /// **GPU 常驻路径（`gpu::attn_forward`）**：S/P 留在显存、反向一次提交，掩码口径
+    /// 与 CPU 一致（用户掩码优先，没给掩码时才按后缀因果物化一张，见 [`causal_mask_data`]）。
     ///
     /// - q: [B*H, T, head_dim]
     /// - k/v: [B*H, T_total, head_dim]（T_total >= T）
-    /// - mask: 可选的 `[T, T_total]` 后缀因果掩码（0 / -inf），只被 GPU/probe 路径消费；
-    ///   传 `None` 时 GPU 需要的话在本函数内物化一次，CPU 分块核始终在核内屏蔽
+    /// - mask: 可选的 `[T, T_total]` **加性**掩码（0 = 可见、`-inf` = 屏蔽，与
+    ///   `softmax(x + mask)` 同口径）。传 `Some` 时 CPU 分块核与 GPU 常驻 / probe
+    ///   录制路径都真的消费它；传 `None` 时 CPU 走核内后缀因果快路，GPU 需要掩码
+    ///   则在函数内按后缀因果物化一次（两者数值等价）
     /// - block_size: CPU 分块的 K/V 块宽（钳到 ≥ 1）
     ///
     /// 返回 out: [B*H, T, head_dim]
@@ -2840,6 +2915,13 @@ impl Tensor {
                 "flash_attention: mask 必须是 [T, T_total]"
             );
         }
+        // 用户传入的**加性掩码**（0 = 可见、-inf = 屏蔽），CPU 与 GPU 两条路径都要真的消费它。
+        //
+        // 这里**拷贝成自有 Vec**：`Tensor::decode()` 在 F32 分支返回的 `DataGuard` 里握着
+        // 槽锁（`MutexGuard` 不是 `Send`），而这段反向闭包要求 `Send + Sync`，guard 进不去。
+        // 掩码只在"显式给了掩码"时存在（SFT 掩码、视觉塔的全 0 掩码），体量 O(t·t_total)、
+        // 每次前向只拷一次，代价可接受。
+        let user_mask: Option<Vec<f32>> = mask.as_ref().map(|m| m.decode().to_vec());
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         // 后缀因果的可见范围：与 causal_mask_data 物化的掩码逐位一致（分块核内屏蔽用）
@@ -2869,14 +2951,13 @@ impl Tensor {
                 Some(v) => v,
                 None => &vd,
             };
-            // GPU 常驻与 probe 录制要真实掩码 buffer；CPU 分块核核内屏蔽，不必物化
-            let mask_owned: Option<Vec<f32>> = (mask.is_none() && crate::gpu::is_available())
+            // GPU 常驻与 probe 录制要真实掩码 buffer（没给掩码时按因果物化一张）；
+            // CPU 分块核直接消费用户掩码（`user_mask`），无掩码时走核内因果快路
+            let causal_owned: Option<Vec<f32>> = (mask.is_none() && crate::gpu::is_available())
                 .then(|| causal_mask_data(t, t_total));
-            // mask 现为 Option<Tensor>（物化后的常量），as_ref 取引用借解码视图的生命周期
-            let mask_guard = mask.as_ref().map(|m| m.decode());
-            let mask_data: Option<&[f32]> = match (&mask_guard, &mask_owned) {
-                (Some(g), _) => Some(&g[..]),
-                (None, Some(v)) => Some(&v[..]),
+            let mask_data: Option<&[f32]> = match (user_mask.as_deref(), causal_owned.as_deref()) {
+                (Some(u), _) => Some(u),
+                (None, Some(c)) => Some(c),
                 (None, None) => None,
             };
             // S = Q'·Kᵀ → P = softmax(S+mask) → O = P·V 录进一次提交，
@@ -2910,6 +2991,7 @@ impl Tensor {
                             t_total,
                             head_dim,
                             visible_before,
+                            user_mask.as_deref(),
                             block_size,
                         ),
                         AttnCache::Cpu,
@@ -2930,6 +3012,7 @@ impl Tensor {
                 t_total,
                 head_dim,
                 visible_before,
+                user_mask.as_deref(),
                 block_size,
             ),
             AttnCache::Cpu,
@@ -2982,7 +3065,9 @@ impl Tensor {
                     }
                 }
                 // CPU 路径（也兜底 GPU 常驻反向失败）：前后向之间不保留 P，
-                // 反向用矩阵乘重算 scores = Q'·Kᵀ，再由 causal_softmax_cpu 归一化出 P。
+                // 反向用矩阵乘重算 scores = Q'·Kᵀ，再由 `attn_softmax_cpu` 归一化出 P
+                // （它同样接受 `mask: Option<&[f32]>`：`None` 按核内后缀因果截断、
+                // `Some` 则逐行加掩码扫满 `T_total`，与前向 `flash_forward_cpu` 逐位一致）。
                 // dP/dS 本来就是 O(T²)，重算 scores 不改变反向工作集的量级。
                 // 反向：全部交给矩阵乘内核（旧的标量三重循环只有 0.24 GFLOP/s，慢 100 倍）
                 // softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]·P[i,k])
@@ -3004,7 +3089,8 @@ impl Tensor {
                     Some(v) => v,
                     None => &vd_b,
                 };
-                // 重算 scores 并做后缀因果 softmax，得到与前向逐位一致的 P（含掩码位置为 0）
+                // 重算 scores 并按**同一掩码口径**归一化，得到与前向逐位一致的 P
+                // （含掩码位置为 0）——反向必须复用同一张掩码，否则梯度会漏回被屏蔽的键
                 // （参数顺序与 attn_forward_ops 一致：m=t, k=head_dim, n=t_total）
                 let scores = matmul_data(
                     MatOperand::F32(&q_scaled),
@@ -3016,7 +3102,14 @@ impl Tensor {
                     false,
                     true,
                 );
-                let p = causal_softmax_cpu(&scores, bh * t, t, t_total, visible_before);
+                let p = attn_softmax_cpu(
+                    &scores,
+                    bh * t,
+                    t,
+                    t_total,
+                    visible_before,
+                    user_mask.as_deref(),
+                );
                 // dV = Pᵀ·dO
                 let dv_out = matmul_data(
                     MatOperand::F32(&p),
@@ -4396,5 +4489,55 @@ mod tests {
         // 梯度缓冲不参与 bf16 约定：数据转 bf16 不影响已攒下的梯度
         let z = x.mul(&x);
         assert_eq!(z.dtype(), DType::Bf16);
+    }
+
+    /// CPU 分块核必须**真的消费传入的掩码**，而不是只按后缀因果自己算。
+    ///
+    /// 证据链：同一份 Q/K/V（`t == t_total` ⇒ 因果规则下 query 0 只看 key 0）
+    /// 1) 不传掩码 → query 0 的输出就是 `v[0]`（softmax 退化成 one-hot）；
+    /// 2) 传一张把 (query 0, key 0) 屏蔽掉的全 -inf 掩码 → query 0 **没有任何可见 key**，
+    ///    输出必须是全 0，且不能出现 NaN（`-inf - (-inf)`）。
+    ///
+    /// 修复前分块核完全忽略 mask（只按 `visible_before` 推断因果），这条会失败；
+    /// 而视觉塔的"双向注意力"也因为同一个原因被静默算成了因果注意力。
+    #[test]
+    fn test_flash_attention_cpu_honors_explicit_mask() {
+        let (bh, t, hd) = (1usize, 3usize, 2usize);
+        let q = Tensor::param(vec![1.0, 0.5, -0.3, 0.8, 0.2, -0.6], vec![bh, t, hd]);
+        let k = Tensor::param(vec![0.4, -0.2, 0.9, 0.3, -0.5, 0.7], vec![bh, t, hd]);
+        let v = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![bh, t, hd]);
+
+        // 1) 无掩码：因果规则下 query 0 只有一个可见 key，softmax 退化为 one-hot
+        let free = Tensor::flash_attention(&q, &k, &v, None, 2).data();
+        assert_eq!(&free[..hd], &[1.0, 2.0], "query 0 应等于 v[0]：{free:?}");
+
+        // 2a) 只屏蔽 (query 0, key 0)：加性掩码里 0 = 可见，所以 key 1/2 仍可见，
+        //     输出必须与"因果规则下只有 key 0 可见"明显不同
+        let mut md = vec![0.0f32; t * t];
+        md[0] = f32::NEG_INFINITY;
+        let mask = Tensor::from_vec(md, vec![t, t]);
+        let masked = Tensor::flash_attention(&q, &k, &v, Some(&mask), 2).data();
+        assert_ne!(free, masked, "掩码必须真的改变输出");
+        assert!(masked.iter().all(|x| x.is_finite()), "掩码路径不该产生 NaN：{masked:?}");
+
+        // 2b) 把 query 0 的**所有** key 都屏蔽：该行没有任何可见 key
+        //     ⇒ 输出全 0，且绝不能出现 `-inf - (-inf) = NaN`
+        let mut md_all = vec![0.0f32; t * t];
+        for j in 0..t {
+            md_all[j] = f32::NEG_INFINITY;
+        }
+        let all_masked = Tensor::from_vec(md_all, vec![t, t]);
+        let out2 = Tensor::flash_attention(&q, &k, &v, Some(&all_masked), 2).data();
+        assert!(
+            out2[..hd].iter().all(|x| *x == 0.0),
+            "整行被屏蔽时输出应为全 0：{:?}",
+            &out2[..hd]
+        );
+        assert!(out2.iter().all(|x| x.is_finite()), "全屏蔽行不该产生 NaN：{out2:?}");
+        // 其它 query 不受影响（只有 query 0 被全屏蔽）
+        assert!(
+            out2[hd..2 * hd].iter().any(|x| *x != 0.0),
+            "只有 query 0 被全屏蔽，query 1 应正常：{out2:?}"
+        );
     }
 }

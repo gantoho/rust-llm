@@ -994,24 +994,44 @@ mod tests {
     }
 
     /// 超出缓存窗口后，KV cache 模式靠滑动窗口继续生成，不再提前结束：
-    /// 同一个 prompt 加不加 `--no-kv-cache` 都应产出同样多的 token。
+    /// 同一个 prompt 加不加 `--no-kv-cache` 都应跑满 `max_new` 个 token。
     ///
-    /// 这里只断言长度，不断言内容：超过上下文窗口后，"增量 + 滑动窗口"（标准推理语义）
-    /// 与"截断后重算"本就不是同一个函数——重算会把窗口内各位置在浅层可见的上下文一并砍掉，
-    /// 深层 K/V 随之不同。机制层面的严格等价由
-    /// `model::tests::test_kv_cache_sliding_window_matches_full_window_forward` 验证。
+    /// **断言 token 数而不是字符数，并且用贪心解码**：超过上下文窗口后，"增量 + 滑动窗口"
+    /// （标准推理语义）与"截断后重算"本就不是同一个函数（重算会把窗口内各位置在浅层可见的
+    /// 上下文一并砍掉，深层 K/V 随之不同），所以**采到什么内容必然不同**。早先这里比
+    /// `chars().count()`，等于在赌两条路径在同一位置采到 EOS——任何改动模型数值的修正
+    /// （如 RoPE 逐头频率表）都会把它抖成 59 vs 55。改成贪心（temperature→0、top_k=1）后
+    /// "采什么"被拿掉，收尾原因只可能是 MaxNew，长度断言与数值改动无关。
+    /// 机制层面的严格等价由 `model::tests::test_kv_cache_sliding_window_matches_full_window_forward` 验证。
     #[test]
     fn test_kv_cache_generate_beyond_window_is_not_truncated() {
         let (model, tokenizer) = tiny_setup();
-        let mut rng_full = Rng::new(1234);
-        let full = generate(&model, &tokenizer, "the", 60, &opts(), KvOpts::off(), &mut rng_full);
-        let mut rng_cache = Rng::new(1234);
-        let cached = generate(&model, &tokenizer, "the", 60, &opts(), KvOpts::on(0, None), &mut rng_cache);
-
+        let greedy = SampleOpts {
+            // 采样内部是 `1.0 / temperature.max(1e-5)`，取到下限即"只挑最大那个"
+            temperature: 1e-5,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..opts()
+        };
+        let run = |kv: KvOpts, max_new: usize| -> usize {
+            let mut rng = Rng::new(1234);
+            let mut g = Generator::new(&model, &tokenizer, "the", max_new, &greedy, kv, &mut rng);
+            g.run();
+            assert_eq!(
+                g.reason,
+                Some(StopReason::MaxNew),
+                "贪心解码下不该提前收尾（窗口耗尽不是收尾原因）：{:?}",
+                g.reason
+            );
+            g.ids.len() - g.n_prompt
+        };
+        let full = run(KvOpts::off(), 60);
+        let cached = run(KvOpts::on(0, None), 60);
+        assert_eq!(full, 60, "全量前向应跑满 max_new");
         assert_eq!(
-            full.chars().count(),
-            cached.chars().count(),
-            "滑动窗口下 cache 模式不应再提前结束：\nfull   = {full}\ncached = {cached}"
+            cached, 60,
+            "滑动窗口下 cache 模式应跑满 max_new（{cached} < 60 说明被窗口截断了）"
         );
     }
 

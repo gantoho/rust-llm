@@ -12,7 +12,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use pollster::block_on;
 
@@ -81,6 +81,10 @@ fn n_workgroups(len: usize) -> u32 {
 // 分流统计：实际走 GPU 的次数 / 回退 CPU 的次数（含未启用 GPU 或尺寸不足）
 static STATS_GPU: AtomicUsize = AtomicUsize::new(0);
 static STATS_CPU: AtomicUsize = AtomicUsize::new(0);
+
+/// 显存护栏提示的一次性开关（见 [`GpuContext::warn_oversize`]）：
+/// 生成时同一个大表每个 token 都会撞上护栏，逐次打印只会刷屏。
+static MEM_GUARD_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// GPU dispatch 诊断记录（采集前 `DIAG_MAX` 次调用，在训练首步结束后统一打印）
 struct GpuDispatchDiag {
@@ -369,6 +373,11 @@ pub fn stats() -> (usize, usize) {
 /// - **poll+回读**：`map_async` → `device.poll(Wait)` → 映射 → 拷回 Vec
 /// 后两段是"每次 dispatch 都要重付"的固定开销，也是逐算子同步架构的病根。
 pub fn flush_diag_log() {
+    // 多进程：GPU 诊断是纯打印（没经过 logln!），N 个 rank 各印一份一模一样的分解
+    // 只会把控制台刷乱，信息量为零。这里统一让 rank 0 说。
+    if crate::runlog::rank_muted() {
+        return;
+    }
     flush_recorder_diag_log();
     let log: Vec<GpuDispatchDiag> = {
         let mut v = GPU_DIAG_LOG.lock().unwrap();
@@ -1634,6 +1643,16 @@ pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     info: wgpu::AdapterInfo,
+    /// 设备硬限制的缓存：显存护栏在每个算子入口都要查，而 `device.limits()` 每次都要
+    /// 拷一份很大的 `Limits` 结构体出来，因此初始化时取一次存下来（见 [`fits`]）。
+    max_buffer_size: u64,
+    /// buffer 作为 storage 绑定时的大小上限（池化 buffer 都是整块绑定，`size: None`）
+    max_storage_binding_size: u64,
+    /// buffer 作为 uniform 绑定时的大小上限（每个 dispatch 一块 24 字节参数块）
+    max_uniform_binding_size: u64,
+    /// 4 KiB（最小 size class）占位 buffer：池里放不下时，常驻录制路径拿它当"垃圾句柄"
+    /// 让录制代码照常走完，但整批作废、绝不提交（见 [`GpuRecorder::oversize_handle`]）
+    placeholder: wgpu::Buffer,
     matmul_pipe: wgpu::ComputePipeline,
     /// 小 tile（64×64）matmul 变体，见 [`use_small_tile`]；与 `matmul_pipe` 共用 `matmul_layout`
     matmul_small_pipe: wgpu::ComputePipeline,
@@ -1773,6 +1792,29 @@ pub fn matmul(
     r
 }
 
+/// 这次 matmul 有没有可能真的落到 GPU 内核上（判据与 [`matmul`] 入口**同源**，避免漂移）。
+///
+/// 调用方是 `tensor.rs` 的 `matmul_data`：bf16 参数要先整块解码成 f32 才能喂内核，
+/// 而"GPU 不可用 / 形状达不到盈亏平衡点"时这次解码纯属浪费——**bf16 存储的全部意义
+/// 就是省访存，白解一遍直接把它抵消掉**。所以先用这个谓词过滤，再做解码。
+///
+/// 注意它在"确定不上 GPU"的分支里替 [`matmul`] 补了 `STATS_CPU` 计数，
+/// 否则 `[done] matmul 分流：GPU x / CPU y` 那行诊断会少算调用次数。
+pub fn matmul_may_use_gpu(m: usize, k: usize, n: usize, batch: usize) -> bool {
+    if PROBE_CAPTURE.load(Ordering::Relaxed) {
+        return true; // LLM_GPU_PROBE 录制模式：没有 GPU 也要记形状，供之后回放
+    }
+    if GPU.get().and_then(|g| g.as_ref()).is_none() {
+        STATS_CPU.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if 2 * m * k * n * batch < MATMUL_MIN_FLOPS.load(Ordering::Relaxed) {
+        STATS_CPU.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
 /// GPU 逐元素缩放：out[i] = a[i] * s
 pub fn scale(a: &[f32], s: f32) -> Option<Vec<f32>> {
     GPU.get().and_then(|g| g.as_ref()).and_then(|g| g.scale(a, s))
@@ -1860,7 +1902,32 @@ fn create() -> Option<GpuContext> {
         };
         pa.cmp(&pb)
     });
-    let adapter = adapters.into_iter().next()?;
+    // 多进程启动：按 `LOCAL_RANK` 在**硬件适配器**之间轮转选卡。
+    // - 只有一张卡（本机情形）时 `% len` 让所有进程落到同一张卡上——这正是"双进程同卡"
+    //   验证要的行为；
+    // - 有多张卡时每个进程各拿一张，`%` 兜住"进程数多于卡数"而不越界。
+    // - 轮转集合里**排除软件光栅器**（`DeviceType::Cpu`，例如 "Microsoft Basic Render
+    //   Driver"）：它会在枚举里占一个坑，进程数一多就会把某个 rank 静默分到 CPU 软栈上
+    //   ——不报错、不缺数据，只是慢两个数量级，跑完才发现"多卡没变快"。
+    let local_rank: usize = std::env::var("LOCAL_RANK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut pool: Vec<usize> = (0..adapters.len())
+        .filter(|&i| adapters[i].get_info().device_type != wgpu::DeviceType::Cpu)
+        .collect();
+    if pool.is_empty() {
+        pool = (0..adapters.len()).collect(); // 一个硬件适配器都没有：只能在软栈上跑
+    }
+    let pick = pool[local_rank % pool.len()];
+    if local_rank != 0 || pool.len() > 1 {
+        println!(
+            "[gpu] LOCAL_RANK={local_rank}：{} 个适配器（{} 个硬件）中取第 {pick} 个",
+            adapters.len(),
+            pool.len()
+        );
+    }
+    let adapter = adapters.into_iter().nth(pick)?;
     let info = adapter.get_info();
     let device_type = match info.device_type {
         wgpu::DeviceType::DiscreteGpu => "DiscreteGpu",
@@ -1886,6 +1953,33 @@ fn create() -> Option<GpuContext> {
         trace: wgpu::Trace::Off,
     }))
     .ok()?;
+
+    // ---- 设备硬限制：显存护栏的判据（见 [`fits`]）----
+    // 池的最小分配单位是 4 KiB（见 `size_class`）。连它都放不下的设备直接判为不可用：
+    // 否则「必然放得下」的小申请（参数 uniform、占位 buffer）也会被护栏拦下，
+    // 护栏就从"优雅回退"退化成"什么都干不了"。真实设备（哪怕上限只有 256 MiB）都远大于它。
+    let dlimits = device.limits();
+    let min_bytes = size_class(4) as usize; // 4 字节 → 4096 字节
+    if !fits(dlimits.max_buffer_size, min_bytes)
+        || !fits(dlimits.max_storage_buffer_binding_size, min_bytes)
+    {
+        eprintln!(
+            "[gpu] 设备上限过小（max_buffer_size = {} B、max_storage_buffer_binding_size = {} B）：\
+             GPU 后端禁用，全部回退 CPU",
+            dlimits.max_buffer_size, dlimits.max_storage_buffer_binding_size
+        );
+        return None;
+    }
+    // 占位 buffer（见 [`GpuContext::placeholder`]）：尺寸已由上面的下限检查保证合法，
+    // 创建它不可能触发 wgpu 校验错误。
+    let placeholder = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("placeholder"),
+        size: min_bytes as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("compute"),
@@ -2063,6 +2157,10 @@ fn create() -> Option<GpuContext> {
         device,
         queue,
         info,
+        max_buffer_size: dlimits.max_buffer_size,
+        max_storage_binding_size: dlimits.max_storage_buffer_binding_size,
+        max_uniform_binding_size: dlimits.max_uniform_buffer_binding_size,
+        placeholder,
         matmul_pipe,
         matmul_small_pipe,
         matmul_layout,
@@ -2155,12 +2253,15 @@ impl GpuContext {
         if 2 * m * k * n * batch < MATMUL_MIN_FLOPS.load(Ordering::Relaxed) {
             return None;
         }
-        let buf_a = self.take_buf(a.len(), KIND_IN);
-        self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a));
-        let buf_b = self.take_buf(b.len(), KIND_IN);
-        self.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b));
+        // 三块显存任一放不下就整单回退 CPU（`take_buf` 里的显存护栏返回 None）。
+        // 真实案例：Qwen2.5-0.5B 的 [151936, 896] 输出头整表 519.4 MiB >
+        // 本机 max_buffer_size 256 MiB —— 以前这里会直接 panic，现在回退 CPU。
         let out_len = batch * m * n;
-        let buf_out = self.take_buf(out_len, KIND_OUT);
+        let buf_a = self.take_buf(a.len(), KIND_IN)?;
+        self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a));
+        let buf_b = self.take_buf(b.len(), KIND_IN)?;
+        self.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b));
+        let buf_out = self.take_buf(out_len, KIND_OUT)?;
         let (pipe, tile) = if use_small_tile() {
             (&self.matmul_small_pipe, MM_TILE_S)
         } else {
@@ -2191,9 +2292,10 @@ impl GpuContext {
     }
 
     fn scale(&self, a: &[f32], s: f32) -> Option<Vec<f32>> {
-        let buf_a = self.take_buf(a.len(), KIND_IN);
+        // 放不下就返回 None（见 [`fits`]），下面的 write_buffer 不会因超限 panic
+        let buf_a = self.take_buf(a.len(), KIND_IN)?;
         self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a));
-        let buf_out = self.take_buf(a.len(), KIND_OUT);
+        let buf_out = self.take_buf(a.len(), KIND_OUT)?;
         let r = self.run(
             &self.scale_pipe,
             &self.unary_layout,
@@ -2211,9 +2313,10 @@ impl GpuContext {
     }
 
     fn relu(&self, a: &[f32]) -> Option<Vec<f32>> {
-        let buf_a = self.take_buf(a.len(), KIND_IN);
+        // 放不下就返回 None（见 [`fits`]）
+        let buf_a = self.take_buf(a.len(), KIND_IN)?;
         self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a));
-        let buf_out = self.take_buf(a.len(), KIND_OUT);
+        let buf_out = self.take_buf(a.len(), KIND_OUT)?;
         let r = self.run(
             &self.relu_pipe,
             &self.unary_layout,
@@ -2234,11 +2337,12 @@ impl GpuContext {
         if a.len() != b.len() {
             return None;
         }
-        let buf_a = self.take_buf(a.len(), KIND_IN);
+        // 放不下就返回 None（见 [`fits`]）
+        let buf_a = self.take_buf(a.len(), KIND_IN)?;
         self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a));
-        let buf_b = self.take_buf(b.len(), KIND_IN);
+        let buf_b = self.take_buf(b.len(), KIND_IN)?;
         self.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b));
-        let buf_out = self.take_buf(a.len(), KIND_OUT);
+        let buf_out = self.take_buf(a.len(), KIND_OUT)?;
         let r = self.run(
             &self.add_pipe,
             &self.add_layout,
@@ -2274,11 +2378,12 @@ impl GpuContext {
             return None; // 太小：GPU 固定开销不划算（如推理单 token），回退 CPU
         }
         let total = rows * d;
-        let buf_x = self.take_buf(total, KIND_IN);
+        // 放不下就返回 None（见 [`fits`]）
+        let buf_x = self.take_buf(total, KIND_IN)?;
         self.queue.write_buffer(&buf_x, 0, bytemuck_bytes(x));
-        let buf_m = self.take_buf(mask_numel, KIND_IN);
+        let buf_m = self.take_buf(mask_numel, KIND_IN)?;
         self.queue.write_buffer(&buf_m, 0, bytemuck_bytes(mask));
-        let buf_out = self.take_buf(total, KIND_OUT);
+        let buf_out = self.take_buf(total, KIND_OUT)?;
         let r = self.run(
             &self.softmax_fwd_pipe,
             &self.matmul_layout,
@@ -2302,11 +2407,12 @@ impl GpuContext {
             return None;
         }
         let total = rows * d;
-        let buf_g = self.take_buf(total, KIND_IN);
+        // 放不下就返回 None（见 [`fits`]）
+        let buf_g = self.take_buf(total, KIND_IN)?;
         self.queue.write_buffer(&buf_g, 0, bytemuck_bytes(g));
-        let buf_p = self.take_buf(total, KIND_IN);
+        let buf_p = self.take_buf(total, KIND_IN)?;
         self.queue.write_buffer(&buf_p, 0, bytemuck_bytes(p));
-        let buf_out = self.take_buf(total, KIND_OUT);
+        let buf_out = self.take_buf(total, KIND_OUT)?;
         let r = self.run(
             &self.softmax_bwd_pipe,
             &self.matmul_layout,
@@ -2324,16 +2430,75 @@ impl GpuContext {
         r
     }
 
+    /// 该用途（`kind`）本次申请要遵守的字节上限。
+    ///
+    /// 池化 buffer 都是**整块绑定**（`BufferBinding { size: None }`），所以除了
+    /// `create_buffer` 的硬上限 `max_buffer_size`，还要过对应 binding 类型的上限：
+    /// - `KIND_READ`：只做拷贝目标与映射回读，不作为 storage/uniform 绑定 → 只看 `max_buffer_size`
+    /// - `KIND_UNIFORM`：`max_uniform_buffer_binding_size`
+    /// - `KIND_IN` / `KIND_OUT`（storage）：`max_storage_buffer_binding_size`
+    fn alloc_limit(&self, kind: u8) -> u64 {
+        let binding = match kind {
+            KIND_READ => u64::MAX,
+            KIND_UNIFORM => self.max_uniform_binding_size,
+            _ => self.max_storage_binding_size,
+        };
+        binding.min(self.max_buffer_size)
+    }
+
+    /// 这次申请（`len` 个 f32、用途 `kind`）放得下设备吗？
+    ///
+    /// 判据与 wgpu 的校验**同源**，按池里真正创建的字节数（size class 上取整之后）判 ——
+    /// 只看 `len * 4` 会漏掉上取整那几十 KiB（`size_class` 对 >64 KiB 按 64 KiB 对齐）。
+    fn can_alloc(&self, len: usize, kind: u8) -> bool {
+        fits(self.alloc_limit(kind), size_class((len * 4) as u64) as usize)
+    }
+
+    /// 记录一次「显存放不下 → 回退 CPU」。
+    ///
+    /// 每个进程只提示一次（生成时同一个大表每个 token 都会撞上，逐次打印只会刷屏），
+    /// 并顺带打印此刻的 matmul 分流计数 —— 它就是"护栏只挡下了这一块大表、
+    /// 其余算子仍在 GPU 上跑"的直接证据。
+    fn warn_oversize(&self, len: usize, kind: u8, bytes: usize) {
+        if MEM_GUARD_WARNED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mb = 1024.0 * 1024.0;
+        let limit = self.alloc_limit(kind);
+        println!(
+            "[gpu] 显存护栏：申请 {} 个 f32 = {:.1} MiB（size class 上取整后 {:.1} MiB）\
+             超过设备上限 {:.1} MiB → 该算子回退 CPU。\
+             （只提示一次；此刻 matmul 分流：GPU {} / CPU {}）",
+            len,
+            len as f64 * 4.0 / mb,
+            bytes as f64 / mb,
+            limit as f64 / mb,
+            STATS_GPU.load(Ordering::Relaxed),
+            STATS_CPU.load(Ordering::Relaxed),
+        );
+    }
+
     /// 从池中取一个 buffer（没有就新建）。池按 (size class, 用途) 键控，
     /// 训练中形状反复出现（QKV/MLP 都是 [B*T,D]×[D,D]），命中率很高。
-    fn take_buf(&self, len: usize, kind: u8) -> wgpu::Buffer {
-        let key = (size_class((len * 4) as u64), kind);
-        self.pool
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .and_then(|v| v.pop())
-            .unwrap_or_else(|| self.make_buf(len, kind))
+    ///
+    /// **放不下设备就返回 None**（见 [`GpuContext::can_alloc`] 与 [`fits`]）：
+    /// 这里是 GPU 后端唯一的分配入口，所有 `create_buffer` 都从它走 ——
+    /// 超限申请绝不能递到 wgpu，那边只会 panic，不会给调用方一个失败返回。
+    fn take_buf(&self, len: usize, kind: u8) -> Option<wgpu::Buffer> {
+        let bytes = size_class((len * 4) as u64) as usize;
+        if !fits(self.alloc_limit(kind), bytes) {
+            self.warn_oversize(len, kind, bytes);
+            return None;
+        }
+        let key = (bytes as u64, kind);
+        Some(
+            self.pool
+                .lock()
+                .unwrap()
+                .get_mut(&key)
+                .and_then(|v| v.pop())
+                .unwrap_or_else(|| self.make_buf(len, kind)),
+        )
     }
 
     /// 归还 buffer 回池。调用点都保证 GPU 已同步完成（poll wait 之后），可安全复用。
@@ -2351,6 +2516,9 @@ impl GpuContext {
         }
     }
 
+    /// 真正向 wgpu 申请显存。**只允许由 [`GpuContext::take_buf`] 调用**：
+    /// 尺寸护栏在那一层（`can_alloc`），到这里尺寸必定不超限，`create_buffer`
+    /// 不可能因超限报校验错误而 panic。
     fn make_buf(&self, len: usize, kind: u8) -> wgpu::Buffer {
         let usage = match kind {
             KIND_READ => wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -2388,6 +2556,14 @@ impl GpuContext {
         y: u32,
         z: u32,
     ) -> Option<Vec<f32>> {
+        // 显存护栏：回读暂存区（[`KIND_READ`]，out_len 个 f32）也必须放得下，否则回退 CPU。
+        // 放在这里等于给所有逐算子路径兜底：即使某个调用点漏判了自己的操作数，
+        // 也不会有一块超限 buffer 走到 `create_buffer`（见 [`fits`] 的真实案例）。
+        if !self.can_alloc(out_len, KIND_READ) {
+            let bytes = size_class((out_len * 4) as u64) as usize;
+            self.warn_oversize(out_len, KIND_READ, bytes);
+            return None;
+        }
         // [诊断] 逐段计时，采集前 DIAG_MAX 次（够覆盖训练首步的全部 dispatch）
         let diag_t = std::time::Instant::now();
         static DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2435,7 +2611,8 @@ impl GpuContext {
             pass.dispatch_workgroups(x, y, z);
         }
         let out_size = (out_len * 4) as u64;
-        let readback = self.take_buf(out_len, KIND_READ);
+        // 回读 buffer 同样受显存护栏约束（上面已判过，这里 `?` 是二重保险）
+        let readback = self.take_buf(out_len, KIND_READ)?;
         encoder.copy_buffer_to_buffer(out_buf, 0, &readback, 0, out_size);
         self.queue.submit([encoder.finish()]);
         let diag_t_submit = diag_t.elapsed();
@@ -2515,6 +2692,32 @@ fn size_class(bytes: u64) -> u64 {
     }
 }
 
+/// 显存分配尺寸护栏（纯函数，便于单测）：`bytes` 是否不超过设备上限 `limit`。
+///
+/// 用 `<=` 而不是 `<`：`max_buffer_size` 的语义是「允许的最大 buffer 字节数」，
+/// 恰好等于上限是合法的（wgpu 的校验条件就是 `size > max_buffer_size`）。
+///
+/// **为什么需要这条护栏 —— 真实崩溃案例**：
+/// Qwen2.5-0.5B（vocab = 151936、n_embd = 896）的输出头 / 词嵌入整表 `[vocab, n_embd]`
+/// 是 151936 × 896 × 4 = 544538624 B = 519.4 MiB，而设备（Radeon RX 560 / DX12）
+/// `device.limits().max_buffer_size` 只有 256 MiB。修复前 `GpuContext::matmul`
+/// 未做任何尺寸判断，直接把这块表交给 `create_buffer`，于是 wgpu 校验失败、
+/// 默认的 uncaptured error handler 当场 panic：
+///
+/// ```text
+/// thread 'main' panicked at wgpu-30.0.1/src/backend/wgpu_core.rs:1619:18:
+/// wgpu error: Validation Error
+/// Caused by: In Device::create_buffer, label = 'pooled'
+///     Buffer size 544538624 is greater than the maximum buffer size (268435456)
+/// ```
+///
+/// 有了它，超限申请在 [`GpuContext::take_buf`]（唯一的分配入口）就被拦下并返回 `None`，
+/// 上层按既有 `Option` 约定回退 CPU —— 慢，但不会把整个进程带走。
+#[inline]
+fn fits(limit: u64, bytes: usize) -> bool {
+    bytes as u64 <= limit
+}
+
 /// 已析构显存句柄（[`GpuHandle`]）的 buffer 暂存区。
 ///
 /// 为什么不直接回池（P1-1）：句柄可能在**录制中途**析构（encoder 里还引用着它的 buffer），
@@ -2552,6 +2755,12 @@ pub struct GpuBatch {
     pub dispatches: usize,
     /// 按 [`opk`] 类别计数的 dispatch 数（诊断用）
     kinds: [usize; opk::N],
+    /// 本批里有申请放不下设备（见 [`fits`]）→ **整批作废**：
+    /// [`GpuContext::batch_finish`] 不提交、[`GpuRecorder::submit_and_read`] 直接返回 None，
+    /// 调用方按既有约定回退 CPU。放在 batch 上而不是 recorder 上，是因为批量路径的
+    /// 参数 uniform（`batch_dispatch`）与常驻路径的中间结果（`GpuRecorder::*`）
+    /// 需要共用同一个"作废"标记。
+    oversize: bool,
 }
 
 impl GpuContext {
@@ -2617,6 +2826,7 @@ impl GpuContext {
             keep_bufs: Vec::new(),
             dispatches: 0,
             kinds: [0; opk::N],
+            oversize: false,
         }
     }
 
@@ -2644,7 +2854,13 @@ impl GpuContext {
             batch.kinds[kind as usize] += 1;
             return;
         }
-        let pbuf = self.take_buf(6, KIND_UNIFORM); // 6 个 u32 = 24 字节
+        let Some(pbuf) = self.take_buf(6, KIND_UNIFORM) else {
+            // 连 4 KiB 的参数 buffer 都放不下：这种设备在 `GpuContext::new` 里就被判为
+            // 不可用（有下限检查），所以这里不可达；真到了这一步也只是作废本批，
+            // 不会 panic、不会带着无效参数提交。
+            batch.oversize = true;
+            return;
+        }; // 6 个 u32 = 24 字节
         self.queue.write_buffer(&pbuf, 0, bytemuck_bytes(&params));
         let mut entries: Vec<wgpu::BindGroupEntry> = bufs
             .iter()
@@ -2723,6 +2939,10 @@ impl GpuContext {
 
     /// 提交整批并等待完成 —— **整步唯一的同步点**
     fn batch_finish(&self, batch: GpuBatch) {
+        if batch.oversize {
+            // 本批有申请放不下设备（见 [`GpuBatch::oversize`]）：整批作废，不提交。
+            return;
+        }
         let GpuBatch { enc, keep_groups, mut keep_bufs, .. } = batch;
         self.queue.submit([enc.finish()]);
         let _ = self
@@ -2810,7 +3030,8 @@ impl Readback {
             spans.push((total, h.len));
             total += h.len;
         }
-        let staging = ctx.take_buf(total.max(1), KIND_READ);
+        // 放不下（一次回读的总字节数超限）就返回 None，调用方回退 CPU 分批读
+        let staging = ctx.take_buf(total.max(1), KIND_READ)?;
         let mut off = 0u64;
         for h in handles {
             let bytes = (h.len * 4) as u64;
@@ -2871,10 +3092,29 @@ fn recorder() -> Option<GpuRecorder> {
 }
 
 impl GpuRecorder {
+    /// 申请放不下设备时返回的**占位句柄**（见 [`fits`]）。
+    ///
+    /// 标记整批作废（[`GpuBatch::oversize`]），并返回一块 4 KiB 的占位 buffer，
+    /// 让后面的录制代码照常走完（句柄类型不变，不必给几十个 `rec.xxx()` 调用点
+    /// 都改成 `Option`）。
+    ///
+    /// 这块 buffer 从不写入、也**永远不会被提交**：`submit_and_read` 见到
+    /// `oversize` 就直接返回 None，encoder 连同里面那些读了垃圾数据的 dispatch
+    /// 一起被丢弃。所以下游算出来的内容是垃圾也无所谓 —— 调用方拿到 None，
+    /// 会回退 CPU 重算，数值不受影响。
+    fn oversize_handle(&mut self, len: usize) -> GpuHandle {
+        self.batch.oversize = true;
+        GpuHandle { buf: self.ctx.placeholder.clone(), len }
+    }
+
     /// 上传 CPU 数据到显存，得到常驻句柄
     pub fn upload(&mut self, data: &[f32]) -> GpuHandle {
         // 用 KIND_OUT（含 COPY_SRC）：上传上去的也可能被回读（如反向里的 Q'/K/V）
-        let buf = self.ctx.take_buf(data.len().max(1), KIND_OUT);
+        // 放不下（> max_buffer_size / storage 绑定上限）→ 占位句柄 + 整批作废。
+        // 这条早退同时护住了下面的 write_buffer：往小 buffer 里写大块数据同样会 panic。
+        let Some(buf) = self.ctx.take_buf(data.len().max(1), KIND_OUT) else {
+            return self.oversize_handle(data.len());
+        };
         if !data.is_empty() {
             self.ctx.queue.write_buffer(&buf, 0, bytemuck_bytes(data));
             self.upload_bytes += data.len() * 4;
@@ -2901,7 +3141,11 @@ impl GpuRecorder {
         bs: usize,
     ) -> GpuHandle {
         let len = bs * m * n;
-        let out = GpuHandle { buf: self.ctx.take_buf(len.max(1), KIND_OUT), len };
+        // 输出放不下（例如 [rows, vocab] 的 logits 在 vocab=151936 时会到几百 MiB）→ 整批作废
+        let Some(buf) = self.ctx.take_buf(len.max(1), KIND_OUT) else {
+            return self.oversize_handle(len);
+        };
+        let out = GpuHandle { buf, len };
         self.ctx
             .batch_matmul(&mut self.batch, &a.buf, &b.buf, &out.buf, m, k, n, bs, a_t, b_t);
         out
@@ -2917,7 +3161,10 @@ impl GpuRecorder {
         mask_numel: usize,
     ) -> GpuHandle {
         let len = rows * d;
-        let out = GpuHandle { buf: self.ctx.take_buf(len.max(1), KIND_OUT), len };
+        let Some(buf) = self.ctx.take_buf(len.max(1), KIND_OUT) else {
+            return self.oversize_handle(len);
+        };
+        let out = GpuHandle { buf, len };
         self.ctx.batch_dispatch(
             &mut self.batch,
             &self.ctx.softmax_fwd_pipe,
@@ -2940,7 +3187,10 @@ impl GpuRecorder {
         d: usize,
     ) -> GpuHandle {
         let len = rows * d;
-        let out = GpuHandle { buf: self.ctx.take_buf(len.max(1), KIND_OUT), len };
+        let Some(buf) = self.ctx.take_buf(len.max(1), KIND_OUT) else {
+            return self.oversize_handle(len);
+        };
+        let out = GpuHandle { buf, len };
         self.ctx.batch_dispatch(
             &mut self.batch,
             &self.ctx.softmax_bwd_pipe,
@@ -2985,7 +3235,10 @@ impl GpuRecorder {
 
     /// 分配一块内容未初始化的显存（内核会全部覆写它）
     fn empty(&mut self, len: usize, kind: u8) -> GpuHandle {
-        GpuHandle { buf: self.ctx.take_buf(len.max(1), kind), len }
+        let Some(buf) = self.ctx.take_buf(len.max(1), kind) else {
+            return self.oversize_handle(len);
+        };
+        GpuHandle { buf, len }
     }
 
     /// 录制归一化前向（LayerNorm / RMSNorm 由 `is_rms` 切换，见 `ln_fwd_main`）；
@@ -3334,7 +3587,9 @@ impl GpuRecorder {
 
     /// 上传 u32 数据（如 targets 下标）
     fn upload_u32(&mut self, data: &[u32]) -> GpuHandle {
-        let buf = self.ctx.take_buf(data.len().max(1), KIND_OUT);
+        let Some(buf) = self.ctx.take_buf(data.len().max(1), KIND_OUT) else {
+            return self.oversize_handle(data.len());
+        };
         if !data.is_empty() {
             self.ctx.queue.write_buffer(&buf, 0, bytemuck_bytes(data));
             self.upload_bytes += data.len() * 4;
@@ -3345,8 +3600,15 @@ impl GpuRecorder {
     /// 提交整批，把 `outs` 回读给 CPU（回读拷贝也录进同一个 encoder → 一次 submit、一次 poll）。
     /// 其余张量留在显存等下一批。
     pub fn submit_and_read(self, outs: &[&GpuHandle]) -> Option<Vec<Vec<f32>>> {
+        if self.batch.oversize {
+            // 本批里有申请放不下设备（见 [`GpuBatch::oversize`] 与 [`fits`]）：
+            // 整批作废 —— 不录回读、不提交、不回读，直接把 None 交给调用方回退 CPU。
+            // 这也是"绝不 panic"的关键：作废的 encoder 连同它的超限/垃圾 dispatch
+            // 一起被丢弃，没有任何一次 `create_buffer` / `write_buffer` 会因为超限被调用。
+            return None;
+        }
         let GpuRecorder { ctx, batch, keep, t0, upload_bytes } = self;
-        let GpuBatch { enc, keep_groups, mut keep_bufs, dispatches, kinds } = batch;
+        let GpuBatch { enc, keep_groups, mut keep_bufs, dispatches, kinds, .. } = batch;
         let mut enc = enc;
         let rb = Readback::record(ctx, &mut enc, outs)?;
         // 诊断：本批回读字节数（与逐算子路径同一口径，便于对照）
@@ -4960,8 +5222,14 @@ pub fn probe_report() {
     const ROT_BIG: usize = 2;
     /// 单块输出超过这个字节数就算「大形状」，少留几块轮转
     const BIG_OUT_BYTES: u64 = 32 << 20;
-    let buf_a = g.take_buf(max_a, KIND_IN);
-    let buf_b = g.take_buf(max_b, KIND_IN);
+    // 显存护栏：录制到的形状里可能有本设备装不下的大表（如 [rows, vocab] 的 logits）。
+    // 这种形状直接跳过 —— 探针是标定用的，没必要为了它 panic。
+    let (Some(buf_a), Some(buf_b)) =
+        (g.take_buf(max_a, KIND_IN), g.take_buf(max_b, KIND_IN))
+    else {
+        println!("[gpu-probe] 录制到的形状里有超出设备显存上限的操作数，跳过回放标定");
+        return;
+    };
     // 空提交一次，把所有待处理的初始化（零填充、管线首次绑定）排干净，
     // 免得它们的耗时落进后面第一个被测形状
     {
@@ -4982,7 +5250,11 @@ pub fn probe_report() {
         // 输出只要装得下这个形状就够：按形状取精确尺寸，用完即还，避免多个 134MB 同时驻留
         let out_len = m * n * bs;
         let rot = if out_len as u64 * 4 > BIG_OUT_BYTES { ROT_BIG } else { ROT_SMALL };
-        let outs: Vec<wgpu::Buffer> = (0..rot).map(|_| g.take_buf(out_len, KIND_OUT)).collect();
+        // 放不下这个形状的输出就跳过它（见上面的显存护栏说明）
+        let Some(outs) = (0..rot).map(|_| g.take_buf(out_len, KIND_OUT)).collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         // 预热：先用这一组自己的 buffer 真跑一次并等它完成。WebGPU 的 buffer 零初始化是
         // **首次使用时**才录进命令流的，不预热就会有一大段清零时间落进计时窗口。
         {
@@ -5070,9 +5342,13 @@ pub fn probe_fma() {
     let flops = threads * ITERS as f64 * 8.0 * 2.0;
 
     let dummy = vec![0.0f32; 256];
-    let buf_in = g.take_buf(dummy.len(), KIND_IN);
+    // 显存护栏：这里的两块 buffer 都只有 1 KiB，正常设备必然放得下；
+    // 真拿不到（设备上限被压到 4 KiB 以下）就直接放弃探针，不 panic。
+    let (Some(buf_in), Some(out)) = (g.take_buf(dummy.len(), KIND_IN), g.take_buf(256, KIND_OUT))
+    else {
+        return;
+    };
     g.queue.write_buffer(&buf_in, 0, bytemuck_bytes(&dummy));
-    let out = g.take_buf(256, KIND_OUT);
 
     // 先热身一次（吃掉管线首次绑定的开销），再计时
     let _ = g.run(
@@ -5115,6 +5391,92 @@ pub fn probe_fma() {
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
+
+    /// 显存护栏纯函数 [`fits`] 的边界：0 / 恰好等于上限 / 上限+1 / 真实崩溃尺寸。
+    #[test]
+    fn mem_guard_fits_boundaries() {
+        // 0 字节：放得下（空张量的边界情形）
+        assert!(fits(0, 0));
+        assert!(fits(4096, 0));
+        // 恰好等于上限：**合法**（wgpu 的判据是 `size > max_buffer_size` 才报错）
+        assert!(fits(268_435_456, 268_435_456));
+        // 上限 + 1：放不下
+        assert!(!fits(268_435_456, 268_435_456 + 1));
+        // 真实案例：Qwen2.5-0.5B 的输出头/词嵌入整表 [151936, 896] = 544538624 B
+        // （519.4 MiB）对本机 256 MiB 上限 —— 这就是当初 panic 的那次申请
+        assert_eq!(151_936 * 896 * 4, 544_538_624);
+        assert!(!fits(268_435_456, 151_936 * 896 * 4));
+        // 同一块表在 1 GiB 上限的设备上放得下：护栏只拦"放不下"的场景，
+        // 不放宽也不收紧能放下时的既有行为
+        assert!(fits(1 << 30, 151_936 * 896 * 4));
+
+        // 判据按 size class 上取整后的字节数：上限之上只多 1 字节也会被 64 KiB 对齐顶过去
+        assert_eq!(size_class(268_435_456), 268_435_456);
+        assert_eq!(size_class(268_435_457), 268_435_456 + 65_536);
+        assert!(!fits(268_435_456, size_class(268_435_457) as usize));
+    }
+
+    /// 护栏在分配入口（`take_buf`）真的生效：超限申请返回 None，
+    /// 而不是把申请递到 wgpu 的 `create_buffer` 里去 panic（用户报的那个崩溃的最小复现）。
+    #[test]
+    fn mem_guard_take_buf_rejects_oversize() {
+        init();
+        let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+            return; // 无 GPU 环境跳过（不视为失败）
+        };
+        // 正常尺寸照旧能拿到 buffer（GPU 路径没有被护栏整体废掉）
+        assert!(g.take_buf(1024, KIND_IN).is_some());
+        assert!(g.take_buf(6, KIND_UNIFORM).is_some());
+        // 超过 `max_buffer_size` 一个 f32：三种用途都必须返回 None
+        let oversize = (g.max_buffer_size / 4) as usize + 1;
+        assert!(g.take_buf(oversize, KIND_IN).is_none());
+        assert!(g.take_buf(oversize, KIND_OUT).is_none());
+        assert!(g.take_buf(oversize, KIND_READ).is_none());
+        // 真实崩溃尺寸：151936 × 896 个 f32 = 519.4 MiB
+        assert!(g.take_buf(151_936 * 896, KIND_IN).is_none());
+        assert!(g.take_buf(151_936 * 896, KIND_OUT).is_none());
+        // 拒绝过超限申请之后池与上下文仍然完好：后续正常分配照旧成功
+        assert!(g.take_buf(1024, KIND_IN).is_some());
+    }
+
+    /// 护栏的判据必须来自设备真实限制（`device.limits()`），而不是写死的常量：
+    /// 缓存的三个上限与设备一致，且"放不下"只在真正超限时才判 False。
+    #[test]
+    fn mem_guard_limits_match_device() {
+        init();
+        let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+            return;
+        };
+        let lim = g.device.limits();
+        assert_eq!(g.max_buffer_size, lim.max_buffer_size);
+        assert_eq!(g.max_storage_binding_size, lim.max_storage_buffer_binding_size);
+        assert_eq!(g.max_uniform_binding_size, lim.max_uniform_buffer_binding_size);
+        assert_eq!(g.alloc_limit(KIND_READ), lim.max_buffer_size);
+        assert_eq!(
+            g.alloc_limit(KIND_UNIFORM),
+            lim.max_uniform_buffer_binding_size.min(lim.max_buffer_size)
+        );
+        assert_eq!(
+            g.alloc_limit(KIND_OUT),
+            lim.max_storage_buffer_binding_size.min(lim.max_buffer_size)
+        );
+        // 0 个元素与极小张量在任何设备上都必须放得下（否则 GPU 后端等于被禁用）
+        for kind in [KIND_IN, KIND_OUT, KIND_READ, KIND_UNIFORM] {
+            assert!(g.can_alloc(0, kind), "kind={kind}");
+            assert!(g.can_alloc(1, kind), "kind={kind}");
+            assert!(g.can_alloc(4096, kind), "kind={kind}");
+        }
+        // 恰好用满上限是合法申请（判据是 `<=`）：上限向下对齐到 size class 粒度后必然放得下
+        let aligned = (g.max_buffer_size / (64 * 1024)) * (64 * 1024);
+        if aligned > 0 {
+            assert!(fits(g.max_buffer_size, size_class(aligned) as usize));
+        }
+        // 真实崩溃尺寸在本机必须被判"放不下"（设备上限若是 1 GiB 以上则跳过这一条）
+        if !fits(lim.max_buffer_size, 544_538_624) {
+            assert!(!g.can_alloc(151_936 * 896, KIND_IN));
+            assert!(!g.can_alloc(151_936 * 896, KIND_OUT));
+        }
+    }
 
     /// CPU 三重循环参考实现（与 tensor.rs 的 matmul_data 相同的算法）。
     /// `a_t`/`b_t` 时按转置物理布局读：a 实际 [B,K,M]、b 实际 [B,N,K]。
@@ -6195,12 +6557,19 @@ mod tests {
             let (br, bc) = if b_t { (n, k) } else { (k, n) };
             let a = vec![0.5f32; bs * ar * ac];
             let b = vec![0.25f32; bs * br * bc];
-            let buf_a = g.take_buf(a.len(), KIND_IN);
+            // 显存护栏：放不下这个形状就跳过（仅标定用的探针，不值得为它 panic）
+            let (Some(buf_a), Some(buf_b)) =
+                (g.take_buf(a.len(), KIND_IN), g.take_buf(b.len(), KIND_IN))
+            else {
+                continue;
+            };
             g.queue.write_buffer(&buf_a, 0, bytemuck_bytes(&a));
-            let buf_b = g.take_buf(b.len(), KIND_IN);
             g.queue.write_buffer(&buf_b, 0, bytemuck_bytes(&b));
-            let outs: Vec<wgpu::Buffer> =
-                (0..2).map(|_| g.take_buf(bs * m * n, KIND_OUT)).collect();
+            let Some(outs): Option<Vec<wgpu::Buffer>> =
+                (0..2).map(|_| g.take_buf(bs * m * n, KIND_OUT)).collect()
+            else {
+                continue;
+            };
 
             // 预热两侧各一遍：把「新建 buffer 的懒零填充」与首次绑定排干，别混进计时窗口
             for force in [0i8, 1] {

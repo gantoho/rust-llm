@@ -228,7 +228,7 @@ step   600 | lr 0.000300 | loss 0.1586 | 2459 tok/s
 |----|------|--------|
 | `step` | 训练步数（从 1 开始数，日志显示 100、200、…、600） | `train_transformer` 打印的是 `step + 1` |
 | `lr` | 打印时刻 `scheduler` 里的学习率 | `scheduler.lr()`，且是在本步 `scheduler.step()` **之后**读取的（`src/train.rs` 的进度行与评估行都在更新后打印）——即"下一步要用"的 lr，不是本步已用的 `cur_lr` |
-| `loss` | 本步 batch 的平均交叉熵 | `forward_loss(&model, &x, &y, b, t, accum)`（内部调用 `cross_entropy_loss`，返回的是未缩放的原始 loss） |
+| `loss` | 本步 batch 的平均交叉熵 | `forward_loss(&model, &x, &y, b, t, accum_window(step, accum, cfg.steps))`（内部调用 `cross_entropy_loss`，返回的是未缩放的原始 loss） |
 | `tok/s` | 训练吞吐：已处理 token 数 ÷ 已耗时 | `tps = steps_done × batch_size × block_size / elapsed` |
 
 > demo 没有验证集，所以日志里没有 `val` / `ppl` 两列；有验证集时 `train_transformer` 还会打印 `val {:.4} (ppl {:.1})`。
@@ -238,7 +238,8 @@ step   600 | lr 0.000300 | loss 0.1586 | 2459 tok/s
 ```rust
 for step in start_step..cfg.steps {
     let (x, y) = loader.sample_batch(rng);                  // 1. 采样 batch（每步）
-    let loss = forward_loss(&model, &x, &y, b, t, accum);   // 2. 前向 + 交叉熵（每步）
+    let loss = forward_loss(&model, &x, &y, b, t,
+                            accum_window(step, accum, cfg.steps)); // 2. 前向 + 交叉熵（每步）
     loss.backward();                                        // 3. 反向（每步，梯度累加到现有梯度上）
 
     // 4~6 只在累积窗口结束时执行；最后一步即使不满 accum 也强制收尾

@@ -22,8 +22,10 @@
 //! - 训练指标 CSV 日志记录（loss / lr / ppl / 速度）
 //! - LoRA 微调模式：冻结主模型，只训练 LoRA 层
 
+use crate::comm::DistRuntime;
 use crate::config::TrainConfig;
 use crate::data::BatchSource;
+use crate::distributed::{allreduce_mean_grads, allreduce_mean_moe_bias, mix_dp_rank, sync_overflow};
 use crate::loss::cross_entropy_loss_masked;
 use crate::model::Transformer;
 use crate::module::Module;
@@ -92,12 +94,38 @@ impl MixedPrecision {
     ///
     /// 返回 true = 无溢出，可以更新参数；false = 有溢出，跳过本步。
     /// 如果无溢出，还会尝试增长 scale。
+    ///
+    /// 单进程下这就是全部逻辑；**多进程请拆成 [`Self::detect_overflow`] +
+    /// [`Self::note_overflow`]**，中间插入跨 DP 的标志汇总（见那两个方法的说明）。
+    /// 训练循环走的正是拆分后的那三步，这一条只作为"等价形式"留给单测与外部调用。
+    #[allow(dead_code)]
     pub fn check_and_update(&mut self, params: &[Tensor]) -> bool {
-        // 检查所有参数的梯度是否有 NaN/Inf（参数间并行短路，找到一个坏值即停）
-        let overflow = params.par_iter().any(|p| {
+        let overflow = self.detect_overflow(params);
+        self.note_overflow(overflow)
+    }
+
+    /// **只做检测**：梯度里是否有 NaN/Inf。不改动 `scale` 与增长计数。
+    ///
+    /// 与 [`Self::note_overflow`] 拆开是为了多进程：溢出的判定必须在各 DP 副本上
+    /// **各自做完、汇总成同一个标志**，再让所有副本用同一个标志推进 scale。
+    /// 各副本各自 `check_and_update` 会让"谁的梯度溢出"这件事决定 scale 的走向——
+    /// 而 scale 就是反缩放系数，于是同一份 allreduce 出来的梯度被除以不同的数，
+    /// 参数更新分叉、训练悄悄跑成 N 份不同的模型。
+    ///
+    /// 参数间并行短路（找到一个坏值即停）。
+    pub fn detect_overflow(&self, params: &[Tensor]) -> bool {
+        params.par_iter().any(|p| {
             let g = p.grad.borrow();
             g.iter().any(|v| v.is_nan() || v.is_infinite())
-        });
+        })
+    }
+
+    /// 用**全体副本一致**的溢出标志推进动态损失缩放，返回是否可以做本次参数更新。
+    ///
+    /// 单进程下它等价于"检测 + 更新"的后半段；多进程下这个标志由
+    /// [`crate::distributed::sync_overflow`] 汇总而来（任一副本溢出 ⇒ 全体按溢出处理），
+    /// 因此各副本的 `scale` 与 `growth_steps` 永远保持同步。
+    pub fn note_overflow(&mut self, overflow: bool) -> bool {
         if overflow {
             // 溢出：scale 减半，重置计数
             self.scale = (self.scale * 0.5).max(self.min_scale);
@@ -278,15 +306,24 @@ pub fn lr_scheduler(cfg: &TrainConfig, total_steps: usize) -> LRScheduler {
 
 /// 梯度裁剪：如果所有参数梯度的总范数超过 max_norm，就整体等比缩放。
 /// 防止个别大梯度把参数"推飞"，这是训练 LLM 的标准防爆措施。
+///
+/// ⚠️ 归约顺序必须是**确定的**，所以这里是"参数间并行求部分和 → 保序收集 →
+/// 按参数顺序串行相加"，而不是 `params.par_iter()…sum()`。后者由 rayon 决定合并顺序
+/// （取决于谁偷到哪一块），同一份数据前后两次可能差最后几位。而这一步在多进程 DP 里
+/// 恰好跑在**梯度同步之后**：各 rank 手里的梯度已经逐位相同，只要裁剪系数因为归约顺序
+/// 差了一位，反缩放后的梯度就不再相同，权重会一步一步悄悄分叉——
+/// 而且不报错、loss 曲线也看不出来（见 `docs/38-分布式训练.md` 的 DP 接线一节）。
 pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
-    // 范数按参数并行归约（每个参数一个独立 sum，闭包内自行 borrow）
-    let total: f32 = params
+    // 范数按参数并行归约（每个参数一个独立 sum，闭包内自行 borrow），但**收集顺序
+    // 固定为参数顺序**——`par_iter().map().collect()` 保序是 rayon 的明确保证
+    let partials: Vec<f32> = params
         .par_iter()
         .map(|p| {
             let g = p.grad.borrow();
             g.iter().map(|v| v * v).sum::<f32>()
         })
-        .sum();
+        .collect();
+    let total: f32 = partials.iter().sum();
     let norm = total.sqrt();
     if norm > max_norm {
         let scale = max_norm / norm;
@@ -336,6 +373,22 @@ pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usiz
         total += loss.item();
     }
     total / eval_iters as f32
+}
+
+/// 第 `step` 步所在的梯度累积窗口大小（微批个数）。
+///
+/// 常规窗口就是 `accum` 个微批；但 **最后一个窗口可能不足** `accum`
+/// （`steps % accum != 0`）。梯度累积的实现是"每微批把上游梯度乘 `1/N` 注入"，
+/// 而参数更新只在窗口末尾发生一次，所以这里的 `N` 必须是**本窗口实际的微批数**：
+/// 一律传 `accum` 会让尾窗的梯度被额外除以 `accum / 实际值`，等效于那一步的学习率
+/// 被悄悄调小——`steps % accum != 0` 时每一步都在发生，且不会有任何报错。
+///
+/// 窗口按**绝对步号**切分（`[0,accum) [accum,2·accum) …`），所以断点续训从窗口中间
+/// 开始时算出来的窗口大小仍与串行一致。
+pub(crate) fn accum_window(step: usize, accum: usize, steps: usize) -> usize {
+    let accum = accum.max(1);
+    let start = (step / accum) * accum;
+    accum.min(steps.saturating_sub(start)).max(1)
 }
 
 /// 前向 + 交叉熵 + MoE 均衡辅助损失，返回「打印用未缩放、反向按 `1/accum` 缩放」的
@@ -504,6 +557,19 @@ impl MetricsLogger {
 ///
 /// - `out_dir = None` 时不保存 checkpoint（demo 用）
 /// - `resume_from = Some(path)` 时从 checkpoint 续训（恢复参数、优化器状态与步数）
+/// - `dist = Some(rt)` 时按**真多进程**的数据并行跑：各副本吃不同数据、每步同步梯度，
+///   并且只有 rank 0 落盘（见下面的"多进程"小节）。`None` = 单进程，路径逐位不变。
+///
+/// ## 多进程（DP）下这段循环的三条约定
+///
+/// 1. **控制流必须完全一致**：评估、早停判据、`accum` 边界、AMP 的跳过决定，
+///    所有 rank 都要做出同样的判断。只要有一个 rank 提前 `break`，
+///    下一次集合通信就永远等不到它（表现为超时挂死，而不是报错）。
+///    所以下面**没有任何一处**用 `dist` 去改变控制流——`dist` 只影响
+///    "要不要通信"和"要不要落盘"，而这两件事由各 rank 相同的配置决定。
+/// 2. **通信点必须成对**：每个 rank 在同一轮循环里调用同一组集合通信。
+/// 3. **只有 rank 0 有副作用**：日志（[`crate::runlog::rank_muted`]）、指标 CSV、
+///    checkpoint。其余 rank 照常算、照常参与通信，只是不写盘。
 ///
 /// 返回最终的最优验证 loss（无验证集时为训练 loss 近似值）。
 pub fn train_transformer(
@@ -514,7 +580,10 @@ pub fn train_transformer(
     out_dir: Option<&str>,
     resume_from: Option<&str>,
     rng: &mut Rng,
+    dist: Option<&DistRuntime>,
 ) -> f32 {
+    // 本进程是否负责落盘（rank 0 或单进程）。只用于门控**副作用**，不参与控制流。
+    let primary = dist.map_or(true, |d| d.is_primary());
     let params = model.parameters();
     // 真正参与训练的参数（LoRA 形态下 = 各层的适配层；普通训练 = 全部）。
     // 梯度裁剪与范数统计只该看这一组：冻结参数不产生梯度（前向走 matmul_frozen），
@@ -622,11 +691,13 @@ pub fn train_transformer(
         );
     }
 
-    // 指标日志
-    let log_path = cfg.log_file.as_deref();
+    // 指标日志：只有 rank 0 建文件。N 个副本同时往同一个 CSV 里写，每行都会被
+    // 别的副本插进来（而且各自记的 step 还不一样），出来的曲线没法读。
+    // 其余 rank 的 MetricsLogger 退化成空实现（`log` 是空操作）。
+    let log_path = if primary { cfg.log_file.as_deref() } else { None };
     let mut metrics = MetricsLogger::new(log_path);
-    if log_path.is_some() {
-        logln!("训练指标将记录到 {}", log_path.unwrap());
+    if let Some(path) = log_path {
+        logln!("训练指标将记录到 {path}");
     }
 
     // GPU dispatch 开销分解：必须等首步的真实 dispatch 跑完才有数据可打印，
@@ -671,6 +742,16 @@ pub fn train_transformer(
     let mut amp_skipped = 0usize; // 因梯度溢出被跳过的参数更新次数
     // 实际完成到的步数：早停会提前退出，结尾统计与 final.ckpt 都不能用 cfg.steps
     let mut last_step_done = start_step;
+    // —— DP 数据分片 ——
+    // 把训练用的 rng 扰动到与 dp_rank 相关的轨道上。N 个副本若都从同一个 rng 状态
+    // 开始采样，每步抽到的批次**完全相同**，梯度平均出来的就是单卡那批的梯度——
+    // 数据并行白跑 N 遍。dp_rank = 0 不扰动（单进程与分布式 0 号副本逐位一致）。
+    // 上面那个 `eval_rng` **不**扰动：各副本必须在同一批验证数据上评估，
+    // 否则 val_loss 不同 ⇒ 早停判据分叉 ⇒ 有人退出有人继续 ⇒ 集合通信挂死。
+    if let Some(d) = dist {
+        mix_dp_rank(rng, d.cfg.coord(d.comm.rank()).dp);
+    }
+
     // —— 预取：让采样与前向/反向重叠 ——
     // 第一批在进入 scope 前先采（否则 spawn 后立刻 recv 会白等一次采样），工作线程
     // 从「第一批之后」的 rng 状态继续克隆采样，超前备好后续批次；每批附带采样后的
@@ -706,7 +787,7 @@ pub fn train_transformer(
             // 回写 rng：调用方看到的状态与串行采样逐位一致（断点续训/测试依赖）
             rng.set_state(worker_state);
 
-            // 2. 前向 + 损失（梯度累积时反向按 1/accum 缩放）
+            // 2. 前向 + 损失（梯度累积时反向按 **本窗口的微批数** 缩放，见 `accum_window`）
             let t_seg = std::time::Instant::now();
             let loss = forward_loss(
                 &model,
@@ -716,7 +797,7 @@ pub fn train_transformer(
                 pixels.as_deref(),
                 batch_size,
                 block_size,
-                accum,
+                accum_window(step, accum, cfg.steps),
             );
             let fwd_ms = t_seg.elapsed().as_secs_f64() * 1000.0;
 
@@ -741,9 +822,18 @@ pub fn train_transformer(
                 // 4. AMP 溢出检查（此时梯度还带着 scale）
                 // 梯度里出现 Inf/NaN 就跳过本次参数更新：不跳的话 AdamW 的一阶/二阶矩会被
                 // Inf 污染，之后每一步都是 NaN，训练再也回不来。scale 同时自动收缩。
+                //
+                // 三步走是为了多进程：**本地检测 → 跨 DP 汇总"任一溢出" → 全体用同一个
+                // 标志推进 scale**。各副本各判各的会让 scale 分叉，而 scale 就是反缩放
+                // 系数——同一份 allreduce 出来的梯度被除以不同的数，参数更新悄悄分叉。
+                let overflow = amp.as_ref().is_some_and(|mp| mp.detect_overflow(&trainable));
+                let overflow = match dist {
+                    Some(d) => sync_overflow(&d.dp_group(), overflow),
+                    None => overflow,
+                };
                 let overflow = match amp.as_mut() {
-                    Some(mp) => !mp.check_and_update(&trainable),
-                    None => false,
+                    Some(mp) => !mp.note_overflow(overflow),
+                    None => overflow,
                 };
                 if overflow {
                     amp_skipped += 1;
@@ -754,9 +844,17 @@ pub fn train_transformer(
                         scale,
                         amp_skipped
                     );
-                } else if let Some(mp) = amp.as_ref() {
-                    // 5. AMP 反缩放：把梯度除回真实尺度，必须在裁剪之前
-                    mp.unscale_gradients(&trainable);
+                } else {
+                    if let Some(mp) = amp.as_ref() {
+                        // 5. AMP 反缩放：把梯度除回真实尺度，必须在裁剪之前
+                        mp.unscale_gradients(&trainable);
+                    }
+                    // 5b. DP 梯度同步：反缩放**之后**、裁剪**之前**各来一次
+                    //（顺序理由见 [`allreduce_mean_grads`]）。一次拼接好的环形
+                    // allreduce 把所有参数的梯度一起平均掉，各副本从此持有逐位相同的梯度。
+                    if let Some(d) = dist {
+                        allreduce_mean_grads(&d.dp_group(), &trainable, 1.0);
+                    }
                 }
 
                 // 周期性打印进度（在 zero_grad 之前，此时梯度有效）
@@ -829,6 +927,16 @@ pub fn train_transformer(
                     //     未开 `moe_bias_balance`（默认）或非 MoE 配置时是空操作。
                     model.update_moe_balance_bias();
 
+                    // 8c. DP 均衡偏置同步（取各副本平均后写回）。偏置**不是参数**，
+                    //     不在上面的梯度 allreduce 里，但它参与下一次前向的**硬路由**：
+                    //     各副本只看自己那份数据的负载，偏置必然分叉，于是同一份参数
+                    //     算出不同的前向 ⇒ 各副本的 val_loss 不同 ⇒ 最优/早停判据分叉
+                    //     ⇒ 一部分 rank 退出循环、另一部分还在等它，下一轮集合通信挂死。
+                    //     非 MoE / 未开该开关时所有 rank 都直接返回，不产生任何通信。
+                    if let Some(d) = dist {
+                        allreduce_mean_moe_bias(&d.dp_group(), model);
+                    }
+
                     // 学习率调度：只在 optimizer 实际更新后递增
                     scheduler.step();
                 }
@@ -856,7 +964,7 @@ pub fn train_transformer(
                 // 早停不能在此处直接 break：必须先存 checkpoint、写指标、打印本步评估行。
                 // 否则最后一次评估会从日志里消失，且 latest.ckpt 停留在上一次评估
                 //（断点续训会拿到落后一个 eval 周期的过期权重）。真正 break 在块末尾。
-                if let Some(dir) = out_dir {
+                if let (Some(dir), true) = (out_dir, primary) {
                     checkpoint::save(
                         &format!("{dir}/latest.ckpt"),
                         model,
@@ -919,7 +1027,9 @@ pub fn train_transformer(
     // 实际完成的步数：早停时小于 cfg.steps - start_step，用 cfg.steps 会让「每步耗时」
     // 被系统性低估（分母偏大）。
     let steps_done = last_step_done.saturating_sub(start_step).max(1);
-    if let Some(dir) = out_dir {
+    // 多进程下只有 rank 0 写盘：N 个副本同时写同一个 ckpt 文件会互相覆盖，
+    // 最坏情况落下一份"写了一半"的存档（连头都读不出来）。
+    if let (Some(dir), true) = (out_dir, primary) {
         checkpoint::save(
             &format!("{dir}/final.ckpt"),
             model,
@@ -1022,7 +1132,7 @@ mod tests {
         let model = Transformer::new(model_cfg, &mut rng);
         let loader = DataLoader::new(corpus, &tokenizer, 16, 4);
         let mut train_rng = Rng::new(train_cfg.seed);
-        train_transformer(&model, &tokenizer, &loader, &train_cfg, None, None, &mut train_rng)
+        train_transformer(&model, &tokenizer, &loader, &train_cfg, None, None, &mut train_rng, None)
     }
 
     /// 极小训练的基准训练配置（所有对照实验共用；调用方按需覆盖少数字段）。
@@ -1109,6 +1219,192 @@ mod tests {
         mp.scale = 65536.0;
         mp.unscale_gradients(&[g.clone()]);
         assert_eq!(*g.grad.borrow(), vec![1.0, -0.5]);
+    }
+
+    /// AMP 的"检测"与"应用"被拆成两个可独立调用的动作，多进程下才能插入
+    /// "跨 DP 汇总任一溢出"这一步：先各自 `detect_overflow`（不改状态），
+    /// 汇总后再让所有副本用同一个标志调 `note_overflow`。
+    #[test]
+    fn test_mixed_precision_detect_then_note_overflow() {
+        let mut mp = MixedPrecision::new(16, 3);
+        assert_eq!(mp.scale, 65536.0, "初始 scale 应为 2^16");
+        assert_eq!(mp.growth_interval, 3);
+
+        // 检测不改状态：连查 3 次也不该推进增长计数
+        let clean = Tensor::from_vec(vec![1.0, 2.0], vec![2]);
+        for _ in 0..3 {
+            assert!(!mp.detect_overflow(&[clean.clone()]), "干净梯度不该被判为溢出");
+        }
+        assert_eq!(mp.scale, 65536.0, "detect_overflow 不能改动 scale");
+
+        // 推进 scale 是 note_overflow 的职责
+        assert!(mp.note_overflow(false));
+        assert!(mp.note_overflow(false));
+        assert_eq!(mp.scale, 65536.0, "未到增长间隔（3 次）不该翻倍");
+        assert!(mp.note_overflow(false));
+        assert_eq!(mp.scale, 131072.0, "满 3 次无溢出应翻倍");
+
+        // 本地检测到溢出
+        let broken = Tensor::from_vec(vec![0.0, 0.0], vec![2]);
+        *broken.grad.borrow_mut() = vec![1.0, f32::INFINITY];
+        assert!(mp.detect_overflow(std::slice::from_ref(&broken)), "含 Inf 的梯度应被判为溢出");
+        // 汇总时发现"别的副本溢出了"：本地干净也必须按溢出处理，全体一起跳过本步
+        assert!(!mp.note_overflow(true), "溢出时不该允许更新参数");
+        assert_eq!(mp.scale, 65536.0, "溢出后 scale 应减半");
+
+        // check_and_update 仍等价于 detect + note（单进程便捷入口，行为不许变）
+        let mut solo = MixedPrecision::new(16, 3);
+        assert!(solo.check_and_update(std::slice::from_ref(&clean)));
+        assert_eq!(solo.scale, 65536.0, "一次无溢出还不到增长间隔，不该翻倍");
+        assert!(!solo.check_and_update(std::slice::from_ref(&broken)));
+        assert_eq!(solo.scale, 32768.0, "本次溢出 ⇒ scale 从 2^16 减半到 2^15");
+    }
+
+    /// DP 接线的端到端验证：两个副本各自持有一个 [`DistRuntime`]（相当于两个进程的
+    /// 进程上下文）与**各自的**分词器 / 模型 / 数据加载器，跑同一段训练循环。
+    ///
+    /// 若干步后权重与验证 loss 必须**逐位一致**。这条测试把接线的四个同步点全串起来了，
+    /// 任何一处漏掉都会以两种形式暴露：两侧权重不同（同步点没接），或者干脆挂死
+    /// （控制流按 rank 分了岔，一侧在等集合通信而另一侧已经走了）。
+    ///
+    /// 刻意打开 `amp`：这样"本地检测 → 跨 DP 汇总 → 全体用同一标志推进 scale"
+    /// 这条链路每一步都会被真实执行（`moe_bias_balance` 默认关闭，那条同步点由
+    /// `comm.rs` 的 MoE 专测覆盖）。
+    #[test]
+    fn test_dp_two_replicas_stay_bit_identical() {
+        use crate::comm::Comm;
+        use crate::distributed::DistConfig;
+
+        let corpus = "the quick brown fox jumps over the lazy dog, and then the dog jumps \
+                      back over the quick brown fox again and again and again.";
+        let cfg = DistConfig::new(2, 1, 1);
+        let (n, base, steps) = (cfg.world_size(), 47501u16, 4usize);
+
+        let hs: Vec<_> = (0..n)
+            .map(|r| {
+                std::thread::spawn(move || {
+                    // 每个副本自己建分词器 / 模型 / 加载器：同种子 ⇒ 同初值、同分布。
+                    // 这正是 SPMD 的形态——各进程独立启动，谁也不共享内存。
+                    let tokenizer = Tokenizer::char(corpus);
+                    let mcfg = TransformerConfig {
+                        n_embd: 16,
+                        n_head: 2,
+                        n_layer: 2,
+                        block_size: 16,
+                        ..TransformerConfig::tiny(tokenizer.vocab_size())
+                    };
+                    let mut rng = Rng::new(11);
+                    let model = Transformer::new(mcfg, &mut rng);
+                    // 用 `from_texts`（会从语料末尾切约 10% 作验证集）而不是 `new`：
+                    // 这样每个评估点都真的跑一次验证前向，返回的也是**验证 loss**——
+                    // 而"各副本的验证 loss 逐位相同"正是早停判据不分叉、不会有人
+                    // 提前退出集合通信的前提。（`DataLoader::new` 没有验证集，
+                    // 那种情况下返回的是各副本自己训练批的 loss，按定义就该不同。）
+                    let loader = DataLoader::from_texts(corpus, None, &tokenizer, 16, 4);
+                    assert!(loader.has_val(), "本测试需要一个验证集");
+                    let tcfg = TrainConfig {
+                        seed: 11,
+                        steps,
+                        batch_size: 4,
+                        warmup_steps: 2,
+                        // 正常量级的裁剪阈值：漏掉 AMP 反缩放时它会立刻失效
+                        grad_clip: 1.0,
+                        amp: true,
+                        eval_every: steps, // 只在最后评估一次
+                        eval_iters: 1,
+                        log_file: None,
+                        ..TrainConfig::default()
+                    };
+                    let rt = DistRuntime {
+                        comm: Comm::new(r, n, "127.0.0.1", base),
+                        cfg,
+                        local_rank: r,
+                    };
+                    let mut trng = Rng::new(11);
+                    let loss = train_transformer(
+                        &model,
+                        &tokenizer,
+                        &loader,
+                        &tcfg,
+                        None,
+                        None,
+                        &mut trng,
+                        Some(&rt),
+                    );
+                    let params: Vec<Vec<f32>> =
+                        model.parameters().iter().map(|p| p.data()).collect();
+                    // 第一个训练批次的指纹：DP 分片生效 ⇒ 两副本吃到的批次必须不同
+                    let mut probe_rng = Rng::new(tcfg.seed);
+                    crate::distributed::mix_dp_rank(&mut probe_rng, r);
+                    let (x0, _, _) = loader.sample_batch(&mut probe_rng);
+                    let fp = x0
+                        .iter()
+                        .fold(0u64, |h, &v| h.wrapping_mul(1_000_003).wrapping_add(v as u64));
+                    (loss, params, fp)
+                })
+            })
+            .collect();
+
+        let got: Vec<(f32, Vec<Vec<f32>>, u64)> =
+            hs.into_iter().map(|h| h.join().expect("工作线程 panic")).collect();
+        let (loss0, p0) = (got[0].0, &got[0].1);
+        let (loss1, p1) = (got[1].0, &got[1].1);
+        assert!(loss0.is_finite() && loss0 > 0.0, "DP 跑完的验证 loss 应为正有限值，实际 {loss0}");
+        // 数据分片真的生效了：两侧吃的是**不同**的批次（否则梯度平均等于单卡那批，
+        // 数据并行白跑 N 遍——这是"接了 DP 但没接数据分片"最容易漏的一处）
+        assert_ne!(
+            got[0].2, got[1].2,
+            "两副本的首个训练批次完全相同——DP 数据分片（mix_dp_rank）没生效"
+        );
+        // 权重逐位一致：这是 DP 同步的直接结论，也是本测试真正要钉死的东西
+        assert_eq!(p0.len(), p1.len(), "两副本的参数个数应一致");
+        for (i, (a, b)) in p0.iter().zip(p1).enumerate() {
+            assert_eq!(a.len(), b.len(), "第 {i} 个参数的元素数应一致");
+            let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            assert_eq!(
+                worst, 0.0,
+                "第 {i} 个参数在两副本上不一致（最大绝对差 {worst}，len {}）——DP 同步没生效",
+                a.len()
+            );
+        }
+        // 参数一致 + 评估走固定的 eval_rng（批次也一致）⇒ 验证 loss 必须逐位一致
+        assert_eq!(loss0, loss1, "两副本的验证 loss 不同：参数或评估批次没有对齐");
+    }
+
+    /// 梯度累积的窗口大小：**只有尾窗会变短**，且变短后必须按实际微批数缩放。
+    ///
+    /// 修复前训练循环一律把 `accum` 传给前向，于是 `steps % accum != 0` 时
+    /// 尾窗的梯度被额外除以 `accum / 实际微批数` —— 那一步的学习率被悄悄调小，
+    /// 不报错、日志也看不出来。
+    #[test]
+    fn test_accum_window_shrinks_only_the_tail() {
+        // 满窗
+        assert_eq!(accum_window(0, 4, 10), 4);
+        assert_eq!(accum_window(3, 4, 10), 4);
+        // 尾窗：steps=10、accum=4 → 窗口 [8,10) 只有 2 个微批
+        assert_eq!(accum_window(8, 4, 10), 2);
+        assert_eq!(accum_window(9, 4, 10), 2);
+        // 整除时没有尾窗
+        assert_eq!(accum_window(7, 4, 8), 4);
+        // accum = 1 恒为 1；steps 被踩到 0 也不能除零
+        assert_eq!(accum_window(0, 1, 5), 1);
+        assert_eq!(accum_window(0, 4, 0), 1);
+
+        // 与训练循环的更新条件自洽：更新发生在 `(step+1) % accum == 0 || step+1 == steps`，
+        // 而每个更新点所在窗口的"实际微批数"之和必须恰好等于总步数
+        for (steps, accum) in [(10usize, 4usize), (8, 4), (7, 3), (1, 5), (5, 5), (12, 5)] {
+            let mut at_update = Vec::new();
+            for step in 0..steps {
+                if (step + 1) % accum == 0 || step + 1 == steps {
+                    at_update.push(accum_window(step, accum, steps));
+                }
+            }
+            assert_eq!(
+                at_update.iter().sum::<usize>(),
+                steps,
+                "steps={steps} accum={accum}：各窗口微批数之和应等于总步数，实际 {at_update:?}"
+            );
+        }
     }
 
     /// VQ-VAE 预训练冒烟：几步训练后 loss 有限且参数确实被更新（走通 AdamW + 裁剪 + cosine 骨架）。

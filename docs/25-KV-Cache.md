@@ -51,53 +51,66 @@
 
 ```rust
 pub struct KVCache {
-    k: Shared<Vec<f32>>, // 行优先 [1, T, D] 展平
-    v: Shared<Vec<f32>>,
+    k: KvBlock,    // f32（Shared<Buffer>，行优先 [1, T, D] 展平）或量化块（int8/int4）
+    v: KvBlock,
     len: usize,    // 当前**保留**的位置数 T（滑动窗口下不会超过 window）
     seen: usize,   // 累计喂进来的位置总数，只增不减（RoPE 绝对位置基准）
     window: usize, // 保留上限；0 = 不丢弃
-    d: usize,      // 隐藏维 D，第一次 append 时确定
+    sink: usize,   // 永久保留的最前面若干位置（Attention Sink / StreamingLLM）
+    d: usize,      // 隐藏维 D（MLA 模式下是 kv_lora_rank），第一次 append 时确定
+    latent: bool,  // MLA 模式：只有 lat 一条流，`v` 保持为空
+}
+
+// 存储块二选一（对外只暴露"读成 f32 / 追加行 / 丢最前行"）
+enum KvBlock {
+    F32(Shared<Buffer>),   // 未量化：Buffer::F32
+    Quant(QMatrix),        // 量化：K 逐通道定标、V 逐 token 定标（第 33 课）
 }
 ```
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
-| `k` / `v` | `Shared<Vec<f32>>` | 该层**保留**的 Key / Value，行优先展平成 `[1, T, D]` |
+| `k` / `v` | `KvBlock` | 该层**保留**的 Key / Value，行优先展平成 `[1, T, D]`；未量化时底层是 `Shared<Buffer>`，开了 `--kv-bits` 则是整数码 + scale |
 | `len` | `usize` | 当前保留的位置数 T（不再靠 `shape()[1]` 反推） |
 | `seen` | `usize` | 累计喂进来的位置数，**只增不减**；新 token 的 RoPE 绝对位置基准（第 8 节） |
-| `window` | `usize` | 保留上限，超出就丢最旧的行；`0` = 不丢弃 |
+| `window` | `usize` | 保留上限，超出就丢中间那些旧行（最前面的 `sink` 行除外）；`0` = 不丢弃 |
+| `sink` | `usize` | 丢弃时跳过最前面的 `sink` 行（`--kv-sink`），必须 `< window` |
 | `d` | `usize` | 隐藏维 D，第一次 `append` 时从 `k.shape()[2]` 确定 |
+| `latent` | `bool` | MLA 模式（`kv_lora_rank > 0`）下缓存只存一份 latent，见第 23 / 50 课 |
 
 > 为什么不用 `Option<Tensor>` 直接存张量？因为推理时"追加一个新位置"如果走「取旧数据 → 拼新数据 → 重新包成张量」，
-> 每步都要把整段历史复制一遍，T 步累计 O(T²) 拷贝。把 `Vec<f32>` 放进 `Shared`（`Arc<Mutex>`）里就地 `extend`，
+> 每步都要把整段历史复制一遍，T 步累计 O(T²) 拷贝。把缓冲放进 `Shared`（`Arc<Mutex>`）里就地 `extend`，
 > 历史数据一次都不用动。`Shared` 是为了让 `Transformer::forward` 这类只读者也能共享同一块缓存。
 
-注意：**每个注意力层各有一个 `KVCache`**。`Transformer::new_kv_cache` 返回 `Vec<KVCache>`，长度 = `n_layer`，并且每个都带上 `block_size` 大小的滑动窗口：
+注意：**每个注意力层各有一个 `KVCache`**。`Transformer::new_kv_cache` 返回 `Vec<KVCache>`，长度 = `n_layer`，每个都带上 `block_size` 大小的滑动窗口；需要 Attention Sink 或缓存量化时用 `new_kv_cache_with(sink, bits)`：
 
 ```rust
 pub fn new_kv_cache(&self) -> Vec<KVCache> {
-    let window = self.cfg.block_size;
-    (0..self.cfg.n_layer).map(|_| KVCache::with_window(window)).collect()
+    self.new_kv_cache_with(0, None)      // 无 sink、不量化
 }
+// new_kv_cache_with：window = cfg.block_size，MLA 配置自动改用 KVCache::new_latent
 ```
 
-### 3.1 append：把新 K/V 追加到缓存尾部，并丢弃超窗的最旧行
+### 3.1 append：把新 K/V 追加到缓存尾部，并丢弃超窗的中间旧行
 
 ```rust
 pub fn append(&mut self, k: &Tensor, v: &Tensor) {
     assert_eq!(k.shape(), v.shape(), "K/V 形状必须一致");
     assert_eq!(k.rank(), 3, "K/V 必须为 3D [1, T, D]，实际 {:?}", k.shape());
     let t = k.shape()[1];
-    self.d = k.shape()[2];
-    self.k.borrow_mut().extend(k.data());
-    self.v.borrow_mut().extend(v.data());
+    let d = k.shape()[2];
+    self.d = d;                       // 首次确定，之后不允许中途改变
+    self.k.push(&k.data_ref(), t, d); // 只追加新块（量化时顺带编码）
+    self.v.push(&v.data_ref(), t, d);
     self.len += t;
     self.seen += t;
-    // 滑动窗口：丢掉最旧的行，让 len 回到 window（drain 从头删，尾部整体左移）
+    // 滑动窗口：丢掉中间那些旧行，让 len 回到 window。
+    // 丢的行是 [sink, len - (window - sink))：最前面的 sink 个（Attention Sink）
+    // 与最近的 window - sink 个都保留。
     if self.window > 0 && self.len > self.window {
-        let drop_elems = (self.len - self.window) * self.d;
-        self.k.borrow_mut().drain(..drop_elems);
-        self.v.borrow_mut().drain(..drop_elems);
+        let drop = self.len - self.window;
+        self.k.drop_front_from(self.sink, drop, self.d);
+        self.v.drop_front_from(self.sink, drop, self.d);
         self.len = self.window;
     }
 }
@@ -105,14 +118,14 @@ pub fn append(&mut self, k: &Tensor, v: &Tensor) {
 
 做的事：
 
-1. 校验 K/V 形状一致且是 3D；
-2. 把新 K/V 的数据 `extend` 到各自的 `Vec<f32>` 末尾——**历史数据原地不动**；
+1. 校验 K/V 形状一致且是 3D、batch = 1（MLA 模式下则改用 `append_latent`，见第 23 / 50 课）；
+2. 把新 K/V 追加到各自的存储块末尾——**历史数据原地不动**（未量化时就是 `Vec<f32>` 上的 `extend`）；
 3. `len` 与 `seen` 各加上本次新增的位置数；
-4. 超过窗口时 `drain` 掉最旧的 `(len - window) * d` 个元素（一次 memmove，不是 O(T²) 的拷贝链）。
+4. 超过窗口时丢掉中间那 `(len - window)` 行（保留最前面的 `sink` 行与最近的若干行），是一次 memmove，不是 O(T²) 的拷贝链。
 
 > 反面教材（本项目**曾经**的写法）：把缓存存成 `Option<Tensor>`，每次 append 时
 > 「取旧数据 → `all.extend(cur.data())` → 重新包成张量」——每步都把整段历史复制一遍，
-> T 步累计 O(T²) 拷贝。改成在 `Vec<f32>` 上就地 `extend` 后，历史数据一次都不用动。
+> T 步累计 O(T²) 拷贝。改成在缓冲上就地 `extend` 后，历史数据一次都不用动。
 
 > 细节：`cur` 在推理模式下形状是 `[1, 1, D]`（只算 1 个新位置），所以 `len` / `seen` 每次 +1，
 > `d` 从 `k.shape()[2]` 取。纯数据追加，推理时无梯度，所以没有走任何 autograd 路径。
@@ -138,9 +151,10 @@ pub fn k(&self) -> Tensor {
 
 - `seq_len()` 返回**保留**的位置数。它是注意力里 K/V 的序列长度，也是 `generate` 判断"首次前向"的依据。
 - `positions_seen()` 返回**累计喂进来**的位置数，只增不减。它是 RoPE 的绝对位置基准（第 8 节），在滑动窗口生效后 `positions_seen > seq_len`。
-- `k()` / `v()` 把展平缓存重新包成 `[1, T, D]` 张量供注意力打分使用。
-  这里**仍会克隆一次整段缓存**——因为打分算子是按「拥有所有权的 `Tensor`」写的；
-  想再省掉这一步，需要让算子支持借用视图，属于后续优化（见 README 的"还能压的地方"）。
+- `k()` / `v()` 把缓存包装成 `[1, T, D]` 张量供注意力打分使用。**未量化时是零拷贝**：
+  直接共享 `Shared<Buffer>` 句柄（`Tensor::shared`），历史数据不再每步克隆一次；
+  量化缓存要读回 f32，所以这一步会反量化出一份 `Vec<f32>`（"量化布局直接打分"需要改编
+  flash 内核 / 反向重算 / GPU 常驻三处，属于后续优化）。
 
 ---
 
@@ -163,10 +177,10 @@ for _ in 0..b {
 }
 let (q, k) = q
     .reshape(vec![b * t, d])
-    .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions);
+    .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions, head_dim, &self.rope);
 let (q, k) = (q.reshape(vec![b, t, d]), k.reshape(vec![b, t, kv_dim]));
 
-// 3. KV cache：把本次新算的 K/V 追加到缓存（超窗自动丢最旧行），再取回保留的全部历史
+// 3. KV cache：把本次新算的 K/V 追加到缓存（超窗自动丢中间那些旧行），再取回保留的全部历史
 let (k, v) = match kv_cache {
     Some(cache) => {
         cache.append(&k, &v);
@@ -190,9 +204,8 @@ let t_total = k.shape()[1];
 
 后续的拆头、注意力分数、softmax 等代码**一行都不用改**，因为它们是按 `t_total` 写的通用代码：
 
-- 拆头时 k/v 用 `t_total` 做 reshape（`vec![b, t_total, self.n_kv_head, head_dim]`，再按 `n_rep` 复制成 `n_head` 个头），q 仍用 `t`；
-- 分数 `scores = q.matmul(&kt).mul_scalar(scale)` 形状 `[B*H, t, t_total]`；
-- 因果掩码 mask 是 `[t, t_total]`，广播相加后 `softmax_last_dim()`，最后 `attn.matmul(&v)`。
+- 拆头时 k/v 用 `t_total` 做 reshape（`vec![b, t_total, self.n_kv_head, head_dim]`；GQA 下 **不再物化 `repeat_kv`**——`flash_attention` 的 CPU 分块核按 Q 头 `hh / n_rep` 核内索引共享的 KV 头），q 仍用 `t`；
+- 打分、加掩码、softmax、加权求和整体由 `Tensor::flash_attention(&q, &k, &v, mask, 32)` 一个融合算子完成，形状 `[B*H, t, head_dim]`。
 
 这就是 KV Cache 优雅的地方：**模型代码零侵入，只把"输入 K/V 的来源"从"当场算"换成"缓存里取"**。
 
@@ -200,7 +213,7 @@ let t_total = k.shape()[1];
 
 ## 5. 位置与掩码：`seen` 作为 RoPE 基准
 
-推理模式下，新 token 的位置不再是"窗口内的第 j 个"，而是"全局的第 seen + j 个"。`forward_core` 里这样算（`src/model.rs:630-661`）：
+推理模式下，新 token 的位置不再是"窗口内的第 j 个"，而是"全局的第 seen + j 个"。`forward_core` 里这样算（`src/model.rs`）：
 
 ```rust
 // RoPE 的基准是**绝对位置**：新 token 的绝对位置 = 累计已喂入的位置数 + 窗口内下标 j
@@ -211,25 +224,25 @@ let (seen, window) = kv_cache
     .unwrap_or((0, 0));
 let base = seen;
 
-// 因果掩码：scores 形状 [B*H, T, T_total]，广播 mask [T, T_total]
-// 缓存本次之后保留 min(seen + t, window) 个位置（window = 0 表示不丢弃）
+// 因果掩码（**条件物化**）：CPU 分块核在核内屏蔽（query i 只算
+// j <= visible_before + i），逐算子路径同样不必物化 —— 只有 GPU 常驻 /
+// 整叠 / probe 路径要真实 [t, t_total] buffer，且只在「GPU 可用 + 无 KV cache +
+// base == 0」时才在这里物化一次供全栈共享；其余情况传 None，由算子自己兜底。
 assert!(window == 0 || t <= window, "单次前向的 token 数（{t}）不能超过 KV cache 窗口（{window}）");
 let t_total = if window == 0 { seen + t } else { (seen + t).min(window) };
 // 缓存里位于"本次新增的第一个 token"左侧（含自身）的位置数
 let visible_before = t_total - t;
-let mut mask_data = vec![0.0f32; t * t_total];
-for i in 0..t {
-    for j in 0..t_total {
-        if j > i + visible_before {
-            mask_data[i * t_total + j] = f32::NEG_INFINITY;
-        }
-    }
-}
+// 只有「gpu feature + GPU 可用 + 无 KV cache + base == 0」时才真的物化这张掩码，
+// 其余情况传 None：CPU 分块核靠 visible_before 在核内屏蔽，GPU 路径需要时自己兜底
+let mask: Option<Tensor> = 需要真实掩码
+    .then(|| Tensor::from_vec(crate::tensor::causal_mask_data(t, t_total), vec![t, t_total]));
 ```
+
+`causal_mask_data(t, t_total)` 填的就是 `j > i + visible_before` 的位置为 `-inf`：
 
 它有两个用途。
 
-**用途 ①：传给注意力内部的 RoPE**（`src/attention.rs:170-173`）。位置序列在这里生成，`rotary_pair` 据此旋转 Q/K：
+**用途 ①：传给注意力内部的 RoPE**（`src/attention.rs`）。位置序列在这里生成，`rotary_pair` 据此旋转 Q/K：
 
 ```rust
 let mut positions = Vec::with_capacity(b * t);
@@ -238,7 +251,7 @@ for _ in 0..b {
 }
 ```
 
-**用途 ②：构造因果掩码**（上面的代码）。注意掩码宽度是"本次前向之后缓存里会有多少行"，而不是 `seen + t` 这个朴素值——滑动窗口打开时，超过 `window` 的部分会立刻被丢掉，掩码必须与之对齐，否则会对着不存在的列求和。
+**用途 ②：构造因果掩码**（上面的代码，**只在需要真实掩码 buffer 时才物化**）。注意掩码宽度是"本次前向之后缓存里会有多少行"，而不是 `seen + t` 这个朴素值——滑动窗口打开时，超过 `window` 的部分会立刻被丢掉，掩码必须与之对齐，否则会对着不存在的列求和。CPU 分块核不物化掩码，但它用的 `visible_before`（= `t_total - t`）与这张掩码逐位等价。
 
 | 量 | 全量模式（无缓存） | 缓存模式（不超窗） | 缓存模式（本轮触发滑动） |
 |----|-------------------|-------------------|------------------------|
@@ -308,7 +321,7 @@ for _ in 0..max_new {
 |---|---|---|
 | 首次前向 | `forward(ctx, 1, ctx.len(), None, false)` | `forward(ctx, 1, ctx.len(), Some(c), false)`：同样前向整个 prompt，但**把每层 K/V 顺手存进缓存** |
 | 之后每步 | `forward(ctx, 1, ctx.len(), None, false)`：整个上下文（截断到最近 32 个）重算 | `forward(&ids[ids.len()-1..], 1, 1, Some(c), false)`：**只喂最后一个 token**，K/V 从缓存取 |
-| 上下文处理 | 每步 `ids.len().saturating_sub(block_size)` 截断，窗口滑到最近 32 个 | 缓存在 `append` 里自己丢最旧行（第 8 节），每步 +1 行 |
+| 上下文处理 | 每步 `ids.len().saturating_sub(block_size)` 截断，窗口滑到最近 32 个 | 缓存在 `append` 里自己丢中间旧行（第 8 节），每步 +1 行 |
 | 停止条件 | 生成满 `max_new` 个 | 生成满 `max_new` 个（缓存容量不再是上限） |
 | 每次前向的位置数 | 32（封顶后固定） | 首次 prompt 长度，之后恒为 1 |
 | 生成 80 个新 token 的累计前向位置数 | 441 + 32×59 = 2329（前 21 步按 11..31 递增） | 11 + 79 = 90 |
@@ -375,7 +388,7 @@ println!(
 
 | 位置 | 行为 |
 |------|------|
-| `append` | `len` 超过 `window` 时 `drain` 掉最旧的 `(len - window)` 行 |
+| `append` | `len` 超过 `window` 时丢掉中间那 `(len - window)` 行；`sink > 0` 时最前面的 `sink` 行永久保留 |
 | `seq_len()` | 封顶在 `window`（注意力里 K/V 的序列长度就是它） |
 | `positions_seen()` | **继续累加**，不受窗口影响（RoPE 的绝对位置基准） |
 | `forward_core` | 掩码宽度取 `min(seen + t, window)`，与丢弃后的实际行数对齐 |
@@ -432,7 +445,7 @@ println!(
 
 - 逐 token 生成时，历史位置的 K/V 每步都在被重复计算——全量模式累计 O(T²)，这是 KV Cache 要消灭的浪费
 - `KVCache` = 每层一份的 `Vec<f32>` 缓存（行优先展平的 `[1, T, D]`，外加 `len` / `seen` / `window` / `d`），
-  `append` 就地 extend（不复制历史）+ 超窗 `drain` 丢最旧行，`seq_len` 读保留行数、`positions_seen` 读累计位置数
+  `append` 就地 extend（不复制历史）+ 超窗丢掉中间那些旧行（`sink` 行保留），`seq_len` 读保留行数、`positions_seen` 读累计位置数
 - `MultiHeadAttention` 用缓存后只有 K/V 变长，Q 只算新位置，后续代码零改动；`Transformer::forward_core` 用 `seen` 修正位置编码、并用 `min(seen + t, window)` 定掩码宽度
 - 流程对比：首次前向整个 prompt 填缓存 → 之后每步只前向 1 个 token；全量模式则是每步重算整个窗口
 - 分布不变的原因：缓存里的 K/V 与全量模式算出的数值相同，注意力、softmax 计算路径一致；demo 用**同 prompt + 同种子**自验证，单元测试守住"窗口内逐 token 相同"

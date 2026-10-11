@@ -30,6 +30,33 @@ pub const LOG_DIR: &str = "logs";
 /// 全局运行日志句柄：一个进程只执行一个子命令，单例足够
 static RUN_LOG: OnceLock<Mutex<Option<RunLog>>> = OnceLock::new();
 
+/// 本进程的全局 rank（`RANK` 环境变量，缺省 0）。
+///
+/// 只在**多进程**启动时才由启动器写入（命令见 `docs/38-分布式训练.md` 的「启动多进程训练」一节）。
+/// 单进程跑时这个变量不存在，取值恒为 0，于是下面所有门控都退化成"什么都不拦"——
+/// 普通训练路径逐位不变。
+static RANK: OnceLock<usize> = OnceLock::new();
+
+/// 本进程的全局 rank（`RANK`，缺省 0）。首次读取后缓存。
+pub fn rank() -> usize {
+    *RANK.get_or_init(|| {
+        std::env::var("RANK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// 本进程是否应当**静音**（`RANK != 0`）。
+///
+/// 多进程训练里 N 个 rank 会各跑一遍同一个训练循环，日志/进度/评估行全部打出来
+/// 就是 N 份互相交错的重复内容，控制台里根本读不出哪一行属于谁。这里按 torch
+/// 启动器的惯例只让 rank 0 说话。注意它管的只是**输出**：所有 rank 的控制流
+/// （含评估、早停判据）必须完全一致，否则集合通信会挂死。
+pub fn rank_muted() -> bool {
+    rank() != 0
+}
+
 /// 命令开始执行的时刻（`main` 入口由 [`mark_start`] 记录）
 ///
 /// 头部的「开始时间」、文件名里的时间戳、尾部的「总耗时」都以它为基准，
@@ -69,9 +96,18 @@ fn with_log(f: impl FnOnce(&mut RunLog)) {
 /// 文件名时间戳与头部「开始时间」都取命令开始执行的时刻（见 [`mark_start`]）。
 /// 每次调用都会新建文件并**替换**全局日志句柄，所以重复调用以最后一次为准
 /// （正常流程里每个子命令只调一次）。
+///
+/// **多进程下只有 rank 0 真的落盘**（见 [`rank_muted`]）：文件名的时间戳只精确到
+/// 毫秒，N 个 rank 几乎必然落在同一个毫秒里，于是 `File::create` 互相截断，
+/// 连 rank 0 的日志都会被写坏。被静音的 rank 保持"未启用日志"的状态，
+/// 后续 [`append`] / [`section`] / [`fields`] / [`json`] / [`finish`] 全部是空操作。
+/// 需要"顺便把路径打出来"的调用方请用 [`announce`]。
 pub fn start(op: &str) -> String {
     let (started, begin) = start_point();
     let path = format!("{LOG_DIR}/{op}_{}.log", fmt_timestamp(begin));
+    if rank_muted() {
+        return path;
+    }
     crate::config::ensure_parent_dir(&path);
     let file = std::fs::File::create(&path)
         .unwrap_or_else(|e| panic!("无法创建运行日志 {path}: {e}"));
@@ -81,6 +117,18 @@ pub fn start(op: &str) -> String {
         *guard = Some(log);
     }
     write_header(op, begin);
+    path
+}
+
+/// 开日志并把「运行日志：<路径>」打到控制台，返回日志路径。
+///
+/// 这是各子命令的统一入口：多进程下被静音的 rank 既不会建文件，也不会打印一个
+/// 指向不存在文件的路径。单进程行为与 [`start`] + `println!` 完全相同。
+pub fn announce(op: &str) -> String {
+    let path = start(op);
+    if !rank_muted() {
+        println!("运行日志：{path}");
+    }
     path
 }
 
@@ -302,15 +350,23 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// 同时输出到控制台与运行日志（日志未启用时等价于 `println!`）
+///
+/// **多进程下被静音的 rank 连 `format!` 都不做**（见 [`rank_muted`]）：N 个副本
+/// 打同一份进度只会把控制台刷成乱码，而且单条进度里的字符串拼接在长跑里也不是
+/// 零成本。判断放在 `format!` 之前，是为了让"静音"真的什么都不做。
 #[macro_export]
 macro_rules! logln {
     () => {{
-        println!();
-        $crate::runlog::append("");
+        if !$crate::runlog::rank_muted() {
+            println!();
+            $crate::runlog::append("");
+        }
     }};
     ($($arg:tt)*) => {{
-        let line = format!($($arg)*);
-        println!("{line}");
-        $crate::runlog::append(&line);
+        if !$crate::runlog::rank_muted() {
+            let line = format!($($arg)*);
+            println!("{line}");
+            $crate::runlog::append(&line);
+        }
     }};
 }

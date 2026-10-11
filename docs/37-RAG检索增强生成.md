@@ -1,6 +1,6 @@
 # 第 37 课：RAG 检索增强生成（Retrieval-Augmented Generation）
 
-> **本课已落地为可运行代码**：`src/rag.rs`（9 个单测）+ `rag` 子命令——分块（字符域切分 + 句读对齐 +
+> **本课已落地为可运行代码**：`src/rag.rs`（单测跑 `cargo test rag`，数量以实际输出为准）+ `rag` 子命令——分块（字符域切分 + 句读对齐 +
 > 可配重叠）、三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）、余弦检索与 MMR 多样化重排、提示组装。
 > 与已有代码的衔接：生成阶段复用 `src/sample.rs` 的 `generate`；稠密向量由 `Transformer::forward_hidden`
 > 做均值池化得到，余弦相似度在 L2 归一化后用点积计算。
@@ -212,8 +212,8 @@ LLM 判断: "这个问题我不确定" → 触发检索
 
 ## 本项目的实际实现
 
-上面的原理已全部落地为可运行代码。核心文件是 [`src/rag.rs`](../src/rag.rs)（9 个单测），
-CLI 入口是 [`rag`](../README.md#13-quant--distributed--align--rag--speculative--distill--fp8--第-33384243-课实验) 子命令。
+上面的原理已全部落地为可运行代码。核心文件是 [`src/rag.rs`](../src/rag.rs)（单测跑 `cargo test rag`，数量以实际输出为准），
+CLI 入口是 [`rag`](../README.md) 子命令。
 
 ### 代码结构
 

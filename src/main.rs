@@ -29,6 +29,7 @@ mod autograd;
 mod checkpoint;
 mod cli;
 mod cmd;
+mod comm;
 mod config;
 mod csa;
 mod data;
@@ -38,6 +39,7 @@ mod fp8;
 mod fp4;
 #[cfg(feature = "gpu")]
 mod gpu;
+mod hf;
 mod layers;
 mod loss;
 mod mhc;
@@ -63,7 +65,7 @@ mod vqvae;
 use cli::{Cli, Cmd};
 use sample::{KvOpts, SampleOpts};
 
-use cmd::core::{cmd_bench, cmd_eval, cmd_finetune, cmd_generate, cmd_preset, cmd_quant, cmd_sft, cmd_train};
+use cmd::core::{cmd_bench, cmd_eval, cmd_finetune, cmd_generate, cmd_import_hf, cmd_preset, cmd_quant, cmd_sft, cmd_train};
 use cmd::deploy::{cmd_chat, cmd_serve};
 use cmd::experiments::{cmd_align, cmd_csa, cmd_distill, cmd_distributed, cmd_fp4, cmd_fp8, cmd_mla, cmd_moe, cmd_rag, cmd_scaling, cmd_speculative, run_demo};
 use cmd::{init_console_utf8, kv_bits_from_name, stop_label};
@@ -264,6 +266,12 @@ fn main() {
             out_dir.as_deref(),
         ),
         Cmd::Preset { name, output } => cmd_preset(&name, &output),
+        Cmd::ImportHf { model_dir, output, tokenizer, tokenizer_out } => cmd_import_hf(
+            &model_dir,
+            &output,
+            tokenizer.as_deref(),
+            tokenizer_out.as_deref(),
+        ),
         Cmd::Demo => run_demo(),
         Cmd::Bench { steps, gen_tokens } => cmd_bench(steps, gen_tokens),
         Cmd::Scaling {

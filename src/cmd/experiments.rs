@@ -144,8 +144,7 @@ pub(crate) fn cmd_scaling(
     mfu: f64,
     out: Option<&str>,
 ) {
-    let log_path = runlog::start("scaling");
-    println!("运行日志：{log_path}");
+    runlog::announce("scaling");
     let cfg = Config::load(config_path);
     let sizes = parse_sizes(sizes_spec);
     let multiples = parse_multiples(multiples_spec);
@@ -725,8 +724,7 @@ pub(crate) fn cmd_moe(
     bias_lr: f32,
     seed: u64,
 ) {
-    let log_path = runlog::start("moe");
-    println!("运行日志：{log_path}");
+    runlog::announce("moe");
 
     let experts_list = parse_multiples(experts_spec);
     let factors = parse_factors(factors_spec);
@@ -998,7 +996,7 @@ pub(crate) fn cmd_moe(
         );
         let mut rng = Rng::new(seed);
         logln!("  —— {tag} ——");
-        let loss = train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+        let loss = train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None);
         let mut probe_rng = Rng::new(seed + 1);
         let st = moe_probe(&model, &loader, 16, &mut probe_rng);
         logln!("  训练收尾 loss = {loss:.4}");
@@ -1082,8 +1080,7 @@ pub(crate) fn cmd_moe(
 /// 拼回时块序没转回来，这些错都不会崩、不会 NaN，只是让模型悄悄收敛到别的地方。
 /// 单进程模拟能让这些边界被逐位对拍钉死，真机调试则要拿 N 张卡去猜。
 pub(crate) fn cmd_distributed(args: &DistArgs) {
-    let log_path = runlog::start("distributed");
-    println!("运行日志：{log_path}");
+    runlog::announce("distributed");
 
     let (dp, tp, pp) = (args.dp, args.tp, args.pp);
     let (micros, steps) = (args.micro_batches, args.steps);
@@ -1690,8 +1687,7 @@ fn loss_curve(losses: &[f32], points: usize) -> String {
 ///
 /// 四件套共用同一套小 Transformer 结构，只在初始化种子上分开：结构一样，差异才能全归给算法。
 pub(crate) fn cmd_align(a: &AlignArgs) {
-    let log_path = runlog::start("align");
-    println!("运行日志：{log_path}");
+    runlog::announce("align");
 
     assert!(
         a.n_embd % 4 == 0,
@@ -2144,8 +2140,7 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
 /// 三条不变量逐条钉住；第二、三节用字符级向量（TF-IDF / 特征哈希）跑检索与 MMR 重排，
 /// 第四节看提示裁剪是否守住预算，第五节接上模型稠密向量做对照（含"为什么它必须先训练"）。
 pub(crate) fn cmd_rag(a: &RagArgs) {
-    let log_path = runlog::start("rag");
-    println!("运行日志：{log_path}");
+    runlog::announce("rag");
 
     assert!(
         a.chunk_size > a.overlap,
@@ -2629,8 +2624,7 @@ impl speculative::Drafter for FixedDrafter {
 /// 推测解码（第 34 课）与多 Token 预测（第 35 课）的可运行实验：
 /// 无损性核对 → 接受率与加速比 → 缓存账目 → 首 token 分布等价 → MTP 头当草稿。
 pub(crate) fn cmd_speculative(s: &SpecArgs) {
-    let log_path = runlog::start("speculative");
-    println!("运行日志：{log_path}");
+    runlog::announce("speculative");
 
     assert!(
         s.n_embd % 4 == 0,
@@ -3190,8 +3184,7 @@ fn corpus_windows(
 ///     这类错误不会让 loss 报表变难看，只会让训练悄悄变差，数值核对是唯一可靠的防线
 /// 三、**对照实验**：同一个学生、同一批数据、同一步数，唯一差别是有没有 KD 项
 pub(crate) fn cmd_distill(d: &DistillArgs) {
-    let log_path = runlog::start("distill");
-    println!("运行日志：{log_path}");
+    runlog::announce("distill");
 
     // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
     assert!(d.teacher_steps >= 1, "教师至少要训 1 步（实际 {}）", d.teacher_steps);
@@ -3522,8 +3515,7 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
 /// 全程只是**数值模拟**：本仓库的算子跑在 CPU 的 f32 上，编解码只会更慢，
 /// 真实的 FP8 加速需要 GPU 的 FP8 tensor core（见 [`crate::fp8`] 的模块说明）。
 pub(crate) fn cmd_fp8(d: &Fp8Args) {
-    let log_path = runlog::start("fp8");
-    println!("运行日志：{log_path}");
+    runlog::announce("fp8");
 
     // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
     assert!(d.rows >= 1 && d.cols >= 1, "演示矩阵尺寸至少为 1");
@@ -3879,8 +3871,7 @@ pub(crate) fn cmd_fp8(d: &Fp8Args) {
 /// 二、**分块缩放与位宽账本**：块大小 → 精度/字节的权衡，并与 FP8 并排对照
 /// 三、**位宽 vs 验证 loss**：同一个训练好的小模型，权重分别落 FP8 / FP4 后的验证 CE
 pub(crate) fn cmd_fp4(d: &Fp4Args) {
-    let log_path = runlog::start("fp4");
-    println!("运行日志：{log_path}");
+    runlog::announce("fp4");
 
     // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
     assert!(d.rows >= 1 && d.cols >= 1, "演示矩阵尺寸至少为 1");
@@ -4208,8 +4199,7 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
 /// 二、**KV 字节账本**：压缩缓存（最近 m 个原始位置 + 压缩块）相对全量缓存的压缩率
 /// 三、**top-k 稀疏算力账本**：每个 query 实际参与打分的槽位数，对照全量 `T`
 pub(crate) fn cmd_csa(d: &CsaArgs) {
-    let log_path = runlog::start("csa");
-    println!("运行日志：{log_path}");
+    runlog::announce("csa");
 
     assert!(d.t >= 8, "上下文长度至少 8（实际 {}）", d.t);
     assert!(d.n_kv_head >= 1 && d.d >= 1, "KV 头数与 head_dim 至少为 1");
@@ -4373,8 +4363,7 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
 /// 二、**权重吸收的解码算力账本**：吸收把"物化 K/V 再点积"换成"直接在 latent 空间点积"
 /// 三、**解耦约束自检**：把"配置写错会 panic"的那几条约束列清楚，并给出开关用法
 pub(crate) fn cmd_mla(d: &MlaArgs) {
-    let log_path = runlog::start("mla");
-    println!("运行日志：{log_path}");
+    runlog::announce("mla");
 
     assert!(d.n_head >= 1 && d.hd_nope >= 1, "头数与 hd_nope 至少为 1");
     assert!(d.hd_rope >= 2 && d.hd_rope % 2 == 0, "解耦 RoPE 维必须是不小于 2 的偶数（实际 {}）", d.hd_rope);
@@ -4595,7 +4584,7 @@ fn demo_transformer() {
         log_file: None, // 演示不落盘
         ..config::TrainConfig::default()
     };
-    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng);
+    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None);
 
     // 生成 1（无 cache）：全量前向用滑动窗口，可以生成超过 block_size 的长文本
     // 三次生成共用同一套采样参数（含重复惩罚），否则差异分不清是 cache 还是采样造成的

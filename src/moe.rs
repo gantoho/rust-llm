@@ -473,6 +473,14 @@ impl MoELayer {
         };
 
         // 3. 逐专家稀疏前向
+        //
+        //    容量丢弃的语义要说清：`plan.sel[e]` 满员后，超出的 token **不再进入该专家**
+        //    （计入 `plan.dropped` 做诊断），而上面算出的门控权重 `w` **不因此重归一化**——
+        //    这正是 Switch Transformer 原版的 token dropping 语义：丢掉的贡献直接算 0，
+        //    该 token 的输出被等比缩小。另一种口径是"丢掉后把剩余权重重新归一化"（Σw 仍为 1），
+        //    两种都能训练、主流实现各有一半在用。本仓库取前者：它与 `switch_gate` 天然的
+        //    Σw < 1 口径自洽，也让"被丢弃"在输出幅度上可见。
+        //    容量上限 = `model.moe_capacity_factor`（`<= 0` 表示不限容量、退化为无丢弃）。
         let mut out: Option<Tensor> = None;
         for (e, sel) in plan.sel.iter().enumerate() {
             if sel.is_empty() {
@@ -580,6 +588,30 @@ impl MoELayer {
     #[allow(dead_code)]
     pub fn balance_bias(&self) -> Vec<f32> {
         self.bias.borrow().clone()
+    }
+
+    /// aux-loss-free 均衡偏置是否启用。
+    ///
+    /// 跨 DP 同步偏置前要用它判断"本层是否参与"：这是**配置决定**的，
+    /// 所有 rank 取值一致，因此"要不要通信"在各副本上一致（集合通信不会少人）。
+    pub fn bias_balance_enabled(&self) -> bool {
+        self.bias_balance
+    }
+
+    /// **覆盖式**写回均衡偏置（跨 DP 取平均后调用）。
+    ///
+    /// 与 [`Self::update_balance_bias`] 的"按负载加减"不同：这里的值已经是
+    /// 全 DP 组的平均，直接覆盖才是正确的——累加会让多次同步把偏置越推越远。
+    /// 偏置只进选路（见 `forward_with_aux`），所以写回它不需要动任何计算图。
+    pub fn set_balance_bias(&self, b: &[f32]) {
+        assert_eq!(
+            b.len(),
+            self.n_expert,
+            "均衡偏置长度应为专家数 {}，实际 {}",
+            self.n_expert,
+            b.len()
+        );
+        *self.bias.borrow_mut() = b.to_vec();
     }
 
     /// **aux-loss-free 均衡偏置**的一步更新（DeepSeek-V3 式），返回是否真的更新过。

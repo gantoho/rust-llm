@@ -124,7 +124,7 @@ pub fn save(path: &str, model: &Transformer, opt: &dyn OptimizerState, step: usi
     let named = model.named_parameters();
     let (opt_t, opt_m, opt_v) = opt.state();
     let header = make_header(model, &named, step, best_val_loss, opt_t, false);
-    let mut f = create_with_head(path, model, &header);
+    let (mut f, tmp) = create_with_head(path, model, &header);
     // 三段数据块，顺序固定：参数 → 一阶动量 m → 二阶动量 v。
     // 每段内部按参数顺序拼接，长度都是「参数总元素数 × 4」。
     for (_, t) in &named {
@@ -136,6 +136,7 @@ pub fn save(path: &str, model: &Transformer, opt: &dyn OptimizerState, step: usi
     for v in opt_v {
         write_f32s(&mut f, path, v);
     }
+    commit_atomic(f, &tmp, path);
 }
 
 /// 保存**权重 only** 存档：只写参数段，不写优化器状态（体积 1× 参数量，而非 3×）。
@@ -151,10 +152,11 @@ pub fn save(path: &str, model: &Transformer, opt: &dyn OptimizerState, step: usi
 pub fn save_weights(path: &str, model: &Transformer, step: usize, best_val_loss: f32) {
     let named = model.named_parameters();
     let header = make_header(model, &named, step, best_val_loss, 0, true);
-    let mut f = create_with_head(path, model, &header);
+    let (mut f, tmp) = create_with_head(path, model, &header);
     for (_, t) in &named {
         write_f32s(&mut f, path, &t.data_ref());
     }
+    commit_atomic(f, &tmp, path);
 }
 
 /// 组装 JSON 头（[`save`] / [`save_weights`] 共用）：参数元信息取自 `named`
@@ -188,8 +190,15 @@ fn make_header(
 }
 
 /// [`save`] / [`save_weights`] 的公共前奏：校验权重是 f32、建权重目录、
-/// 写出「魔数 + u32 头长 + JSON 头」，返回停在数据段起点的文件句柄。
-fn create_with_head(path: &str, model: &Transformer, header: &CkptHeader) -> File {
+/// 写出「魔数 + u32 头长 + JSON 头」，返回停在数据段起点的文件句柄**与临时文件路径**。
+///
+/// 写的是 `<path>.tmp` 而不是目标文件本身：存档是"先截断再写"，而训练中途存档动辄
+/// 3× 参数量、要写几秒——正好也是最可能被打断的时候（Ctrl-C、OOM、断电）。
+/// 直接写目标路径的话，一次中断就把**上一次完好的存档**变成半截垃圾，
+/// 而那时恰恰是你最需要它的时候。写完再由 [`commit_atomic`] 改名过去：
+/// 同目录内改名是原子的，读端要么看到旧的完整档、要么看到新的完整档。
+/// 临时名以 `.tmp` 结尾，不会被 `*.ckpt` 之类的通配匹配到。
+fn create_with_head(path: &str, model: &Transformer, header: &CkptHeader) -> (File, String) {
     assert!(
         !model.has_quant(),
         "保存前必须先 Transformer::dequantize_weights()：存档里写的是 f32 权重，\
@@ -198,14 +207,23 @@ fn create_with_head(path: &str, model: &Transformer, header: &CkptHeader) -> Fil
     // 权重目录（默认 checkpoints/）不存在时自动创建，保证产物不会落到根目录
     crate::config::ensure_parent_dir(path);
     let json = serde_json::to_vec(header).expect("序列化 checkpoint 头失败");
-    let mut f = File::create(path).unwrap_or_else(|e| panic!("无法创建 checkpoint {path}: {e}"));
+    let tmp = format!("{path}.tmp");
+    let mut f = File::create(&tmp).unwrap_or_else(|e| panic!("无法创建 checkpoint {tmp}: {e}"));
     let write = |r: std::io::Result<()>| {
-        r.unwrap_or_else(|e| panic!("写入 checkpoint {path} 失败: {e}"))
+        r.unwrap_or_else(|e| panic!("写入 checkpoint {tmp} 失败: {e}"))
     };
     write(f.write_all(MAGIC));
     write(f.write_all(&(json.len() as u32).to_le_bytes()));
     write(f.write_all(&json));
-    f
+    (f, tmp)
+}
+
+/// 落盘收尾：刷盘 + 关闭临时文件，再**原子改名**到目标路径（见 [`create_with_head`]）。
+fn commit_atomic(f: File, tmp: &str, path: &str) {
+    let mut f = f;
+    f.flush().unwrap_or_else(|e| panic!("刷写 checkpoint {tmp} 失败: {e}"));
+    drop(f);
+    std::fs::rename(tmp, path).unwrap_or_else(|e| panic!("把 {tmp} 改名为 {path} 失败: {e}"));
 }
 
 /// 零拷贝地把 f32 切片按字节写出（参数 / 动量共用，避免逐元素 write_all 的系统调用开销）

@@ -575,6 +575,26 @@ pub enum Cmd {
         #[command(flatten)]
         mla: MlaArgs,
     },
+    /// **导入 HuggingFace 权重**（LLaMA / Qwen2 系）：把 `config.json` + `*.safetensors`
+    /// 转成本仓库的原生存档（`LLMCP2`）。转换时把 RoPE 配对方式、bias、输出头是否绑定
+    /// 等**语义**一并写进存档头，之后训练/推理/量化都走既有原生路径。
+    ///
+    /// ⚠️ 全程 f32：参数量 P 的模型峰值约需 2P×4B 内存（TinyLlama-1.1B ≈ 9GB 可行，8B 级不建议）。
+    /// 支持面与限制见 `src/hf.rs` 的模块文档。
+    ImportHf {
+        /// HF 模型目录（含 `config.json` 与一个或多个 `*.safetensors`）
+        #[arg(long)]
+        model_dir: String,
+        /// 输出存档路径（写成权重 only 档：只有参数 + 配置头，不含优化器状态）
+        #[arg(long)]
+        output: String,
+        /// HF 的 `tokenizer.json` 路径（给了就一并转成本仓库格式）
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// 转换后分词器的输出路径；缺省写到输出存档同目录的 `tokenizer.json`
+        #[arg(long)]
+        tokenizer_out: Option<String>,
+    },
 }
 
 /// 知识蒸馏实验的参数（第 42 课）。

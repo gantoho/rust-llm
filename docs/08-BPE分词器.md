@@ -125,12 +125,13 @@ pub fn train(corpus: &str, target_vocab: usize) -> Self {
 
 ```rust
 assert!(target_vocab >= 256, "BPE 词表至少 256（字节级）");
-// 初始：每个 token 就是一个字节
-let mut vocab: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
-let mut merges: Vec<(u16, u16)> = Vec::new();
+// 初始：每个 token 就是一个字节（id 类型是 u32：HF 词表可以到 15 万以上，u16 装不下）
+let mut vocab: Vec<Vec<u8>> = (0u32..=255).map(|b| vec![b as u8]).collect();
+// merges 是三元组 (a, b, 结果 id)：**结果 id 显式记录**，不再靠 `256 + 下标` 推
+let mut merges: Vec<(u32, u32, u32)> = Vec::new();
 
-// 语料 -> 字节 -> id 序列
-let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
+// 语料 -> 字节 -> id 序列（自研训练下 byte_id 恒等，见 5.4）
+let mut ids: Vec<u32> = data.iter().map(|&b| b as u32).collect();
 ```
 
 初始词表 = **256 个字节**（0~255），每个 token 恰好是一个字节。为什么用字节而不是字符？
@@ -147,13 +148,13 @@ let mut ids: Vec<u16> = data.iter().map(|&b| b as u16).collect();
 
 ```rust
 // pair -> 当前频次：初始扫一遍，之后随每次合并增量增减
-let mut pair_freq: HashMap<(u16, u16), usize> = HashMap::new();
+let mut pair_freq: HashMap<(u32, u32), usize> = HashMap::new();
 for w in ids.windows(2) {
     *pair_freq.entry((w[0], w[1])).or_insert(0) += 1;
 }
 // 最大堆：键 (频次, Reverse(pair))，频次最高者在顶、平手取 pair 值小者
 // （确定性 tie-break，保证结果与旧实现的 max_by 规则一致）
-let mut heap: BinaryHeap<(usize, Reverse<(u16, u16)>)> = BinaryHeap::new();
+let mut heap: BinaryHeap<(usize, Reverse<(u32, u32)>)> = BinaryHeap::new();
 for (&p, &f) in &pair_freq {
     if f > 0 {
         heap.push((f, Reverse(p)));
@@ -181,9 +182,9 @@ let best = loop {
 
 ```rust
 fn bump_pair(
-    pair_freq: &mut HashMap<(u16, u16), usize>,
-    heap: &mut BinaryHeap<(usize, Reverse<(u16, u16)>)>,
-    pair: (u16, u16),
+    pair_freq: &mut HashMap<(u32, u32), usize>,
+    heap: &mut BinaryHeap<(usize, Reverse<(u32, u32)>)>,
+    pair: (u32, u32),
     delta: i32,
 ) {
     let e = pair_freq.entry(pair).or_insert(0);
@@ -230,9 +231,34 @@ std::mem::swap(&mut ids, &mut buf); // 双缓冲交替复用，避免逐轮重�
 训练结束后得到两份"产物"：
 
 - **`vocab: Vec<Vec<u8>>`**：token id → 它代表的字节序列（解码要用）
-- **`merges: Vec<(u16, u16)>`**：合并规则表，按下标顺序排列（**越早合并优先级越高**，编码要用）
+- **`merges: Vec<(u32, u32, u32)>`**：合并规则表 `(左符号 id, 右符号 id, 合并后的 id)`，按下标顺序排列（**越早合并优先级越高**，编码要用）。结果 id 是**显式**记下来的，不再是"下标 + 256"的隐含约定——HF 导入时新 token 的 id 由 HF 词表决定，未必等于 `256 + 下标`
 
 词表大小 = 256 + 合并次数。演示里 `BPETokenizer::train(CORPUS, 400)` 得到 **400 = 256 字节 + 144 次合并**。
+
+### 5.4 字节 id 映射 `byte_id[256]`：字节不一定是 id 本身
+
+自研训练时 `byte_id[b] = b`（0~255 的字节 id 就是它自己）。但 **HF 的词表不是这个口径**：
+LLaMA/Qwen 的 `tokenizer.json` 里 `<unk>` / `<s>` / `</s>` 占了 0/1/2 号位置，真正的字节
+token 从 3 起且编号不连续（GPT-2 的 byte-level 词表还把 256 个字节映射到可打印字符码位）。
+
+所以编码起点统一走查表：
+
+```rust
+let mut ids: Vec<u32> = bytes.iter().map(|&b| self.byte_id[b as usize]).collect();
+```
+
+`byte_id` 恰好 256 项（存档里有 `byte_ids` 字段，缺省为恒等映射，旧档逐位不变），
+`Tokenizer::load_hf` 从 `tokenizer.json` 的单个字节 token 反推它。
+
+另外 HF 口径还带两个性质（都由 `pretok` 这一个开关统辖）：
+
+- **预切分**：`pretok = true` 时先按 GPT-2 正则 `gpt2_pretokenize` 切成片，再逐片跑 BPE；
+- **特殊 token 在内容词表里**：HF 的 `<s>` / `</s>` 本来就有自己的 id，所以
+  `Tokenizer::vocab_size()` 对 HF 档**不再 +3**（自研档仍是"内容词表 + BOS/EOS/PAD"）。
+
+`Tokenizer::load_hf(path)` 直接读 HF 的 `tokenizer.json`（32k / 128k / 151k 词表都支持，
+仅限 `pre_tokenizer = ByteLevel` 的字节级 BPE；SentencePiece / WordPiece / Unigram 会明确报错），
+与第 39 课的 `import-hf`（导入 HF 权重）配套使用。
 
 ---
 
@@ -242,10 +268,23 @@ std::mem::swap(&mut ids, &mut buf); // 双缓冲交替复用，避免逐轮重�
 
 ```rust
 pub fn encode(&self, text: &str) -> Vec<usize> {
-    let mut ids: Vec<u16> = text.as_bytes().iter().map(|&b| b as u16).collect();
-    for (idx, &(a, b)) in self.merges.iter().enumerate() {
-        let new_id = (256 + idx) as u16;
-        let mut out: Vec<u16> = Vec::with_capacity(ids.len());
+    if self.pretok {
+        // HF 口径：先按 GPT-2 正则切片，再逐片合并（见 5.4）
+        let mut out = Vec::new();
+        for piece in gpt2_pretokenize(text) {
+            out.extend(self.merge_piece(&piece));
+        }
+        return out;
+    }
+    self.merge_piece(text.as_bytes())
+}
+
+// 单片的合并（两种口径共用）
+fn merge_piece(&self, bytes: &[u8]) -> Vec<usize> {
+    // 起点不是字节本身，而是查 byte_id 表（自研档为恒等映射，见 5.4）
+    let mut ids: Vec<u32> = bytes.iter().map(|&b| self.byte_id[b as usize]).collect();
+    for &(a, b, new_id) in self.merges.iter() {   // 三元组：结果 id 是显式记录的
+        let mut out: Vec<u32> = Vec::with_capacity(ids.len());
         let mut i = 0;
         while i < ids.len() {
             if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
@@ -265,8 +304,8 @@ pub fn encode(&self, text: &str) -> Vec<usize> {
 要点：
 
 - **按规则优先级单趟扫描**（通行的标准实现）：从 `merges[0]` 到 `merges[最后]`，每条规则在序列上扫一遍，能合并就替换成它对应的新 token。复杂度 O(len × 合并数)，大语料也能秒级完成（若"每次只合并一个 pair 并全量重扫"是 O(n²×m)，174KB 语料会卡死）
-- `new_id = 256 + idx`：merge 下标 idx 直接映射成 token id——因为训练时第 idx 次合并恰好产生 id `256 + idx`
-- 字节 id（0~255）直接复用训练时的字节 → id 映射
+- **结果 id 直接用 `merges` 里的第三项**，不再是 `256 + 下标`——自研训练时两者恰好相等，HF 词表里则不然（见 5.4）
+- 字节 id 走 `byte_id` 映射（自研档为 0~255 恒等映射），所以"字节 → id"这一步与 HF 口径共用同一套代码
 - 演示里 `"the garden"` 编码后只有 **2 个 token**（"the" 和 " garden" 都被压缩成了单个 token）
 
 以 `"lowest"` 为例走一遍：字节 `[l,o,w,e,s,t]` → 应用规则 0（假设是 `(l,o)`）→ `[256,w,e,s,t]` → 应用规则 1（`(256,w)`）→ `[257,e,s,t]` → 继续应用 `(e,s)`、`(s,t)` 对应规则……最终 6 个字节被压成 3 个 token（单元测试要求 `"low"` 编码后不超过 3 个 token）。
@@ -382,7 +421,7 @@ let row: &[f32] = match vocab_bytes {
 ## 9. 运行与测试
 
 ```bash
-cargo test   # 全部测试通过
+cargo test tokenizer      # 分词器相关单测（数量会随代码增长，以实际输出为准）
 cargo run --release -- demo    # 演示 2（BPE）：词表 400（256 + 144 次合并）；"Red" -> [82, 101, 100]；"the garden" -> 2 个 token
 ```
 
@@ -431,3 +470,8 @@ let tok = Tokenizer::load("tokenizer.json");
 ```
 
 这保证了训练、评估、生成、对话都使用完全相同的词表。
+
+存档里除了 `vocab` / `merges`，还记着 `byte_ids`、`pretok`、`specials`、`extra_literals`、
+图片 token 段——HF 口径的那几项缺省时按"自研口径"补齐，所以旧存档读回来逐位不变。
+另有一条**独立**的入口：`Tokenizer::load_hf("tokenizer.json")` 直接读 HuggingFace 的分词器文件
+（见 5.4），它与 `Tokenizer::load` 不是同一个东西：前者吃 HF 的原生格式，后者吃本仓库自己 `save` 出来的格式。
