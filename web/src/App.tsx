@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import {
   ChatMessage,
   ChatParams,
+  MaxTokens,
   chat,
+  chatRequestBody,
   chatStream,
   embed,
   getHealth,
@@ -45,7 +47,8 @@ const DEFAULT_PARAMS: ChatParams = {
   temperature: 0.8,
   top_k: 40,
   top_p: 0.9,
-  max_tokens: 200,
+  // auto = 以服务器为准：请求体里不带 max_tokens，服务端用自己的 --max-new（见 api.ts）
+  max_tokens: 'auto',
 }
 
 // ==================== 图标（内联 SVG，无外部依赖） ====================
@@ -478,8 +481,15 @@ function ChatTab({
             <Num label="temperature" value={params.temperature} step={0.1} onChange={(v) => setParams({ ...params, temperature: v })} />
             <Num label="top_k" value={params.top_k} step={1} onChange={(v) => setParams({ ...params, top_k: v })} />
             <Num label="top_p" value={params.top_p} step={0.05} onChange={(v) => setParams({ ...params, top_p: v })} />
-            <Num label="max_tokens" value={params.max_tokens} step={10} onChange={(v) => setParams({ ...params, max_tokens: v })} />
+            <MaxTokensCtl value={params.max_tokens} onChange={(v) => setParams({ ...params, max_tokens: v })} />
           </div>
+          {/* 当前参数回显：auto 时明确写成「由服务端决定」 */}
+          <p className="hint">
+            max_tokens：
+            {params.max_tokens === 'auto'
+              ? '由服务端决定（请求体不带该字段，用服务端 --max-new）'
+              : params.max_tokens}
+          </p>
         </section>
 
         <section>
@@ -514,6 +524,40 @@ function renderMeta(meta: string) {
   )
 }
 
+/**
+ * `max_tokens` 控件：`auto`（默认）= 以服务器为准——请求体里**不带** `max_tokens`，
+ * 服务端用它自己的 `--max-new`；切到「自定义」才发数字。
+ * 不提供 0 / null 表达 auto：服务端把 0 判成非法（`max_tokens 必须大于 0`）。
+ */
+function MaxTokensCtl({ value, onChange }: { value: MaxTokens; onChange: (v: MaxTokens) => void }) {
+  const auto = value === 'auto'
+  return (
+    <label className="num">
+      <span>max_tokens</span>
+      <select
+        className="ctl"
+        value={auto ? 'auto' : 'custom'}
+        onChange={(e) => onChange(e.target.value === 'auto' ? 'auto' : 200)}
+      >
+        <option value="auto">auto（由服务端决定）</option>
+        <option value="custom">自定义</option>
+      </select>
+      <input
+        type="number"
+        min={1}
+        step={10}
+        disabled={auto}
+        placeholder="服务端 --max-new"
+        value={auto ? '' : value}
+        onChange={(e) => {
+          const v = Number(e.target.value)
+          if (Number.isFinite(v) && v > 0) onChange(Math.trunc(v))
+        }}
+      />
+    </label>
+  )
+}
+
 function Num({ label, value, step, onChange }: { label: string; value: number; step: number; onChange: (v: number) => void }) {
   return (
     <label className="num">
@@ -533,7 +577,8 @@ function Num({ label, value, step, onChange }: { label: string; value: number; s
 
 /** 生成与当前会话等价的 cURL 命令，方便复制到终端验证（key 直接带当前值，复制即可跑） */
 function curlExample(apiKey: string, model: string, p: ChatParams, stream: boolean, messages: ChatMessage[]): string {
-  const body = JSON.stringify({ model, messages, ...p, stream }, null, 0)
+  // 与真实请求共用 chatRequestBody：max_tokens=auto 时这里也不会出现该字段
+  const body = chatRequestBody(model, messages, p, stream)
   const auth = apiKey || '$API_KEY'
   return `curl http://127.0.0.1:8080/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer ${auth}" \\\n  -d '${body}'`
 }

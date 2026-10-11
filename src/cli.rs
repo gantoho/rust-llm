@@ -141,8 +141,8 @@ pub enum Cmd {
         /// 模型可围绕该图片生成文字描述
         #[arg(long)]
         image: Option<String>,
-        /// 生成的最大新 token 数
-        #[arg(long, default_value_t = 100)]
+        /// 生成的最大新 token 数（上限，不是保证：还会被上下文窗口与 EOS/stop 标记提前截断）
+        #[arg(long, default_value_t = 1000)]
         max_new: usize,
         /// 采样温度（>1 更随机，<1 更确定）
         #[arg(long, default_value_t = 0.8)]
@@ -214,8 +214,8 @@ pub enum Cmd {
         /// 重复惩罚的回看窗口：只看最近 N 个 token（0 = 关闭）
         #[arg(long, default_value_t = 64)]
         repetition_window: usize,
-        /// 每次生成的最大 token 数
-        #[arg(long, default_value_t = 200)]
+        /// 每次生成的最大 token 数（上限，不是保证：还会被上下文窗口与 EOS/stop 标记提前截断）
+        #[arg(long, default_value_t = 1000)]
         max_new: usize,
         /// KV cache 的量化位宽：none = f32；int8 / int4 = KIVI 式压缩
         #[arg(long, value_parser = ["none", "int8", "int4"], default_value = "none")]
@@ -284,8 +284,9 @@ pub enum Cmd {
         /// 重复惩罚的回看窗口：只看最近 N 个 token（0 = 关闭）
         #[arg(long, default_value_t = 64)]
         repetition_window: usize,
-        /// 单次生成的最大 token 数（`max_tokens` 缺省时用它）
-        #[arg(long, default_value_t = 200)]
+        /// 单次生成的最大 token 数（`max_tokens` 缺省时用它；上限，不是保证：
+        /// 还会被上下文窗口与 EOS/stop 标记提前截断）
+        #[arg(long, default_value_t = 1000)]
         max_new: usize,
         /// KV cache 的量化位宽：none = f32；int8 / int4 = KIVI 式压缩
         #[arg(long, value_parser = ["none", "int8", "int4"], default_value = "none")]

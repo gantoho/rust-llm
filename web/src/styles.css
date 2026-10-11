@@ -758,6 +758,12 @@ a {
   width: 100%;
 }
 
+/* max_tokens 的 auto（由服务端决定）/ 自定义下拉：与数字输入同宽同字体 */
+.num select {
+  font-family: var(--mono);
+  width: 100%;
+}
+
 /* ============ 卡片页（向量化 / 状态） ============ */
 
 .pane-body {

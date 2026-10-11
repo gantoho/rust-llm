@@ -8,11 +8,41 @@ export interface ChatMessage {
   image_url?: string
 }
 
+/**
+ * `max_tokens` 的取值：正数 = 请求里显式指定；`'auto'` = **以服务器为准**
+ * （请求体里整个字段不上行，服务端用自己的 `--max-new` 默认值）。
+ * 注意不能用 0 / null 表达 auto——服务端把 0 判成非法（`max_tokens 必须大于 0`），
+ * null 也会被当成显式值走类型校验。
+ */
+export type MaxTokens = number | 'auto'
+
 export interface ChatParams {
   temperature: number
   top_k: number
   top_p: number
-  max_tokens: number
+  max_tokens: MaxTokens
+}
+
+/**
+ * 组装对话补全请求体（`chat` / `chatStream` / 页面上的「等价 cURL」共用一份）。
+ *
+ * `max_tokens: 'auto'` 时**整个字段都不出现**，服务端才会落到服务级 `--max-new`；
+ * 显式给数字时才带上。
+ */
+export function chatRequestBody(
+  model: string,
+  messages: ChatMessage[],
+  params: ChatParams,
+  stream: boolean,
+): string {
+  const { max_tokens, ...rest } = params
+  return JSON.stringify({
+    model,
+    messages,
+    ...rest,
+    ...(max_tokens === 'auto' ? {} : { max_tokens }),
+    stream,
+  })
 }
 
 /** 组装请求头：有 key 才带鉴权 */
@@ -82,7 +112,7 @@ export async function chat(
   const res = await fetch('/v1/chat/completions', {
     method: 'POST',
     headers: headers(apiKey),
-    body: JSON.stringify({ model, messages, ...params, stream: false }),
+    body: chatRequestBody(model, messages, params, false),
   })
   if (!res.ok) await fail(res)
   return res.json()
@@ -118,7 +148,7 @@ export async function chatStream(
   const res = await fetch('/v1/chat/completions', {
     method: 'POST',
     headers: headers(apiKey),
-    body: JSON.stringify({ model, messages, ...params, stream: true }),
+    body: chatRequestBody(model, messages, params, true),
     signal,
   })
   if (!res.ok) await fail(res)

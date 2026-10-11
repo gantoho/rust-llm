@@ -395,7 +395,7 @@ cargo run --release -- generate [参数]
 | `--tokenizer <路径>` | string | 自动查找 | 分词器文件路径（缺省从 `{out_dir}/tokenizer.json` 加载） |
 | `--prompt <文本>` | string | `""`（空） | 初始提示词（模型从这里开始续写） |
 | `--image <路径>` | string | 无（不用） | **图片理解输入**：图片经视觉编码器（ViT）注入前缀 embedding，模型围绕它生成文字。prompt 里没有 `<\|image\|>` 时自动在尾部补一个；需要 `model.vision` 配置；**Beam Search 分支不支持，会忽略并打日志** |
-| `--max-new <数量>` | int | `100` | 最多生成的新 token 数 |
+| `--max-new <数量>` | int | `1000` | 最多生成的新 token 数（**上限，不是保证**，见下方说明） |
 | `--temperature <温度>` | float | `0.8` | 采样温度（>1 更随机，<1 更确定，0 = 贪心） |
 | `--top-k <数量>` | int | `40` | top-k 采样：只从概率最高的 k 个 token 里选 |
 | `--top-p <概率>` | float | `0.9` | top-p 采样：累积概率到 p 的最小集合 |
@@ -406,6 +406,12 @@ cargo run --release -- generate [参数]
 | `--beam <束宽>` | int | 无（不用） | Beam Search 束宽（通常 4-10），指定后使用确定性搜索 |
 | `--length-penalty <α>` | float | `0.6` | Beam Search 长度惩罚（0=不惩罚，>0 偏好长序列） |
 | `--merge-lora` | flag | 关 | 推理前把 LoRA 增量就地并进主干权重（数值不变，省掉每层两次小矩阵乘） |
+
+**`--max-new` 默认 `1000`，它是上限而不是保证**：实际长度还会被 **EOS / 停止标记**提前收尾。
+默认值给的是"够用的量级"，**开发时要快速试跑就自己压小**（如 `--max-new 4`）——反之，写 `1000`
+也不代表一定吐 1000 个 token。此外 `block_size`（上下文窗口）是**输入与生成共用**的：生成侧靠
+滑动窗口（[第 25 课](docs/25-KV-Cache.md)）不会被窗口直接掐停，但超出窗口后最早的位置会滑出视野
+（[第 15 课](docs/15-推理与采样.md)）。
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，推理时自动加载。
 
@@ -673,10 +679,16 @@ cargo run --release -- chat [参数]
 | `--top-p <概率>` | float | `0.9` | top-p 采样 |
 | `--repetition-penalty <系数>` | float | `1.1` | 重复惩罚（`1.0` = 关闭） |
 | `--repetition-window <数量>` | int | `64` | 重复惩罚的回看窗口（`0` = 关闭） |
-| `--max-new <数量>` | int | `200` | 每次生成的最大 token 数 |
+| `--max-new <数量>` | int | `1000` | 每次生成的最大 token 数（**上限，不是保证**，见下方说明） |
 | `--seed <种子>` | int | `42` | 随机种子 |
 | `--prompt-format <模板>` | string | `sft` | `sft` = 用与 `sft` 子命令一致的对话模板拼 prompt（模型才会"回答"）；`raw` = 直接把历史拼给模型 |
 | `--merge-lora` | flag | 关 | 推理前把 LoRA 增量就地并进主干权重（数值不变，省掉每层两次小矩阵乘） |
+
+**`--max-new` 默认 `1000`，它是上限而不是保证**：实际长度还会被 **EOS / SFT 停止标记**提前收尾；
+而且 `block_size` 是「system + 历史 + 本轮生成」共用的窗口——本轮生成先从窗口里扣掉 `--max-new`，
+剩下的才给历史。所以窗口小的自研模型（如 [`config/config.json`](config/config.json) 的
+`block_size=512`）用默认值会触发 `--max-new ≥ 上下文窗口` 告警，且输入预算被压到 0（历史全丢），
+这时要显式压小 `--max-new`。**开发时要快速试跑就自己传小值**（如 `--max-new 4`）。
 
 **推理不需要语料**：训练时自动保存 `tokenizer.json` 到 checkpoint 目录，对话时自动加载。
 
@@ -692,7 +704,7 @@ cargo run --release -- chat [参数]
 
 **未正常收尾的回答不写进对话历史**：空回答整轮跳过；被 `--max-new` 截断（没有收尾标记）的回答也跳过，
 并打印一条 `[info]`。这两种状态在训练语料里从未出现过——历史里一旦留下「助手：」后面空着，
-或"说了 200 个 token 还不收尾"的示范，模型会跟着沉默，此后每轮全空。
+或"跑满 `--max-new` 还没收尾"的示范，模型会跟着沉默，此后每轮全空。
 
 **上下文预算**：`block_size` 是「system prompt + 对话历史 + 本轮生成」三者共用的窗口。分配优先级依次是：
 system prompt 永远保留（它是序列开头的位置锚点），本轮生成预留 `--max-new` 个 token，剩下的额度给对话历史。
@@ -739,11 +751,18 @@ checkpoint → LoRA → RoPE），区别只在最后不进 REPL 而是进 accept
 | `--system <文本>` | string | `""` | 服务级系统提示（请求 messages 里的 system 接在它后面） |
 | `--temperature` / `--top-k` / `--top-p` | — | `0.8` / `40` / `0.9` | 采样默认值，请求里的同名字段可逐个覆盖 |
 | `--repetition-penalty` / `--repetition-window` | — | `1.1` / `64` | 重复惩罚及其回看窗口 |
-| `--max-new <数量>` | int | `200` | 生成上限（请求 `max_tokens` 缺省时用它） |
+| `--max-new <数量>` | int | `1000` | 生成上限（请求 `max_tokens` 缺省时用它；**上限，不是保证**，见下方说明） |
 | `--kv-bits <位宽>` / `--kv-sink <N>` | string/int | `none` / `0` | KV cache 量化与 Attention Sink |
 | `--seed <种子>` | int | `42` | 请求不带 `seed` 时的随机种子 |
 | `--prompt-format <模板>` | string | `sft` | 同 `chat`：`sft` / `raw` |
 | `--merge-lora` | flag | 关 | 推理前把 LoRA 增量并进主干权重 |
+
+**`--max-new` 默认 `1000`，它是"请求省略 `max_tokens` 时的缺省上限"，不是保证**：实际长度还会被
+**EOS / 停止标记**提前收尾（`finish_reason` 为 `"stop"`）。窗口小的模型要显式压小：启动时若
+`--max-new ≥ block_size`（例如自研 `checkpoints/zh` 的窗口 512）会打印告警，且
+`prompt_budget = block_size - max_new` 被压到 0——历史全丢。**生成段一定留在窗口内**：缺省值也会
+先钳到 `block_size`（与显式 `max_tokens` 同一条路径），所以不会出现"生成到一半滑出视野"。
+**开发时要快速试跑就自己传小值**（如 `--max-new 4`）。
 
 **端点**：
 

@@ -17,3 +17,5 @@
 /.temp/
 /web/node_modules
 /web/dist
+
+/openapi/

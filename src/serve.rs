@@ -1401,7 +1401,10 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
 
     // ---- 其余标量 ----
     let max_tokens = match obj.get("max_tokens") {
-        None => cfg.max_new,
+        // 缺省值也要钳到窗口内：显式路径钳、缺省路径不钳的话，`--max-new` 一调到
+        // 比 `block_size` 大（默认 1000 vs 自研模型常是 512），「不传 max_tokens」
+        // 反而会生成超出窗口预算的长度——两条路径必须对称。
+        None => cfg.max_new.min(cfg.block_size.max(1)),
         Some(v) => {
             let n = v.as_u64().ok_or_else(|| bad("max_tokens 必须是正整数"))?;
             if n == 0 {
@@ -2553,6 +2556,35 @@ mod tests {
         assert_eq!(job.seed, Some(7));
         assert_eq!(job.sample.stop, &["STOP"]);
         assert!(job.id.starts_with("chatcmpl-"));
+    }
+
+    /// 缺省 `max_tokens` 必须和显式路径一样钳到上下文窗口内。
+    ///
+    /// 反例：`--max-new` 默认 1000、自研模型 `block_size` 常是 512，若缺省路径不钳，
+    /// 「不传 max_tokens」反倒比「传 max_tokens」生成得更长——两条路径行为不对称。
+    #[test]
+    fn parse_chat_default_max_tokens_clamped_to_block_size() {
+        // 夹具 max_new = 200 > block_size = 64：缺省路径必须被钳到 64
+        let c = ServeCfg { block_size: 64, ..cfg(true) };
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c).unwrap();
+        assert_eq!(job.max_tokens, 64, "缺省 max_tokens 必须钳到 block_size");
+        // 显式路径语义不变：给 200（> block_size）同样钳到 64
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"max_tokens":200}"#,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(job.max_tokens, 64, "显式 max_tokens 的钳制语义不变");
+
+        // 缺省值本身小于窗口时原样保留（不放大）
+        let c512 = cfg(true);
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c512).unwrap();
+        assert_eq!(job.max_tokens, 200);
+
+        // block_size = 0 的兜底与既有 `.max(1)` 写法一致
+        let c0 = ServeCfg { block_size: 0, ..cfg(true) };
+        let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c0).unwrap();
+        assert_eq!(job.max_tokens, 1);
     }
 
     #[test]

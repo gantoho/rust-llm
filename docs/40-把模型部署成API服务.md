@@ -135,7 +135,7 @@ cache，总吞吐不变而单条延迟翻倍；排队反而让延迟曲线平稳
 | `top_p` | 数字 | `--top-p`（0.9） | `(0, 1]` |
 | `repetition_penalty` | 数字 | `--repetition-penalty`（1.1） | `[0.1, 10]` |
 | `repetition_window` | 整数 | `--repetition-window`（64） | ≤100000 |
-| `max_tokens` | 整数 | `--max-new`（200） | >0，且钳到上下文窗口内 |
+| `max_tokens` | 整数 | `--max-new`（1000） | >0；**两者都钳到上下文窗口内**（缺省用服务级 `--max-new` 后再钳） |
 | `stop` | 字符串/数组 | SFT 模板停止标记 | ≤4 个，每个 ≤64 字节 |
 | `seed` | 整数 | 服务级 `--seed` | 非负；给了就用独立 RNG，可复现 |
 | `stream` | bool | false | — |
@@ -150,6 +150,12 @@ cache，总吞吐不变而单条延迟翻倍；排队反而让延迟曲线平稳
 `prompt_budget = block_size - max_tokens`，超出的历史从最老的轮次丢起
 （与 `chat` 完全同源，见 `prompt::assemble`）。裁剪发生时服务端日志会打印
 `历史超出输入预算：312 → 180 token`。
+
+**`max_tokens` 的缺省值来自服务级 `--max-new`（默认 `1000`），它是上限而不是保证**：实际长度还会被
+**EOS / 停止标记**提前收尾（`finish_reason` 为 `"stop"`）。窗口小的模型要显式压小——`--max-new ≥ block_size`
+时输入预算被压到 0（历史全丢，启动时也会打印告警）；**生成段一定留在窗口内**：缺省值也会先钳到
+`block_size`（与显式 `max_tokens` 同一条路径），所以不会出现"生成到一半滑出视野"。
+**开发时要快速试跑就自己传小值**（如 `--max-new 4`）。
 
 ### 4.2 非流式响应
 
