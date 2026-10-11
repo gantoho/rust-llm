@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::autograd::record;
@@ -38,22 +38,76 @@ const EPS: f32 = 1e-8;
 /// （见 binary / matmul / swiglu 的前向与反向）。
 /// 另外，锁持有期间 panic 不会毒化后续访问：这里统一用
 /// `PoisonError::into_inner` 忽略毒化，避免一次断言失败引发连锁误报。
-pub struct Shared<T>(Arc<Mutex<T>>);
+///
+/// **身份与代数（GPU 权重常驻显存的键）**：每个共享单元在创建时领一个全局唯一的
+/// [`Shared::id`]（**不复用**，所以"张量释放后新张量落在同一地址"不会造成假命中），
+/// 并在每次**可变借用**时把 [`Shared::version`] 自增一次。GPU 侧用
+/// `(id, version, 形状/切法, dtype)` 做缓存键，因此任何写入路径
+/// （`decode_mut` / `set_data` / `to_bf16` / 优化器参数更新 / 量化回写 / checkpoint 载入…）
+/// 都自动让旧缓存键失配，**不需要在几十个写入点手工调用失效函数** ——
+/// 漏一处就是"训练后仍用旧权重"的静默错误，把失效放在唯一的可变借用入口上才可能不漏。
+pub struct Shared<T>(Arc<SharedCell<T>>);
+
+/// 共享单元的载荷：值 + 身份 + 写入代数。
+pub struct SharedCell<T> {
+    value: Mutex<T>,
+    /// 写入代数：每次 [`Shared::borrow_mut`] 自增。宁可多自增（保守失效），不可漏。
+    version: AtomicU64,
+    /// 全局唯一且不复用的单元 id（0 保留给"无身份"）
+    id: u64,
+}
+
+/// 共享单元的 id 分配器：进程内单调递增，**绝不复用**（含跨进程 fork 后的多 rank 场景，
+/// 各 rank 各自计数即可 —— 缓存是进程内的）。
+static NEXT_SHARED_ID: AtomicU64 = AtomicU64::new(1);
 
 impl<T> Shared<T> {
     /// 用一个值新建共享句柄（对应原 `Rc::new(RefCell::new(v))`）
     pub fn new(v: T) -> Self {
-        Shared(Arc::new(Mutex::new(v)))
+        Shared(Arc::new(SharedCell {
+            value: Mutex::new(v),
+            version: AtomicU64::new(0),
+            id: NEXT_SHARED_ID.fetch_add(1, Ordering::Relaxed),
+        }))
     }
 
     /// 只读借用（对应 `RefCell::borrow`）。guard 存活期内持有锁。
     pub fn borrow(&self) -> MutexGuard<'_, T> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.0
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 可变借用（对应 `RefCell::borrow_mut`）。guard 存活期内持有锁。
+    ///
+    /// 顺手把写入代数 +1：这里**是全部写入路径的唯一入口**
+    /// （`decode_mut` / `set_data` / `to_bf16` / 优化器就地更新 / 量化回写都经它），
+    /// GPU 常驻缓存以此判定"内容变了"。
+    ///
+    /// **必须在拿到锁之后再自增**（顺序反了会有静默错误）：自增与随后的写入都在同一把锁内，
+    /// 于是任何读者读到的 `(version, 内容)` 一定是自洽的一对 —— 要么是"写入前"的
+    /// (v, 旧内容)，要么是"写入后"的 (v+1, 新内容)。若先自增再等锁，就会出现
+    /// "版本已经是 v+1、内容还是旧的"这个窗口，读者完全可能把旧内容当成 v+1 代缓存下来，
+    /// 之后真正写完 v+1 的读者就会命中这份旧内容 —— 正是本任务要杜绝的静默错误。
     pub fn borrow_mut(&self) -> MutexGuard<'_, T> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        let guard = self
+            .0
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.0.version.fetch_add(1, Ordering::Relaxed);
+        guard
+    }
+
+    /// 本单元的写入代数（内容每被改动一次 +1）
+    pub fn version(&self) -> u64 {
+        self.0.version.load(Ordering::Relaxed)
+    }
+
+    /// 本单元的全局唯一 id（不复用）
+    pub fn id(&self) -> u64 {
+        self.0.id
     }
 
     /// 两个句柄是否指向同一份底层数据（对应 `Rc::ptr_eq` / `Arc::ptr_eq`）。
@@ -469,45 +523,102 @@ impl SrcIdxView<'_> {
 
 /// matmul 内核的只读操作数视图（decode-at-boundary 约定的 matmul 族例外）。
 ///
-/// - [`MatOperand::F32`]：f32 缓冲原样借用，零转换；
-/// - [`MatOperand::Bf16`]：锁内原始借位 u16 位模式，内核**逐元素**
+/// - [`MatData::F32`]：f32 缓冲原样借用，零转换；
+/// - [`MatData::Bf16`]：锁内原始借位 u16 位模式，内核**逐元素**
 ///   [`bf16_to_f32`]、f32 累加——与「先整块 decode 再算」数值逐位一致
 ///   （转换函数相同、累加顺序相同），但省掉入口整块物化
 ///   （4096×4096 bf16 权重 = 64MB 瞬时分配 + 全量并行转换）。
 ///
+/// **身份（GPU 权重常驻显存的键）**：`cell` / `ver` 记录这份数据来自哪个共享单元、
+/// 当时是第几代内容（0 = 无身份，例如算子内部临时算出来的切片，永远不参与常驻缓存）。
+/// 调用方必须**先取到只读 guard 再构造**，这样 `ver` 是在持锁状态下读到的：
+/// 写入方（`borrow_mut`）必须先拿到同一把锁，于是"这次上传的字节"与"读到的 ver"
+/// 一定属于同一代内容（详见 `crate::gpu::ResId`）。
+///
 /// 借用方须保证底层锁（`MutexGuard`）活到内核读完为止。
 #[derive(Clone, Copy)]
-enum MatOperand<'a> {
+struct MatOperand<'a> {
+    data: MatData<'a>,
+    cell: u64,
+    ver: u64,
+}
+
+/// [`MatOperand`] 的数据本体（f32 / bf16 两种存储）
+#[derive(Clone, Copy)]
+enum MatData<'a> {
     F32(&'a [f32]),
     Bf16(&'a [u16]),
 }
 
 impl<'a> MatOperand<'a> {
-    /// 从锁内缓冲构造零物化视图（借位期间变体不会改变）。
-    fn of(buf: &'a Buffer) -> Self {
-        match buf {
-            Buffer::F32(v) => MatOperand::F32(v.as_slice()),
-            Buffer::Bf16(v) => MatOperand::Bf16(v.as_slice()),
+    /// 从锁内缓冲构造零物化视图（借位期间变体不会改变），并带上数据单元的身份。
+    /// 调用约定：`slot` 必须是**已经取到的**只读 guard 的解引用（这样 `ver` 是在持锁状态下读到），
+    /// `src` 是它所属的共享单元。
+    fn of(slot: &'a Buffer, src: &Shared<Buffer>) -> Self {
+        MatOperand {
+            data: MatData::of(slot),
+            cell: src.id(),
+            ver: src.version(),
         }
     }
 
-    /// 取第 i 个元素：f32 原样读，bf16 位模式即时转换（纯位移，见 [`bf16_to_f32`]）。
-    #[inline]
-    fn get(self, i: usize) -> f32 {
-        match self {
-            MatOperand::F32(v) => v[i],
-            MatOperand::Bf16(v) => bf16_to_f32(v[i]),
+    /// 无身份的 f32 视图（算子内部临时切片：不参与 GPU 常驻缓存）
+    #[allow(non_snake_case)]
+    fn F32(v: &'a [f32]) -> Self {
+        MatOperand {
+            data: MatData::F32(v),
+            cell: 0,
+            ver: 0,
+        }
+    }
+
+    /// 无身份的 bf16 视图（同上）
+    #[allow(non_snake_case)]
+    fn Bf16(v: &'a [u16]) -> Self {
+        MatOperand {
+            data: MatData::Bf16(v),
+            cell: 0,
+            ver: 0,
         }
     }
 
     /// GPU 内核只吃 f32：f32 直接借用，bf16 物化成 f32（仅 gpu 构建需要）。
     #[cfg(feature = "gpu")]
     fn to_f32(self) -> std::borrow::Cow<'a, [f32]> {
-        match self {
-            MatOperand::F32(v) => std::borrow::Cow::Borrowed(v),
-            MatOperand::Bf16(v) => {
+        match self.data {
+            MatData::F32(v) => std::borrow::Cow::Borrowed(v),
+            MatData::Bf16(v) => {
                 std::borrow::Cow::Owned(v.par_iter().map(|&x| bf16_to_f32(x)).collect())
             }
+        }
+    }
+
+    /// 送进 GPU 的常驻缓存键（无身份时返回 None，见 [`crate::gpu::ResId`]）
+    #[cfg(feature = "gpu")]
+    fn res_id(self) -> Option<crate::gpu::ResId> {
+        (self.cell != 0).then_some(crate::gpu::ResId {
+            cell: self.cell,
+            ver: self.ver,
+            bf16: matches!(self.data, MatData::Bf16(_)),
+        })
+    }
+
+    /// 取第 i 个元素：f32 原样读，bf16 位模式即时转换（纯位移，见 [`bf16_to_f32`]）。
+    #[inline]
+    fn get(self, i: usize) -> f32 {
+        match self.data {
+            MatData::F32(v) => v[i],
+            MatData::Bf16(v) => bf16_to_f32(v[i]),
+        }
+    }
+}
+
+impl<'a> MatData<'a> {
+    /// 从锁内缓冲构造零物化视图（借位期间变体不会改变）。
+    fn of(buf: &'a Buffer) -> Self {
+        match buf {
+            Buffer::F32(v) => MatData::F32(v.as_slice()),
+            Buffer::Bf16(v) => MatData::Bf16(v.as_slice()),
         }
     }
 }
@@ -551,7 +662,10 @@ fn matmul_data(
         // 而 bf16 存储的全部意义就是省访存（判据与内核入口同源，见该函数的说明）。
         if crate::gpu::matmul_may_use_gpu(m, k, n, batch) {
             let (ga, gb) = (a.to_f32(), b.to_f32());
-            if let Some(v) = crate::gpu::matmul(&ga, &gb, m, k, n, batch, a_t, b_t) {
+            // 右操作数的身份随行（见 `MatOperand` 的说明）：GPU 借此把权重留在显存里跨调用复用
+            if let Some(v) =
+                crate::gpu::matmul_ident(&ga, &gb, b.res_id(), m, k, n, batch, a_t, b_t)
+            {
                 return v;
             }
         }
@@ -570,12 +684,13 @@ fn matmul_data(
     let b_u16;
     let (a2, b2): (MatOperand<'_>, MatOperand<'_>) = if b_t {
         // 物理 b [B,N,K] -> 逻辑 [B,K,N]
-        match b {
-            MatOperand::F32(v) => {
+        // 物化出来的这份是**临时切片**（无身份），只用于 CPU 兜底路径
+        match b.data {
+            MatData::F32(v) => {
                 b_f32 = transpose_flat(v, n, k, batch);
                 (a, MatOperand::F32(b_f32.as_slice()))
             }
-            MatOperand::Bf16(v) => {
+            MatData::Bf16(v) => {
                 b_u16 = transpose_flat(v, n, k, batch);
                 (a, MatOperand::Bf16(b_u16.as_slice()))
             }
@@ -638,14 +753,14 @@ fn matmul_data(
                         let acc_row = &mut acc[r * nc..r * nc + nc];
                         // f32 臂逐字保持原 zip 内核（数值零变化）；bf16 臂读 u16
                         // 行段逐元素转换——同一 bf16_to_f32、同一 f32 累加顺序
-                        match b2 {
-                            MatOperand::F32(b2f) => {
+                        match b2.data {
+                            MatData::F32(b2f) => {
                                 let b_row = &b2f[b_off..b_off + nc];
                                 for (o, &b_v) in acc_row.iter_mut().zip(b_row) {
                                     *o += a_v * b_v;
                                 }
                             }
-                            MatOperand::Bf16(b2u) => {
+                            MatData::Bf16(b2u) => {
                                 let b_row = &b2u[b_off..b_off + nc];
                                 for (o, &b_v) in acc_row.iter_mut().zip(b_row) {
                                     *o += a_v * bf16_to_f32(b_v);
@@ -1031,8 +1146,11 @@ fn matmul_backward(
             let same_data = Shared::ptr_eq(&sd, &od);
             let sdb = sd.borrow();
             let odb = if same_data { None } else { Some(od.borrow()) };
-            let sa = MatOperand::of(&sdb);
-            let sb = odb.as_deref().map(MatOperand::of).unwrap_or(sa);
+            let sa = MatOperand::of(&sdb, &sd);
+            let sb = odb
+                .as_deref()
+                .map(|g| MatOperand::of(g, &od))
+                .unwrap_or(sa);
             // ∂a = g @ bᵀ、∂b = aᵀ @ g：GPU 内核支持按转置读物理矩阵，
             // 无需在 CPU 构造 52 万~210 万元素的转置矩阵（仅 CPU 回退时才物化）
             let da = matmul_data(MatOperand::F32(&g), sb, m, n, k, batch, false, !b_t);
@@ -2355,8 +2473,11 @@ impl Tensor {
         let same_data = Shared::ptr_eq(&a.data, &b.data);
         let sd = a.data.borrow();
         let od = if same_data { None } else { Some(b.data.borrow()) };
-        let sa = MatOperand::of(&sd);
-        let sb = od.as_deref().map(MatOperand::of).unwrap_or(sa);
+        let sa = MatOperand::of(&sd, &a.data);
+        let sb = od
+            .as_deref()
+            .map(|g| MatOperand::of(g, &b.data))
+            .unwrap_or(sa);
         let out_data = matmul_data(sa, sb, m, k1, n, a.shape[0], false, false);
         drop(sd);
         drop(od);
@@ -2387,8 +2508,11 @@ impl Tensor {
         let same_data = Shared::ptr_eq(&a.data, &b.data);
         let sd = a.data.borrow();
         let od = if same_data { None } else { Some(b.data.borrow()) };
-        let sa = MatOperand::of(&sd);
-        let sb = od.as_deref().map(MatOperand::of).unwrap_or(sa);
+        let sa = MatOperand::of(&sd, &a.data);
+        let sb = od
+            .as_deref()
+            .map(|g| MatOperand::of(g, &b.data))
+            .unwrap_or(sa);
         let out_data = matmul_data(sa, sb, m, k1, n, 1, false, b_t);
         drop(sd);
         drop(od);
@@ -2428,8 +2552,11 @@ impl Tensor {
         let same_data = Shared::ptr_eq(&a.data, &w.data);
         let sd = a.data.borrow();
         let wd = if same_data { None } else { Some(w.data.borrow()) };
-        let sa = MatOperand::of(&sd);
-        let sw = wd.as_deref().map(MatOperand::of).unwrap_or(sa);
+        let sa = MatOperand::of(&sd, &a.data);
+        let sw = wd
+            .as_deref()
+            .map(|g| MatOperand::of(g, &w.data))
+            .unwrap_or(sa);
         let out_data = matmul_data(sa, sw, m, k1, n, 1, false, false);
         drop(sd);
         drop(wd);
@@ -2450,7 +2577,7 @@ impl Tensor {
                 // dx = g @ Wᵀ：g 是 [m, n]，W 是 [k, n]（按 n 转置读）→ [m, k]
                 let dx = matmul_data(
                     MatOperand::F32(&g),
-                    MatOperand::of(&wd),
+                    MatOperand::of(&wd, &w_bwd.data),
                     m,
                     n,
                     k1,

@@ -70,7 +70,7 @@
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** / **distill** / **fp8** / **fp4** / **csa** / **mla** / **import-hf** |
 | API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 + 完整问答记录（问答正文只落日志文件）；**模型采出图片段时解码成 PNG，内嵌进 `message.image_url`（data URI）** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
-| GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU；**显存申请超过设备上限时先分块在 GPU 上算，连最小块都放不下才回退 CPU（不 panic）**，见 [§15](#15-gpu-加速可选-feature) |
+| GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU；**显存申请超过设备上限时先分块在 GPU 上算，连最小块都放不下才回退 CPU（不 panic）**；**权重（右操作数）可常驻显存跨调用复用，常驻块与分块的 dispatch 合并成一次 submit/poll（不改数值、逐位一致）**，见 [§15](#15-gpu-加速可选-feature) |
 
 ### 前沿技术（第 31-38 课）
 
@@ -1473,9 +1473,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **427 个单元测试**
+用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **431 个单元测试**
 （另有 2 个集成冒烟测试 `tests/smoke.rs`：启动真实二进制跑 `--help` 与 `preset`），
-其中 `src/gpu.rs` 16 个（含 3 个 `#[ignore]` 的性能标定探针）；不带 `--features gpu` 时 410 个。
+其中 `src/gpu.rs` 20 个（含 3 个 `#[ignore]` 的性能标定探针）；不带 `--features gpu` 时 410 个。
 零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
@@ -1626,7 +1626,7 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `help_lists_subcommands` | `--help` 正常退出且列出 train / eval / generate / serve / preset 等子命令 |
 | `preset_writes_config_file` | `preset --output` 落盘的配置是合法 JSON 且含 `model` / `train` / `n_embd` 字段 |
 
-`--features gpu` 额外 17 个（16 个在 `src/gpu.rs`，另 1 个是 `model::tests::test_gpu_resident_path_matches_loop_path`；以 `--list` 可核对）：
+`--features gpu` 额外 21 个（20 个在 `src/gpu.rs`，另 1 个是 `model::tests::test_gpu_resident_path_matches_loop_path`；以 `--list` 可核对）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -1640,12 +1640,16 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `gpu_matmul_small_tile_matches_big_tile_bits` | 4 形状 × 4 转置组合下，64×64 与 128×128 两个 matmul 内核输出**逐位相同** |
 | `chunk_plan_boundaries` | 分块计划（**纯函数**，不需要 GPU）：真实形状 `[151936,896]` 对本机 256 MiB 上限必须切成 3 块 `[50646,50645,50645]`（`batch_chunk = 1`）、恰好放得下 ⇒ 单块且 `is_whole`（零额外拷贝）、n=501 时余数落在前块、A 自己超限 ⇒ 改为切 batch、上限极窄 ⇒ 由「最小列宽 256 + 块数上限 256」挡下返回 `None`（仍回退 CPU） |
 | `gpu_matmul_chunked_matches_whole_bits` | **分块结果 == 整块结果，逐位相同**（`assert_eq!`，不放容差）：用纯函数压低上限强制切出多列块 / 多 batch 档，覆盖 `b_t` 两种物理布局、`a_t`、块宽不落在 tile 整数倍上，再对一遍 CPU 参考 |
+| `chunked_matmul_one_submit_matches_per_chunk_submit` | **合并同步不改变数值**：同一个分块计划下，「每块各 submit + poll + 回读」（改动前的写法，用 `run` 手工复现）与「一次 submit + poll」用 `assert_eq!` 逐位对拍；形状挑成每块只有约 4.2 MFLOP（同步开销占绝对多数），顺带打印两条路的 ms 与比值 |
+| `resident_cache_hit_is_bit_identical` | **常驻命中幂等**：同一权重连续三次调用必须逐位一致（容差 0），且 `resident_stats()` 里 `builds == 1`、`misses == 1`（首次只记一次「两次机会」）、`hits ≥ 1`、`updates == 0`、占用字节 = 整张 B |
+| `resident_cache_invalidates_after_weight_change` | **P2 失效契约（本任务头号风险）**：`set_data` / `decode_mut`（优化器就地更新的形态）改过权重之后，结果必须随之变化，且与「同内容但从未见过的新张量」**逐位相同**、与 CPU 三重循环参考一致（1e-3）；没有写入时连续调用仍逐位一致、`updates ≥ 2` |
+| `resident_chunked_table_matches_whole_bits` | **分块常驻逐位一致**：整表放不下时按列块各自常驻，常驻命中下的分块结果与「整块一次算」`assert_eq!`；同时断言「第一次查表不常驻、第二次才建表」与块数 = 列块数 × batch 档数 |
 | `mem_guard_fits_boundaries` | 显存护栏判据的边界：恰好等于上限合法（判据是 `<=`）、上限 +1 放不下、按池里真正创建的字节数（`size_class` 上取整）判 —— 真实崩溃尺寸 `151936×896×4 = 544538624 B` 在 256 MiB 上限的设备上必须判「放不下」 |
 | `mem_guard_take_buf_rejects_oversize` | 护栏在**分配入口**真的生效：超限申请（含真实崩溃尺寸）在 storage / 回读三种用途下都返回 `None`（而不是递到 `create_buffer` 去 panic），且拒绝之后池与上下文完好、正常尺寸照旧拿得到 buffer |
 | `mem_guard_limits_match_device` | 判据来自设备真实限制而非写死的常量：缓存的三个上限与 `device.limits()` 一致、`alloc_limit` 按用途取 min，0 个元素与极小张量在任何设备上都放得下（否则 GPU 后端等于被护栏禁用） |
 | `matmul_throughput_probe`（`#[ignore]`） | 单次提交内连跑同一 matmul，测**纯内核**吞吐（排除回读造成的假象） |
 | `mm_tile_ab_probe`（`#[ignore]`） | 同进程内按「大 → 小」交替各 3 轮，标定两种 tile 的 ms 与 GFLOP/s |
-| `chunked_head_matmul_vs_cpu_probe`（`#[ignore]`） | 输出头那一刀该走 CPU 兜底还是分块 GPU：同一份 519.4 MiB 权重、同一个 `Tensor::matmul` 入口**只切换分派**，逐 m（1 / 8 / 64 / 512）打印两条路的 ms 与最大差（实测 m=1 打平、m=64 快 2.3×，最大差恒为 0.00e0） |
+| `chunked_head_matmul_vs_cpu_probe`（`#[ignore]`） | 输出头那一刀该走 CPU 兜底还是 GPU：同一份 519.4 MiB 权重、同一个 `Tensor::matmul` 入口**只切换分派**，逐 m（1 / 8 / 64 / 512）打印**三条路**的 ms（CPU 兜底 / 分块 GPU 冷启动 / 常驻稳态，每条取 3 次最小值）与最大差、常驻占用与计数（实测 m=1 常驻 18.2 ms vs CPU 301.0 ms = 16.53×、m=512 443.9 vs 928.9 ms = 2.09×，所有档最大差恒为 0.00e0；常驻需预热两次，见 §15 的 ③） |
 
 三个标定探针要手动跑（它们不是通过/失败型测试，而是打印数据）：
 
@@ -1740,6 +1744,7 @@ SwiGLU 都已支持（每层分别回注 16/18 项参数梯度，默认关闭只
 | `LLM_GPU_PROBE` | 存在即录制第一步的全部 matmul 形状并逐形状单独回放，打印每形状吞吐 + 纯 FMA 峰值 | 关 |
 | `LLM_GPU_ABLATE` | 逗号分隔算子类别名（`heads_split,heads_join,col_sum`），命中的类别只计数不提交，用步时差反推真实耗时 | 空 |
 | `LLM_GPU_ABLATE_MM` | 逗号分隔形状谓词（`k<=32`、`n>=8192`、`m<=128`），命中的 matmul 只计数不提交 | 空 |
+| `LLM_GPU_RESIDENT_MB` | 权重常驻显存的预算（MiB）；**`0` = 关闭常驻**（核显建议调小或设 0，见下面的 ③）。**每个进程只在 GPU 初始化时读一次**：启动后改 env 无效，A/B 对照必须两个独立进程 | `4 × max_buffer_size`，夹在 `[512, 2048]`（本机 256 MiB 上限 ⇒ `1024`） |
 
 **GPU vs CPU 选择指南**：
 
@@ -1814,9 +1819,82 @@ GPU 初始化**（`request_device` + 管线编译）、约 **7.6 s 载入 ckpt**
 长生成（`--max-new 100`，上一轮同机实测）约 **0.41 s/token**，分块前后一致：增量解码 m=1 与 CPU 打平
 （输出头那一刀 CPU 兜底 326.5 ms vs 分块 GPU 333.5 ms），真正的瓶颈是**每 token 重传 519 MiB 权重**。
 同机标定（RX 560、逐 m 采样、同一个 `Tensor::matmul` 入口只切换分派，上一轮实测）：m=8 366.9 vs 300.2 ms、
-**m=64 813.3 vs 349.5 ms（2.3×）**、m=512 953.9 vs 690.0 ms，两条路输出最大差 **0.00e0**；
-**下一步是权重常驻显存 + 合并 submit/poll**。详见
-[docs/27-GPU加速.md](docs/27-GPU加速.md) §11 与 §12。
+**m=64 813.3 vs 349.5 ms（2.3×）**、m=512 953.9 vs 690.0 ms，两条路输出最大差 **0.00e0** ——
+这是分块那一刀的历史标定。详见 [docs/27-GPU加速.md](docs/27-GPU加速.md) §11 与 §12；
+**它的下一步（权重常驻显存 + 合并 submit/poll）已落地，见下面的 ③**。
+
+**③ 权重常驻显存（P2）+ 合并 submit/poll（P1）**。上面两条只解决「放不下」，没解决「搬得太多」：
+增量解码 m = 1 时每个 token 都要把 519.4 MiB 输出头权重**重传一遍 PCIe**，这才是它与 CPU 兜底打平的根因
+（真正的浮点只有 2×1×896×151936 ≈ 0.27 GFLOP）。现在把**右操作数（权重）**留在显存里跨调用复用，
+并把一次分块的全部列块 dispatch 与**全部**回读拷贝录进**同一个 encoder**（一次 submit、一次 poll；
+做分块时还是每块各付一次）。合并同步本身只有 1.05~1.28× 的收益，价值在「不改变数值的简化 +
+作为常驻的前提」：3 个常驻块现在只对应 1 次提交。两条都不改变任何数值：冷启动与常驻稳态的输出与
+CPU 兜底**最大差恒为 0.00e0**（`assert_eq!` 守着）。
+
+| m | CPU 兜底 | 分块 GPU 冷启动（每次重传 B） | 常驻稳态（P2 命中） | CPU/稳态 |
+|---|---------|---------------------------|-------------------|---------|
+| 1 | 301.0 ms | 357.0 ms | **18.2 ms** | **16.53×** |
+| 8 | 349.8 ms | 300.0 ms | **21.7 ms** | **16.15×** |
+| 64 | 731.1 ms | 298.5 ms | **60.3 ms** | **12.13×** |
+| 512 | 928.9 ms | 768.8 ms | **443.9 ms** | **2.09×** |
+
+标定口径：`cargo test --release --features gpu chunked_head_matmul_vs_cpu_probe -- --ignored --nocapture`
+（RX 560 / DX12，真实形状 `[vocab = 151936, d = 896]`，每个 m **先建常驻表再计时、取 3 次最小值**）。
+常驻走「两次机会」规则（第一次调用只登记、第二次建表、那一遍仍要上传），所以
+**收益从第三次调用起才拿满**，探针必须先预热两次。绝对值随后台负载能差 3~7 倍
+（同一探针另一次「机器很忙」的采样：m = 64 冷启动 2227.4 ms、m = 512 稳态 3018.1 ms），**比值结论不变**。
+
+⚠️ **端到端加速比：此前"不可信、只有推算"的口径已更新，现在有实测了**。旧口径是用 `generate` 的**墙钟**做 A/B，
+它确实不可信——本机墙钟被一次性开销淹没（GPU 初始化（DX12 着色器编译）在 **27~60 s** 之间跳、
+ckpt 载入 **7.6~13.6 s**，两项合计占墙钟 95% 以上），`--max-new 40` 的 A/B 甚至给出
+「省 27.4 s / 省 1.7 s」这种自相矛盾的结果。改用 `serve` 的**纯解码段**指标绕开启动噪声后，
+**端到端已测得 ≈2.2×**：非流式 `POST /v1/chat/completions` 返回的 `usage.tokens_per_second` 由服务端
+`DecodeTimer` 给出，**计时从 prefill 结束才开始**（见 [src/serve.rs](src/serve.rs)），所以这个数不含
+GPU 初始化、ckpt 载入、prefill 与网络耗时（流式与非流式走同一个 `DecodeTimer`）。
+口径：RX 560 / DX12、Qwen2.5-0.5B、`max_tokens=300`（`temperature=0.8` / `top_p=0.9`）、
+**每个进程先预热一次**（满足常驻的「两次机会」规则）、A/B 两个独立进程：
+
+| 组 | 常驻 | tok/s（n） | 每 token | 加速比 |
+|----|------|-----------|---------|--------|
+| A | 关（`LLM_GPU_RESIDENT_MB=0`） | **2.76**（2.71–2.79，n=5，±1.3%） | 362.5 ms | — |
+| B | 开（`=1024`） | **6.15**（5.56–6.64，n=6，±9%） | 162.5 ms | **mean 2.23× / median 2.25×**（区间 1.99–2.45×） |
+
+同一批请求的**纯请求墙钟** A 109.46 s vs B 49.77 s = **2.20×**；但**含启动的完整墙钟只有 1.70×**
+（A ≈144.9 s vs B ≈85.2 s）——两组 ready 时间都在 ≈35 s 量级且**无差别**（A 35.3–35.6 s / B 34.7–35.4 s），
+这正是此前 `generate` 墙钟 A/B 自相矛盾的根因：启动时间不是常数，它是**波动比被优化的那一段还大**的噪声。
+
+**对外只按这一句引用**：
+*"RX 560 单机、Qwen2.5-0.5B、`serve` 非流式、预热一次后 300-token 长解码段 ≈2.2×（2.0–2.4×）"* ——
+**不要引用单一数字**（B 组单次采样本身有 ±9% 抖动），**也不要把上面微观的 16.53× 说成端到端收益**。
+两者的差额来自**预算装不下**：1 GiB 预算装完 519.4 MiB 输出头后只剩约 505 MiB，而模型总权重约 1.9 GB，
+**其余权重（24 层 attn / MLP）每步仍在重传**，B 组剩下的约 160 ms/token 主要来自那里；
+所以输出头单算子省 0.28~0.31 s/token，端到端每步只省下 200 ms（362.5 → 162.5 ms）。
+完整方法与结果表、引用纪律、测量纪律见 [docs/27-GPU加速.md](docs/27-GPU加速.md) §13.7~§13.11。
+
+- **环境变量 `LLM_GPU_RESIDENT_MB`**：常驻预算（MiB），默认 `4 × max_buffer_size` 夹在 `[512, 2048]`
+  （本机 256 MiB 上限 ⇒ 1024）；**`0` = 关闭常驻**。**每个进程只在 GPU 初始化时读一次**
+  （`resident_budget()` 的唯一调用点在 `GpuContext` 构造里，构造只在 `create()` 中发生一次），
+  启动后改 env 无效 ⇒ 做 A/B 对照**必须两个独立进程**。
+- **核显建议**：默认值只在 RX 560 / DX12 上验证过。核显与系统内存共享，而常驻是「独占死内存」
+  （不进池、不给别的算子复用），建议把 `LLM_GPU_RESIDENT_MB` **调小，或直接设 0 关掉**。
+- **失效契约**：键 = `(数据单元 id, 写入代数, bf16, 布局)`；`id` 全局单调、**绝不复用**
+  （排除「张量释放后新张量落在同一地址」的假命中）；写入代数由**唯一的可变借用入口**
+  [`Shared::borrow_mut`](src/tensor.rs) 在**持锁之后**自增 ⇒ `set_data` / `decode_mut` / `to_bf16` /
+  优化器就地更新 / 量化回写 / ckpt 载入 / HF 导入 / `merge_lora` / 分布式分片写回全都自动让旧键失配，
+  **结构上不可能漏**。内容变而布局不变 ⇒ 原地重传全部块（不新建显存对象、绝不用旧内容）；
+  预算**只填不淘汰**（工作集超预算时 LRU 会让每次调用都"淘汰刚常驻的、重建上一批"，比不缓存更差）；
+  任一块放不下 ⇒ 已取的还池并退回「逐次上传 + 分块」，**绝不 panic**。
+- **未做项 P3**（常驻录制路径沿 N 分块，即 `lm_ce` / `softmax` 那条）按「不交半成品」保持现状：
+  要动被 matmul/scale/add/relu/softmax 共用的 `Params`（24 字节 6×u32 ⇒ 30+ 个派发点）、
+  下游要求句柄是单块连续 buffer 而 `copy_buffer_to_buffer` **没有跨列 stride**、
+  录制器三条不变式与 `oversize_handle` 这条"绝不 panic 的路径"都要重新论证，
+  而收益只覆盖「大 vocab 输出头整批作废」这一窄场景。详见
+  [docs/27-GPU加速.md](docs/27-GPU加速.md) §13。
+- **后续方向（唯一还能明显抬升 tok/s 的一步）：把预算调大**。端到端只有 ≈2.2× 的原因就是 1 GiB 预算
+  装完 519.4 MiB 输出头后只剩约 505 MiB，而模型总权重约 1.9 GB，**其余权重每步仍在重传**。
+  把 `LLM_GPU_RESIDENT_MB` 调到 `2048` / `4096`（取决于显卡显存）让 24 层 attn / MLP 权重也常驻，
+  是继常驻与合并 submit/poll 之后**唯一**还没做、且预期收益明显的一步；超预算**不会崩**，
+  只会退化为逐次上传（见 [docs/27-GPU加速.md](docs/27-GPU加速.md) §13.11）。
 
 ---
 
@@ -2278,7 +2356,7 @@ TinyLlama-1.1B ≈ 9GB 可行；8B 级需 60GB+，建议换更小的模型（内
 
 ## 代码验证状态
 
-- **测试**：`cargo test --features gpu -- --list` 当前列出 **427 个单元测试**（另有 2 个 `tests/smoke.rs`
+- **测试**：`cargo test --features gpu -- --list` 当前列出 **431 个单元测试**（另有 2 个 `tests/smoke.rs`
   集成用例；数量随代码增长，别把它当常量背）。**全量串行**跑
   （`cargo test --features gpu -- --test-threads=1`）上一次实测（当时 418 个单元用例）
   **415 passed / 1 failed / 2 ignored**：唯一失败的是
@@ -2670,6 +2748,15 @@ loss 直接变 NaN，整轮实验作废。
   `bᵀ` 正好是 `[K,N]` 行主序，必须按**非**转置读。写死成 `true` 会把两种布局算串——
   `hidden.matmul(&head.transpose())` 的**前向完全正常、反向梯度却错**，只看 loss 曲线发现不了。
   现在按前向 `b_t` 取反，`test_matmul_transposed_rhs_view` 用「两种布局 × 前向/反向」逐位对照守住。
+- **GPU 权重常驻缓存的失效必须挂在唯一写入入口，且版本自增要在持锁之后**：常驻键里的「内容代数」
+  （[`Shared::version`](src/tensor.rs)）只由 [`Shared::borrow_mut`](src/tensor.rs) 自增一处，而
+  `set_data` / `decode_mut` / `to_bf16` / 优化器就地更新 / 量化回写 / checkpoint 载入 / HF 导入 /
+  `merge_lora` / 分布式分片写回**全部**经它 —— 于是「漏失效」在**结构上不可能**。若改成在几十个写入
+  调用点手工调用失效函数，漏掉任何一处就是「训练之后仍在用旧权重」的**静默错误**（形状、loss 曲线
+  都看不出来）。第二个坑是顺序：`borrow_mut` 必须**先拿到锁、再 `fetch_add`**。反过来写会出现
+  「版本已经是 v+1、内容还是旧的」这个窗口，读者完全可能把旧内容当成 v+1 代常驻下来，之后真正写完
+  v+1 的读者就会命中这份旧内容 —— 同样是静默错误，而且比漏失效更难查（它只在并发/时序恰好命中时出现）。
+  代价只有每个 `Shared` 多 16 字节（`AtomicU64` + `u64`）与每次可变借用一次 `fetch_add(Relaxed)`。
 
 ## 后续方向
 
@@ -2699,6 +2786,10 @@ loss 直接变 NaN，整轮实验作废。
 
 仍可继续推进的方向：
 
+- **GPU 权重常驻的预算调大**：把 `LLM_GPU_RESIDENT_MB` 从默认 1 GiB 调到 `2048` / `4096` MiB
+  （取决于显卡显存），让 24 层 attn / MLP 权重也常驻显存。当前端到端只有 ≈2.2×
+  （[§15 的 ③](#15-gpu-加速可选-feature)：`serve` 纯解码段实测），原因就是预算只装得下 519.4 MiB 输出头，
+  其余约 1.9 GB 里的绝大部分权重每步仍在重传；超预算不会崩，只会退化为逐次上传
 - 更大的语料与模型规模（`config/config.json` 可直接调大，CPU 训练需耐心）
 - **真实 FP8 训练**：本仓库的 `src/fp8.rs` 只是数值模拟（编解码往返），要拿到 2 倍吞吐与一半显存
   必须把 matmul 换成 GPU 的 FP8 tensor core kernel（前向 E4M3、反向 E5M2 + 主权重高精度副本），

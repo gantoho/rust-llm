@@ -1707,6 +1707,14 @@ pub struct GpuContext {
     /// 存储/读回 buffer 池：键 = (size class 字节数, 用途)，按需取还，避免每算子新建 GPU 对象
     /// （用 Mutex 保证 GpuContext 可放进静态 OnceLock）
     pool: Mutex<HashMap<(u64, u8), Vec<wgpu::Buffer>>>,
+    /// 权重常驻显存缓存（P2，见 [`ResidentCache`]）。持锁期间常驻路径的整个
+    /// 「查表 → 录制 → 提交 → 回读」都串行化了：常驻块是**共享可写**的（版本变了要原地重传），
+    /// 只有把使用窗口整个锁住，才能排除"另一个线程正把新内容写进同一块 buffer、
+    /// 而本线程已录好的 dispatch 仍以为读的是旧内容"这类竞态。
+    /// 锁序固定为 `resident → pool`（`take_buf`/`put_buf`/`drain_pending` 都不会反向加锁）。
+    resident: Mutex<ResidentCache>,
+    /// 常驻缓存的字节预算（见 [`resident_budget`]）
+    resident_budget: usize,
 }
 
 /// 全局 GPU 上下文（初始化一次；None 表示不可用）
@@ -1766,9 +1774,32 @@ pub fn backend() -> String {
 /// GPU 批量矩阵乘（行优先）：out[B,M,N] = a[B,M,K] @ b[B,K,N]；batch=1 即普通 2D。
 /// `a_t`/`b_t` 为转置访问标志：为 true 时物理 a/b 分别是 [B,K,M]、[B,N,K]，
 /// 内核按转置读取（反向传播的 ∂a = g @ bᵀ、∂b = aᵀ @ g 直接复用，免构造转置矩阵）。
+///
+/// 这是**不带操作数身份**的入口（不碰权重常驻缓存）；`tensor.rs` 走 [`matmul_ident`]。
 pub fn matmul(
     a: &[f32],
     b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    batch: usize,
+    a_t: bool,
+    b_t: bool,
+) -> Option<Vec<f32>> {
+    matmul_ident(a, b, None, m, k, n, batch, a_t, b_t)
+}
+
+/// 同 [`matmul`]，但带上**右操作数（权重）的身份**：`b_id` 非空时该操作数可以常驻显存
+/// 跨调用复用（P2），消灭"每个 token 重传几百 MiB 权重"的 PCIe 开销。
+///
+/// 数值上与 [`matmul`] **逐位一致**：常驻命中的块就是"逐次上传时那次上传的同一份字节"
+/// （切法共用 [`b_chunk_elements`]），差别只在"传过一次就不再传"。
+/// `b_id = None` 或该操作数不满足常驻条件（太小 / 放不下 / 预算不够 / 只见过一次）时，
+/// 行为与 [`matmul`] 完全相同。
+pub fn matmul_ident(
+    a: &[f32],
+    b: &[f32],
+    b_id: Option<ResId>,
     m: usize,
     k: usize,
     n: usize,
@@ -1787,13 +1818,56 @@ pub fn matmul(
     let r = GPU
         .get()
         .and_then(|g| g.as_ref())
-        .and_then(|g| g.matmul(a, b, m, k, n, batch, a_t, b_t));
+        .and_then(|g| g.matmul_ident(a, b, b_id, m, k, n, batch, a_t, b_t));
     if r.is_some() {
         STATS_GPU.fetch_add(1, Ordering::Relaxed);
     } else {
         STATS_CPU.fetch_add(1, Ordering::Relaxed);
     }
     r
+}
+
+/// 权重常驻缓存的计数：(命中, 未命中, 新建, 原地重传, 因预算/显存放弃, 当前占用字节, 条目数)。
+///
+/// 供标定与测试断言用（例如"第二次调用必须命中"、"改了权重之后必须重传而不是命中"）。
+pub fn resident_stats() -> (u64, u64, u64, u64, u64, usize, usize) {
+    let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+        return (0, 0, 0, 0, 0, 0, 0);
+    };
+    let c = g.resident.lock().unwrap();
+    (
+        c.hits,
+        c.misses,
+        c.builds,
+        c.updates,
+        c.skips,
+        c.bytes,
+        c.map.len(),
+    )
+}
+
+/// 清空权重常驻缓存（显存全部还池），并清零计数。
+///
+/// 用途：显式释放显存（换模型、跑长训练前腾地方）与测试里隔离用例。
+/// 正常路径**不需要**调用它 —— 失效是自动的（见 [`ResId`] 与 [`ResidentCache`] 的契约）。
+pub fn reset_resident_cache() {
+    let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+        return;
+    };
+    let mut c = g.resident.lock().unwrap();
+    let tables: Vec<ResidentTable> = c.map.drain().map(|(_, t)| t).collect();
+    c.pending.clear();
+    c.bytes = 0;
+    c.hits = 0;
+    c.misses = 0;
+    c.builds = 0;
+    c.updates = 0;
+    c.skips = 0;
+    for t in tables {
+        for buf in t.chunks {
+            g.put_buf(buf);
+        }
+    }
 }
 
 /// 这次 matmul 有没有可能真的落到 GPU 内核上（判据与 [`matmul`] 入口**同源**，避免漂移）。
@@ -2206,6 +2280,18 @@ fn create() -> Option<GpuContext> {
         fma_pipe,
         params_buf,
         pool: Mutex::new(HashMap::new()),
+        resident: Mutex::new(ResidentCache {
+            map: HashMap::new(),
+            pending: HashMap::new(),
+            bytes: 0,
+            budget: resident_budget(dlimits.max_buffer_size),
+            hits: 0,
+            misses: 0,
+            builds: 0,
+            updates: 0,
+            skips: 0,
+        }),
+        resident_budget: resident_budget(dlimits.max_buffer_size),
     })
 }
 
@@ -2254,6 +2340,24 @@ impl GpuContext {
         a_t: bool,
         b_t: bool,
     ) -> Option<Vec<f32>> {
+        self.matmul_ident(a, b, None, m, k, n, batch, a_t, b_t)
+    }
+
+    /// [`GpuContext::matmul`] 的身份版：`b_id` 给出右操作数（权重）的
+    /// [`ResId`] 时走**权重常驻显存**（P2），`None` 时与旧路径逐位一致（不碰常驻缓存）。
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_ident(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        b_id: Option<ResId>,
+        m: usize,
+        k: usize,
+        n: usize,
+        batch: usize,
+        a_t: bool,
+        b_t: bool,
+    ) -> Option<Vec<f32>> {
         // wgpu 默认限制每维度最多 65535 个 workgroup，超出则回退 CPU。
         // 按**小** tile 判：小 tile 的 workgroup 数只会更多，两边都兜得住。
         if m == 0
@@ -2282,13 +2386,194 @@ impl GpuContext {
             .min(self.alloc_limit(KIND_READ));
         // 连"最小块宽"都放不下（或上限病态）→ 保持既有护栏语义：整单回退 CPU
         let plan = chunk_plan(m, k, n, batch, limit, std::mem::size_of::<f32>())?;
-        self.matmul_planned(a, b, m, k, n, batch, a_t, b_t, &plan)
+        // ---- P2：权重常驻显存 ----
+        // 常驻块是共享可写的（内容变了要原地重传），所以**整个使用窗口都持锁**：
+        // 从查表一路到 submit + poll 结束。这样"同一份常驻块被两个线程同时读写"不可能发生。
+        if let Some(id) = b_id {
+            let layout = ResLayout::new(b.len(), b_t, batch, k, &plan);
+            if self.resident_budget > 0 && b.len() * 4 >= RESIDENT_MIN_BYTES && layout.consistent()
+            {
+                let mut cache = self.resident.lock().unwrap();
+                if let Some(tbl) = self.resident_ensure(&mut cache, id, &layout, b) {
+                    return self.matmul_planned(a, b, m, k, n, batch, a_t, b_t, &plan, Some(&tbl));
+                }
+            }
+        }
+        self.matmul_planned(a, b, m, k, n, batch, a_t, b_t, &plan, None)
+    }
+
+    /// 查/建/更新常驻表；返回 `None` = 这次不常驻（调用方照旧逐次上传，见 [`ResidentCache`]）。
+    ///
+    /// 调用方必须已经持有 `self.resident` 的锁，并在整个使用窗口内不放（见 `matmul_ident`）。
+    fn resident_ensure(
+        &self,
+        cache: &mut ResidentCache,
+        id: ResId,
+        layout: &ResLayout,
+        b: &[f32],
+    ) -> Option<ResidentTable> {
+        if let Some(old) = cache.map.get(&id.cell) {
+            // ---- 已有该单元的常驻副本 ----
+            if old.layout == *layout && old.id.bf16 == id.bf16 {
+                if old.id.ver == id.ver {
+                    cache.hits += 1;
+                    return Some(old.clone());
+                }
+                // 内容变了（训练里权重每步都变）→ **原地重传**：成本与"每次都上传"相同，
+                // 但不再新建显存对象，也不会出现"改了权重却仍拿旧常驻内容去算"。
+                // write_buffer 在本次 submit 开头生效，所以这次 dispatch 读到的就是新内容。
+                let tbl = old.clone();
+                if !self.resident_write_chunks(layout, b, &tbl.chunks) {
+                    return None; // 布局自洽性已查过，这里只是防御
+                }
+                let entry = cache.map.get_mut(&id.cell).unwrap();
+                entry.id.ver = id.ver;
+                entry.id.bf16 = id.bf16;
+                cache.updates += 1;
+                return cache.map.get(&id.cell).cloned();
+            }
+            // 布局不一致（列宽/b_t/batch 换了切法）→ 重建；重建后总量超预算就放弃常驻
+            // （保留旧条目不动：另一个布局可能还在用，而且不淘汰才有硬上界）
+            let new_bytes = layout.bytes();
+            if cache.bytes.saturating_sub(old.bytes) + new_bytes > cache.budget {
+                cache.skips += 1;
+                return None;
+            }
+            let Some(chunks) = self.resident_take_chunks(layout) else {
+                cache.skips += 1; // 单块就放不下（显存护栏）：退回逐次上传 + 分块
+                return None;
+            };
+            if !self.resident_write_chunks(layout, b, &chunks) {
+                for buf in chunks {
+                    self.put_buf(buf);
+                }
+                return None;
+            }
+            let old = cache.map.remove(&id.cell).unwrap();
+            for buf in old.chunks {
+                self.put_buf(buf);
+            }
+            cache.bytes = cache.bytes.saturating_sub(old.bytes) + new_bytes;
+            cache.map.insert(
+                id.cell,
+                ResidentTable {
+                    id,
+                    layout: layout.clone(),
+                    chunks,
+                    bytes: new_bytes,
+                },
+            );
+            cache.pending.remove(&(id.cell, res_layout_hash(layout)));
+            cache.builds += 1;
+            return cache.map.get(&id.cell).cloned();
+        }
+        // ---- 没见过这个单元：两次机会规则 ----
+        let key = (id.cell, res_layout_hash(layout));
+        let promoted = cache.pending.get(&key) == Some(&id.ver);
+        if !promoted {
+            if cache.pending.len() >= RESIDENT_PENDING_MAX {
+                cache.pending.clear();
+            }
+            cache.pending.insert(key, id.ver);
+            cache.misses += 1;
+            return None;
+        }
+        let bytes = layout.bytes();
+        if cache.bytes + bytes > cache.budget {
+            cache.skips += 1; // 预算不够：这条单元不常驻（不淘汰已有条目，见 ResidentCache 的说明）
+            return None;
+        }
+        let Some(chunks) = self.resident_take_chunks(layout) else {
+            cache.skips += 1;
+            return None;
+        };
+        if !self.resident_write_chunks(layout, b, &chunks) {
+            for buf in chunks {
+                self.put_buf(buf);
+            }
+            return None;
+        }
+        cache.bytes += bytes;
+        cache.pending.remove(&key);
+        cache.map.insert(
+            id.cell,
+            ResidentTable {
+                id,
+                layout: layout.clone(),
+                chunks,
+                bytes,
+            },
+        );
+        cache.builds += 1;
+        cache.map.get(&id.cell).cloned()
+    }
+
+    /// 按布局申请全部常驻块（每块都过显存护栏）。任何一块放不下就整体放弃，
+    /// 已取出的立刻还池 —— 这正是"常驻放不下 → 退回每次上传 + 分块"的兜底路径，绝不 panic。
+    fn resident_take_chunks(&self, layout: &ResLayout) -> Option<Vec<wgpu::Buffer>> {
+        let elems = layout.chunk_elems();
+        let mut chunks = Vec::with_capacity(elems.len());
+        for e in elems {
+            let Some(buf) = self.take_buf(e.max(1), KIND_IN) else {
+                for b in chunks {
+                    self.put_buf(b);
+                }
+                return None;
+            };
+            chunks.push(buf);
+        }
+        Some(chunks)
+    }
+
+    /// 把 B 的每一块按布局写进 `chunks`（新建时用新块，内容变了时用原有块原地重传）。
+    /// 切法与逐次上传路径共用 [`b_chunk_elements`]，两条路的字节必须一致。
+    fn resident_write_chunks(&self, layout: &ResLayout, b: &[f32], chunks: &[wgpu::Buffer]) -> bool {
+        let n: usize = layout.cols.iter().sum();
+        let mut stage: Vec<f32> = Vec::new();
+        let mut idx = 0usize;
+        let mut b0 = 0usize;
+        while b0 < layout.batch {
+            let bc = layout.batch_chunk.min(layout.batch - b0);
+            let mut c0 = 0usize;
+            for &w in &layout.cols {
+                let Some(buf) = chunks.get(idx) else {
+                    return false;
+                };
+                let piece = b_chunk_elements(
+                    b,
+                    &mut stage,
+                    layout.whole,
+                    layout.b_t,
+                    n,
+                    layout.k,
+                    b0,
+                    bc,
+                    c0,
+                    w,
+                );
+                self.queue.write_buffer(buf, 0, bytemuck_bytes(piece));
+                idx += 1;
+                c0 += w;
+            }
+            b0 += bc;
+        }
+        idx == chunks.len()
     }
 
     /// 按 [`ChunkPlan`] 执行分块矩阵乘：batch 分档 × N 列块，逐块 dispatch 后按列拼回。
     ///
+    /// **一次 submit、一次 poll**（P1）：所有列块的 dispatch 与**全部**回读拷贝都录进同一个
+    /// encoder，末尾只提交一次、只同步一次。加分块之前的写法是每块各调一次 [`GpuContext::run`]，
+    /// 也就是每块各付一次 submit + poll；3 块就是 3 轮同步，而同步（`poll(Wait)` 等 GPU 跑完 +
+    /// 映射 + 拷回）正是逐算子路径里最贵的一段（实测占 90%，见 [`GpuBatch`] 的说明）。
+    /// 一次提交不改变任何数值：dispatch 之间的先后在 GPU 上本来就是串行的，这里只是把
+    /// 「等它们跑完」从 N 次收敛成 1 次。
+    ///
     /// 每个输出元素仍由**同一个内核**在 K 上按同一顺序累加，块边界只影响"这次算哪几列"，
     /// 所以结果与整块一次算逐位相同（由 `gpu_matmul_chunked_matches_whole_bits` 守住）。
+    ///
+    /// `resident` 为 [`ResidentTable`] 时（P2），列块的 B 直接从常驻显存借句柄，
+    /// 不再逐次上传（见 [`GpuContext::resident_ensure`]）。
     #[allow(clippy::too_many_arguments)]
     fn matmul_planned(
         &self,
@@ -2301,6 +2586,7 @@ impl GpuContext {
         a_t: bool,
         b_t: bool,
         plan: &ChunkPlan,
+        resident: Option<&ResidentTable>,
     ) -> Option<Vec<f32>> {
         let (pipe, tile) = if use_small_tile() {
             (&self.matmul_small_pipe, MM_TILE_S)
@@ -2311,67 +2597,86 @@ impl GpuContext {
         if !plan.is_whole(n, batch) {
             self.note_chunked(m, k, n, batch, plan);
         }
-        let mut out = vec![0.0f32; batch * m * n];
-        // 非连续切片的暂存区（跨块复用，避免每块重新分配）。见下面的两种布局说明。
+        let t0 = std::time::Instant::now();
+        // ---- 阶段 1：录制（每个块一次 dispatch，共用同一个 encoder，不提交）----
+        // 输出块：submit 之前必须一直活着（encoder 里引用着它们的 buffer），
+        // 回读拼接完之后由 [`GpuContext::release_planned`] 还池。
+        let mut outs: Vec<(wgpu::Buffer, usize)> = Vec::new();
+        // 每块输出的归属 (batch 起点 b0, 列起点 c0, 块宽 w)：按列拼回时定位用
+        let mut at: Vec<(usize, usize, usize)> = Vec::new();
+        // 本次从池里取出的临时 buffer（A 块 / B 块）：成功与失败都在 [`GpuContext::release_planned`] 归还
+        let mut taken: Vec<wgpu::Buffer> = Vec::new();
+        // 非连续切片的暂存区（跨块复用，避免每块重新分配）。见下面 `b_chunk_elements` 的说明。
         let mut stage: Vec<f32> = Vec::new();
+        let mut bat = self.batch_begin();
+        let mut ok = true;
         let mut b0 = 0usize;
-        while b0 < batch {
+        // batch 档序号：常驻表的 chunks 就是按「档序 × 列块序」展平存放的
+        let mut bgi = 0usize;
+        while b0 < batch && ok {
             let bc = plan.batch_chunk.min(batch - b0);
             // A 的 batch 维是最外层：a_t=false 时物理 [B,M,K]、a_t=true 时物理 [B,K,M]，
             // 两种布局下"一个 batch 一段"都是连续的，切 batch 不用做任何重排。
             let a_chunk = &a[b0 * m * k..(b0 + bc) * m * k];
             let Some(buf_a) = self.take_buf(a_chunk.len(), KIND_IN) else {
-                return None;
+                ok = false;
+                break;
             };
             self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a_chunk));
+            taken.push(buf_a.clone());
 
             let mut c0 = 0usize;
-            for &w in &plan.cols {
-                // B 块的物理布局（元素数都是 bc·k·w，只有排布不同）：
-                // - 整块（唯一的那个块覆盖全部列与全部 batch）：直接借位，零拷贝，
-                //   与分块之前的路径完全一致；
-                // - b_t=true（物理 [B,N,K]）：列切片就是"每列 K 个元素"的连续行段，
-                //   每个 batch 一段 memcpy 即可（batch=1 时连拼都不用拼）；
-                // - b_t=false（物理 [B,K,N]）：列切片跨步 N，只能按 K 行逐段取 w 个元素。
-                //   代价是**一遍全表扫描**（每段 w 个连续元素，宽块下就是一串整缓存行），
-                //   与"先物化整个转置矩阵"相比省掉了输入侧的随机访问和一份 519 MiB 的分配。
-                let b_chunk: &[f32] = if plan.is_whole(n, batch) {
-                    b
-                } else if b_t && bc == 1 {
-                    let s = b0 * n * k + c0 * k;
-                    &b[s..s + w * k]
-                } else {
-                    stage.clear();
-                    stage.reserve(bc * k * w);
-                    if b_t {
-                        for bi in 0..bc {
-                            let s = ((b0 + bi) * n + c0) * k;
-                            stage.extend_from_slice(&b[s..s + w * k]);
+            for (ci, &w) in plan.cols.iter().enumerate() {
+                // B 块的两种来源：
+                // - 常驻命中（P2）：常驻表里早已按同一布局上传好这一块，直接借句柄
+                //   （**不**进 `taken`：常驻 block 归缓存所有，绝不能还池）；
+                // - 否则从池里取一块上传（与加分块之前逐位一致的切法）。
+                let (buf_b, from_pool) = match resident {
+                    Some(tbl) => match tbl.chunks.get(bgi * plan.cols.len() + ci) {
+                        Some(b) => (b.clone(), false),
+                        // 布局相等就一定有这一块（见 `ResLayout::chunk_elems`）；这里只是防御：
+                        // 真出现不一致就作废本批，调用方按 Option 约定回退 CPU，绝不越界 panic
+                        None => {
+                            ok = false;
+                            break;
                         }
-                    } else {
-                        for bi in 0..bc {
-                            for kk in 0..k {
-                                let s = ((b0 + bi) * k + kk) * n + c0;
-                                stage.extend_from_slice(&b[s..s + w]);
-                            }
-                        }
+                    },
+                    None => {
+                        let b_chunk = b_chunk_elements(
+                            b,
+                            &mut stage,
+                            plan.is_whole(n, batch),
+                            b_t,
+                            n,
+                            k,
+                            b0,
+                            bc,
+                            c0,
+                            w,
+                        );
+                        let Some(buf) = self.take_buf(b_chunk.len(), KIND_IN) else {
+                            ok = false;
+                            break;
+                        };
+                        self.queue.write_buffer(&buf, 0, bytemuck_bytes(b_chunk));
+                        (buf, true)
                     }
-                    &stage
                 };
-                let Some(buf_b) = self.take_buf(b_chunk.len(), KIND_IN) else {
-                    self.put_buf(buf_a);
-                    return None;
-                };
-                self.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b_chunk));
+                if from_pool {
+                    taken.push(buf_b.clone());
+                }
                 let out_len = bc * m * w;
                 let Some(buf_out) = self.take_buf(out_len, KIND_OUT) else {
-                    self.put_buf(buf_a);
-                    self.put_buf(buf_b);
-                    return None;
+                    ok = false;
+                    break;
                 };
                 // 关键：这里传给内核的 "n" 是**块宽 w**（不是整张的 n）—— 内核用 n 同时给
                 // 输出定行距、给 b_t=false 的 B 定行距，两者在块内自洽，正是分块能成立的原因。
-                let r = self.run(
+                //
+                // 用 `record_dispatch` 而不是 `batch_dispatch`：逐算子路径从不看消融开关
+                // （`run()` 也不看），这里必须保持同一语义（见 `batch_dispatch` 的说明）。
+                let recorded = self.record_dispatch(
+                    &mut bat,
                     pipe,
                     &self.matmul_layout,
                     &[(&buf_a, 0), (&buf_b, 1), (&buf_out, 2)],
@@ -2383,32 +2688,139 @@ impl GpuContext {
                         a_t as u32,
                         b_t as u32,
                     ],
-                    &buf_out,
-                    out_len,
                     m.div_ceil(tile) as u32,
                     w.div_ceil(tile) as u32,
                     bc as u32,
                 );
-                self.put_buf(buf_b);
-                self.put_buf(buf_out);
-                let Some(r) = r else {
-                    self.put_buf(buf_a);
-                    return None;
-                };
-                // 按列拼回：out[(b0+bi)·m + i][c0 .. c0+w] = 块结果[(bi·m + i)][0..w]，分段连续
-                for bi in 0..bc {
-                    for i in 0..m {
-                        let dst = ((b0 + bi) * m + i) * n + c0;
-                        let src = (bi * m + i) * w;
-                        out[dst..dst + w].copy_from_slice(&r[src..src + w]);
-                    }
+                if !recorded {
+                    // 连参数 uniform 都申请不到：本批已作废，输出块直接还池（未提交，安全）
+                    self.put_buf(buf_out);
+                    ok = false;
+                    break;
                 }
+                outs.push((buf_out, out_len));
+                at.push((b0, c0, w));
                 c0 += w;
             }
-            self.put_buf(buf_a);
             b0 += bc;
+            bgi += 1;
+        }
+        if !ok {
+            self.release_planned(taken, false);
+            self.release_planned(outs.into_iter().map(|(b, _)| b).collect(), false);
+            return None;
+        }
+        // ---- 阶段 2：一次 submit + 一次 poll（回读拷贝也录进同一个 encoder）----
+        let t_record = t0.elapsed();
+        let (parts, submitted, submit_ms, sync_ms) = self.submit_many(bat, &outs);
+        let Some(parts) = parts else {
+            // 回读暂存区放不下（提交前失败则 `submitted == false`）：两块都要归还，
+            // 已提交时只能挂 PENDING（见 `release_planned`）
+            self.release_planned(taken, submitted);
+            self.release_planned(outs.into_iter().map(|(b, _)| b).collect(), submitted);
+            if submitted {
+                self.drain_pending();
+            }
+            return None;
+        };
+        // ---- 阶段 3：按列拼回（纯 CPU 拷贝，与逐块 dispatch 时完全相同的搬法）----
+        let mut out = vec![0.0f32; batch * m * n];
+        for (part, &(b0, c0, w)) in parts.iter().zip(at.iter()) {
+            let bc = if m * w == 0 { 0 } else { part.len() / (m * w) };
+            // out[(b0+bi)·m + i][c0 .. c0+w] = 块结果[(bi·m + i)][0..w]，分段连续
+            for bi in 0..bc {
+                for i in 0..m {
+                    let dst = ((b0 + bi) * m + i) * n + c0;
+                    let src = (bi * m + i) * w;
+                    out[dst..dst + w].copy_from_slice(&part[src..src + w]);
+                }
+            }
+        }
+        // 归还本批的池化 buffer。**可以直接还池**：`submit_many` 里的 `collect` 已经
+        // `poll(Wait)` 过（这就是它取回数据的同步点），GPU 对本批 buffer 的引用已全部结束 ——
+        // 与 `run()` / `batch_finish` 在 poll 之后直接还池是同一条纪律。
+        // 若这里改成走 PENDING，纯生成循环里没有别的调用点会触发 drain_pending，
+        // 每个 token 的 A 块与输出块就会在 PENDING 里只进不出（池被慢慢耗干）。
+        self.release_planned(taken, false);
+        // 顺手清空其他地方（句柄析构）挂进来的 PENDING：此刻刚刚 poll 过，入池安全
+        self.drain_pending();
+        // [诊断] 一次分块 matmul = 一条记录：out_len 是本次回读的总元素数，
+        // x 是本次录制的 dispatch 数、y 是列块数、z 是 batch 档数（x 不再等于 1，
+        // 因此 `flush_diag_log` 里的"每次"口径对这条记录是"每次调用"）
+        let total = t0.elapsed();
+        let diag = GpuDispatchDiag {
+            x: outs.len() as u32,
+            y: plan.cols.len() as u32,
+            z: bgi as u32,
+            out_len: batch * m * n,
+            total_ms: total.as_secs_f64() * 1000.0,
+            upload_ms: 0.0,
+            dispatch_ms: t_record.as_secs_f64() * 1000.0 + submit_ms,
+            sync_ms,
+            map_call_ms: 0.0,
+            poll_ms: 0.0,
+            view_ms: 0.0,
+            copy_ms: 0.0,
+        };
+        {
+            let mut log = GPU_DIAG_LOG.lock().unwrap();
+            if log.len() < DIAG_MAX {
+                log.push(diag);
+            }
         }
         Some(out)
+    }
+
+    /// 阶段 2：一次 `submit` + 一次 `poll`，把 `outs` 里的每块输出回读到 CPU。
+    /// 返回 (每块结果, 是否已经提交过, submit 耗时 ms, 同步耗时 ms)。
+    ///
+    /// 「是否已经提交过」决定失败路径怎么归还 buffer：没提交时 GPU 上没有本批的工作，
+    /// 直接还池是安全的；已提交（回读阶段失败）则只能挂 [`PENDING`]，等下一次
+    /// poll 之后由 [`GpuContext::drain_pending`] 统一入池（见该常量的说明）。
+    fn submit_many(
+        &self,
+        batch: GpuBatch,
+        outs: &[(wgpu::Buffer, usize)],
+    ) -> (Option<Vec<Vec<f32>>>, bool, f64, f64) {
+        let GpuBatch { enc, keep_groups, mut keep_bufs, .. } = batch;
+        let mut enc = enc;
+        let refs: Vec<(&wgpu::Buffer, usize)> = outs.iter().map(|(b, l)| (b, *l)).collect();
+        let Some(rb) = Readback::record_raw(self, &mut enc, &refs) else {
+            // 回读暂存区放不下（见 [`fits`]）：本批不提交，encoder 连同已录的 dispatch 一起丢弃。
+            drop(keep_groups);
+            for buf in keep_bufs.drain(..) {
+                self.put_buf(buf);
+            }
+            return (None, false, 0.0, 0.0);
+        };
+        let t = std::time::Instant::now();
+        self.queue.submit([enc.finish()]);
+        let submit_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let result = rb.collect(); // 内部 map + poll(Wait) + 拷回
+        let sync_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // GPU 已跑完（collect 里的 poll(Wait)）：bind group 可以丢，暂存的 uniform 归还池
+        drop(keep_groups);
+        for buf in keep_bufs.drain(..) {
+            self.put_buf(buf);
+        }
+        (result, true, submit_ms, sync_ms)
+    }
+
+    /// 把一次分块 matmul 取出的池化 buffer 全部归还（`submitted` = 本批是否已经提交过）。
+    /// 失败路径必须走它：既不留下悬挂的 buffer，也绝不在 GPU 还可能引用时把 buffer 交给别人。
+    fn release_planned(&self, bufs: Vec<wgpu::Buffer>, submitted: bool) {
+        if submitted {
+            // 已提交：GPU 可能仍在读这些 buffer，只能进 PENDING 等下一次 poll 之后入池
+            let mut pending = PENDING.lock().unwrap();
+            for buf in bufs {
+                pending.push(buf);
+            }
+        } else {
+            for buf in bufs {
+                self.put_buf(buf);
+            }
+        }
     }
 
     fn scale(&self, a: &[f32], s: f32) -> Option<Vec<f32>> {
@@ -2971,6 +3383,239 @@ fn chunk_plan(
     None
 }
 
+/// 取 B 操作数在「batch 档起点 b0、列区间 [c0, c0+w)」下的那一块内容
+/// （**分块路径唯一的切法**，逐次上传与常驻表建立都必须走它，否则两条路会切出不同的字节）。
+///
+/// 元素数都是 bc·k·w，只有排布不同：
+/// - `whole`（唯一的那个块覆盖全部列与全部 batch）：直接借位，零拷贝，与分块之前的路径完全一致；
+/// - `b_t = true`（物理 [B,N,K]）：列切片就是"每列 K 个元素"的连续行段，
+///   每个 batch 一段 memcpy 即可（batch = 1 时连拼都不用拼）；
+/// - `b_t = false`（物理 [B,K,N]）：列切片跨步 N，只能按 K 行逐段取 w 个元素。
+///   代价是**一遍全表扫描**（每段 w 个连续元素，宽块下就是一串整缓存行），
+///   与"先物化整个转置矩阵"相比省掉了输入侧的随机访问和一份 519 MiB 的分配。
+///
+/// `stage` 是跨块复用的暂存区（只有需要重排的两种情形才用它）。
+#[allow(clippy::too_many_arguments)]
+fn b_chunk_elements<'x>(
+    b: &'x [f32],
+    stage: &'x mut Vec<f32>,
+    whole: bool,
+    b_t: bool,
+    n: usize,
+    k: usize,
+    b0: usize,
+    bc: usize,
+    c0: usize,
+    w: usize,
+) -> &'x [f32] {
+    if whole {
+        return b;
+    }
+    if b_t && bc == 1 {
+        let s = b0 * n * k + c0 * k;
+        return &b[s..s + w * k];
+    }
+    stage.clear();
+    stage.reserve(bc * k * w);
+    if b_t {
+        for bi in 0..bc {
+            let s = ((b0 + bi) * n + c0) * k;
+            stage.extend_from_slice(&b[s..s + w * k]);
+        }
+    } else {
+        for bi in 0..bc {
+            for kk in 0..k {
+                let s = ((b0 + bi) * k + kk) * n + c0;
+                stage.extend_from_slice(&b[s..s + w]);
+            }
+        }
+    }
+    stage
+}
+
+// ================== 权重常驻显存（P2）：把 B 操作数留在显存里跨调用复用 ==================
+//
+// 病根（实测，见 `chunked_head_matmul_vs_cpu_probe`）：m = 1 时"分块 GPU"与"CPU 兜底"打平，
+// 因为每个 token 都要把 519.4 MiB 的输出头权重**重新上传一遍 PCIe**（本机 3 块 × 173 MiB），
+// 而 CPU 侧是 20 线程直接吃内存带宽 —— 上传恰好把 GPU 的算力优势吃光。
+// 权重表在生成/训练里反复用同一份内容，把它留在显存里就能整段省掉这笔重传。
+//
+// 为什么**只**缓存右操作数（B）：`Tensor::matmul` 的左操作数（激活）每个 token / 每一步
+// 都是新内容，缓存它等于"每次上传 + 白占一份显存"；真正反复重传的是 B 侧的权重表
+// （QKV/MLP 权重、输出头 `[vocab, d]`）。
+
+/// B 操作数的身份（P2 常驻缓存的键的前半部分）。
+///
+/// - `cell`：底层 `Shared<Buffer>` 单元的唯一 id，由 `tensor.rs` 在创建单元时从全局计数器
+///   分配。**不复用**，因此不存在"张量释放后新分配的张量恰好落在同一个地址"这种假命中
+///   （裸指针做键就有这个漏洞）。
+/// - `ver`：该单元的**写入代数**，每次可变借用（`Shared::borrow_mut` / `decode_mut` /
+///   `set_data` / `to_bf16` / 优化器参数更新 / 量化回写…）自增一次。内容一变代数就变，
+///   缓存键随之失配 —— 这是"改了权重之后绝不会静默用旧权重"的**唯一**依据（见
+///   `ResidentCache` 的失效契约）。
+/// - `bf16`：底层存储类型。bf16 的内核输入是解码后的 f32，内容同样由 (cell, ver) 唯一确定；
+///   把类型也放进键里是冗余保险（`to_bf16` 本身也会推高 `ver`）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ResId {
+    pub cell: u64,
+    pub ver: u64,
+    pub bf16: bool,
+}
+
+/// 决定常驻副本内容的一切（键的后半部分）：同一个数据单元在不同形状/切法下要分成不同条目。
+///
+/// 注意 `m` **不在**里面：列块的切法与 m 无关（m 只决定输出块大小与 grid），
+/// 所以 m = 1/8/64 只要 `chunk_plan` 给出的列宽一致就能复用同一份常驻副本。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct ResLayout {
+    /// B 的物理元素数（`elems` 个 f32 全部要进显存）
+    elems: usize,
+    b_t: bool,
+    batch: usize,
+    k: usize,
+    /// 整块（唯一一块覆盖全部列与全部 batch）：此时 chunks 只有一块、内容就是整张 B
+    whole: bool,
+    batch_chunk: usize,
+    /// 每块的列宽，顺序拼接 = n
+    cols: Vec<usize>,
+}
+
+impl ResLayout {
+    fn new(elems: usize, b_t: bool, batch: usize, k: usize, plan: &ChunkPlan) -> Self {
+        ResLayout {
+            elems,
+            b_t,
+            batch,
+            k,
+            whole: plan.batch_chunk == batch && plan.cols.len() == 1,
+            batch_chunk: plan.batch_chunk,
+            cols: plan.cols.clone(),
+        }
+    }
+
+    /// 每个常驻块的元素数（顺序 = 「batch 档序 × 列块序」，与 `matmul_planned` 的索引一致）
+    fn chunk_elems(&self) -> Vec<usize> {
+        let mut v = Vec::new();
+        let mut b0 = 0usize;
+        while b0 < self.batch {
+            let bc = self.batch_chunk.min(self.batch - b0);
+            for &w in &self.cols {
+                v.push(if self.whole { self.elems } else { bc * self.k * w });
+            }
+            b0 += bc;
+        }
+        v
+    }
+
+    /// 整表按 `size_class` 上取整后的显存占用（与池 / 护栏同一口径）
+    fn bytes(&self) -> usize {
+        self.chunk_elems()
+            .iter()
+            .map(|&e| size_class((e * 4) as u64) as usize)
+            .sum()
+    }
+
+    /// 布局与数据长度是否自洽：分块切法假定物理 B 恰好是 `batch × k × n`。
+    /// 不自洽就**不常驻**（逐次上传那条路照旧按同一公式切，行为与改动前一致）。
+    fn consistent(&self) -> bool {
+        if self.elems == 0 || self.batch == 0 || self.k == 0 {
+            return false;
+        }
+        if self.whole {
+            return true;
+        }
+        // 下溢保护：分块情形下 B 至少要有 batch·k·n 个元素
+        let n: usize = self.cols.iter().sum();
+        self.elems >= self.batch.saturating_mul(self.k).saturating_mul(n)
+            && self.cols.iter().all(|&w| w > 0)
+    }
+}
+
+/// 布局的稳定哈希：只用于"两次机会"观察窗的键，进程内一致即可（不做跨进程持久化）。
+/// 哈希碰撞最坏只是让某条布局被多晋升一次，而建立常驻表时用的始终是**真实布局**，
+/// 因此不会算出错误结果。
+fn res_layout_hash(layout: &ResLayout) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    layout.hash(&mut h);
+    h.finish()
+}
+
+/// 一个 B 操作数的常驻副本（数据单元的某个 `ResLayout` 下的全部块）。
+struct ResidentTable {
+    id: ResId,
+    layout: ResLayout,
+    /// 按「batch 档序 × 列块序」展平的已上传块；`layout.whole` 时只有一块（就是整张 B）
+    chunks: Vec<wgpu::Buffer>,
+    bytes: usize,
+}
+
+impl Clone for ResidentTable {
+    /// 克隆只复制 `wgpu::Buffer` 的句柄（内部是 `Arc`），显存不复制 —— 这正是"借出去用"的成本。
+    fn clone(&self) -> Self {
+        ResidentTable {
+            id: self.id,
+            layout: self.layout.clone(),
+            chunks: self.chunks.clone(),
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// 常驻缓存（键 = 数据单元 id，值 = 该单元的常驻副本）。
+///
+/// **失效契约（本任务的头号风险）**：
+/// 1. 命中的充要条件是 `(cell, ver, bf16, layout)` **全等**。任何一处不等都不得直接复用：
+///    - `ver` 不等（内容变了）→ 布局一致时**原地重传**全部块，并把条目的 ver 更新到新值；
+///      布局不一致时重建条目（旧块还池）。训练里权重每步都变，走的就是"原地重传"，
+///      成本与"每次上传"相同，但不再新建显存对象，也不会出现"训练后仍用旧权重"。
+///    - `layout` 不等（列宽/b_t/batch 变了）→ 重建，绝不拿别的切法切出来的块去算。
+/// 2. `cell` 全局唯一且不复用，故不存在"地址相同、内容不同"的假命中。
+/// 3. **两次机会（two-strike）**：同一个 `(cell, ver, layout)` 必须先被看到**两次**才会常驻。
+///    理由：训练里绝大多数 B 是**一次性的激活**（每步都是新张量、新 ver），首次即缓存会
+///    把预算（可达 1 GiB）填满垃圾，反而挤掉真正反复用到的权重；权重表在生成/训练中
+///    反复出现，(cell, ver, layout) 第二次一定再现，只晚一次调用就进入常驻。
+/// 4. 预算只增不减地填：满了就不再新增（**不做 LRU 淘汰**）。理由：工作集一旦超过预算，
+///    LRU 会让每次调用都"淘汰刚常驻的、重建上一批"，等于每次调用都付一次上传 + 重建，
+///    比不缓存更差；不淘汰则显存有硬上界（`budget`），命中集一旦建立就稳定。
+/// 5. 常驻块**不还池**：它们只属于缓存（`matmul_planned` 不会把它们放进 `taken`），
+///    淘汰/重建时经 `put_buf` 归还。
+struct ResidentCache {
+    map: HashMap<u64, ResidentTable>,
+    /// 两次机会的观察窗：(单元 id, 布局哈希) -> 上次见到的 ver
+    pending: HashMap<(u64, u64), u64>,
+    bytes: usize,
+    budget: usize,
+    hits: u64,
+    misses: u64,
+    builds: u64,
+    updates: u64,
+    skips: u64,
+}
+
+/// 常驻缓存的最小规模：比它更小的操作数每次上传也就几十微秒，不值得占着显存不放。
+const RESIDENT_MIN_BYTES: usize = 64 * 1024;
+/// 两次机会观察窗的条目上限：训练里每个激活都是新单元，无上限会一路涨。
+/// 超限整体清空（清空只会让少数权重的晋升推迟一次，不影响正确性）。
+const RESIDENT_PENDING_MAX: usize = 4096;
+
+/// 常驻缓存的默认预算：设备单块上限的 4 倍，夹在 [512 MiB, 2 GiB]。
+///
+/// 为什么不是"越大越好"：常驻显存是**独占**的（不进池、不给别的算子复用），预算就是
+/// "GPU 上多占的死内存"的硬上界。本机（RX 560，max_buffer_size = 256 MiB）取到 1 GiB，
+/// 正好能放下 Qwen2.5-0.5B 输出头整表 519.4 MiB（分 3 块常驻）。
+/// 环境变量 `LLM_GPU_RESIDENT_MB` 可覆盖（省显存/标定用），0 = 关闭常驻。
+fn resident_budget(max_buffer_size: u64) -> usize {
+    let default = (max_buffer_size.saturating_mul(4)).clamp(512 << 20, 2 << 30);
+    match std::env::var("LLM_GPU_RESIDENT_MB") {
+        Ok(v) => v
+            .parse::<usize>()
+            .map(|mb| mb.saturating_mul(1 << 20))
+            .unwrap_or(default as usize),
+        Err(_) => default as usize,
+    }
+}
+
 /// 已析构显存句柄（[`GpuHandle`]）的 buffer 暂存区。
 ///
 /// 为什么不直接回池（P1-1）：句柄可能在**录制中途**析构（encoder 里还引用着它的 buffer），
@@ -3088,6 +3733,10 @@ impl GpuContext {
     ///
     /// **每个 dispatch 都要从池里另取一块 24 字节 uniform**：所有 dispatch 若共用同一块，
     /// `write_buffer` 的写入全部在提交开头生效，后写的会把先写的覆盖掉，让先录的 dispatch 读到错参数。
+    ///
+    /// 消融开关（`LLM_GPU_ABLATE`）在这里生效：它只面向「一次提交里录很多 dispatch」的
+    /// 常驻/批量路径。逐算子路径（`run()`）从不看它，所以 [`GpuContext::matmul_planned`]
+    /// 直接用 [`GpuContext::record_dispatch`]，保持改动前的语义。
     #[allow(clippy::too_many_arguments)]
     fn batch_dispatch(
         &self,
@@ -3107,12 +3756,30 @@ impl GpuContext {
             batch.kinds[kind as usize] += 1;
             return;
         }
+        let _ = self.record_dispatch(batch, pipe, layout, bufs, params, x, y, z);
+    }
+
+    /// [`GpuContext::batch_dispatch`] 的核心：无条件把一次 dispatch 录进本批的 encoder
+    /// （不做消融判定）。返回 false = 连 4 KiB 的参数 uniform 都申请不到，本批已作废。
+    #[allow(clippy::too_many_arguments)]
+    fn record_dispatch(
+        &self,
+        batch: &mut GpuBatch,
+        pipe: &wgpu::ComputePipeline,
+        layout: &wgpu::BindGroupLayout,
+        bufs: &[(&wgpu::Buffer, u32)],
+        params: [u32; 6],
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> bool {
+        let kind = self.classify(pipe);
         let Some(pbuf) = self.take_buf(6, KIND_UNIFORM) else {
             // 连 4 KiB 的参数 buffer 都放不下：这种设备在 `GpuContext::new` 里就被判为
             // 不可用（有下限检查），所以这里不可达；真到了这一步也只是作废本批，
             // 不会 panic、不会带着无效参数提交。
             batch.oversize = true;
-            return;
+            return false;
         }; // 6 个 u32 = 24 字节
         self.queue.write_buffer(&pbuf, 0, bytemuck_bytes(&params));
         let mut entries: Vec<wgpu::BindGroupEntry> = bufs
@@ -3151,6 +3818,7 @@ impl GpuContext {
         batch.keep_bufs.push(pbuf);
         batch.dispatches += 1;
         batch.kinds[kind as usize] += 1;
+        true
     }
 
     /// 批量内录制一次 matmul
@@ -3261,58 +3929,134 @@ impl Drop for GpuHandle {
     }
 }
 
+/// 一块回读暂存（大小受 `KIND_READ` 上限约束，见 [`fits`]）。
+///
+/// 为什么要有多块：一次回读的总量可以是任意大（输出头 logits `[4096, vocab]` 就有
+/// 2.3 GiB），而单块 buffer 受设备上限约束（本机 256 MiB）。按上限切成多块 staging，
+/// 所有拷贝命令仍录进**同一个** encoder ⇒ 依旧是一次 submit、一次 poll。
+struct ReadbackStage {
+    buf: wgpu::Buffer,
+    /// 本 staging 装了多少个元素（读映射视图时用它夹定长度）
+    elems: usize,
+    /// (全局 span 下标, 该 span 在本 staging 内的元素偏移)
+    items: Vec<(usize, usize)>,
+}
+
 /// 一次回读的暂存：提交前把拷贝命令录进 encoder，poll 之后再取数据。
 /// 多个张量合成**一次**提交、一次 poll —— 分开回读要为每个张量各付一次固定开销（实测 ~10ms/次）。
 struct Readback {
-    staging: wgpu::Buffer,
-    /// (元素偏移, 元素个数)
+    stages: Vec<ReadbackStage>,
+    /// (元素偏移, 元素个数)，与传入的句柄一一对应
     spans: Vec<(usize, usize)>,
     total: usize,
 }
 
 impl Readback {
-    /// 把若干句柄拷进一块暂存 buffer（命令录进 `enc`，尚未提交）
+    /// 把若干句柄拷进暂存 buffer（命令录进 `enc`，尚未提交）
     fn record(
         ctx: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
         handles: &[&GpuHandle],
     ) -> Option<Readback> {
-        let mut spans = Vec::with_capacity(handles.len());
+        let bufs: Vec<(&wgpu::Buffer, usize)> = handles.iter().map(|h| (&h.buf, h.len)).collect();
+        Self::record_raw(ctx, enc, &bufs)
+    }
+
+    /// 同上，但接收**裸 buffer**：分块 matmul 的输出块不是 [`GpuHandle`]
+    /// （它们归还走池化路径而不是 `PENDING`，见 `GpuContext::matmul_planned`）。
+    fn record_raw(
+        ctx: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        bufs: &[(&wgpu::Buffer, usize)],
+    ) -> Option<Readback> {
+        let mut spans = Vec::with_capacity(bufs.len());
         let mut total = 0usize;
-        for h in handles {
-            spans.push((total, h.len));
-            total += h.len;
+        for &(_, len) in bufs {
+            spans.push((total, len));
+            total += len;
         }
-        // 放不下（一次回读的总字节数超限）就返回 None，调用方回退 CPU 分批读
-        let staging = ctx.take_buf(total.max(1), KIND_READ)?;
-        let mut off = 0u64;
-        for h in handles {
-            let bytes = (h.len * 4) as u64;
-            if bytes > 0 {
-                enc.copy_buffer_to_buffer(&h.buf, 0, &staging, off, bytes);
-                off += bytes;
+        // 先按上限把各 span 分组（纯计算，不碰显存），再逐组申请 staging：
+        // 判据与 `take_buf` 同源（size class 上取整后的字节数 ≤ alloc_limit(KIND_READ)），
+        // 否则会「算得下、取不到」——切了一堆组，最后一组照样申请失败。
+        let limit = ctx.alloc_limit(KIND_READ);
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut cur: Vec<usize> = Vec::new();
+        let mut cur_elems = 0usize;
+        for (i, &(_, len)) in spans.iter().enumerate() {
+            if !cur.is_empty()
+                && !fits(limit, size_class(((cur_elems + len) * 4) as u64) as usize)
+            {
+                groups.push(std::mem::take(&mut cur));
+                cur_elems = 0;
             }
+            cur.push(i);
+            cur_elems += len;
         }
-        Some(Readback { staging, spans, total })
+        if !cur.is_empty() {
+            groups.push(cur);
+        }
+        let mut stages = Vec::with_capacity(groups.len());
+        for group in groups {
+            let elems: usize = group.iter().map(|&i| spans[i].1).sum();
+            // 单个张量自己就超限（它独占一组）→ 返回 None，调用方按既有约定回退 CPU
+            let buf = ctx.take_buf(elems.max(1), KIND_READ)?;
+            let mut items = Vec::with_capacity(group.len());
+            let mut off = 0usize;
+            for &i in &group {
+                let len = spans[i].1;
+                if len > 0 {
+                    enc.copy_buffer_to_buffer(
+                        bufs[i].0,
+                        0,
+                        &buf,
+                        (off * 4) as u64,
+                        (len * 4) as u64,
+                    );
+                    items.push((i, off));
+                    off += len;
+                }
+            }
+            stages.push(ReadbackStage { buf, elems, items });
+        }
+        Some(Readback {
+            stages,
+            spans,
+            total,
+        })
     }
 
     /// 等待并取出数据（提交之后调用）
     fn collect(self) -> Option<Vec<Vec<f32>>> {
-        let Readback { staging, spans, total } = self;
+        let Readback { stages, spans, total } = self;
         let ctx = GPU.get().and_then(|g| g.as_ref())?;
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if total == 0 {
+            // 全是空句柄：不必碰显存，直接给出一串空 Vec（与旧实现的行为一致）
+            return Some(spans.iter().map(|_| Vec::new()).collect());
+        }
+        // 所有 staging 一起 map，再 poll **一次**：多块 staging 不额外多付同步
+        let slices: Vec<_> = stages.iter().map(|s| s.buf.slice(..)).collect();
+        for slice in &slices {
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+        }
         let _ = ctx
             .device
             .poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        let view = slice.get_mapped_range().ok()?;
-        let all = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, total) };
-        let out = spans.iter().map(|&(o, n)| all[o..o + n].to_vec()).collect();
-        drop(view);
-        staging.unmap();
+        let mut all = vec![0.0f32; total];
+        for (stage, slice) in stages.iter().zip(&slices) {
+            let view = slice.get_mapped_range().ok()?;
+            let data = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, stage.elems) };
+            for &(i, off) in &stage.items {
+                let (go, len) = spans[i];
+                all[go..go + len].copy_from_slice(&data[off..off + len]);
+            }
+            drop(view);
+            stage.buf.unmap();
+        }
         // 归池：collect 内部已 poll(Wait)，GPU 空闲，可安全复用（P1-1：staging 不再逐步新建）
-        ctx.put_buf(staging);
-        Some(out)
+        for stage in stages {
+            ctx.put_buf(stage.buf);
+        }
+        Some(spans.iter().map(|&(o, n)| all[o..o + n].to_vec()).collect())
     }
 }
 
@@ -5939,7 +6683,7 @@ mod tests {
             );
             assert!(plan.cols.iter().sum::<usize>() == n, "{tag}：{plan:?}");
             let chunked = g
-                .matmul_planned(&a, &b, m, k, n, batch, a_t, b_t, &plan)
+                .matmul_planned(&a, &b, m, k, n, batch, a_t, b_t, &plan, None)
                 .unwrap_or_else(|| panic!("{tag}：分块执行失败 {plan:?}"));
             assert_eq!(
                 whole, chunked,
@@ -5960,14 +6704,15 @@ mod tests {
     /// 标定探针（`--ignored`）：**输出头那一刀到底该走 CPU 兜底还是分块 GPU**。
     ///
     /// 形状就是真实模型（Qwen2.5-0.5B）：`[vocab=151936, d=896]` 的输出头整表 519.4 MiB，
-    /// 本机 256 MiB 上限放不下。两条路都从同一份 `Tensor` 出发、走同一个 `Tensor::matmul`：
+    /// 本机 256 MiB 上限放不下。三条路都从同一份 `Tensor` 出发、走同一个 `Tensor::matmul`：
     /// - **CPU 兜底**：把盈亏平衡阈值拉到不可能达到的高度（于是不碰内核），
     ///   `tensor.rs` 会物化转置表 + 20 线程三重循环
-    /// - **分块 GPU**：阈值归 0 → 本文件的 `matmul` → `chunk_plan` → 逐块 dispatch
+    /// - **分块 GPU 冷启动**：阈值归 0 → 本文件的 `matmul` → `chunk_plan` → 逐块 dispatch，
+    ///   权重每个 token 都要重传一遍 PCIe（P1 之后是"一次 submit + 一次 poll"）
+    /// - **分块 GPU 稳态（P2 权重常驻命中）**：该 m 的常驻表建好之后的调用，B 侧不再上传。
+    ///   常驻走"两次机会"规则（见 [`ResidentCache`]），所以这里跑满两次预热再计时。
     ///
-    /// 结论（本机 RX 560 / 20 逻辑核，实测见输出）：m=1 时 CPU 兜底反而**略快**，
-    /// m≥8 时两者同量级、大 m 时分块明显更快。根因是分块每次都要把 519 MiB 权重
-    /// 重传一遍 PCIe，而 CPU 那边是 20 线程直接吃内存带宽。
+    /// 结论以实测输出为准（不写死在注释里）。
     #[test]
     #[ignore = "仅用于性能标定，不进常规测试"]
     fn chunked_head_matmul_vs_cpu_probe() {
@@ -5977,30 +6722,339 @@ mod tests {
         }
         use crate::tensor::Tensor;
         let (vocab, d) = (151_936usize, 896usize);
-        // 权重只用来计时，取值无所谓（全是同一个常数，两种路径的结果也必然一致）
+        // 权重只用来计时，取值无所谓（全是同一个常数，三条路径的结果也必然一致）
         let w = Tensor::from_vec(vec![0.01f32; vocab * d], vec![vocab, d]);
         let saved = MATMUL_MIN_FLOPS.load(Ordering::Relaxed);
+        let max_diff = |p: &[f32], q: &[f32]| {
+            p.iter()
+                .zip(q)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
         for m in [1usize, 8, 64, 512] {
             let x = Tensor::from_vec(vec![0.02f32; m * d], vec![m, d]);
+            // 计时取 **3 次的最小值**：这台机器上同时跑着 IDE/浏览器/后台任务，
+            // 单次采样能差出 3 倍以上（实测同一 m 的 CPU 兜底在 1.0s~3.5s 之间跳），
+            // 最小值才是"这段代码本身要多久"，也才让三次路径之间的比较有意义。
+            const REPS: usize = 3;
             MATMUL_MIN_FLOPS.store(usize::MAX, Ordering::Relaxed); // 强制 CPU 兜底
-            let t0 = std::time::Instant::now();
-            let a = x.matmul(&w.transpose());
-            let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed); // 强制分块 GPU
+            let mut cpu_ms = f64::MAX;
+            let mut a = x.matmul(&w.transpose());
+            for _ in 0..REPS {
+                let t0 = std::time::Instant::now();
+                a = x.matmul(&w.transpose());
+                cpu_ms = cpu_ms.min(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed); // 强制走分块 GPU
+            // 每个 m 都从"没有常驻"开始：冷启动口径才可比（否则前一个 m 建的表会漏进来）
+            reset_resident_cache();
             let t1 = std::time::Instant::now();
-            let b = x.matmul(&w.transpose());
-            let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
-            let err = a
-                .data()
-                .iter()
-                .zip(b.data())
-                .map(|(p, q)| (p - q).abs())
-                .fold(0.0f32, f32::max);
+            let cold = x.matmul(&w.transpose());
+            let cold_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            // 两次机会 + 建表各占一次调用，之后才是稳态（常驻命中）
+            let _ = x.matmul(&w.transpose());
+            let _ = x.matmul(&w.transpose());
+            let mut warm_ms = f64::MAX;
+            let mut warm = cold.clone();
+            for _ in 0..REPS {
+                let t2 = std::time::Instant::now();
+                warm = x.matmul(&w.transpose());
+                warm_ms = warm_ms.min(t2.elapsed().as_secs_f64() * 1000.0);
+            }
+            let (hits, _misses, builds, updates, skips, bytes, entries) = resident_stats();
+            let cold_err = max_diff(&a.data(), &cold.data());
+            let warm_err = max_diff(&cold.data(), &warm.data());
             println!(
-                "[probe] m={m:<4} CPU 兜底 {cpu_ms:8.1}ms | 分块 GPU（3 块）{gpu_ms:8.1}ms | 最大差 {err:.2e}"
+                "[probe] m={m:<4} CPU 兜底 {cpu_ms:7.1}ms | 分块 GPU 冷启动 {cold_ms:7.1}ms | \
+                 常驻稳态 {warm_ms:7.1}ms（CPU/稳态 {:.2}×）| 最大差 冷{cold_err:.2e}/稳{warm_err:.2e} | \
+                 常驻 {:.1}MB/{entries} 条（命中 {hits} / 新建 {builds} / 原地重传 {updates} / 放弃 {skips}）",
+                cpu_ms / warm_ms,
+                bytes as f64 / 1048576.0,
             );
         }
+        reset_resident_cache();
         MATMUL_MIN_FLOPS.store(saved, Ordering::Relaxed);
+    }
+
+    /// **P1 对照**：同一分块计划下，「每块各 submit + poll」（改动前的写法，这里用
+    /// [`GpuContext::run`] 手工复现）vs「一次 submit + 一次 poll」（现在的 `matmul_planned`）。
+    ///
+    /// 形状挑成"每块的计算量极小、同步开销占绝对多数"：limit = 1 MiB、k = 256、m = 8 时
+    /// 会切出 9 个列块，每块只有 3.7 MFLOP（GPU 上 ~0.05ms），于是两者之差几乎就是
+    /// **8 次多余的 submit+poll+回读**的价钱 —— 这正是 P1 要消掉的东西。
+    /// 顺便把两条路的输出逐位对拍（`assert_eq!`），保证"合并同步"没有改变任何数值。
+    #[test]
+    fn chunked_matmul_one_submit_matches_per_chunk_submit() {
+        init();
+        if !is_available() {
+            return;
+        }
+        MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
+        let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+            return;
+        };
+        let (m, k, n, batch, b_t) = (8usize, 256usize, 8192usize, 1usize, false);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 53) as f32 * 0.021).sin()).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| ((i % 71) as f32 * 0.013).cos()).collect();
+        let plan = chunk_plan(m, k, n, batch, 1 << 20, 4).expect("1 MiB 上限下应当能分块");
+        assert!(plan.cols.len() >= 4, "这个用例要切出足够多的块：{plan:?}");
+        // ---- (a) 逐块 submit + poll：改动前的写法（`matmul_planned` 里曾经就是这段）----
+        let per_chunk_once = || -> Vec<f32> {
+            let (pipe, tile) = if use_small_tile() {
+                (&g.matmul_small_pipe, MM_TILE_S)
+            } else {
+                (&g.matmul_pipe, MM_TILE)
+            };
+            let mut out = vec![0.0f32; batch * m * n];
+            let mut stage: Vec<f32> = Vec::new();
+            let buf_a = g.take_buf(a.len(), KIND_IN).unwrap();
+            g.queue.write_buffer(&buf_a, 0, bytemuck_bytes(&a));
+            let mut c0 = 0usize;
+            for &w in &plan.cols {
+                let b_chunk =
+                    b_chunk_elements(&b, &mut stage, plan.is_whole(n, batch), b_t, n, k, 0, batch, c0, w);
+                let buf_b = g.take_buf(b_chunk.len(), KIND_IN).unwrap();
+                g.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b_chunk));
+                let out_len = batch * m * w;
+                let buf_out = g.take_buf(out_len, KIND_OUT).unwrap();
+                let r = g
+                    .run(
+                        pipe,
+                        &g.matmul_layout,
+                        &[(&buf_a, 0), (&buf_b, 1), (&buf_out, 2)],
+                        [batch as u32, m as u32, k as u32, w as u32, 0, b_t as u32],
+                        &buf_out,
+                        out_len,
+                        m.div_ceil(tile) as u32,
+                        w.div_ceil(tile) as u32,
+                        batch as u32,
+                    )
+                    .expect("逐块跑应当成功");
+                g.put_buf(buf_b);
+                g.put_buf(buf_out);
+                for bi in 0..batch {
+                    for i in 0..m {
+                        let dst = ((0 + bi) * m + i) * n + c0;
+                        let src = (bi * m + i) * w;
+                        out[dst..dst + w].copy_from_slice(&r[src..src + w]);
+                    }
+                }
+                c0 += w;
+            }
+            g.put_buf(buf_a);
+            out
+        };
+        const REPS: usize = 3;
+        let mut old_ms = f64::MAX;
+        let mut old = Vec::new();
+        for _ in 0..REPS {
+            let t = std::time::Instant::now();
+            old = per_chunk_once();
+            old_ms = old_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // ---- (b) 一次 submit + 一次 poll ----
+        let mut new_ms = f64::MAX;
+        let mut new = Vec::new();
+        for _ in 0..REPS {
+            let t = std::time::Instant::now();
+            new = g
+                .matmul_planned(&a, &b, m, k, n, batch, false, b_t, &plan, None)
+                .expect("一次提交路径应当成功");
+            new_ms = new_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!(
+            "[probe] 分块 {} 块（每块 2×{m}×{k}×{} ≈ {:.1} MFLOP，同步开销为主）| \
+             逐块 submit+poll {old_ms:.2}ms | 一次 submit+poll {new_ms:.2}ms | 提速 {:.2}×",
+            plan.cols.len(),
+            plan.cols[0],
+            2.0 * m as f64 * k as f64 * plan.cols[0] as f64 / 1e6,
+            old_ms / new_ms,
+        );
+        assert_eq!(old, new, "合并同步不能改变任何一个 bit");
+    }
+
+    /// **P2 幂等 + 命中断言**：同一份权重连续调用必须逐位一致，且第二次之后走常驻命中
+    /// （不再上传），否则"常驻"这件事就没有发生。
+    #[test]
+    fn resident_cache_hit_is_bit_identical() {
+        use crate::tensor::Tensor;
+        init();
+        if !is_available() {
+            return;
+        }
+        MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
+        reset_resident_cache();
+        // B = n×k = 1024×512 个 f32 = 2 MiB ≥ RESIDENT_MIN_BYTES（64 KiB）
+        let (m, k, n) = (8usize, 512usize, 1024usize);
+        let w = Tensor::from_vec(
+            (0..n * k).map(|i| ((i % 97) as f32 * 0.011).sin()).collect(),
+            vec![n, k],
+        );
+        let x = Tensor::from_vec(
+            (0..m * k).map(|i| ((i % 89) as f32 * 0.017).cos()).collect(),
+            vec![m, k],
+        );
+        let r1 = x.matmul(&w.transpose()).data();
+        let r2 = x.matmul(&w.transpose()).data();
+        let r3 = x.matmul(&w.transpose()).data();
+        // 逐位一致（容差 0）：常驻只是"不再上传"，不能改变任何一个 bit
+        assert_eq!(r1, r2, "同一权重连续两次调用必须逐位一致");
+        assert_eq!(r2, r3, "同一权重连续三次调用必须逐位一致");
+        let (hits, misses, builds, updates, skips, bytes, entries) = resident_stats();
+        assert_eq!(builds, 1, "只该建立一条常驻表：hits={hits} misses={misses}");
+        assert_eq!(misses, 1, "首次调用只记一次'两次机会'：{misses}");
+        assert!(hits >= 1, "第二次调用之后必须命中常驻：hits={hits}");
+        assert_eq!(updates, 0, "内容没变，不该有原地重传：{updates}");
+        assert_eq!(skips, 0, "预算充足，不该放弃常驻：{skips}");
+        assert_eq!(entries, 1, "只该有一条常驻条目");
+        assert_eq!(bytes, n * k * 4, "常驻占用应等于整张 B：{bytes}");
+    }
+
+    /// **P2 失效契约（本任务的头号风险）**：改了权重之后再次 matmul 必须拿到新结果。
+    ///
+    /// 覆盖三条最容易出错的写入路径：`set_data`、`decode_mut`（优化器就地更新的形态）、
+    /// 以及"改了内容但没改形状/视图"（转置视图与权重共享同一份数据单元）。
+    /// 判据用**两个互相独立的证据**：
+    /// 1. 结果必须与"同样内容、但从未见过的新张量"逐位相同（后者必然是一次全新上传）；
+    /// 2. 结果必须与 CPU 三重循环参考一致（容差 1e-3，与既有对拍测试同风格）。
+    #[test]
+    fn resident_cache_invalidates_after_weight_change() {
+        use crate::tensor::Tensor;
+        init();
+        if !is_available() {
+            return;
+        }
+        MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
+        reset_resident_cache();
+        let (m, k, n) = (8usize, 512usize, 1024usize);
+        let w_data: Vec<f32> = (0..n * k).map(|i| ((i % 97) as f32 * 0.011).sin()).collect();
+        let w = Tensor::from_vec(w_data.clone(), vec![n, k]);
+        let x = Tensor::from_vec(
+            (0..m * k).map(|i| ((i % 89) as f32 * 0.017).cos()).collect(),
+            vec![m, k],
+        );
+        let x_data = x.data();
+
+        // --- 1) 先把常驻表建起来（两次机会 + 建表），并确认命中 ---
+        let old = x.matmul(&w.transpose()).data();
+        let _ = x.matmul(&w.transpose());
+        let _ = x.matmul(&w.transpose());
+        let (hits0, ..) = resident_stats();
+        assert!(hits0 >= 1, "预热之后应当命中常驻：{hits0}");
+
+        // --- 2) set_data 改权重（shape/视图都没变）---
+        let mut new_data = w_data.clone();
+        new_data[0] += 1.0;
+        new_data[k + 7] -= 2.5;
+        new_data[n * k - 1] += 0.75;
+        w.set_data(new_data.clone());
+        let got = x.matmul(&w.transpose()).data();
+        assert_ne!(got, old, "改了权重之后结果必须随之变化（绝不能命中旧常驻内容）");
+        // 证据 1：与"从未缓存过的同内容张量"逐位相同
+        let fresh = Tensor::from_vec(new_data.clone(), vec![n, k]);
+        let want = x.matmul(&fresh.transpose()).data();
+        assert_eq!(got, want, "常驻重传的结果必须与全新上传逐位一致");
+        // 证据 2：与 CPU 三重循环参考一致
+        let c = cpu_matmul(&x_data, &new_data, m, k, n, 1, false, true);
+        let err = got
+            .iter()
+            .zip(&c)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "对 CPU 参考最大误差 {err}");
+
+        // --- 3) decode_mut 就地更新（优化器 `step` 的写法），同样必须立刻生效 ---
+        {
+            let mut d = w.decode_mut();
+            d[3] -= 4.0;
+            d[k * 2 + 5] += 3.0;
+        }
+        let got2 = x.matmul(&w.transpose()).data();
+        assert_ne!(got2, got, "decode_mut 改过权重后结果必须更新");
+        let updated = w.data();
+        let fresh2 = Tensor::from_vec(updated.clone(), vec![n, k]);
+        let want2 = x.matmul(&fresh2.transpose()).data();
+        assert_eq!(got2, want2, "就地更新后的常驻重传必须与全新上传逐位一致");
+
+        // --- 4) 反向：不动权重连续调用仍然逐位一致（失效不能"过度"到每次都重算错） ---
+        let again = x.matmul(&w.transpose()).data();
+        assert_eq!(got2, again, "没有写入时连续调用必须逐位一致");
+        let (_h, _mi, _b, updates, _s, _bytes, _e) = resident_stats();
+        assert!(updates >= 2, "两次写入都应当触发原地重传：updates={updates}");
+        reset_resident_cache();
+    }
+
+    /// **P2 分块常驻**：整表放不下时按 [`ChunkPlan`] 切块，每块各自常驻；
+    /// 常驻命中下的分块结果必须与"整块一次算"**逐位相同**，且下一次调用真的不再上传。
+    #[test]
+    fn resident_chunked_table_matches_whole_bits() {
+        init();
+        if !is_available() {
+            return;
+        }
+        // 阈值压到 0：小形状也要真的走内核（否则会被 CPU 兜底挡掉，测了个寂寞）
+        MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
+        reset_resident_cache();
+        let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+            return;
+        };
+        // 与 `gpu_matmul_chunked_matches_whole_bits` 同形：limit 刚好逼出多列块
+        let (m, k, n, batch) = (7usize, 16usize, 512usize, 2usize);
+        let a: Vec<f32> = (0..m * k * batch)
+            .map(|i| ((i % 53) as f32 * 0.021).sin())
+            .collect();
+        let b: Vec<f32> = (0..n * k * batch)
+            .map(|i| ((i % 71) as f32 * 0.013).cos())
+            .collect();
+        let whole = g
+            .matmul(&a, &b, m, k, n, batch, false, true)
+            .expect("整块一次算应当走 GPU");
+        let limit = 32768u64;
+        let plan = chunk_plan(m, k, n, batch, limit, 4).expect("应当能分块");
+        assert!(plan.cols.len() > 1, "这个用例必须真的切成多列块：{plan:?}");
+        let layout = ResLayout::new(b.len(), true, batch, k, &plan);
+        assert!(layout.consistent());
+        // 数据单元身份：这里手工构造（测试直接调 `resident_ensure`，绕过 `Tensor`）
+        let id = ResId {
+            cell: 0x5eed_0001,
+            ver: 0,
+            bf16: false,
+        };
+        let mut cache = g.resident.lock().unwrap();
+        // 两次机会：第一次只登记，第二次才建表
+        assert!(
+            g.resident_ensure(&mut cache, id, &layout, &b).is_none(),
+            "第一次见不该直接常驻"
+        );
+        let tbl = g
+            .resident_ensure(&mut cache, id, &layout, &b)
+            .expect("第二次见应当建立分块常驻表");
+        assert_eq!(
+            tbl.chunks.len(),
+            plan.cols.len() * batch.div_ceil(plan.batch_chunk),
+            "每个 batch 档 × 每个列块一块"
+        );
+        let got = g
+            .matmul_planned(&a, &b, m, k, n, batch, false, true, &plan, Some(&tbl))
+            .expect("常驻命中的分块执行不该失败");
+        assert_eq!(whole, got, "分块常驻的结果必须与整块一次算逐位相同");
+        // 命中路径：同一布局再来一次，应当命中而不是新建
+        let tbl2 = g
+            .resident_ensure(&mut cache, id, &layout, &b)
+            .expect("同一布局应当命中");
+        assert_eq!(tbl2.chunks.len(), tbl.chunks.len());
+        let got2 = g
+            .matmul_planned(&a, &b, m, k, n, batch, false, true, &plan, Some(&tbl2))
+            .expect("命中路径不该失败");
+        assert_eq!(got, got2, "命中路径必须逐位一致");
+        // 注意：`resident_stats()` 自己也要锁 `resident`（std 的 Mutex 不可重入），
+        // 必须先放开手里的锁再查计数
+        drop(cache);
+        let (hits, _mi, _b, _u, skips, _bytes, entries) = resident_stats();
+        assert!(hits >= 1, "第二次查表应当命中：{hits}");
+        assert_eq!(skips, 0);
+        assert_eq!(entries, 1);
+        reset_resident_cache();
     }
 
     /// GPU 掩码 softmax 与 CPU 参考实现逐元素对比。
