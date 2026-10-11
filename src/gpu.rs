@@ -86,6 +86,10 @@ static STATS_CPU: AtomicUsize = AtomicUsize::new(0);
 /// 生成时同一个大表每个 token 都会撞上护栏，逐次打印只会刷屏。
 static MEM_GUARD_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// 分块执行提示的一次性开关（见 [`GpuContext::note_chunked`]）：
+/// 与上面的护栏提示**互斥的两条出路**——放不下整块时，要么分块在 GPU 上算，要么回退 CPU。
+static CHUNK_NOTE_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// GPU dispatch 诊断记录（采集前 `DIAG_MAX` 次调用，在训练首步结束后统一打印）
 struct GpuDispatchDiag {
     x: u32, y: u32, z: u32,
@@ -1801,18 +1805,26 @@ pub fn matmul(
 /// 注意它在"确定不上 GPU"的分支里替 [`matmul`] 补了 `STATS_CPU` 计数，
 /// 否则 `[done] matmul 分流：GPU x / CPU y` 那行诊断会少算调用次数。
 pub fn matmul_may_use_gpu(m: usize, k: usize, n: usize, batch: usize) -> bool {
+    if matmul_would_use_gpu(m, k, n, batch) {
+        return true;
+    }
+    STATS_CPU.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// [`matmul_may_use_gpu`] 的**无副作用**版本（不碰分流计数）。
+///
+/// 供 `tensor.rs` 在"要不要为内核省掉一次操作数物化"时先行判断：那里决定的是**布局**
+/// （转置视图直接喂内核，还是先 `contiguous()` 物化），而同一个形状随后还会走一遍
+/// [`matmul_may_use_gpu`]，用它计数才不会把一次调用算成两次。
+pub fn matmul_would_use_gpu(m: usize, k: usize, n: usize, batch: usize) -> bool {
     if PROBE_CAPTURE.load(Ordering::Relaxed) {
         return true; // LLM_GPU_PROBE 录制模式：没有 GPU 也要记形状，供之后回放
     }
     if GPU.get().and_then(|g| g.as_ref()).is_none() {
-        STATS_CPU.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if 2 * m * k * n * batch < MATMUL_MIN_FLOPS.load(Ordering::Relaxed) {
-        STATS_CPU.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    true
+    2 * m * k * n * batch >= MATMUL_MIN_FLOPS.load(Ordering::Relaxed)
 }
 
 /// GPU 逐元素缩放：out[i] = a[i] * s
@@ -2224,8 +2236,13 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl GpuContext {
-    /// 批量矩阵乘（tiled：16×16 共享内存块，块内用共享内存复用两个输入矩阵的行/列）。
+    /// 批量矩阵乘（tiled：共享内存块，块内用共享内存复用两个输入矩阵的行/列）。
     /// `a_t`/`b_t`：物理存储转置标志，见 [`matmul`]。
+    ///
+    /// **整块放不下就分块**：三块显存任一装不下整张时，按 [`chunk_plan`] 沿 N（输出列）
+    /// 切块、必要时连 batch 一起切，逐块 dispatch 后把结果拼回。真实案例：Qwen2.5-0.5B 的
+    /// `[151936, 896]` 输出头整表 519.4 MiB > 本机 256 MiB 上限 —— 分块前这个算子每个 token
+    /// 都整单回退 CPU（生成 ~9 s/token），分块后切成 3 块在 GPU 上算。
     fn matmul(
         &self,
         a: &[f32],
@@ -2253,42 +2270,145 @@ impl GpuContext {
         if 2 * m * k * n * batch < MATMUL_MIN_FLOPS.load(Ordering::Relaxed) {
             return None;
         }
-        // 三块显存任一放不下就整单回退 CPU（`take_buf` 里的显存护栏返回 None）。
-        // 真实案例：Qwen2.5-0.5B 的 [151936, 896] 输出头整表 519.4 MiB >
-        // 本机 max_buffer_size 256 MiB —— 以前这里会直接 panic，现在回退 CPU。
-        let out_len = batch * m * n;
-        let buf_a = self.take_buf(a.len(), KIND_IN)?;
-        self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a));
-        let buf_b = self.take_buf(b.len(), KIND_IN)?;
-        self.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b));
-        let buf_out = self.take_buf(out_len, KIND_OUT)?;
+        // 操作数长度与逻辑形状必须自洽（下面按 batch/列区间切片，长度不对就不是"分块"能救的了）
+        if a.len() < batch * m * k || b.len() < batch * k * n {
+            return None;
+        }
+        // 一份"放得下"的判据对这四块 buffer 都成立：A/B/输出走 storage 绑定上限，
+        // 回读暂存区走 max_buffer_size，取三者最紧的那个（偏保守，最多少切几列）。
+        let limit = self
+            .alloc_limit(KIND_IN)
+            .min(self.alloc_limit(KIND_OUT))
+            .min(self.alloc_limit(KIND_READ));
+        // 连"最小块宽"都放不下（或上限病态）→ 保持既有护栏语义：整单回退 CPU
+        let plan = chunk_plan(m, k, n, batch, limit, std::mem::size_of::<f32>())?;
+        self.matmul_planned(a, b, m, k, n, batch, a_t, b_t, &plan)
+    }
+
+    /// 按 [`ChunkPlan`] 执行分块矩阵乘：batch 分档 × N 列块，逐块 dispatch 后按列拼回。
+    ///
+    /// 每个输出元素仍由**同一个内核**在 K 上按同一顺序累加，块边界只影响"这次算哪几列"，
+    /// 所以结果与整块一次算逐位相同（由 `gpu_matmul_chunked_matches_whole_bits` 守住）。
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_planned(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        batch: usize,
+        a_t: bool,
+        b_t: bool,
+        plan: &ChunkPlan,
+    ) -> Option<Vec<f32>> {
         let (pipe, tile) = if use_small_tile() {
             (&self.matmul_small_pipe, MM_TILE_S)
         } else {
             (&self.matmul_pipe, MM_TILE)
         };
-        let r = self.run(
-            pipe,
-            &self.matmul_layout,
-            &[(&buf_a, 0), (&buf_b, 1), (&buf_out, 2)],
-            [
-                batch as u32,
-                m as u32,
-                k as u32,
-                n as u32,
-                a_t as u32,
-                b_t as u32,
-            ],
-            &buf_out,
-            out_len,
-            m.div_ceil(tile) as u32,
-            n.div_ceil(tile) as u32,
-            batch as u32,
-        );
-        self.put_buf(buf_a);
-        self.put_buf(buf_b);
-        self.put_buf(buf_out);
-        r
+        // 整块放不下、这次真的分了块 → 提示一次（与"回退 CPU"的护栏提示对称）
+        if !plan.is_whole(n, batch) {
+            self.note_chunked(m, k, n, batch, plan);
+        }
+        let mut out = vec![0.0f32; batch * m * n];
+        // 非连续切片的暂存区（跨块复用，避免每块重新分配）。见下面的两种布局说明。
+        let mut stage: Vec<f32> = Vec::new();
+        let mut b0 = 0usize;
+        while b0 < batch {
+            let bc = plan.batch_chunk.min(batch - b0);
+            // A 的 batch 维是最外层：a_t=false 时物理 [B,M,K]、a_t=true 时物理 [B,K,M]，
+            // 两种布局下"一个 batch 一段"都是连续的，切 batch 不用做任何重排。
+            let a_chunk = &a[b0 * m * k..(b0 + bc) * m * k];
+            let Some(buf_a) = self.take_buf(a_chunk.len(), KIND_IN) else {
+                return None;
+            };
+            self.queue.write_buffer(&buf_a, 0, bytemuck_bytes(a_chunk));
+
+            let mut c0 = 0usize;
+            for &w in &plan.cols {
+                // B 块的物理布局（元素数都是 bc·k·w，只有排布不同）：
+                // - 整块（唯一的那个块覆盖全部列与全部 batch）：直接借位，零拷贝，
+                //   与分块之前的路径完全一致；
+                // - b_t=true（物理 [B,N,K]）：列切片就是"每列 K 个元素"的连续行段，
+                //   每个 batch 一段 memcpy 即可（batch=1 时连拼都不用拼）；
+                // - b_t=false（物理 [B,K,N]）：列切片跨步 N，只能按 K 行逐段取 w 个元素。
+                //   代价是**一遍全表扫描**（每段 w 个连续元素，宽块下就是一串整缓存行），
+                //   与"先物化整个转置矩阵"相比省掉了输入侧的随机访问和一份 519 MiB 的分配。
+                let b_chunk: &[f32] = if plan.is_whole(n, batch) {
+                    b
+                } else if b_t && bc == 1 {
+                    let s = b0 * n * k + c0 * k;
+                    &b[s..s + w * k]
+                } else {
+                    stage.clear();
+                    stage.reserve(bc * k * w);
+                    if b_t {
+                        for bi in 0..bc {
+                            let s = ((b0 + bi) * n + c0) * k;
+                            stage.extend_from_slice(&b[s..s + w * k]);
+                        }
+                    } else {
+                        for bi in 0..bc {
+                            for kk in 0..k {
+                                let s = ((b0 + bi) * k + kk) * n + c0;
+                                stage.extend_from_slice(&b[s..s + w]);
+                            }
+                        }
+                    }
+                    &stage
+                };
+                let Some(buf_b) = self.take_buf(b_chunk.len(), KIND_IN) else {
+                    self.put_buf(buf_a);
+                    return None;
+                };
+                self.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b_chunk));
+                let out_len = bc * m * w;
+                let Some(buf_out) = self.take_buf(out_len, KIND_OUT) else {
+                    self.put_buf(buf_a);
+                    self.put_buf(buf_b);
+                    return None;
+                };
+                // 关键：这里传给内核的 "n" 是**块宽 w**（不是整张的 n）—— 内核用 n 同时给
+                // 输出定行距、给 b_t=false 的 B 定行距，两者在块内自洽，正是分块能成立的原因。
+                let r = self.run(
+                    pipe,
+                    &self.matmul_layout,
+                    &[(&buf_a, 0), (&buf_b, 1), (&buf_out, 2)],
+                    [
+                        bc as u32,
+                        m as u32,
+                        k as u32,
+                        w as u32,
+                        a_t as u32,
+                        b_t as u32,
+                    ],
+                    &buf_out,
+                    out_len,
+                    m.div_ceil(tile) as u32,
+                    w.div_ceil(tile) as u32,
+                    bc as u32,
+                );
+                self.put_buf(buf_b);
+                self.put_buf(buf_out);
+                let Some(r) = r else {
+                    self.put_buf(buf_a);
+                    return None;
+                };
+                // 按列拼回：out[(b0+bi)·m + i][c0 .. c0+w] = 块结果[(bi·m + i)][0..w]，分段连续
+                for bi in 0..bc {
+                    for i in 0..m {
+                        let dst = ((b0 + bi) * m + i) * n + c0;
+                        let src = (bi * m + i) * w;
+                        out[dst..dst + w].copy_from_slice(&r[src..src + w]);
+                    }
+                }
+                c0 += w;
+            }
+            self.put_buf(buf_a);
+            b0 += bc;
+        }
+        Some(out)
     }
 
     fn scale(&self, a: &[f32], s: f32) -> Option<Vec<f32>> {
@@ -2473,6 +2593,31 @@ impl GpuContext {
             len as f64 * 4.0 / mb,
             bytes as f64 / mb,
             limit as f64 / mb,
+            STATS_GPU.load(Ordering::Relaxed),
+            STATS_CPU.load(Ordering::Relaxed),
+        );
+    }
+
+    /// 记录一次「大矩阵乘没回退 CPU，而是分块在 GPU 上算」。
+    ///
+    /// 与 [`GpuContext::warn_oversize`] 对称：那条讲"放不下 → 回退 CPU"，这条讲"放不下 →
+    /// 分块"，两者是同一次申请的两条出路，用户看输出就知道走的是哪一条。
+    /// 同样每个进程只提示一次（生成时每个 token 都会走一次分块）。
+    fn note_chunked(&self, m: usize, k: usize, n: usize, batch: usize, plan: &ChunkPlan) {
+        if CHUNK_NOTE_WARNED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mb = 1024.0 * 1024.0;
+        let widest = plan.cols.iter().copied().max().unwrap_or(n);
+        let b_groups = batch.div_ceil(plan.batch_chunk);
+        println!(
+            "[gpu] 分块 matmul：out[{m},{n}]（k={k}, batch={batch}）放不下设备上限 {:.1} MiB，\
+             沿 N 切成 {} 块（最宽 {widest} 列）× {} 档 batch，逐块在 GPU 上算后按列拼回\
+             —— 本算子留在 GPU，没有整单回退 CPU。\
+             （只提示一次；此刻 matmul 分流：GPU {} / CPU {}）",
+            self.alloc_limit(KIND_IN) as f64 / mb,
+            plan.cols.len(),
+            b_groups,
             STATS_GPU.load(Ordering::Relaxed),
             STATS_CPU.load(Ordering::Relaxed),
         );
@@ -2716,6 +2861,114 @@ fn size_class(bytes: u64) -> u64 {
 #[inline]
 fn fits(limit: u64, bytes: usize) -> bool {
     bytes as u64 <= limit
+}
+
+// ---------------------- 大矩阵乘的分块计划（纯函数） ----------------------
+
+/// 分块 matmul 的**最小列宽**：块比这更窄时，每次 dispatch 的固定开销（编码/提交/poll/回读）
+/// 会盖过计算本身，而且 64 列的 tile 都盖不满。下限用来挡住"上限被压得很低 → 切出几十上百个
+/// 窄条"的病态方案（那种情况宁可照旧回退 CPU）。
+const MM_CHUNK_MIN_COLS: usize = 256;
+/// 分块 matmul 的**块数上限**：沿 N 最多切这么多块（配合最小列宽 = `⌈n/MM_CHUNK_MAX⌉` 的下限）。
+/// 没有它，`limit` 极小时会一路细分到每块一列（几万次 dispatch，比 CPU 还慢）。
+const MM_CHUNK_MAX: usize = 256;
+
+/// 一次分块 matmul 的执行计划（纯数据，便于单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkPlan {
+    /// 每次 dispatch 处理多少个 batch 维（`[B,M,N]` 的 B；与"大表"无关，通常就是整个 batch）
+    batch_chunk: usize,
+    /// 沿 N（输出列）的块宽，按顺序拼起来正好等于 n
+    cols: Vec<usize>,
+}
+
+impl ChunkPlan {
+    /// 是不是"整块一次算"（整批 + 单列块）：是的话分块路径不产生任何额外拷贝，
+    /// 行为与加分块之前**完全一致**（同尺寸 buffer、同参数、同一次 dispatch）。
+    fn is_whole(&self, n: usize, batch: usize) -> bool {
+        self.batch_chunk == batch && self.cols == [n]
+    }
+
+    /// 一次 matmul 要 dispatch 多少次（batch 档数 × 列块数）——只用于测试与诊断。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn dispatches(&self, batch: usize) -> usize {
+        self.cols.len() * batch.div_ceil(self.batch_chunk)
+    }
+}
+
+/// 一个块要**同时**放下的三块显存（元素数）：
+/// - A 块 `[bc,m,k]`（`a_t` 时物理 `[bc,k,m]`，元素数相同）
+/// - B 块 `[bc,k,w]`（`b_t` 时物理 `[bc,w,k]`，元素数相同）
+/// - 输出块 `[bc,m,w]`（回读暂存区与它同尺寸）
+///
+/// 判据与 [`GpuContext::take_buf`] 同源：比的是 `size_class` 上取整后的字节数。
+/// 只看 `元素数×4` 会漏掉最后那几十 KiB 的上取整——"算得下、取不到"会让分块白分一场。
+fn chunk_bufs_fit(bc: usize, m: usize, k: usize, w: usize, limit: u64, elem: usize) -> bool {
+    let fits_one = |elems: usize| fits(limit, size_class((elems * elem) as u64) as usize);
+    fits_one(bc * m * k) && fits_one(bc * k * w) && fits_one(bc * m * w)
+}
+
+/// 在 batch 分档 `bc` 下能放下的最大列宽（≤ n）。0 = 连一列都放不下（多半是 A 块自己超限）。
+fn chunk_max_cols(bc: usize, m: usize, k: usize, n: usize, limit: u64, elem: usize) -> usize {
+    // 每加一列：B 多 k 个元素、输出多 m 个元素（回读与输出同尺寸，取两者里更紧的那个即可）
+    let per_col = bc * (k + m) * elem;
+    if per_col == 0 {
+        return n;
+    }
+    let mut w = (limit as usize / per_col).min(n);
+    // 用 size class 判据校正估算（偏差最多是两次 64 KiB 上取整，循环几步就收敛）
+    while w > 0 && !chunk_bufs_fit(bc, m, k, w, limit, elem) {
+        w -= 1;
+    }
+    while w < n && chunk_bufs_fit(bc, m, k, w + 1, limit, elem) {
+        w += 1;
+    }
+    w
+}
+
+/// 分块计划（**纯函数**，单测见 `chunk_plan_boundaries`）：
+/// 把 `out[M,N] = A[M,K]·B[K,N]`（含 `batch` 维）沿 **N（输出列）** 切成若干块，
+/// 必要时把 batch 也一起切小，使每块的 A/B/输出/回读都能放进 `limit` 字节。
+///
+/// 返回 `None` = 连"最小块宽"都放不下（或形状退化）→ 调用方按既有约定回退 CPU 护栏。
+///
+/// 为什么切 N 而不是切 K：沿 K 切会改变每个输出元素的累加顺序（浮点不满足结合律，
+/// 结果不再逐位一致），还得再加一次跨块归约；沿 N 切的每个输出元素仍是**同一个内核、
+/// 同一份 K 循环**，只是列区间不同，结果与整块一次算逐位相同（见
+/// `gpu_matmul_chunked_matches_whole_bits`）。
+fn chunk_plan(
+    m: usize,
+    k: usize,
+    n: usize,
+    batch: usize,
+    limit: u64,
+    elem: usize,
+) -> Option<ChunkPlan> {
+    if m == 0 || k == 0 || n == 0 || batch == 0 || limit == 0 || elem == 0 {
+        return None;
+    }
+    // 最小列宽：既要 ≥ MM_CHUNK_MIN_COLS，又要保证块数 ≤ MM_CHUNK_MAX（块数上限保护）。
+    // n 本身比这个下限还窄时**不细分**：只有"整条 N 一块放得下"才算有解，放不下就回退 CPU
+    // ——为几十列去切几块，每次 dispatch 的固定开销（提交/poll/回读）比计算本身还贵。
+    let w_lo = MM_CHUNK_MIN_COLS.max(n.div_ceil(MM_CHUNK_MAX)).min(n);
+    // 从整批开始往下试：B 那块大表与 batch 无关，切 batch 只在 A / 输出自己就放不下时才需要
+    for bc in (1..=batch).rev() {
+        let w_max = chunk_max_cols(bc, m, k, n, limit, elem);
+        if w_max < w_lo {
+            continue; // 这一档 batch 下连最小块都放不下 → 试更小的 batch（A/输出都会跟着变小）
+        }
+        let cnt = n.div_ceil(w_max);
+        // 均分而不是"每块 w_max + 一条小尾巴"：块宽一致（池里只出现 1~2 个 size class，
+        // 也少一次零头 dispatch），且均分后的块宽必然 ≤ w_max（n ≤ cnt·w_max ⇒ ⌈n/cnt⌉ ≤ w_max）
+        let base = n / cnt;
+        let rem = n % cnt;
+        let cols = (0..cnt).map(|i| base + usize::from(i < rem)).collect();
+        return Some(ChunkPlan {
+            batch_chunk: bc,
+            cols,
+        });
+    }
+    None
 }
 
 /// 已析构显存句柄（[`GpuHandle`]）的 buffer 暂存区。
@@ -5559,6 +5812,195 @@ mod tests {
                 "m={m} k={k} n={n} batch={batch} a_t={a_t} b_t={b_t} 最大误差 {max_err}"
             );
         }
+    }
+
+    /// 分块方案的**纯函数**边界：整块正好放下 ⇒ 单块；放不下 ⇒ 真的切开并均分；
+    /// A/输出自己超限 ⇒ 切 batch；上限极窄 ⇒ 由"块数上限"保护挡下并返回 None（回退 CPU）。
+    #[test]
+    fn chunk_plan_boundaries() {
+        const E: usize = 4; // f32
+        const LIM: u64 = 268_435_456; // 本机真实上限：256 MiB
+
+        // ---- 真实案例：Qwen2.5-0.5B 输出头 [151936, 896] 对本机 256 MiB 上限 ----
+        // 修复前它是"整单回退 CPU"（生成 ~9 s/token），现在必须能切成 3 块在 GPU 上算
+        let plan = chunk_plan(9, 896, 151_936, 1, LIM, E).expect("真实形状必须能分块");
+        assert_eq!(plan.batch_chunk, 1, "大表与 batch 无关，不该去切 batch");
+        assert_eq!(plan.cols.len(), 3, "256 MiB / (896 列 × 4B) ≈ 3 块：{plan:?}");
+        assert_eq!(plan.cols.iter().sum::<usize>(), 151_936, "列块必须恰好覆盖 n");
+        assert_eq!(plan.cols, vec![50646, 50645, 50645], "均分（块宽差 ≤ 1）");
+        assert_eq!(plan.dispatches(1), 3);
+        for &w in &plan.cols {
+            assert!(chunk_bufs_fit(1, 9, 896, w, LIM, E), "块宽 {w} 应当放得下");
+        }
+
+        // ---- 整块正好放下 ⇒ 单块（且 `is_whole` 为真 = 零额外拷贝，行为与分块前一致）----
+        // m=4 k=8 n=64：A 128B / B 2 KiB / out 1 KiB，size class 都上取整到 4 KiB
+        let plan = chunk_plan(4, 8, 64, 1, 4096, E).expect("恰好放得下");
+        assert_eq!(plan, ChunkPlan { batch_chunk: 1, cols: vec![64] });
+        assert!(plan.is_whole(64, 1));
+        assert_eq!(plan.dispatches(1), 1);
+        // 只差 1 字节：上取整后顶过上限 → 连一块都放不下 → None（护栏照旧把整单交给 CPU）
+        assert_eq!(chunk_plan(4, 8, 64, 1, 4095, E), None);
+
+        // ---- 需要 2 块：w_max=256 ⇒ 均分成 [256,256]；n=501 时余数落在前面的块上 ----
+        let plan = chunk_plan(4, 8, 512, 1, 8192, E).expect("应切成 2 块");
+        assert_eq!(plan.cols, vec![256, 256]);
+        assert!(!plan.is_whole(512, 1));
+        assert_eq!(plan.dispatches(1), 2);
+        assert_eq!(chunk_plan(4, 8, 501, 1, 8192, E).unwrap().cols, vec![251, 250]);
+
+        // ---- A 自己就超限 ⇒ 切 batch（B 与 batch 无关，切 batch 救的是 A 与输出）----
+        // m=128 k=64 batch=4：A=128 KiB > 64 KiB；bc=2 时 A 恰好 64 KiB 放得下
+        let plan = chunk_plan(128, 64, 32, 4, 65536, E).expect("应切 batch");
+        assert_eq!(plan.batch_chunk, 2, "整批 A 放不下 → 分两档 batch：{plan:?}");
+        assert_eq!(plan.cols, vec![32], "列方向一块就够，不该无谓地切 N");
+        assert_eq!(plan.dispatches(4), 2);
+
+        // ---- 极窄上限：由"最小列宽 + 块数上限"挡下，返回 None（调用方回退 CPU）----
+        // n=100000 ⇒ 块数 ≤ MM_CHUNK_MAX=256 要求每块 ≥ 391 列；上限只够 376 列 → 放弃
+        assert_eq!(MM_CHUNK_MIN_COLS, 256);
+        assert_eq!(chunk_plan(1, 1000, 100_000, 1, 0, E), None, "上限为 0");
+        assert_eq!(
+            chunk_plan(1, 1000, 100_000, 1, 1_507_328, E),
+            None,
+            "上限只够 376 列，低于 391 的下限 → 宁可整单回退 CPU"
+        );
+        // 同一形状、上限放宽到 24 个 64 KiB（只多 64 KiB）⇒ 393 列/块、255 块，正好卡在上限内
+        let plan = chunk_plan(1, 1000, 100_000, 1, 1_572_864, E).expect("应能分块");
+        assert_eq!(plan.cols.len(), 255);
+        assert!(plan.cols.len() <= MM_CHUNK_MAX);
+        assert!(plan.cols.iter().all(|&w| w >= MM_CHUNK_MIN_COLS), "{plan:?}");
+        assert_eq!(plan.cols.iter().sum::<usize>(), 100_000);
+
+        // ---- 形状退化：不给方案（调用方本来也不会拿这些形状进来）----
+        for bad in [(0, 8, 8, 1), (4, 0, 8, 1), (4, 8, 0, 1), (4, 8, 8, 0)] {
+            assert_eq!(chunk_plan(bad.0, bad.1, bad.2, bad.3, LIM, E), None, "{bad:?}");
+        }
+        // n 比最小列宽还窄：只有"整条 N 一块放得下"才算有解（上面 4×8×64 那条）。
+        // 连整条都放不下时**不细分**——为几十列切几块，dispatch 固定开销比计算还贵 → 回退 CPU
+        assert_eq!(chunk_plan(5, 24, 70, 1, 4096, E), None);
+        assert!(chunk_plan(5, 24, 70, 1, 1 << 30, E).unwrap().is_whole(70, 1));
+    }
+
+    /// **分块结果 == 不分块结果，逐位相同**（`assert_eq!`，不放任何容差）。
+    ///
+    /// 沿 N 切块不改变每个输出元素沿 K 的累加顺序，所以两边只可能差在"寻址 / 拼接"上，
+    /// 一旦有个 bit 不同就是 bug。用例用纯函数 `chunk_plan` 压低上限，强制切出多列块 /
+    /// 多 batch 档，覆盖 `b_t` 的两种物理布局、`a_t`、以及 batch 分档三条路径。
+    #[test]
+    fn gpu_matmul_chunked_matches_whole_bits() {
+        init();
+        if !is_available() {
+            return; // 无 GPU 环境跳过（不视为失败）
+        }
+        // 阈值压到 0，强制这些小形状也真的走内核（否则会被 CPU 兜底挡掉，测了个寂寞）
+        MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
+        let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
+            return;
+        };
+        // (m, k, n, batch, a_t, b_t, limit, 是否靠"切 batch"分块)：limit 都刚好逼出分块
+        let cases: &[(usize, usize, usize, usize, bool, bool, u64, bool)] = &[
+            (7, 16, 512, 2, false, false, 32768, false), // b_t=false：列切片跨步 N，走"按行物化"
+            (7, 16, 512, 2, false, true, 32768, false),  // b_t=true：列切片是连续行段
+            (5, 24, 512, 1, true, false, 32768, false),  // a_t=true（A 物理 [K,M]）
+            (5, 24, 512, 1, true, true, 32768, false),   // 双转置（防御性）
+            // 块宽不落在 64 的整数倍上（n=701 → 351+350）：内核最后一个 tile 会被边界夹掉，
+            // 分块路径同样要与整块一致
+            (5, 24, 701, 1, false, false, 34816, false),
+            (128, 64, 32, 4, false, false, 65536, true), // A 自己超限 → 只能靠 batch 分档
+        ];
+        for &(m, k, n, batch, a_t, b_t, limit, want_batch_split) in cases {
+            let (ar, ac) = if a_t { (k, m) } else { (m, k) };
+            let (br, bc) = if b_t { (n, k) } else { (k, n) };
+            let a: Vec<f32> = (0..ar * ac * batch)
+                .map(|i| ((i % 53) as f32 * 0.021).sin())
+                .collect();
+            let b: Vec<f32> = (0..br * bc * batch)
+                .map(|i| ((i % 71) as f32 * 0.013).cos())
+                .collect();
+            let tag = format!("m={m} k={k} n={n} batch={batch} a_t={a_t} b_t={b_t}");
+            // 不分块：整批 + 整张 N 一次 dispatch（分块之前走的就这一条）
+            let whole = g
+                .matmul(&a, &b, m, k, n, batch, a_t, b_t)
+                .unwrap_or_else(|| panic!("{tag}：整块一次算应当走 GPU"));
+            let plan = chunk_plan(m, k, n, batch, limit, 4)
+                .unwrap_or_else(|| panic!("{tag}：limit={limit} 下应当能分块"));
+            // 这个用例必须在**预期的那一维**上真的分块，否则等于白测
+            if want_batch_split {
+                assert_eq!(plan.cols, vec![n], "{tag}：列方向一块就够");
+                assert!(plan.batch_chunk < batch, "{tag}：应当切 batch：{plan:?}");
+            } else {
+                assert!(plan.cols.len() > 1, "{tag}：应当切列：{plan:?}");
+                assert_eq!(plan.batch_chunk, batch, "{tag}：不该无谓地切 batch");
+            }
+            assert!(
+                plan.dispatches(batch) > 1,
+                "{tag}：这个用例必须真的分块（limit={limit}）：{plan:?}"
+            );
+            assert!(plan.cols.iter().sum::<usize>() == n, "{tag}：{plan:?}");
+            let chunked = g
+                .matmul_planned(&a, &b, m, k, n, batch, a_t, b_t, &plan)
+                .unwrap_or_else(|| panic!("{tag}：分块执行失败 {plan:?}"));
+            assert_eq!(
+                whole, chunked,
+                "{tag}：分块与不分块必须逐位一致（plan={plan:?}）"
+            );
+            // 再对一次 CPU 三重循环参考：分块路径本身也要落在正确的数上（容差 0 不现实，
+            // 内核与参考实现都是同一套 f32 累加，但这里只是防"两条 GPU 路径一起错"）
+            let c = cpu_matmul(&a, &b, m, k, n, batch, a_t, b_t);
+            let max_err = chunked
+                .iter()
+                .zip(&c)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_err < 1e-3, "{tag}：对 CPU 参考最大误差 {max_err}");
+        }
+    }
+
+    /// 标定探针（`--ignored`）：**输出头那一刀到底该走 CPU 兜底还是分块 GPU**。
+    ///
+    /// 形状就是真实模型（Qwen2.5-0.5B）：`[vocab=151936, d=896]` 的输出头整表 519.4 MiB，
+    /// 本机 256 MiB 上限放不下。两条路都从同一份 `Tensor` 出发、走同一个 `Tensor::matmul`：
+    /// - **CPU 兜底**：把盈亏平衡阈值拉到不可能达到的高度（于是不碰内核），
+    ///   `tensor.rs` 会物化转置表 + 20 线程三重循环
+    /// - **分块 GPU**：阈值归 0 → 本文件的 `matmul` → `chunk_plan` → 逐块 dispatch
+    ///
+    /// 结论（本机 RX 560 / 20 逻辑核，实测见输出）：m=1 时 CPU 兜底反而**略快**，
+    /// m≥8 时两者同量级、大 m 时分块明显更快。根因是分块每次都要把 519 MiB 权重
+    /// 重传一遍 PCIe，而 CPU 那边是 20 线程直接吃内存带宽。
+    #[test]
+    #[ignore = "仅用于性能标定，不进常规测试"]
+    fn chunked_head_matmul_vs_cpu_probe() {
+        init();
+        if !is_available() {
+            return;
+        }
+        use crate::tensor::Tensor;
+        let (vocab, d) = (151_936usize, 896usize);
+        // 权重只用来计时，取值无所谓（全是同一个常数，两种路径的结果也必然一致）
+        let w = Tensor::from_vec(vec![0.01f32; vocab * d], vec![vocab, d]);
+        let saved = MATMUL_MIN_FLOPS.load(Ordering::Relaxed);
+        for m in [1usize, 8, 64, 512] {
+            let x = Tensor::from_vec(vec![0.02f32; m * d], vec![m, d]);
+            MATMUL_MIN_FLOPS.store(usize::MAX, Ordering::Relaxed); // 强制 CPU 兜底
+            let t0 = std::time::Instant::now();
+            let a = x.matmul(&w.transpose());
+            let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed); // 强制分块 GPU
+            let t1 = std::time::Instant::now();
+            let b = x.matmul(&w.transpose());
+            let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let err = a
+                .data()
+                .iter()
+                .zip(b.data())
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "[probe] m={m:<4} CPU 兜底 {cpu_ms:8.1}ms | 分块 GPU（3 块）{gpu_ms:8.1}ms | 最大差 {err:.2e}"
+            );
+        }
+        MATMUL_MIN_FLOPS.store(saved, Ordering::Relaxed);
     }
 
     /// GPU 掩码 softmax 与 CPU 参考实现逐元素对比。

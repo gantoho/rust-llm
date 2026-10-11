@@ -512,6 +512,22 @@ impl<'a> MatOperand<'a> {
     }
 }
 
+/// 这次 2D 矩阵乘有没有可能落到 GPU 内核上（判据在 [`crate::gpu::matmul_would_use_gpu`]，
+/// 与内核入口同源、且**不碰分流计数**）。只用来决定"右操作数的转置视图要不要先物化"：
+/// 会走内核时不物化（内核本来就按 `b_t` 读物理 `[N,K]`），不会走内核时物化。
+#[inline]
+fn gpu_would_use_matmul(m: usize, k: usize, n: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu::matmul_would_use_gpu(m, k, n, 1)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (m, k, n);
+        false // 没有内核可用，别为它省物化
+    }
+}
+
 /// 矩阵乘数据计算（GPU 优先，失败自动回退 CPU）。
 /// 行优先存储：out[B,M,N] = a[B,M,K] @ b[B,K,N]；batch=1 时即普通 2D 矩阵乘。
 /// `a_t`/`b_t` 为转置访问标志：为 true 时物理 a/b 分别是 [B,K,M]、[B,N,K]。
@@ -984,6 +1000,12 @@ fn attn_forward_ops(
 ///
 /// 梯度矩阵乘同样优先走 GPU（`matmul_data`，与 forward 一致），
 /// 否则 backward 的三重循环在 CPU 上会主导训练时间（实测大模型每步 >2 分钟）。
+///
+/// `b_t` 是**前向**那次 matmul 的右操作数转置标志（物理 `[n,k]`）。它决定 ∂a 怎么读 b 的
+/// 物理缓冲：前向没转置（物理 `[k,n]`）时 ∂a = g @ bᵀ 要按转置读（`b_t = true`，内核直接读
+/// 原缓冲）；前向转置过（物理 `[n,k]`，如 `x @ Wᵀ` 里未物化的 `Wᵀ` 视图）时 bᵀ 的物理正好是
+/// `[k,n]` 行主序，必须按**非**转置读（`b_t = false`）。写死成 `true` 会把两种布局算串，
+/// 由 `tensor::tests::test_matmul_transposed_rhs_view` 守住。
 fn matmul_backward(
     result: &mut Tensor,
     a: &Tensor,
@@ -992,6 +1014,7 @@ fn matmul_backward(
     k: usize,
     n: usize,
     batch: usize,
+    b_t: bool,
 ) {
     let rg = result.grad.clone();
     let sg = a.grad.clone();
@@ -1012,7 +1035,7 @@ fn matmul_backward(
             let sb = odb.as_deref().map(MatOperand::of).unwrap_or(sa);
             // ∂a = g @ bᵀ、∂b = aᵀ @ g：GPU 内核支持按转置读物理矩阵，
             // 无需在 CPU 构造 52 万~210 万元素的转置矩阵（仅 CPU 回退时才物化）
-            let da = matmul_data(MatOperand::F32(&g), sb, m, n, k, batch, false, true);
+            let da = matmul_data(MatOperand::F32(&g), sb, m, n, k, batch, false, !b_t);
             let db = matmul_data(sa, MatOperand::F32(&g), k, m, n, batch, true, false);
             drop(g);
             drop(sdb);
@@ -1423,6 +1446,20 @@ impl Tensor {
     /// 0 维张量恒为连续；唯一非连续来源是 [`Tensor::permute`] 视图。
     pub fn is_contiguous(&self) -> bool {
         self.strides == row_major_strides(&self.shape)
+    }
+
+    /// 是否是「连续张量的 2D 转置视图」：即 `permute([1,0])` 的产物（`strides = [1, 父行宽]`）。
+    ///
+    /// 这种视图的物理缓冲恰好就是 GPU 内核 `b_t = true` 要读的「物理 `[N,K]`」布局，
+    /// 因此矩阵乘**不必**先把它物化：省掉的是一次 `[K,N]` 整表 gather
+    /// （Qwen2.5-0.5B 的输出头是 519 MiB；物化要按 strides 把整表 walk 一遍，
+    /// 而且每写一行就要重走一遍 —— 单次生成能放大到数百 GB 访存，这才是生成
+    /// 慢到 ~9 s/token 的真凶，见 `Tensor::matmul` 的说明）。
+    ///
+    /// 判据从严：只有「2 维 + strides 正好等于 `[1, shape[0]]`」才算。连续张量唯一能满足它的
+    /// 情形是 1×1（那时转置是恒等，走哪条路结果都一样）；三维的 `permute([0,2,1])` 不在其列。
+    pub(crate) fn is_transposed_2d_view(&self) -> bool {
+        self.rank() == 2 && self.strides[0] == 1 && self.strides[1] == self.shape[0]
     }
 
     /// 物化为连续张量：已连续时返回自身克隆（零开销），
@@ -2292,9 +2329,20 @@ impl Tensor {
         // 入口物化：permute 视图（如权重 transpose）先 gather 成连续缓冲，
         // matmul_data 按行主序线性读；连续时 contiguous() 只是克隆句柄、零开销。
         let a = self.contiguous();
-        let b = other.contiguous();
+        // B 侧唯一的例外：**连续张量的 2D 转置视图不物化**（见 [`Tensor::is_transposed_2d_view`]）。
+        // 它的物理缓冲本来就是内核 `b_t = true` 那一支要读的 `[N,K]` 布局，直接交给内核即可；
+        // 物化它等于按 strides 把整表 walk 一遍（输出头 519 MiB，每写一行都要重走全表），
+        // 那是生成路径上最大的一笔访存，也是"分块本可以救、却被这次物化挡在门外"的原因。
+        //
+        // 只在"这次真有可能落到内核上"时才跳过物化：没有 GPU（或形状低于盈亏平衡点）时
+        // 根本没人消费那个布局，照旧走 `contiguous()`（并行 gather）比 CPU 兜底侧的
+        // b_t 转置物化更快，也更贴近改动前的行为。
+        let b_t = a.rank() == 2
+            && other.is_transposed_2d_view()
+            && gpu_would_use_matmul(a.shape[0], a.shape[1], other.shape[1]);
+        let b = if b_t { other.clone() } else { other.contiguous() };
         if a.rank() == 2 {
-            return a.matmul_2d(&b);
+            return a.matmul_2d(&b, b_t);
         }
         // 3D 批量
         assert_eq!(a.shape[0], b.shape[0], "批量维度必须一致");
@@ -2316,15 +2364,17 @@ impl Tensor {
         let requires = a.req() || b.req();
         let mut result = a.new_like(out_data, vec![a.shape[0], m, n], requires);
         if requires {
-            matmul_backward(&mut result, &a, &b, m, k1, n, a.shape[0]);
+            matmul_backward(&mut result, &a, &b, m, k1, n, a.shape[0], false);
         }
         result
     }
 
-    fn matmul_2d(&self, other: &Tensor) -> Tensor {
-        // 入口物化（matmul 已物化过，这里承接直接调用者）
+    /// `b_t` = 右操作数按**物理 `[N,K]` 转置读**（见 [`Tensor::is_transposed_2d_view`]：
+    /// 调用方传入的 `other` 是转置视图本身，未物化）。
+    fn matmul_2d(&self, other: &Tensor, b_t: bool) -> Tensor {
+        // 入口物化（matmul 已物化过，这里承接直接调用者）；b_t 时 other 保持视图不物化
         let a = self.contiguous();
-        let b = other.contiguous();
+        let b = if b_t { other.clone() } else { other.contiguous() };
         let (m, k1) = (a.shape[0], a.shape[1]);
         let (k2, n) = (b.shape[0], b.shape[1]);
         assert_eq!(
@@ -2339,14 +2389,14 @@ impl Tensor {
         let od = if same_data { None } else { Some(b.data.borrow()) };
         let sa = MatOperand::of(&sd);
         let sb = od.as_deref().map(MatOperand::of).unwrap_or(sa);
-        let out_data = matmul_data(sa, sb, m, k1, n, 1, false, false);
+        let out_data = matmul_data(sa, sb, m, k1, n, 1, false, b_t);
         drop(sd);
         drop(od);
 
         let requires = a.req() || b.req();
         let mut result = a.new_like(out_data, vec![m, n], requires);
         if requires {
-            matmul_backward(&mut result, &a, &b, m, k1, n, 1);
+            matmul_backward(&mut result, &a, &b, m, k1, n, 1, b_t);
         }
         result
     }
@@ -3595,6 +3645,46 @@ mod tests {
         let b = Tensor::from_vec(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]);
         let c = a.matmul(&b);
         assert_eq!(c.data(), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    /// 右操作数是「连续张量的 2D 转置视图」时**不再物化**它（[`Tensor::is_transposed_2d_view`]）：
+    /// 判据、前向数值、以及反向（梯度要顺着视图自己的 permute 闭包回到父张量）都必须与
+    /// "先 `contiguous()` 物化再乘"逐位一致。生成路径上输出头 `hidden @ Wᵀ` 走的就是这条。
+    #[test]
+    fn test_matmul_transposed_rhs_view() {
+        // 与输出头同构：x [M,d] @ Wᵀ，W 物理 [vocab,d]（词嵌入表），转置视图是 [d,vocab]
+        let x_data = vec![1.0, 2.0, 3.0, 7.0, 8.0, 9.0]; // x [2,3]（M=2, d=3）
+        let w_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // W [2,3]（vocab=2, d=3）
+
+        // ① 判据：转置视图命中；连续张量、物化后的转置、三维 permute 都不命中
+        let w0 = Tensor::param(w_data.clone(), vec![2, 3]);
+        assert_eq!(w0.transpose().shape(), &[3, 2], "转置视图应是 [d, vocab]");
+        assert!(w0.transpose().is_transposed_2d_view());
+        assert!(!w0.is_transposed_2d_view());
+        assert!(!w0.transpose().contiguous().is_transposed_2d_view());
+        let t3 = Tensor::param(vec![0.0; 24], vec![2, 3, 4]).permute(&[0, 2, 1]);
+        assert!(!t3.is_transposed_2d_view());
+
+        // ② 前向 + 反向：视图路（不物化）与物化路必须逐位一致
+        let run = |materialize: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let x = Tensor::param(x_data.clone(), vec![2, 3]);
+            let w = Tensor::param(w_data.clone(), vec![2, 3]);
+            let wt = w.transpose();
+            let rhs = if materialize { wt.contiguous() } else { wt };
+            let y = x.matmul(&rhs);
+            let out = y.data().to_vec();
+            y.sum().backward(); // 上游梯度全 1
+            (out, x.grad(), w.grad())
+        };
+        let (y_view, dx_view, dw_view) = run(false);
+        let (y_mat, dx_mat, dw_mat) = run(true);
+        // y[i,j] = Σ_k x[i,k]·W[j,k]；dx[i,k] = Σ_j W[j,k]；dW[j,k] = Σ_i x[i,k]
+        assert_eq!(y_view, vec![14.0, 32.0, 50.0, 122.0]);
+        assert_eq!(dx_view, vec![5.0, 7.0, 9.0, 5.0, 7.0, 9.0]);
+        assert_eq!(dw_view, vec![8.0, 10.0, 12.0, 8.0, 10.0, 12.0]);
+        assert_eq!(y_view, y_mat);
+        assert_eq!(dx_view, dx_mat);
+        assert_eq!(dw_view, dw_mat);
     }
 
     #[test]

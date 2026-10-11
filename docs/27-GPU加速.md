@@ -344,3 +344,270 @@ GELU 与 SwiGLU 现在都已支持（每层分别回注 16/18 项参数梯度）
    验证两条路径的 loss 逐位相同，并用 `s/步` 解释"整叠为什么反而略快"（提示：数一数每步各提交了几次）；
 5. 用小 tile 内核算一下这张卡的实测峰值（`LLM_GPU_PROBE` 会打印纯 FMA 峰值），
    对比 MX150 的理论 FP32 算力，看看利用率还差多少、差在哪。
+
+---
+
+## 11. 显存上限与申请护栏：放不下就回退，绝不 panic
+
+> 与全课其它小节不同，这一节讲的不是「怎么更快」，而是「**怎么不崩**」：
+> GPU 后端在把申请递给 wgpu 之前先自己判一次尺寸，放不下就沿既有的 `Option` 约定回退 CPU。
+> 它来自一次真实崩溃（[§11.2](#112-起因一次真实崩溃)），判据由三个 `mem_guard_*` 单测守着。
+>
+> **放不下现在有两条出路**：大矩阵乘只要还能切出一块就**分块留在 GPU 上算**（第 12 章），
+> 连最小块都放不下才真的回退 CPU。本节讲的是护栏本身（也就是「真的放不下」那一条），
+> 分块是它的第二条出路——两条路的提示都只打一次，用户看输出就知道走的是哪条。
+
+### 11.1 一次申请要过三类上限
+
+池化 buffer 全部是**整块绑定**（`BufferBinding { size: None }`），所以除了 `create_buffer` 自己的
+硬上限，还要过对应 binding 类型的上限。`GpuContext::alloc_limit(kind)` 取的就是二者的小值：
+
+| 上限（来自 `device.limits()`） | 什么时候卡你 | 本机（Radeon RX 560 / DX12） |
+|------|------|------|
+| `max_buffer_size` | **任何**用途的 `create_buffer` 都躲不开 | **256 MiB —— 实际卡住那张 519.4 MiB 大表的就是它** |
+| `max_storage_buffer_binding_size` | buffer 作为 **storage** 绑定（`KIND_IN` / `KIND_OUT`）时的上限 | 初始化时按 512 MiB 申请（`max(x, 512MiB)`），本机不是瓶颈 |
+| `max_uniform_buffer_binding_size` | buffer 作为 **uniform** 绑定（`KIND_UNIFORM`，参数块只有 24 B）时的上限 | 不是瓶颈 |
+
+用途到上限的映射写在一处：
+
+- `KIND_READ`（只做拷贝目标与映射回读，**从不**作 storage / uniform 绑定）→ 只看 `max_buffer_size`；
+- `KIND_UNIFORM` → `min(max_uniform_buffer_binding_size, max_buffer_size)`；
+- `KIND_IN` / `KIND_OUT`（storage）→ `min(max_storage_buffer_binding_size, max_buffer_size)`。
+
+> 那三个上限在**初始化时缓存一次**（`GpuContext` 的三个字段）。原因是护栏在每个算子入口都要查，
+> 而 `device.limits()` 每次调用都要拷一份很大的 `Limits` 结构体出来——逐算子取会明显拖慢。
+
+### 11.2 起因：一次真实崩溃
+
+Qwen2.5-0.5B（vocab = 151936、n_embd = 896）的输出头 / 词嵌入整表是 `[vocab, n_embd]`，
+也就是 `151936 × 896 × 4 = 544538624 B ≈ 519.4 MiB`。生成时算 logits 的那次 matmul 会把这整张表
+当**操作数**上传（`GpuContext::matmul` 里的 `take_buf(b.len(), KIND_IN)`：物理布局 `[vocab, d]` 即
+`[N, K]`，内核按 `b_t = true` 读），而它的 FLOPs（`2·rows·d·vocab`，rows = 1 时也有 2.7 亿）
+远超分流阈值、必然尝试上 GPU —— 于是这次申请被原样递给 `create_buffer`，wgpu 的校验失败，
+默认的 uncaptured error handler 当场 panic：
+
+```text
+cargo run --release --features gpu -- generate --ckpt checkpoints\qwen05\model.ckpt \
+    --tokenizer checkpoints\qwen05\tokenizer.json --prompt "你可以做什么"
+
+wgpu error: Validation Error
+Caused by: In Device::create_buffer, label = 'pooled'
+    Buffer size 544538624 is greater than the maximum buffer size (268435456)
+```
+
+`268435456` = 256 MiB，正是本机 `device.limits().max_buffer_size`；`544538624` 恰好是
+64 KiB 的整数倍（8309 × 64 KiB），所以池的 size class 上取整这次没有额外放大它。
+常驻显存版的输出头（`lm_head_ce`）也会整块 `upload` 同一张表，走的是同一条护栏 ——
+**每个会把这表搬上显存的地方都从 `take_buf` 走**，所以护栏只需在一处把住。
+
+### 11.3 判据：与 wgpu 的校验**同源**
+
+```rust
+fn alloc_limit(&self, kind: u8) -> u64            // 按用途取上限，并 min(max_buffer_size)（见 §11.1）
+fn can_alloc(&self, len: usize, kind: u8) -> bool // fits(alloc_limit(kind), size_class(len * 4))
+fn fits(limit: u64, bytes: usize) -> bool         // bytes <= limit
+```
+
+三点都是刻意的：
+
+1. **按池里真正创建的字节数判**（`size_class` 上取整之后），而不是只看 `len * 4`。
+   池对 >64 KiB 的申请按 64 KiB 对齐，只看元素字节数会漏掉最多 65535 B（近 64 KiB）—— 而边界上
+   恰好是这点对齐量决定 `create_buffer` 会不会报校验错误（单测里的例子：`size_class(268435457) = 268435456 + 65536`）。
+2. **用 `<=` 而不是 `<`**：wgpu 的判据是 `size > max_buffer_size` 才报错，**恰好等于上限是合法的**。
+3. **判据只来自 `device.limits()`，不写死常量**：同一份代码在 1 GiB 上限的卡上照旧让这张表上 GPU
+   （`mem_guard_fits_boundaries` 里有这条对照）——护栏只拦「放不下」，不放宽也不收紧其它行为。
+
+### 11.4 回退路径与诊断提示
+
+- `take_buf` 是 GPU 后端**唯一**的分配入口（池命中与新建都从它走）：超限直接返回 `None`，
+  绝不把申请递到 wgpu——那边只会 panic，不会给调用方一个失败返回。
+- 逐算子提交点 `run()` 还**单独**对回读暂存区（`KIND_READ`）判一次：即使某个调用点漏判了自己的操作数，
+  也不会有超限 buffer 走到 `create_buffer`。
+- `None` 一路沿既有约定回退 CPU（`gpu::matmul` → `tensor.rs` 的 CPU 实现），数值不变，只是慢。
+  大矩阵乘在回退之前还会先试一次**分块**（第 12 章）：只有 `chunk_plan` 也返回 `None`
+  （连最小块宽都放不下）时，才真的走到这条 CPU 回退。
+- 初始化另有一道**下限检查**：连 4 KiB（池的最小 size class）都放不下的设备直接判为不可用。
+  没有它，参数 uniform、占位 buffer 这类「必然放得下」的小申请也会被护栏拦掉，
+  护栏就从「优雅回退」退化成「什么都干不了」。
+
+同一条 generate 命令修复后 **exit 0**；而且输出头那一刀**已经不再撞护栏**了——它现在走第 12 章的
+分块路径，打印的是分块提示（本轮实测原文见 [§12.5](#125-实测标定)）。护栏提示本身只在**真的回退**
+（连分块都救不了）时出现，文本如下（其中的数字是护栏挡下那张 519.4 MiB 表的实测，提示只打一次）：
+
+```text
+[gpu] 显存护栏：申请 136134656 个 f32 = 519.4 MiB（size class 上取整后 519.4 MiB）超过设备上限 256.0 MiB → 该算子回退 CPU。（只提示一次；此刻 matmul 分流：GPU 0 / CPU 96）
+```
+
+- **每个进程只提示一次**（`MEM_GUARD_WARNED` 是个 `AtomicBool`，用 `swap(true)` 抢）：生成时同一张
+  大表每个 token 都会撞上，逐次打印只会刷屏（分块提示由 `CHUNK_NOTE_WARNED` 同样只打一次）；
+- 顺带打印**此刻的 matmul 分流计数**（进程内累计，含「低于 FLOPs 阈值本来就走 CPU」的调用点，
+  见 `matmul_may_use_gpu`），用来一眼看清这一刻 GPU / CPU 各接了多少次 matmul；
+- 打印完照常生成，输出的中文是正确的。
+
+### 11.5 常驻录制路径的占位句柄
+
+常驻路径（[§4.2](#42-常驻--批量录制路径resident)）的 `GpuRecorder::*` 是**录制**接口，几十个调用点
+（`upload` / `matmul` / `softmax_mask` / `empty` / …）都返回 `GpuHandle` 而不是 `Option`。放不下时的做法是：
+
+1. `oversize_handle(len)` 把**整批**标记为作废（`GpuBatch::oversize = true`），并返回一块 **4 KiB 的
+   占位 buffer**（初始化时创建，尺寸由下限检查保证合法）；
+2. 录制代码拿着这个句柄照常往下录——下游基于垃圾数据算出来的内容无所谓；
+3. `submit_and_read` / `batch_finish` 见到 `oversize` 就**直接不提交**：encoder 连同里面那些读了垃圾
+   数据的 dispatch 一起被丢弃，占位 buffer 从不写入、**永远不会被提交**；
+4. 调用方拿到 `None`，回退 CPU 重算，数值不受影响。
+
+这样就不必把几十个调用点的签名都改成 `Option`（改一处就要跟着改整条录制链）。
+另一个必须**在写入前**早退的理由：往一块小 buffer 里 `write_buffer` 大块数据同样会 panic，
+所以 `upload` 在 `take_buf` 失败时立刻返回占位句柄，根本走不到写入。
+
+### 11.6 边界：这是「不崩」，不是「提速」
+
+- 护栏**不改变能放下时的既有行为**：放得下就照旧上 GPU；
+- 它兜的是「**某次申请确实放不下**」这种场景。放不下时先试**分块**（第 12 章）：只要还能切出
+  ≥ 256 列的一块，这张表参与的矩阵乘就留在 GPU 上算，**不**回退 CPU；连最小块都放不下才真的回退，
+  那时才付「整单在 CPU 上算」的代价；
+- 所以它是**最后兜底**，不是性能方案；分块同样不是"全面加速"，只是把"回退"换成"慢一点"
+  （边界见 [§12.6](#126-边界分块不是全面加速)）。
+- ⚠️ **别把冷启动的墙钟当成每 token 成本**：`generate --max-new 4` 那条命令的墙钟约 **37 s**，
+  但其中约 **27 s 是 GPU 初始化**（`request_device` + 管线编译）、约 **7.6 s 载入 ckpt**，
+  真正生成只有约 **2 s**（本轮实测：日志里的总耗时 **36.9 s**，另用一条"加载 ckpt 前就失败"的命令
+  单独量到 GPU 初始化 **27.2 s**）。早先这里写过"实测 Qwen2.5-0.5B 生成为 **~47 s/token**"，
+  那是把这条墙钟除以 4 的**误读**——它量的是冷启动，不是每 token 的成本；长生成的真实成本是
+  **0.41 s/token**（[§12.6](#126-边界分块不是全面加速)）。
+- 三个单测把关：`mem_guard_fits_boundaries`（判据边界：`<=`、size class 上取整、真实崩溃尺寸）、
+  `mem_guard_take_buf_rejects_oversize`（分配入口真的返回 `None`，且拒绝之后池与上下文完好）、
+  `mem_guard_limits_match_device`（判据来自 `device.limits()`、`alloc_limit` 按用途取 min、
+  0 个元素与极小张量在任何设备上都放得下）。
+
+---
+
+## 12. 整块放不下就分块：沿 N 切，结果逐位一致
+
+> 第 11 章的护栏回答了「放不下怎么才能不崩」。这一章讲它的**第二条出路**：大矩阵乘整块放不下时，
+> 不再整单回退 CPU，而是**沿 N（输出列）切成几块、逐块在 GPU 上算、再按列拼回**。
+> 护栏本身一条都没改 —— 连最小块宽都放不下时，仍然照旧回退 CPU。
+
+### 12.1 为什么切 N，不切 K
+
+`out[M,N] = A[M,K]·B[K,N]` 三条轴都能切，实际只有 N 能用：
+
+- **切 K 会改浮点累加顺序**：每个输出元素都是 `Σ_k` 的 f32 累加，浮点不满足结合律，分段算完再相加
+  与整段一次算**不再逐位一致**；跨块还得多一轮归约（多一份显存、多一次 dispatch）。
+- **切 N 不动 K 循环**：块边界只决定「这次算哪几列」，每个输出元素仍是**同一个内核、同一份 K 循环**、
+  同一累加顺序 ⇒ 与整块一次算**逐位相同**。这条由 `gpu_matmul_chunked_matches_whole_bits` 守住：
+  它用 `assert_eq!`（**不放任何容差**）比对「整块一次算」与「分块算」。
+- 切 M 与切 N 同理（行与行之间本来就独立），但 M 是左操作数的行，切它只对「A 块自己就超限」有用 ——
+  实现里并不在 M 上切，需要时切的是 **batch 维**（`[B,M,K]` 的最外层）：切它等于同时缩小 A 块与输出块。
+
+### 12.2 两种 `b_t` 布局的切片代价
+
+块宽 `w` 一定时，B 块的元素数恒为 `bc·k·w`，但**取这 w 列要付的代价取决于物理布局**：
+
+| 情形 | 物理布局 | 这一块怎么取 | 额外拷贝 |
+|------|---------|-------------|---------|
+| 整块就放得下（`plan.is_whole`） | 任意 | **直接借整个 `b`** | **零** —— 同尺寸 buffer、同参数、同一次 dispatch，与加分块之前完全一致 |
+| `b_t = true`、`batch = 1` | `[N,K]` | 列切片就是连续的 `w·k` 个元素，直接借位 | **零** |
+| `b_t = true`、`batch > 1` | `[B,N,K]` | 每个 batch 一段连续行段 memcpy | `bc·k·w` |
+| `b_t = false` | `[B,K,N]` | 列切片跨步 `N`，只能按 K 行逐段取 `w` 个元素 | `bc·k·w`（所有列块合起来 ≈ **一遍全表扫描**） |
+
+最后一行要按 K 行一段段取，代价是「扫一遍表」；真实输出头走的其实是上面那行（`batch = 1` 的连续行段，
+零拷贝借位）。而**两种布局共同的收获**是：B 块每个列块只上传一份，合起来仍只是整表一遍 ——
+**不再需要先在 CPU 上把整张转置表物化出来**（那是改动前真正贵的一步，见 [§12.4](#124-配套改动转置视图免物化判据从严)）。
+
+### 12.3 块宽：均分、最小列宽、块数上限，失败仍然回退
+
+`chunk_plan(m, k, n, batch, limit, elem) -> Option<ChunkPlan { batch_chunk, cols }>` 是个**纯函数**
+（单测 `chunk_plan_boundaries` 不需要 GPU），判据与分配入口 `take_buf` 的 `size_class` 上取整**同源**：
+
+```rust
+fn chunk_bufs_fit(bc, m, k, w, limit, elem)  // A[bc,m,k] + B[bc,k,w] + out[bc,m,w] 三块都要放得下
+fn chunk_max_cols(bc, m, k, n, limit, elem)  // 这一档 batch 下能放下的最大列宽
+```
+
+- **按「池里真正创建的字节数」判**：`size_class(元素数 × 4)` 之后才和上限比。只看 `元素数 × 4` 会漏掉
+  最后那几十 KiB 的上取整（> 64 KiB 按 64 KiB 对齐），于是「算得下、取不到」，分块白分一场。
+- **先整批、后分档**：B 那块大表与 batch 无关，所以 `bc` 从 `batch` 往下试，只在 **A / 输出自己就超限**
+  时才切 batch（真实形状 `[151936, 896]`、`batch = 1`，于是 `batch_chunk` 恒为 1）。
+- **最小列宽 `MM_CHUNK_MIN_COLS = 256`**：块比这更窄时，每次 dispatch 的固定开销（编码 / 提交 / poll / 回读）
+  会盖过计算本身，64 列的 tile 也盖不满。没有这条下限，`limit` 极小时会一路细分到「每块一列」
+  （几万次 dispatch，比 CPU 还慢）。
+- **块数上限 `MM_CHUNK_MAX = 256`**：最小列宽取 `w_lo = max(256, ⌈n/256⌉).min(n)` —— 真实形状下是
+  **594 列**（`⌈151936/256⌉`），块数上限定住了最坏情况的 dispatch 次数。
+- **均分而不是「满块 + 小尾巴」**：先算能放下的最大列宽 `w_max`（从 `limit/(k+m)/4` 估个起点，
+  再用同源判据校正），再按 `cnt = ⌈n/w_max⌉` 反算 `base = n / cnt`、余数摊在前 `rem` 块上。
+  因为 `n ≤ cnt·w_max ⇒ ⌈n/cnt⌉ ≤ w_max`，均分后每块必然仍放得下；好处是块宽只差 ≤ 1（池里只出现
+  1~2 个 size class），也少一次零头 dispatch。真实形状的账（本机 256 MiB 上限）：
+  `w_max = 74898`（此时 B 块的 `size_class` 恰好等于 256 MiB —— 判据是 `<=`，再多一列就顶出去），
+  `cnt = ⌈151936/74898⌉ = 3` ⇒ **`[50646, 50645, 50645]`**。
+- **失败即回退**：`chunk_plan` 返回 `None`（形状退化、上限为 0、连最小块宽都放不下）时，
+  `GpuContext::matmul` 返回 `None` → 该算子按第 11 章的老约定回退 CPU。**护栏语义一个字没改**，
+  只是多了一条出路。
+
+### 12.4 配套改动：转置视图免物化（判据从严）
+
+分块要真能救下输出头，还差一步：`hidden @ Wᵀ` 里的 `Wᵀ` 过去会在 `Tensor::matmul` 入口被
+`contiguous()` 物化成一张 `[d, vocab]` 整表（519.4 MiB，按 strides 把整表 walk 一遍）—— 物化发生在
+内核之前，分块再优雅也碰不到它。现在入口先判一次：
+
+- [`Tensor::is_transposed_2d_view`](../src/tensor.rs)：**2 维**且 `strides == [1, shape[0]]`，
+  也就是 `permute([1, 0])` 的产物。判据**从严**：连续张量唯一能满足它的是 1×1（那时转置是恒等，
+  走哪条路结果都一样）；三维的 `permute([0, 2, 1])` 不在其列。
+- [`gpu_would_use_matmul`](../src/tensor.rs)：`gpu::matmul_would_use_gpu` 的**不计数**版（判据与内核入口
+  同源：GPU 可用 + FLOPs 阈值），只用来决定「要不要为内核省掉这次物化」；紧接着那次
+  `matmul_may_use_gpu` 照旧记分流计数，不会把一次调用算成两次。
+
+两条同时命中才把转置视图**原样**交给内核（内核本来就按 `b_t = true` 读物理 `[N,K]`）；**无 GPU /
+低于 FLOPs 阈值时行为与改动前逐位一致**（照旧 `contiguous()` 并行 gather）。
+
+> ⚠️ **踩坑：免物化之后，反向的 `b_t` 必须按前向取反**。`matmul_backward` 里 `∂a = g·bᵀ` 的内核标志
+> 原先**写死 `b_t = true`**，那只在「右操作数已经被物化成 `[K,N]` 行主序」时成立。免物化后 b 的物理是
+> `[N,K]`，`bᵀ` 正好是 `[K,N]` 行主序，内核必须按**非**转置读。写死 `true` 会把两种布局算串 ——
+> 训练里 `hidden.matmul(&head.transpose())` 的反向梯度会错，而**前向完全正常**，只看 loss 曲线发现不了。
+> 现在按前向 `b_t` 取反，`tensor::tests::test_matmul_transposed_rhs_view` 用「两种布局 × 前向 / 反向」
+> 逐位对照把这条钉死。
+
+### 12.5 实测标定
+
+输出头那一刀到底该走 CPU 兜底还是分块 GPU：同一份权重、同一个 `Tensor::matmul` 入口，**只切换分派**
+（CPU 兜底 = 把分流阈值抬到 `usize::MAX`；分块 GPU = 阈值归 0），逐 m 采样。形状就是真实模型
+（`[vocab = 151936, d = 896]`，整表 519.4 MiB > 本机 256 MiB 上限）：
+
+| m | CPU 兜底（物化转置表 + 20 线程三重循环） | 分块 GPU（3 块） | 比值 |
+|---|---|---|---|
+| 1 | 326.5 ms | 333.5 ms | 打平（CPU 略快 2%） |
+| 8 | 366.9 ms | 300.2 ms | GPU 快 1.22× |
+| 64 | 813.3 ms | 349.5 ms | **GPU 快 2.3×** |
+| 512 | 953.9 ms | 690.0 ms | GPU 快 1.38× |
+
+- **口径**：同一台机（Radeon RX 560 / DX12、20 逻辑核）、逐 m 采样；两条路的输出**最大差 0.00e0**
+  （分块结果与 CPU 兜底逐位相同）。探针是 `gpu::tests::chunked_head_matmul_vs_cpu_probe`（`#[ignore]`）：
+  `cargo test --release --features gpu chunked_head_matmul_vs_cpu_probe -- --ignored --nocapture`。
+- **可复现性**：写这一章时复跑同一探针得到 m = 1：301.4 / 331.3 ms、m = 8：357.4 / 274.7 ms、
+  m = 64：736.1 / 371.3 ms（1.98×）、m = 512：965.1 / 706.3 ms —— 绝对值随 GPU 降频与后台负载浮动
+  （同一张卡连续满载可差 15%，见第 5 章），**结论不变**：m = 1 与 CPU 打平、m ≥ 8 分块占优、
+  m = 64 差距最大、两条路逐位一致。
+- **提示原文**（本轮实跑 `generate --max-new 4` 的输出，与「回退 CPU」那条一样只打一次）：
+
+```text
+[gpu] 分块 matmul：out[3,151936]（k=896, batch=1）放不下设备上限 256.0 MiB，沿 N 切成 3 块（最宽 50646 列）× 1 档 batch，逐块在 GPU 上算后按列拼回—— 本算子留在 GPU，没有整单回退 CPU。（只提示一次；此刻 matmul 分流：GPU 0 / CPU 96）
+```
+
+- **守着的单测**：`chunk_plan_boundaries`（纯函数边界：真实形状必须切成 3 块 `[50646, 50645, 50645]`、
+  恰好放得下 ⇒ 单块且 `is_whole`、n = 501 时余数落在前块、A 自己超限 ⇒ 改切 batch、上限极窄 ⇒ 由
+  「最小列宽 + 块数上限」挡下返回 `None`）、`gpu_matmul_chunked_matches_whole_bits`（分块 vs 整块
+  **逐位相同**，覆盖两种 `b_t` 布局、`a_t`、batch 分档、块宽不落在 tile 整数倍上）。
+
+### 12.6 边界：分块不是「全面加速」
+
+- **m = 1 与 CPU 打平**：增量解码每个 token 都要把 519 MiB 权重**重传一遍 PCIe**，而 CPU 那边是
+  20 线程直接吃内存带宽 —— 两条路都在搬同一张表，谁也快不了。分块的价值在 m ≥ 8 之后（预填充、评估、
+  训练），m = 64 时是 2.3×。
+- **长生成实测**（`--max-new 100`，上一轮同机实测）：约 **0.41 s/token**，分块前后一致 —— 瓶颈就是上面那次重传，
+  不是这次矩阵乘本身。
+- ⚠️ **别被 generate 的墙钟误导**：`generate --max-new 4` 的墙钟约 **37 s**，但其中约 27 s 是
+  **GPU 初始化**（`request_device` + 管线编译）、约 7.6 s 载入 ckpt，真正生成只有约 2 s；
+  同一命令不带 `--features gpu` 只要 **9.8 s**（走到「生成」8.14 s）。把 37 s 除以 4 得到的
+  「9 s/token」是**误读**（第 11 章里早先写错的 `~47 s/token` 也是同一处误读）。
+- **下一步**：**权重常驻显存**（别再每个 token 重传）+ 把多次 dispatch **合并 submit / poll**。
+  范式已经有了 —— 第 [4.2](#42-常驻--批量录制路径resident) 节的常驻链路就是「一个子层只提交一次」，
+  输出头在 `lm_head_ce` 上也有常驻版本；把这条思路接到大矩阵乘的权重上，才能把 m = 1 那一刀也拿下来。

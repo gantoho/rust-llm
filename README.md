@@ -70,7 +70,7 @@
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** / **distill** / **fp8** / **fp4** / **csa** / **mla** / **import-hf** |
 | API 服务 | `src/serve.rs` | **OpenAI 兼容 HTTP 服务**：`POST /v1/chat/completions`（非流式 + SSE 流式）、`GET /v1/models`、`GET /v1/embeddings`、`GET /health`、`GET /v1/status`、`GET /openapi.json` / `/openapi.yaml`（接口规范）；`Generator` 状态机流式生成、背压队列、客户端断开即中止、API key 鉴权、CORS、请求日志 + 完整问答记录（问答正文只落日志文件）；**模型采出图片段时解码成 PNG，内嵌进 `message.image_url`（data URI）** |
 | 随机数 | `src/rng.rs` | 自实现 xorshift64 伪随机数发生器 |
-| GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU |
+| GPU 加速 | `src/gpu.rs` | 可选（`--features gpu`）：wgpu 计算着色器加速 matmul/scale/add/relu，失败自动回退 CPU；**显存申请超过设备上限时先分块在 GPU 上算，连最小块都放不下才回退 CPU（不 panic）**，见 [§15](#15-gpu-加速可选-feature) |
 
 ### 前沿技术（第 31-38 课）
 
@@ -1473,9 +1473,9 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 420 个
-（418 个单元测试 + 2 个集成冒烟测试 `tests/smoke.rs`：启动真实二进制跑 `--help` 与 `preset`），
-其中 `src/gpu.rs` 10 个（含 2 个 `#[ignore]` 的性能标定探针）；不带 `--features gpu` 时 409 个。
+用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **427 个单元测试**
+（另有 2 个集成冒烟测试 `tests/smoke.rs`：启动真实二进制跑 `--help` 与 `preset`），
+其中 `src/gpu.rs` 16 个（含 3 个 `#[ignore]` 的性能标定探针）；不带 `--features gpu` 时 410 个。
 零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒。GPU 用例会真实创建 wgpu 设备并逐个形状比对
 CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1` 串行跑：并行跑多个 GPU 用例会互相抢设备，
 曾观察到随机失败。
@@ -1486,6 +1486,7 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `test_broadcast_add` | 广播加法正确性 |
 | `test_softmax` / `test_log_softmax` | softmax 数值稳定性 |
 | `test_matmul_2d` / `test_matmul_3d` | 2D / 3D 矩阵乘法 |
+| `test_matmul_transposed_rhs_view` | 右操作数是「连续张量的 2D 转置视图」时**不物化**它（输出头 `hidden @ Wᵀ` 走这条）：判据从严（只有 2 维且 `strides == [1, shape[0]]` 命中）、前向与反向（含 `∂a = g·bᵀ` 的内核 `b_t` 按前向取反）都与「先 `contiguous()` 再乘」逐位一致 |
 | `test_permute` | 任意维度重排 |
 | `test_reshape_grad_flows` | reshape 梯度传递 |
 | `test_relu_grad` | ReLU 反向传播 |
@@ -1625,7 +1626,7 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `help_lists_subcommands` | `--help` 正常退出且列出 train / eval / generate / serve / preset 等子命令 |
 | `preset_writes_config_file` | `preset --output` 落盘的配置是合法 JSON 且含 `model` / `train` / `n_embd` 字段 |
 
-`--features gpu` 额外 10 个（都在 `src/gpu.rs`，`--list` 可核对）：
+`--features gpu` 额外 17 个（16 个在 `src/gpu.rs`，另 1 个是 `model::tests::test_gpu_resident_path_matches_loop_path`；以 `--list` 可核对）：
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -1637,14 +1638,21 @@ CPU 参考实现，单个用例就要几十秒，建议加 `-- --test-threads=1`
 | `gpu_attn_layer_resident_matches_loop_reference` | 注意力常驻链路前向 + 11 项边界梯度 |
 | `gpu_stack_resident_matches_sublayer_reference` | 整叠常驻路径前向 + `dx` + 每层 16/18 项参数梯度（GELU/SwiGLU，含 3 个 SwiGLU case）vs 逐子层常驻路径 |
 | `gpu_matmul_small_tile_matches_big_tile_bits` | 4 形状 × 4 转置组合下，64×64 与 128×128 两个 matmul 内核输出**逐位相同** |
+| `chunk_plan_boundaries` | 分块计划（**纯函数**，不需要 GPU）：真实形状 `[151936,896]` 对本机 256 MiB 上限必须切成 3 块 `[50646,50645,50645]`（`batch_chunk = 1`）、恰好放得下 ⇒ 单块且 `is_whole`（零额外拷贝）、n=501 时余数落在前块、A 自己超限 ⇒ 改为切 batch、上限极窄 ⇒ 由「最小列宽 256 + 块数上限 256」挡下返回 `None`（仍回退 CPU） |
+| `gpu_matmul_chunked_matches_whole_bits` | **分块结果 == 整块结果，逐位相同**（`assert_eq!`，不放容差）：用纯函数压低上限强制切出多列块 / 多 batch 档，覆盖 `b_t` 两种物理布局、`a_t`、块宽不落在 tile 整数倍上，再对一遍 CPU 参考 |
+| `mem_guard_fits_boundaries` | 显存护栏判据的边界：恰好等于上限合法（判据是 `<=`）、上限 +1 放不下、按池里真正创建的字节数（`size_class` 上取整）判 —— 真实崩溃尺寸 `151936×896×4 = 544538624 B` 在 256 MiB 上限的设备上必须判「放不下」 |
+| `mem_guard_take_buf_rejects_oversize` | 护栏在**分配入口**真的生效：超限申请（含真实崩溃尺寸）在 storage / 回读三种用途下都返回 `None`（而不是递到 `create_buffer` 去 panic），且拒绝之后池与上下文完好、正常尺寸照旧拿得到 buffer |
+| `mem_guard_limits_match_device` | 判据来自设备真实限制而非写死的常量：缓存的三个上限与 `device.limits()` 一致、`alloc_limit` 按用途取 min，0 个元素与极小张量在任何设备上都放得下（否则 GPU 后端等于被护栏禁用） |
 | `matmul_throughput_probe`（`#[ignore]`） | 单次提交内连跑同一 matmul，测**纯内核**吞吐（排除回读造成的假象） |
 | `mm_tile_ab_probe`（`#[ignore]`） | 同进程内按「大 → 小」交替各 3 轮，标定两种 tile 的 ms 与 GFLOP/s |
+| `chunked_head_matmul_vs_cpu_probe`（`#[ignore]`） | 输出头那一刀该走 CPU 兜底还是分块 GPU：同一份 519.4 MiB 权重、同一个 `Tensor::matmul` 入口**只切换分派**，逐 m（1 / 8 / 64 / 512）打印两条路的 ms 与最大差（实测 m=1 打平、m=64 快 2.3×，最大差恒为 0.00e0） |
 
-两个标定探针要手动跑（它们不是通过/失败型测试，而是打印数据）：
+三个标定探针要手动跑（它们不是通过/失败型测试，而是打印数据）：
 
 ```bash
 cargo test --release --features gpu matmul_throughput_probe -- --ignored --nocapture
 cargo test --release --features gpu mm_tile_ab_probe -- --ignored --nocapture
+cargo test --release --features gpu chunked_head_matmul_vs_cpu_probe -- --ignored --nocapture
 ```
 
 ---
@@ -1756,6 +1764,59 @@ SwiGLU 都已支持（每层分别回注 16/18 项参数梯度，默认关闭只
 结束时打印 `[gpu] 稳态（末尾 20 批）…`。这些是性能分析用的，不影响训练结果。
 
 **自动回退**：GPU 初始化失败或任何调用出错时，自动回退 CPU，不影响正确性
+
+**显存申请护栏（放不下有两条出路：分块在 GPU 上算 / 连最小块都放不下才回退 CPU，绝不 panic）**：
+GPU 后端唯一的分配入口在申请显存前，先拿设备的 `max_buffer_size` / `max_storage_buffer_binding_size` /
+`max_uniform_buffer_binding_size` 判一次（判据与 wgpu 的校验**同源**，且按池里**真正创建**的字节数判，
+即 `size_class` 上取整之后的），放不下就返回 `None`，**不会把超限申请递到 `create_buffer` 去 panic**。
+它来自一次真实崩溃：Qwen2.5-0.5B（vocab = 151936、n_embd = 896）的输出头 / 词嵌入整表
+`[vocab, n_embd]` 是 `151936 × 896 × 4 = 544538624 B ≈ 519.4 MiB`，超过本机（Radeon RX 560 / DX12）
+`max_buffer_size` 的 256 MiB——生成时算 logits 的那次 matmul 会把这整张表当操作数上传
+（`GpuContext::matmul` 里的 `take_buf(b.len(), KIND_IN)`），修复前这里当场
+`wgpu error: Validation Error … Buffer size 544538624 is greater than the maximum buffer size (268435456)`。
+修复分两层：
+
+**① 第一条出路：分块在 GPU 上算**（大矩阵乘专用）。`GpuContext::matmul` 在申请之前先用**纯函数**
+`chunk_plan` 算一份计划，沿 **N（输出列）** 切块（必要时连 batch 一起切小），逐块 dispatch 后按列拼回。
+真实形状切成 **3 块 `[50646, 50645, 50645]`**（`batch_chunk = 1`），同一条 generate 命令 **exit 0**，
+打印的是这一行（本轮实测原文，每个进程只打一次）：
+
+```text
+[gpu] 分块 matmul：out[3,151936]（k=896, batch=1）放不下设备上限 256.0 MiB，沿 N 切成 3 块（最宽 50646 列）× 1 档 batch，逐块在 GPU 上算后按列拼回—— 本算子留在 GPU，没有整单回退 CPU。（只提示一次；此刻 matmul 分流：GPU 0 / CPU 96）
+```
+
+- **切 N 不切 K**：沿 N 切时每个输出元素仍是同一个内核、同一份 K 循环 ⇒ 与整块一次算**逐位一致**
+  （`gpu_matmul_chunked_matches_whole_bits` 用 `assert_eq!`、容差 0 守住）；切 K 会改浮点累加顺序，
+  还要多一轮跨块归约。
+- **块宽均分，最小列宽 256、块数上限 256**：块太窄时每次 dispatch 的固定开销（编码 / 提交 / poll / 回读）
+  会盖过计算本身，那种情况宁可照旧回退 CPU。判据与分配入口 `take_buf` 的 `size_class` 上取整**同源**。
+- **两种物理布局**：`b_t=true`（物理 `[N,K]`）的列切片是连续行段（`batch=1` 时零拷贝借位）；
+  `b_t=false`（物理 `[K,N]`）的列切片跨步，只能按 K 行一段段取（约一遍全表扫描）。两种布局下 B 块都只按
+  列块上传（合起来仍是整表一遍），换来的是**不必先在 CPU 上物化整张转置表**（见下一条）。整块放得下时
+  **直接借整个 `b`，零额外拷贝、与加分块之前完全一致**。
+- 配套的**转置视图免物化**：`Tensor::matmul` 对 `hidden @ Wᵀ` 里那个 2D 转置视图不再 `contiguous()`
+  物化整表（判据从严：只有 2 维且 `strides == [1, shape[0]]` 命中，且这次真会落到内核上），
+  无 GPU / 低于 FLOPs 阈值时行为与改动前**逐位一致**；命中时 b 的物理布局正好是内核 `b_t = true` 要读的
+  `[N,K]`，直接交给内核读。
+
+**② 第二条出路：真的放不下才回退 CPU**。连最小块宽都放不下（`chunk_plan` 返回 `None`）时，照旧返回
+`None` 走 CPU 回退路径，打印下面这行（数字取自护栏挡下那张 519.4 MiB 表的实测；提示同样每个进程只打一次）：
+
+```text
+[gpu] 显存护栏：申请 136134656 个 f32 = 519.4 MiB（size class 上取整后 519.4 MiB）超过设备上限 256.0 MiB → 该算子回退 CPU。（只提示一次；此刻 matmul 分流：GPU 0 / CPU 96）
+```
+
+⚠️ **别被 generate 的墙钟误导**：`generate --max-new 4` 那条命令的墙钟约 **37 s**，但其中约 **27 s 是
+GPU 初始化**（`request_device` + 管线编译）、约 **7.6 s 载入 ckpt**，真正生成只有约 **2 s**（本轮实测：
+程序记的总耗时 **36.9 s**，另用一条「加载 ckpt 前就失败」的命令单独量到 GPU 初始化 **27.2 s**）；
+同一命令不带 `--features gpu` 只要 **9.8 s**（走到「生成」8.14 s）。此前把这条墙钟除以 4 得到的
+"~9 s/token"（以及这里写过的 `~47 s/token`）都是**误读**——它量的是冷启动，不是每 token 的成本。
+长生成（`--max-new 100`，上一轮同机实测）约 **0.41 s/token**，分块前后一致：增量解码 m=1 与 CPU 打平
+（输出头那一刀 CPU 兜底 326.5 ms vs 分块 GPU 333.5 ms），真正的瓶颈是**每 token 重传 519 MiB 权重**。
+同机标定（RX 560、逐 m 采样、同一个 `Tensor::matmul` 入口只切换分派，上一轮实测）：m=8 366.9 vs 300.2 ms、
+**m=64 813.3 vs 349.5 ms（2.3×）**、m=512 953.9 vs 690.0 ms，两条路输出最大差 **0.00e0**；
+**下一步是权重常驻显存 + 合并 submit/poll**。详见
+[docs/27-GPU加速.md](docs/27-GPU加速.md) §11 与 §12。
 
 ---
 
@@ -2217,11 +2278,13 @@ TinyLlama-1.1B ≈ 9GB 可行；8B 级需 60GB+，建议换更小的模型（内
 
 ## 代码验证状态
 
-- **测试**：`cargo test --features gpu -- --list` 当前列出 **420 个用例**（数量随代码增长，
-  别把它当常量背）。**全量串行**跑（`cargo test --features gpu -- --test-threads=1`）实测
+- **测试**：`cargo test --features gpu -- --list` 当前列出 **427 个单元测试**（另有 2 个 `tests/smoke.rs`
+  集成用例；数量随代码增长，别把它当常量背）。**全量串行**跑
+  （`cargo test --features gpu -- --test-threads=1`）上一次实测（当时 418 个单元用例）
   **415 passed / 1 failed / 2 ignored**：唯一失败的是
   `model::tests::quantize_weights_reduces_bytes_and_keeps_loss_close`——**既存的序相关用例**
-  （基线上同序同样失败，与本节改动无关）；2 个 ignored 是 `src/gpu.rs` 的性能标定探针。
+  （基线上同序同样失败，与本节改动无关）；ignored 都是 `src/gpu.rs` 的性能标定探针
+  （当时 2 个，现在是 3 个）。
   ⚠️ **全量并行跑还会有若干条既存失败，甚至可能整进程崩掉**（实测
   `0xC0000005`）：GPU 用例对时序/驱动敏感，几条"两次训练必须逐位一致"的对照用例会被
   同机并行负载影响。**排查改动请两条路都走**：
@@ -2599,6 +2662,14 @@ loss 直接变 NaN，整轮实验作废。
   启动校验直接拒绝两者同开（`mla_absorb ⇒ !qk_norm`），而不是静默给出错误结果。
 - **吸收只在无梯度推理下开启**：反传需要 `c_k`/`c_v` 的中间梯度，而吸收把 K/V 从计算图里消掉了。
   实现里用 `!grad_enabled()` 分流——训练走朴素解耦路径（数值等价、可反传），推理走吸收路径（省显存/算力）。
+- **免物化转置视图时，反向的 `b_t` 必须按前向取反**：`Tensor::matmul` 现在对「连续张量的 2D 转置视图」
+  （[`Tensor::is_transposed_2d_view`](src/tensor.rs)，判据从严：2 维 + `strides == [1, shape[0]]`）
+  不再 `contiguous()` 物化整表（输出头那张 519 MiB 的 `[d, vocab]`），而是把视图原样交给内核按
+  `b_t = true` 读。配套必须改的是 `matmul_backward` 里 `∂a = g·bᵀ` 的内核标志：它原先**写死
+  `b_t = true`**，那只在「右操作数已被物化成 `[K,N]` 行主序」时成立；免物化后 b 的物理是 `[N,K]`，
+  `bᵀ` 正好是 `[K,N]` 行主序，必须按**非**转置读。写死成 `true` 会把两种布局算串——
+  `hidden.matmul(&head.transpose())` 的**前向完全正常、反向梯度却错**，只看 loss 曲线发现不了。
+  现在按前向 `b_t` 取反，`test_matmul_transposed_rhs_view` 用「两种布局 × 前向/反向」逐位对照守住。
 
 ## 后续方向
 
