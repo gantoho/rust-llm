@@ -7,7 +7,7 @@
 
 ---
 
-## 为什么需要对齐？
+## 1. 为什么需要对齐？
 
 预训练模型的目标是**预测下一个 token**，但这个目标和"对人类有用、无害、诚实"之间存在巨大鸿沟：
 
@@ -16,7 +16,7 @@
 
 **对齐（Alignment）** 就是让模型的行为符合人类的价值观和偏好。
 
-## 三阶段训练流程
+## 2. 三阶段训练流程
 
 现代 LLM 的训练通常分为三个阶段：
 
@@ -37,7 +37,7 @@
   数据: 人工排序的 (好回答, 差回答) 对
 ```
 
-## 监督微调（SFT）
+## 3. 监督微调（SFT）
 
 SFT 是最简单的对齐方式：直接用高质量的 (指令, 回答) 数据微调模型。
 
@@ -53,14 +53,14 @@ Loss: CrossEntropy(模型输出, Target tokens)
 - 数据质量 > 数据数量：少量高质量数据 >> 大量低质量数据（LIMA 论文：仅 1000 条精心标注的数据就能达到很好的 SFT 效果）
 - 回答风格需要一致（不能有时详细、有时简略）
 
-## RLHF（Reinforcement Learning from Human Feedback）
+## 4. RLHF（Reinforcement Learning from Human Feedback）
 
-### 核心思想
+### 4.1 核心思想
 
 1. 训练一个**奖励模型（Reward Model, RM）**，学习人类对回答质量的偏好
 2. 用强化学习（PPO）优化 LLM，使其生成奖励模型打高分的回答
 
-### 步骤详解
+### 4.2 步骤详解
 
 #### 步骤 1：收集偏好数据
 
@@ -110,7 +110,7 @@ $$
 
 **KL 惩罚的作用**：防止模型"hack"奖励模型——如果不加 KL 约束，LLM 会找到奖励模型的漏洞（如反复说"我非常确定"来得高分），而不是真正提高回答质量（这叫 reward hacking）。
 
-### PPO 算法核心
+### 4.3 PPO 算法核心
 
 PPO 是一种**策略梯度**方法，核心是 clipped surrogate objective：
 
@@ -125,7 +125,7 @@ $$
 
 **直觉**：不要让策略更新太大——如果新策略和旧策略差异超过 $\epsilon$，就用 clip 截断梯度。
 
-### RLHF 的完整训练流程
+### 4.4 RLHF 的完整训练流程
 
 ```
                 ┌─────────────┐
@@ -151,9 +151,9 @@ $$
                 └─────────────┘
 ```
 
-## DPO（Direct Preference Optimization，2023）
+## 5. DPO（Direct Preference Optimization，2023）
 
-### 为什么需要 DPO？
+### 5.1 为什么需要 DPO？
 
 RLHF 的 PPO 阶段非常复杂：
 - 需要训练单独的奖励模型
@@ -162,7 +162,7 @@ RLHF 的 PPO 阶段非常复杂：
 
 DPO 的核心思想：**跳过奖励模型，直接用偏好数据优化 LLM**。
 
-### 数学推导
+### 5.2 数学推导
 
 DPO 从 RLHF 的目标函数出发，经过数学推导，得到一个**闭式解**：
 
@@ -179,7 +179,7 @@ $$
 
 **直觉**：增大好回答相对于参考模型的概率比，同时减小差回答的概率比。
 
-### DPO vs RLHF 对比
+### 5.3 DPO vs RLHF 对比
 
 | 方面 | RLHF (PPO) | DPO |
 |------|-----------|-----|
@@ -189,13 +189,13 @@ $$
 | 实现复杂度 | 高 | 低 |
 | 性能 | 被认为更好（但差距在缩小） | 接近 RLHF |
 
-## 其他对齐方法
+## 6. 其他对齐方法
 
-### RLAIF（RL from AI Feedback）
+### 6.1 RLAIF（RL from AI Feedback）
 
 用 AI 代替人类标注偏好数据（如用商用大模型判断哪个回答更好），大幅降低标注成本。
 
-### GRPO（Group Relative Policy Optimization，DeepSeek）
+### 6.2 GRPO（Group Relative Policy Optimization，DeepSeek）
 
 DeepSeek 提出的简化 PPO 方法：
 - 不需要单独的价值模型（Critic）
@@ -208,16 +208,16 @@ $$
 
 其中 $\hat{A}_i = \frac{r_i - \text{mean}(\{r_j\})}{\text{std}(\{r_j\})}$ 是组内相对优势。
 
-### Constitutional AI（Anthropic）
+### 6.3 Constitutional AI（Anthropic）
 
 让 AI 自己根据一组"宪法"原则来修订和改进回答，减少人工参与。
 
-## 本项目的实际实现
+## 7. 本仓库实现要点
 
 上面的原理已全部落地为可运行代码。核心文件是 [`src/align.rs`](../src/align.rs)（单测跑 `cargo test align`，数量以实际输出为准），
 CLI 入口是 [`align`](../README.md) 子命令。
 
-### 代码结构
+### 7.1 代码结构
 
 | 组件 | 位置 | 说明 |
 |------|------|------|
@@ -235,7 +235,7 @@ CLI 入口是 [`align`](../README.md) 子命令。
 | `grpo_loss` | `align.rs` | GRPO 损失：组内相对优势 + 裁剪代理目标，与 PPO 形式相同但优势来源不同 |
 | `ppo_loss` | `align.rs` | PPO 损失：裁剪代理目标 + 参考模型 KL 惩罚（`kl_coef` 控制约束松紧） |
 
-### CLI 用法
+### 7.2 CLI 用法
 
 ```bash
 # 默认配置（奖励模型 150 步 + DPO 60 步 + GRPO + PPO）
@@ -256,7 +256,18 @@ cargo run --release -- align --n-embd 32 --n-layer 4 --block-size 64
 
 ---
 
-## 拓展方向
+## 8. 小结与下一课
+
+### 本课小结
+
+- 对齐要解决的问题：预训练目标是"预测下一个 token"，而不是"给出好回答"；后者的信号只能来自人类偏好
+- 三阶段流水线：预训练 → SFT（学格式）→ 对齐（学好坏）
+- RLHF = 奖励模型（Bradley-Terry 成对损失）+ PPO（clip 目标 + 对参考模型的 KL 惩罚）；KL 项是防 reward hacking 的关键
+- DPO 用闭式解跳过奖励模型，只维护"策略 + 参考"两个模型，训练稳定性接近 SFT
+- 其他路线：RLAIF（AI 代替人工标注）、GRPO（组内相对优势、免 Critic）、Constitutional AI（宪法原则自修订）
+- 本仓库把四条线全部落地为 `src/align.rs` + `align` 子命令：奖励模型、DPO、GRPO、PPO（KL 用 k3 估计，无偏且恒非负）
+
+### 拓展方向
 
 > 核心内容已全部实现（`src/align.rs` + `align` 子命令），这里是进阶拓展。
 
@@ -264,3 +275,5 @@ cargo run --release -- align --n-embd 32 --n-layer 4 --block-size 64
 2. **实现 Bradley-Terry Loss**：给定 (好回答分数, 差回答分数)，实现奖励模型的损失函数。
 3. **实现 DPO Loss**：给定 (策略模型概率, 参考模型概率, 好回答, 差回答)，实现 DPO 损失函数。
 4. **对比实验**：在小模型上分别用 SFT 和 DPO 训练，观察生成质量的变化。
+
+> **下一课**：[第 37 课 RAG 检索增强生成（Retrieval-Augmented Generation）](37-RAG检索增强生成.md) —— 对齐改的是"怎么回答"，下一课改的是"知识从哪来"——用检索把外部文档喂进上下文。

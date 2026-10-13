@@ -342,7 +342,7 @@ impl HfConfig {
             if !rs.is_null() {
                 return Err(format!(
                     "config.json 带 rope_scaling（{rs}）：本仓库只实现了 linear / ntk / yarn 三种，\
-                     HF 的 llama3 / longrope / dynamic 等口径不同，需要先手工换算（见 docs/20 §13）"
+                     HF 的 llama3 / longrope / dynamic 等口径不同，需要先手工换算（见 docs/20「实现更正：频率表是逐头重复的」一节）"
                 ));
             }
         }

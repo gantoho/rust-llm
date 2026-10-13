@@ -16,21 +16,21 @@
 
 ## 2. KV Cache 回顾（第 25 课）
 
-推理时，每生成一个新 token，需要用到之前所有 token 的 K 和 V。
+推理时每生成一个新 token 都要用到之前所有 token 的 K 和 V，标准 MHA 每个头都有自己独立的 K 和 V，
+于是缓存大小是：
 
-标准 MHA：每个头都有独立的 K 和 V。
-
-```
+```text
 KV Cache 大小 = 2 * n_layer * n_head * T * head_dim * sizeof(f32)
 ```
 
 例如 LLaMA-7B（n_layer=32, n_head=32, head_dim=128, T=2048）：
 
-```
+```text
 2 * 32 * 32 * 2048 * 128 * 4B = 2GB
 ```
 
-这 2GB 全部是 K/V 缓存，推理时必须常驻显存。
+这 2GB 全部是 K/V 缓存，推理时必须常驻显存——本课只关心"省多少份"，
+缓存本身的结构、`append` / 滑动窗口 / Attention Sink 等细节**归属课是 [第 25 课 KV Cache](25-KV-Cache.md)**，这里不再展开。
 
 ---
 
@@ -107,39 +107,13 @@ GQA KV Cache = 2 * n_layer * n_kv_head * T * head_dim
 
 ---
 
-## 6. 配置示例
-
-```json
-{
-  "model": {
-    "n_head": 8,
-    "n_kv_head": 2
-  }
-}
-```
-
-`n_kv_head: 0` 或不设 = 标准 MHA（n_kv_head = n_head）。
-
-**约束**：`n_head` 必须能被 `n_kv_head` 整除。
-
----
-
-## 7. 关键要点
-
-- GQA = 多个 Q 头共享一组 K/V 头，是 MHA 和 MQA 的折中
-- KV Cache 缩小 `n_head / n_kv_head` 倍，推理显存大幅降低
-- 训练时几乎不影响效果（LLaMA 2 验证）
-- 实现：K/V 投影维度变小 + flash_attention 核内按 `hh / n_rep` 索引共享头（零物化）
-
----
-
-## 8. 延伸：MLA 低秩压缩 KV Cache（DeepSeek-V2/V3）
+## 6. 延伸：MLA 低秩压缩 KV Cache（DeepSeek-V2/V3）
 
 > **已落地代码**：[`src/attention.rs`](../src/attention.rs) 的 `MultiHeadAttention`
 > （`kv_lora_rank > 0` 时走 `forward_mla`）+ `KVCache::new_latent` / `append_latent` /
 > `positions`。配置开关：`model.kv_lora_rank`（默认 `0` = 关闭）。
 
-### 8.1 GQA 之后，为什么还要 MLA
+### 6.1 GQA 之后，为什么还要 MLA
 
 GQA 的思路是"**少存几份**"：让多个 Q 头共享 K/V 头，缓存缩小 `n_head / n_kv_head` 倍。
 
@@ -157,7 +131,7 @@ MLA（Multi-head Latent Attention）换了个方向："**每份压扁**"——K 
 两种思路可以叠加（MLA 里同样有 `n_kv_head`），但收益来源不同：GQA 省的是"份数"，
 MLA 省的是"每份的体积"。
 
-### 8.2 省了多少
+### 6.2 省了多少
 
 ```text
 MHA/GQA 缓存 = 2 * n_layer * T * n_kv_head * head_dim * 4 字节
@@ -167,13 +141,13 @@ MLA   缓存 =     n_layer * T * kv_lora_rank          * 4 字节
 DeepSeek-V2：`kv_lora_rank = 512`，对比 `n_kv_head × head_dim = 128 × 192`，
 缓存小了约 96 倍。长上下文下 KV Cache 常常比权重还大，这一项直接决定能开多长的上下文。
 
-### 8.3 代价写在明处：算力换显存
+### 6.3 代价写在明处：算力换显存
 
 普通注意力每次只算**新 token** 的 K/V；MLA 每次推理都要把**整段 latent 升维回 K/V**
 （`forward_mla` 第 3 步是全量 `c_k`/`c_v` 投影）。省的是显存，付的是算力——
 这不是"免费的压缩"，而是一个明确的取舍。
 
-### 8.4 本实现的取舍（教学版）
+### 6.4 本实现的取舍（教学版）
 
 - **保留论文的核心**：KV 联合低秩压缩 + 缓存只存 latent。
 - **decoupled RoPE 单独成课**：论文把 Q/K 的 rope 子维单独拎出来只对那部分旋转，
@@ -186,7 +160,7 @@ DeepSeek-V2：`kv_lora_rank = 512`，对比 `n_kv_head × head_dim = 128 × 192`
   `k_rope` 由输入直接投影）与 `model.mla_absorb = true`（解码在 `r + n_head·hd_rope` 维 latent 空间完成、
   K/V 不物化），详见 [第 50 课](50-MLA解耦RoPE与权重吸收.md)。
 
-### 8.5 配置与约束
+### 6.5 配置与约束
 
 ```json
 {
@@ -206,3 +180,44 @@ DeepSeek-V2：`kv_lora_rank = 512`，对比 `n_kv_head × head_dim = 128 × 192`
 - MLA 的压缩投影 `c_kv` **不挂 LoRA 适配器**：它同时供给 K 和 V 两条路，低秩增量在那里
   既破坏"压缩"的口径，也没有现成的社区做法；要调 MLA 的 KV 表示，直接调
   `kv_lora_rank` 重训更干净。
+
+---
+
+## 7. 配置示例
+
+```json
+{
+  "model": {
+    "n_head": 8,
+    "n_kv_head": 2
+  }
+}
+```
+
+`n_kv_head: 0` 或不设 = 标准 MHA（n_kv_head = n_head）。
+
+**约束**：`n_head` 必须能被 `n_kv_head` 整除。
+
+启用 MLA 时另加 `kv_lora_rank`（见 6.5 节）。
+
+---
+
+## 8. 小结与下一课
+
+### 本课小结
+
+- GQA = 多个 Q 头共享一组 K/V 头，是 MHA 和 MQA 的折中
+- KV Cache 缩小 `n_head / n_kv_head` 倍，推理显存大幅降低
+- 训练时几乎不影响效果（LLaMA 2 验证）
+- 实现：K/V 投影维度变小 + flash_attention 核内按 `hh / n_rep` 索引共享头（零物化）
+
+### 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
+
+1. **扫 `n_kv_head`**：把 `config/config.json` 的 `model.n_kv_head` 在 `1 / 2 / 4 / 8`（配合 `n_head = 8`）各训一遍，对比 loss 与推理显存——`1` 就是 MQA，看它与 GQA 的差距。
+2. **确认零物化**：在 `flash_attention` 的 CPU 分块核里加一行计数，确认 `n_rep > 1` 时按 `hh / n_rep` 索引共享头、而不是先 `repeat_kv` 复制一份。
+3. **验整除约束**：把 `n_kv_head` 设成不整除 `n_head` 的值（如 `n_head = 8`、`n_kv_head = 3`），确认构造时直接断言失败而不是静默算错。
+4. **算一遍 KV Cache 的字节数**：用第 5 节的三行公式，按本仓库的实际 `n_layer` / `n_head` / `block_size` 估算 MHA 与 GQA 的缓存字节数，和进程实际驻留对比。
+
+> **下一课**：[第 24 课 Flash Attention](24-Flash-Attention.md) —— GQA 省的是缓存的"份数"，下一课解决注意力打分矩阵本身的显存与 IO 瓶颈。

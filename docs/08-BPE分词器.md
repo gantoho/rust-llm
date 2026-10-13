@@ -418,16 +418,30 @@ let row: &[f32] = match vocab_bytes {
 
 ---
 
-## 9. 运行与测试
+## 9. 拓展与延伸阅读
+
+分词器序列化的完整讲解（为什么需要持久化、`tokenizer.json` 的 JSON 格式与 `merges` / `byte_ids` / `pretok` 三个字段的口径、自动保存与自动加载的优先级、HF `tokenizer.json` 的导入）见[第 39 课 工程化完善](39-工程化完善.md)第 3 节。
+
+- 本课只保留一条会反复用到的约定：`config/config.json` 的 `tokenizer_file` 为 `null` 时，训练会自动保存到 `{out_dir}/tokenizer.json`，之后 `eval` / `generate` / `chat` 不再需要单独指定分词器——训练与推理因此共用同一份词表。
+- 本课 5.4 的 `Tokenizer::load_hf` 与 `Tokenizer::load` 是两个不同入口：前者读 HuggingFace 原生格式，后者读本仓库 `save` 出来的格式。
+
+## 10. 运行与验证
 
 ```bash
 cargo test tokenizer      # 分词器相关单测（数量会随代码增长，以实际输出为准）
 cargo run --release -- demo    # 演示 2（BPE）：词表 400（256 + 144 次合并）；"Red" -> [82, 101, 100]；"the garden" -> 2 个 token
 ```
 
----
+## 11. 小结与下一课
 
-## 10. 拓展方向
+### 本课小结
+
+- 模型只认数字，分词器负责"文字 ↔ id"的转换
+- 字符级分词：简单直观，但序列长、有词表外字符；词级分词：词表大、仍有 OOV
+- BPE：字节级底座（256 个字节起步，零 OOV）+ 反复合并最高频相邻 pair
+- 训练产出 `merges`（合并规则）和 `vocab`（id → 字节序列）；编码贪心复现合并；解码查表拼接
+
+### 拓展方向
 
 > 核心内容已全部实现，这里是进阶拓展。
 
@@ -436,42 +450,4 @@ cargo run --release -- demo    # 演示 2（BPE）：词表 400（256 + 144 次�
 3. 思考：`encode` 为什么必须按"merge 下标最小"合并，而不是按"频率最高"合并？（提示：训练时的合并顺序决定了 id 分配，编码必须复现同一顺序才能保证解码还原）
 4. 思考：`CharTokenizer` 遇到词表外字符会 panic，BPE 为什么永远不会有这个问题？
 
----
-
-## 11. 本课总结
-
-- 模型只认数字，分词器负责"文字 ↔ id"的转换
-- 字符级分词：简单直观，但序列长、有词表外字符；词级分词：词表大、仍有 OOV
-- BPE：字节级底座（256 个字节起步，零 OOV）+ 反复合并最高频相邻 pair
-- 训练产出 `merges`（合并规则）和 `vocab`（id → 字节序列）；编码贪心复现合并；解码查表拼接
-- 下一课：token 变成向量之后，怎么让它们"互相看"？——注意力机制！
-
-## 12. 扩展：分词器序列化（第 39 课补充）
-
-训练 BPE 分词器需要遍历整个语料统计频率，大语料可能耗时数十秒。序列化后可以：
-
-```rust
-// 训练后保存（统一 Tokenizer 入口）
-let tok = Tokenizer::bpe(corpus, 2048);
-tok.save("tokenizer.json");
-
-// 下次直接加载（秒级完成）
-let tok = Tokenizer::load("tokenizer.json");
-```
-
-`config/config.json` 中通过 `tokenizer_file` 字段控制：
-
-```jsonc
-{
-  "train": {
-    "tokenizer_file": null  // null = 从语料训练并自动保存到 {out_dir}/tokenizer.json
-  }
-}
-```
-
-这保证了训练、评估、生成、对话都使用完全相同的词表。
-
-存档里除了 `vocab` / `merges`，还记着 `byte_ids`、`pretok`、`specials`、`extra_literals`、
-图片 token 段——HF 口径的那几项缺省时按"自研口径"补齐，所以旧存档读回来逐位不变。
-另有一条**独立**的入口：`Tokenizer::load_hf("tokenizer.json")` 直接读 HuggingFace 的分词器文件
-（见 5.4），它与 `Tokenizer::load` 不是同一个东西：前者吃 HF 的原生格式，后者吃本仓库自己 `save` 出来的格式。
+> **下一课**：[第 9 课 注意力机制](09-注意力机制.md) —— token 变成向量之后，怎么让它们"互相看"？——注意力机制！

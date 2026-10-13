@@ -90,9 +90,7 @@ MLA 路径的细节不同：缓存里存的是**未归一化**的 latent，所�
 重做一次，保证 latent 增量与全量重算一致
 （`test_qk_norm_with_mla_latent_cache_matches_full_recompute`）。
 
----
-
-## 5. 默认路径逐位不变
+### 默认路径逐位不变
 
 - 默认 `qk_norm = false`：`q_norm` / `k_norm` 都是 `None`；
 - `apply_qk_norm` 在 `None` 时**直接返回输入张量**，不产生任何算子（只是一次所有权转移）；
@@ -105,9 +103,17 @@ MLA 路径的细节不同：缓存里存的是**未归一化**的 latent，所�
 `c_q/c_k/c_v/c_proj` 的权重与偏置逐位相同，多出来的只有每层 Q、K 两个 `gamma`
 （`parameters().len()` 从 8 变 10，`gamma.numel() == d / n_head`）。
 
+### 代码地图
+
+| 位置 | 内容 |
+|------|------|
+| [`src/attention.rs`](../src/attention.rs) | `q_norm` / `k_norm` 字段、`apply_qk_norm`、两条前向里的调用点 |
+| [`src/model.rs`](../src/model.rs) | `TransformerConfig::qk_norm` 字段、常驻快路的绕行条件 |
+| [`src/scaling.rs`](../src/scaling.rs) | `params_per_layer` 的 `2 * hd` 参数量口径 |
+
 ---
 
-## 6. 验证方式
+## 5. 运行与验证
 
 ```bash
 # QK-Norm 单测（逐头单位 RMS 与尺度不变、不扰动初始化、梯度到 gamma、与增量缓存一致）
@@ -136,11 +142,9 @@ cargo test test_qk_norm_changes_training_same_seed
 | `test_qk_norm_with_mla_latent_cache_matches_full_recompute` | MLA latent 缓存下两条路径仍一致 |
 | `test_qk_norm_changes_training_same_seed` | 同种子对照：开了确实改变 loss，且 loss 有限（新参数不破坏训练） |
 
----
+### 常见坑（实测踩出来的）
 
-## 7. 两个坑（实测踩出来的）
-
-### 7.1 归一化的是 `head_dim`，不是 `n_embd`
+#### 1. 归一化的是 `head_dim`，不是 `n_embd`
 
 QK-Norm 的口径是**每个头内部**的 `head_dim` 向量，所以 `gamma` 长度是 `head_dim = n_embd / n_head`，
 不是 `n_embd`。实现里必须先把 `[B, T, n_head·head_dim]` 摊成 `[B·T·n_head, head_dim]` 再归一化、
@@ -150,7 +154,7 @@ QK-Norm 的口径是**每个头内部**的 `head_dim` 向量，所以 `gamma` �
 以及**跨头**求均值——那会把不同头的信息混在一起，语义完全变了。GQA 下 K 侧尤其容易写错：
 它只有 `n_kv_head` 个头，但 `gamma` 仍然只有一套，各 KV 头共用。
 
-### 7.2 开 QK-Norm 会让 GPU 常驻快路失效（性能取舍，不是数值问题）
+#### 2. 开 QK-Norm 会让 GPU 常驻快路失效（性能取舍，不是数值问题）
 
 [`src/model.rs`](../src/model.rs) 里判断是否走"GPU 常驻快路"的条件包含 `|| self.cfg.qk_norm`：
 
@@ -166,15 +170,13 @@ QK-Norm 的口径是**每个头内部**的 `head_dim` 向量，所以 `gamma` �
 
 ---
 
-## 8. 代码地图与拓展方向
+## 6. 小结与下一课
 
-| 位置 | 内容 |
-|------|------|
-| [`src/attention.rs`](../src/attention.rs) | `q_norm` / `k_norm` 字段、`apply_qk_norm`、两条前向里的调用点 |
-| [`src/model.rs`](../src/model.rs) | `TransformerConfig::qk_norm` 字段、常驻快路的绕行条件 |
-| [`src/scaling.rs`](../src/scaling.rs) | `params_per_layer` 的 `2 * hd` 参数量口径 |
+### 本课小结
 
-拓展方向：
+QK-Norm 把每个头的 `head_dim` 向量归一化到单位 RMS，让注意力 logit 的尺度只由 `head_dim` 与 `gamma` 决定；默认关闭时参数表与前向逐位不变。
+
+### 拓展方向
 
 - **与 warmup 的关系**：QK-Norm 的卖点之一是"允许更短 warmup、更大学习率"，
   可以做一个"开/关 QK-Norm × 不同 warmup 长度"的对照，看谁在短 warmup 下先发散。
@@ -183,3 +185,5 @@ QK-Norm 的口径是**每个头内部**的 `head_dim` 向量，所以 `gamma` �
 - **只归一化一侧**：本实现 Q、K 两侧都归一化；也可以只归一化 Q（参数减半）看稳定性差多少。
 - **与 MLA 组合**：见 `test_qk_norm_with_mla_latent_cache_matches_full_recompute`，
   两者正交、可同时开启。
+
+> **下一课**：[第 46 课 Muon 优化器](46-Muon优化器.md) —— 换优化器：Muon 用 Newton–Schulz 正交化动量矩阵。

@@ -342,7 +342,18 @@ pub fn tiny(vocab_size: usize) -> Self {
 
 ---
 
-## 6. 拓展方向
+## 6. 小结与下一课
+
+### 本课小结
+
+- Transformer 由 **token embedding + N 层 Transformer Block + 最终归一化 + 输出头** 四大部分组成（位置信息由第 20 课的 RoPE 在注意力内部提供，不再有独立的 `pos_emb` 表）
+- Transformer Block 是 **pre-norm** 结构：`Norm → Attention → 残差`，再 `Norm → MLP → 残差`；默认 `Norm` 是 RMSNorm、`MLP` 是 SwiGLU（第 21 / 22 课），写回经典风格（LayerNorm + GELU MLP）则 MLP 做 `D → 4D → D` 的升维降维
+- `Transformer::forward` 数据流：`idx [B*T] → [B, T, D] → ... → [B*T, V]`，只有进出输出头时形状变化，层内形状始终 `[B, T, D]`
+- 因果掩码保证"只能看过去"，RoPE 保证"知道相对位置"
+- 输出头权重绑定（`tie_embeddings = true`，默认）：`x @ tok_emb.tableᵀ`，与 Transformer 的"输入输出共享词嵌入"一致；置 `false` 则单独建一份输出头
+- `tiny` 配置：`n_embd=64`、`n_head=4`（head_dim=16）、`n_layer=2`、`block_size=32`，默认（RMSNorm + SwiGLU）下约 13.9 万参数，CPU 上几分钟就能跑一轮训练
+
+### 拓展方向
 
 > 核心内容已全部实现，这里是进阶拓展。
 
@@ -352,15 +363,4 @@ pub fn tiny(vocab_size: usize) -> Self {
 4. **看 Block 内部分工**：把 MLP 的隐藏维改成 `2 * cfg.n_embd`（2 倍而不是默认宽度；GELU MLP 的隐藏维默认由 `MLP_RATIO`（`src/layers.rs`）决定、SwiGLU 由 `swiglu_hidden` 决定，两者都可用 `model.ffn_hidden` 显式覆盖），训练看 loss 变化——体会 MLP 宽度对模型能力的影响。
 5. **思考**：我们的输出头就是 `tok_emb.table` 的转置（权重绑定）。为什么可以这样做？相比"独立的 lm_head"省了多少参数？（提示：`[V, D]` 和 `[D, V]` 互为转置，`lm_head` 的参数量 `64×V+V` 恰好被省掉了。）
 
----
-
-## 7. 本课总结
-
-- Transformer 由 **token embedding + N 层 Transformer Block + 最终归一化 + 输出头** 四大部分组成（位置信息由第 20 课的 RoPE 在注意力内部提供，不再有独立的 `pos_emb` 表）
-- Transformer Block 是 **pre-norm** 结构：`Norm → Attention → 残差`，再 `Norm → MLP → 残差`；默认 `Norm` 是 RMSNorm、`MLP` 是 SwiGLU（第 21 / 22 课），写回经典风格（LayerNorm + GELU MLP）则 MLP 做 `D → 4D → D` 的升维降维
-- `Transformer::forward` 数据流：`idx [B*T] → [B, T, D] → ... → [B*T, V]`，只有进出输出头时形状变化，层内形状始终 `[B, T, D]`
-- 因果掩码保证"只能看过去"，RoPE 保证"知道相对位置"
-- 输出头权重绑定（`tie_embeddings = true`，默认）：`x @ tok_emb.tableᵀ`，与 Transformer 的"输入输出共享词嵌入"一致；置 `false` 则单独建一份输出头
-- `tiny` 配置：`n_embd=64`、`n_head=4`（head_dim=16）、`n_layer=2`、`block_size=32`，默认（RMSNorm + SwiGLU）下约 13.9 万参数，CPU 上几分钟就能跑一轮训练
-
-- 下一课：写训练循环（前向 → 算损失 → 反向传播 → 更新参数），让这个 Transformer 真的学会生成文本！
+> **下一课**：[第 13 课 训练循环](13-训练循环.md) —— 写训练循环（前向 → 算损失 → 反向传播 → 更新参数），让这个 Transformer 真的学会生成文本！

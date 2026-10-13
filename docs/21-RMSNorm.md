@@ -141,10 +141,22 @@ pub enum NormLayer {
 
 ---
 
-## 8. 关键要点
+## 8. 小结与下一课
+
+### 本课小结
 
 - RMSNorm = LayerNorm 去掉减均值和 β，只保留方差归一化
 - 效果相当，速度更快（少一次 reduction，少一组参数）
 - 现代 LLM（LLaMA/Mistral/Qwen/Gemma）全部使用 RMSNorm
 - 反向公式比 LayerNorm 更简洁
 - 延伸：[第 45 课 QK-Norm](45-QK-Norm.md) 就是把这个 RMSNorm 用到注意力的 Q/K 上——对每个头的 `head_dim` 向量归一化（**投影之后、RoPE 之前**），把 Q/K 的尺度钉死，避免注意力 logits 随权重增长而漂移；GQA 下 K 侧各 KV 头共用一套 `gamma`，每层只多 `2 × head_dim` 个参数
+
+### 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
+
+1. **换回去对比**：把 `config/config.json` 的 `model.use_rmsnorm` 在 `true` / `false` 之间各训一遍，对比最终 loss——验证 4.2 节"效果相当"的结论。
+2. **量一次 reduction 的收益**：给 `Tensor::rmsnorm` 与 LayerNorm 各做一次计时（同形状、同线程数），看少一次 reduction 换来多少差距。
+3. **换 `NormLayer` 的挂载点**：只在 `ln1` 或只在 `ln2` 上用 RMSNorm（改 `TransformerBlock` 的构造），观察 loss 曲线是否比"全换"更差。
+
+> **下一课**：[第 22 课 SwiGLU 激活函数](22-SwiGLU.md) —— 归一化解决的是"尺度"，下一课解决"表达力"——把 MLP 换成门控式的 SwiGLU 结构。

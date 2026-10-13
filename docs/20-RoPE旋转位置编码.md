@@ -55,7 +55,7 @@ x = token_embedding + pos_emb
 
 > 补充：RoPE 也不是"万能外推药"。角度随位置线性增长，训练长度之外同样会失效。
 > 业界用 **NTK-aware scaling、YaRN** 等技巧把频率表拉长来做长度外推——本仓库已经实现，
-> 见第 13 节（连 CLI 开关一并给出）。
+> 见第 11 节「长度外推」（连 CLI 开关一并给出）。
 
 ---
 
@@ -84,7 +84,7 @@ b' = a·sinθ + b·cosθ
 
 > 这是本仓库默认的 `RopeStyle::Interleaved` 配对（也是 GPT-J / NeoX 的口径）。
 > HuggingFace 的 LLaMA / Qwen 用另一种配对 `rotate_half`（`i` 与 `i + d/2` 配对），
-> 本仓库也已支持（`RopeStyle::Half`）——两者频率表相同、旋转结果不同，详见第 14 节。
+> 本仓库也已支持（`RopeStyle::Half`）——两者频率表相同、旋转结果不同，详见第 12 节「实现更正」。
 
 每一对看作平面上的一个点，第 `i` 对 `(x_{2i}, x_{2i+1})` 绕原点旋转角度：
 
@@ -102,7 +102,7 @@ x'_{2i+1} = x_{2i}·sinθ_i + x_{2i+1}·cosθ_i
 > 注意频率方案 `10000^(2i/d)` 和正弦编码一模一样（第 11 课）：`i` 越小频率越高（角度变化快，管近处的精细位置），
 > `i` 越大频率越低（角度变化慢，管远处的粗略位置）。这样"近距离靠高维、远距离靠低维"的分工被保留了下来。
 > 本仓库实现里这个 `d` 就是**单个头的宽度 `head_dim`**（不是 Q/K 拍平后的总宽）：每个头都拥有完整的频率谱，
-> 行内逐头重复同一套角度，见第 7、14 节。
+> 行内逐头重复同一套角度，见第 7、12 节。
 
 ### 3.3 手算一个例子
 
@@ -319,7 +319,7 @@ fn rope_pair_index(e: usize, head_dim: usize, style: RopeStyle) -> (usize, usize
 }
 
 /// 用现成的 cos/sin 表旋转一个张量（[rows, D]；D 必须是 head_dim 的整数倍）。
-/// 表按 head_dim 建，行内每 head_dim 个元素重复使用同一套角度（为什么必须如此见第 14 节）。
+/// 表按 head_dim 建，行内每 head_dim 个元素重复使用同一套角度（为什么必须如此见第 12 节）。
 /// 反向用旋转矩阵的转置 R(θ)ᵀ 回传梯度，闭包直接查表。
 fn rotate_with_tab(
     x: &Tensor,
@@ -622,44 +622,7 @@ let (q, k) = (
 
 ---
 
-## 11. 拓展方向
-
-> 核心内容已全部实现，这里是进阶拓展。
-
-1. **手算一对旋转**：设 `d = 2`、`pos = 1`，对向量 `[1.0, 0.0]` 手算 `rotary` 的输出
-   （提示：`θ₀ = 1/10000^0 = 1` rad，`cos1 ≈ 0.5403, sin1 ≈ 0.8415`），再用 `x.rotary(&[1], 2, &RopeSpec::default())` 验证。
-2. **验证梯度方向**：`rotary` 的反向已修复为 `R(θ)ᵀ`（见第 8.2 节）。自己动手把测试改成"正角度旋转"的错误版本，
-   跑 `test_rotary` 和 `test_rotary_grad_exact`，观察只有后者能发现错误——体会"既测范数、又测方向"的价值。
-3. **对照实际接入**：对照 10.3 节的代码，在 `src/attention.rs` 里找到 RoPE 的接入位置。
-   试着把 `rotary_pair` 改成"先 `rotary` 转 Q、再 `rotary` 转 K"（各自建表，两边都传同一个 `head_dim` / `spec`），
-   跑 `cargo test` 确认结果一致——体会 `rotary_pair` 一次建表省下的重复计算。
-4. **验证相对位置性质**：写一个测试——取同一个 `q`，在位置 `m` 旋转；取同一个 `k`，在位置 `n` 旋转，
-   断言 `q_m · k_n` 只和 `n - m` 有关（对固定的位置差 `d`，换不同的 `m` 结果应相同）。这正是第 5 节推导的代码验证。
-5. **思考外推**：把 `block_size` 从 32 改成 64 重新训练，再让模型生成超过训练长度的文本，
-   观察 RoPE 的输出质量在训练长度之外如何退化，想想为什么（角度随位置线性增长，训练长度之外照样失效）。
-6. **思考**：为什么 `θ_i = pos / 10000^(2i/d)` 里的 `10000` 和 `d` 与正弦编码一模一样？
-   如果把它改成 `10` 会怎样？（提示：所有维度频率变高，近距离区分更敏感、远距离更早"打满"一圈。）
-
----
-
-## 12. 本课总结
-
-- 正弦编码的两个局限：编码**绝对位置**（相对关系要模型自己学）、**外推差**（训练长度外没见过的输入分布）。
-- RoPE 把 d 维拆成 **d/2 对**，第 i 对按 `θ_i = pos / 10000^(2i/d)` 旋转：
-  `x'_{2i} = x_{2i}·cosθ - x_{2i+1}·sinθ`、`x'_{2i+1} = x_{2i}·sinθ + x_{2i+1}·cosθ`。
-- 旋转是**正交变换**：`R(θ)ᵀR(θ) = I`，范数不变 → 数值稳定、不破坏 LayerNorm。
-- **相对位置性质**：`q_m · k_n = qᵀR((n-m)θ)k`，点积只与位置差 `n - m` 有关——位置被"编死"进了打分公式。
-- 与 **KV cache 天然兼容**：新 token 按 `base + j` 旋转自己的 Q/K，历史 K 已旋转、直接复用。
-- `src/rope.rs` 的实现分三层：`build_cos_sin_tab` 预计算 cos/sin 表（线程本地 4 槽缓存：`FREQ_SLOT` 按 `(head_dim, spec)` 记忆化频率表、`TAB_SLOT` 按 `(head_dim, spec, positions)` 记忆化整表，命中即 `Arc` 零拷贝；4 槽是为了让多模态下"视觉塔与主干交替前向"不互相顶掉）→ `rotate_with_tab` 查表旋转（角度按 **head_dim** 建、行内逐头重复，见 §14）→ `rotary_pair` 一次建表同时旋转 Q/K（**允许 Q/K 总宽不同**，GQA 与 MLA 靠这一点才成立）；反向按正交矩阵的转置 `R(θ)ᵀ` 回传（已修复并通过 `test_rotary_grad_exact` 验证）。
-- `test_rotary` 三个断言分别验证：正交性（范数不变）、`pos=0` 恒等、梯度范数守恒；`test_rotary_grad_exact` 逐元素验证梯度方向。
-- 两种**配对方式**（默认 `Interleaved` 相邻配对 `(2i, 2i+1)` / `Half` 的 `rotate_half`）**共用同一张频率表**，但配对下标不同 ⇒ 是不同的旋转，所以必须随权重一起记录：`TransformerConfig::rope_style` 会写进 checkpoint 头（`model.rope_style`），运行时不能靠猜；GPU 常驻快路只支持相邻配对（`RopeSpec::is_plain` 要求 `style == Interleaved`）。
-- 实际接入：在 `MultiHeadAttention` 拆头前、KV cache append 之前对 Q/K 旋转（只转 Q/K、不转 V），已完成接入；`Transformer` 已无 `pos_emb` 字段（第 11 课正弦编码被替换）。
-
-- 下一课（第 21 课）：RMSNorm 均方根归一化
-
----
-
-## 13. 长度外推：Linear（位置插值）/ NTK-aware / YaRN（本仓库已实现）
+## 11. 长度外推：Linear（位置插值）/ NTK-aware / YaRN（本仓库已实现）
 
 第 2.2 节说"外推是后话"——**那句话现在不成立了**：`src/rope.rs` 的 `RopeScaling`
 已经把三种主流外推都实现了，并且开成了 CLI 开关（`RopeArgs`，已 flatten 进
@@ -696,7 +659,7 @@ cargo run --release -- generate --config config/config.json --ckpt checkpoints/z
    的权重，都会整段回落逐算子/CPU 路径：功能正确，但没有 GPU 加速
    （判据是 `RopeSpec::is_plain`：`scaling == None && base == 10000 && style == Interleaved`）。
 
-## 14. 实现更正：频率表是**逐头重复**的
+## 12. 实现更正：频率表是**逐头重复**的
 
 早期 `build_cos_sin_tab` 按**张量最后一维**（= `n_head × head_dim`）建表，等于把一整套
 频率横跨所有头铺开：head 0 只拿到高频段、最后一个头只拿到低频段，每个头各覆盖 `1/n_head`
@@ -730,3 +693,39 @@ cargo run --release -- generate --config config/config.json --ckpt checkpoints/z
 > 两者频率表完全相同、旋转结果不同，**权重不能直接互换**，所以这一位不能靠猜；旧存档缺该字段时
 > 按 `Interleaved` 读入（与加这个字段之前逐位一致）。
 
+---
+
+## 13. 小结与下一课
+
+### 本课小结
+
+- 正弦编码的两个局限：编码**绝对位置**（相对关系要模型自己学）、**外推差**（训练长度外没见过的输入分布）。
+- RoPE 把 d 维拆成 **d/2 对**，第 i 对按 `θ_i = pos / 10000^(2i/d)` 旋转：
+  `x'_{2i} = x_{2i}·cosθ - x_{2i+1}·sinθ`、`x'_{2i+1} = x_{2i}·sinθ + x_{2i+1}·cosθ`。
+- 旋转是**正交变换**：`R(θ)ᵀR(θ) = I`，范数不变 → 数值稳定、不破坏 LayerNorm。
+- **相对位置性质**：`q_m · k_n = qᵀR((n-m)θ)k`，点积只与位置差 `n - m` 有关——位置被"编死"进了打分公式。
+- 与 **KV cache 天然兼容**：新 token 按 `base + j` 旋转自己的 Q/K，历史 K 已旋转、直接复用。
+- `src/rope.rs` 的实现分三层：`build_cos_sin_tab` 预计算 cos/sin 表（线程本地 4 槽缓存：`FREQ_SLOT` 按 `(head_dim, spec)` 记忆化频率表、`TAB_SLOT` 按 `(head_dim, spec, positions)` 记忆化整表，命中即 `Arc` 零拷贝；4 槽是为了让多模态下"视觉塔与主干交替前向"不互相顶掉）→ `rotate_with_tab` 查表旋转（角度按 **head_dim** 建、行内逐头重复，见 §12）→ `rotary_pair` 一次建表同时旋转 Q/K（**允许 Q/K 总宽不同**，GQA 与 MLA 靠这一点才成立）；反向按正交矩阵的转置 `R(θ)ᵀ` 回传（已修复并通过 `test_rotary_grad_exact` 验证）。
+- `test_rotary` 三个断言分别验证：正交性（范数不变）、`pos=0` 恒等、梯度范数守恒；`test_rotary_grad_exact` 逐元素验证梯度方向。
+- 两种**配对方式**（默认 `Interleaved` 相邻配对 `(2i, 2i+1)` / `Half` 的 `rotate_half`）**共用同一张频率表**，但配对下标不同 ⇒ 是不同的旋转，所以必须随权重一起记录：`TransformerConfig::rope_style` 会写进 checkpoint 头（`model.rope_style`），运行时不能靠猜；GPU 常驻快路只支持相邻配对（`RopeSpec::is_plain` 要求 `style == Interleaved`）。
+- 实际接入：在 `MultiHeadAttention` 拆头前、KV cache append 之前对 Q/K 旋转（只转 Q/K、不转 V），已完成接入；`Transformer` 已无 `pos_emb` 字段（第 11 课正弦编码被替换）。
+
+### 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
+
+1. **手算一对旋转**：设 `d = 2`、`pos = 1`，对向量 `[1.0, 0.0]` 手算 `rotary` 的输出
+   （提示：`θ₀ = 1/10000^0 = 1` rad，`cos1 ≈ 0.5403, sin1 ≈ 0.8415`），再用 `x.rotary(&[1], 2, &RopeSpec::default())` 验证。
+2. **验证梯度方向**：`rotary` 的反向已修复为 `R(θ)ᵀ`（见第 8.2 节）。自己动手把测试改成"正角度旋转"的错误版本，
+   跑 `test_rotary` 和 `test_rotary_grad_exact`，观察只有后者能发现错误——体会"既测范数、又测方向"的价值。
+3. **对照实际接入**：对照 10.3 节的代码，在 `src/attention.rs` 里找到 RoPE 的接入位置。
+   试着把 `rotary_pair` 改成"先 `rotary` 转 Q、再 `rotary` 转 K"（各自建表，两边都传同一个 `head_dim` / `spec`），
+   跑 `cargo test` 确认结果一致——体会 `rotary_pair` 一次建表省下的重复计算。
+4. **验证相对位置性质**：写一个测试——取同一个 `q`，在位置 `m` 旋转；取同一个 `k`，在位置 `n` 旋转，
+   断言 `q_m · k_n` 只和 `n - m` 有关（对固定的位置差 `d`，换不同的 `m` 结果应相同）。这正是第 5 节推导的代码验证。
+5. **思考外推**：把 `block_size` 从 32 改成 64 重新训练，再让模型生成超过训练长度的文本，
+   观察 RoPE 的输出质量在训练长度之外如何退化，想想为什么（角度随位置线性增长，训练长度之外照样失效）。
+6. **思考**：为什么 `θ_i = pos / 10000^(2i/d)` 里的 `10000` 和 `d` 与正弦编码一模一样？
+   如果把它改成 `10` 会怎样？（提示：所有维度频率变高，近距离区分更敏感、远距离更早"打满"一圈。）
+
+> **下一课**：[第 21 课 RMSNorm](21-RMSNorm.md) —— 归一化层换成只算均方根的 RMSNorm，省掉一次 reduction 与一组偏置。

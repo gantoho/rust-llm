@@ -129,11 +129,9 @@ A⁰ = softmax_rows(depth_raw)        // 行 softmax 先保证非负、行和为
 **收敛为什么是学出来的 `γ` 而不是取平均**：均匀平均会让最后一个子层的写入参数
 （`β`、`A`）**永久失去梯度**——`mean_s(Σ_t A_{s,t}X_t) = Σ_t X_t / n` 只用到"列和为 1"，
 `mean_s(β_s y) = y / n` 只用到"β 和为 1"，两者都与具体取值无关。换成非均匀的 `γ` 加权求和后
-`Σ_s γ_s β_s` 重新依赖 `β`，参数才能被训练（详见 §7.1）。
+`Σ_s γ_s β_s` 重新依赖 `β`，参数才能被训练（详见 §5 常见坑第 1 条）。
 
----
-
-## 5. 默认路径逐位不变
+### 默认路径逐位不变
 
 - `n_stream = 1`（默认）时 `TransformerBlock` **根本不构造** `HyperConnection`，
   `Transformer` 也不构造 `hc_collapse`：不新增参数、不消耗随机数；
@@ -144,9 +142,17 @@ A⁰ = softmax_rows(depth_raw)        // 行 softmax 先保证非负、行和为
 - 即便手动构造 `HyperConnection::new(1, _)`，`softmax(单元素)` 与 `Sinkhorn(1×1)` 都精确等于 1，
   读出 / 写入也与普通残差逐位相同（`test_single_stream_degenerates_to_residual_bitwise`）。
 
+### 代码地图
+
+| 位置 | 内容 |
+|------|------|
+| [`src/mhc.rs`](../src/mhc.rs) | `HyperConnection`、`expand_streams` / `collapse_streams`、Sinkhorn 参考实现 |
+| [`src/model.rs`](../src/model.rs) | `TransformerBlock::forward_streams`、`Transformer::forward_core` 的多流分支 |
+| [`src/train.rs`](../src/train.rs) | `test_mhc_changes_training_same_seed`（同种子账本） |
+
 ---
 
-## 6. 验证方式
+## 5. 运行与验证
 
 ```bash
 # mHC 单测（Sinkhorn 不动点 / 行列和 / 谱范数 / 双随机 / n=1 逐位退化 / 参数字典 / 梯度）
@@ -183,11 +189,9 @@ cargo test mhc_changes_training_same_seed
 | `test_mhc_two_streams_changes_forward_and_receives_grad` | `n_stream = 2` 改变前向且 mHC 参数拿到梯度 |
 | `test_mhc_changes_training_same_seed` | 同种子完整训练循环下 loss 确实改变且有限 |
 
----
+### 常见坑（实测踩出来的）
 
-## 7. 两个坑（实测踩出来的）
-
-### 7.1 均匀平均收敛 ⇒ 最后一层的混合参数是"死参数"
+#### 1. 均匀平均收敛 ⇒ 最后一层的混合参数是"死参数"
 
 第一版把收敛写成"对 `n` 条流取平均"。结果 `test_mhc_two_streams_changes_forward_and_receives_grad`
 失败：缺梯度的恰好是 `blocks.0.hc_attn.alpha_raw`、`blocks.0.hc_attn.depth_raw`、
@@ -202,7 +206,7 @@ cargo test mhc_changes_training_same_seed
 1. `expand_streams` 给第 `s` 条流乘静态增益 `1 + s·0.01`，各流互不相同；
 2. 收敛改成可学的 `γ = softmax(gamma_raw)`（`concentrated_logits` 初始化，首条流为主）。
 
-### 7.2 "均匀损失对混合参数梯度为 0"是错的直觉
+#### 2. "均匀损失对混合参数梯度为 0"是错的直觉
 
 一度想用"均匀损失下 `depth_raw` 梯度恒为 0"当不变量断言，实测失败。原因是 Sinkhorn 的
 Jacobian 不是正交投影：`A` 被推离某个非均匀点后，行列归一化的两次除法对自由参数的依赖
@@ -212,15 +216,13 @@ Jacobian 不是正交投影：`A` 被推离某个非均匀点后，行列归一�
 
 ---
 
-## 8. 代码地图与拓展方向
+## 6. 小结与下一课
 
-| 位置 | 内容 |
-|------|------|
-| [`src/mhc.rs`](../src/mhc.rs) | `HyperConnection`、`expand_streams` / `collapse_streams`、Sinkhorn 参考实现 |
-| [`src/model.rs`](../src/model.rs) | `TransformerBlock::forward_streams`、`Transformer::forward_core` 的多流分支 |
-| [`src/train.rs`](../src/train.rs) | `test_mhc_changes_training_same_seed`（同种子账本） |
+### 本课小结
 
-拓展方向：
+mHC 把单条残差流拓宽成 `n` 条并行流，用 Sinkhorn 投影到双随机矩阵，换来"步长保范 + 保均值"两个保证；`n_stream = 1` 时逐位退化成普通残差。
+
+### 拓展方向
 
 - **`n_stream` 扫描**：`2 / 4 / 8` 对照，看"通路变宽"的收益拐点与显存代价（多流会让
   中间激活按 `n` 倍放大）。
@@ -230,3 +232,5 @@ Jacobian 不是正交投影：`A` 被推离某个非均匀点后，行列归一�
   而双随机约束已经钉住了谱范数，两者的交互值得实测。
 - **GPU 常驻整叠路径**：多流目前自动回退逐层路径，要吃到整叠快路需要把 `forward_streams`
   也接进常驻批次（见第 27 课）。
+
+> **下一课**：[第 48 课 FP4 量化感知训练](48-FP4量化感知训练.md) —— 把位宽再砍一半：FP4（E2M1）量化感知训练与位宽账本。

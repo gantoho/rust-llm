@@ -7,7 +7,7 @@
 
 ---
 
-## 为什么 Scaling Laws 重要？
+## 1. 为什么 Scaling Laws 重要？
 
 Scaling Laws 是指导 LLM 发展的**第一性原理**——它告诉你：
 
@@ -17,11 +17,11 @@ Scaling Laws 是指导 LLM 发展的**第一性原理**——它告诉你：
 
 > **核心洞察**：模型的 loss（困惑度）与参数量、数据量、算力之间存在**幂律关系**（Power Law），且这种关系非常稳定，跨越多个数量级都成立。
 
-## OpenAI Scaling Laws（2020）
+## 2. OpenAI Scaling Laws（2020）
 
 Kaplan et al. 在论文《Scaling Laws for Neural Language Models》中发现：
 
-### 幂律关系
+### 2.1 幂律关系
 
 $$
 L(N) = \left(\frac{N_c}{N}\right)^{\alpha_N}, \quad \alpha_N \approx 0.076
@@ -41,18 +41,18 @@ $$
 - $D$ 是训练数据量（token 数）
 - $C$ 是训练算力（FLOPs）
 
-### 关键发现
+### 2.2 关键发现
 
 1. **参数量最重要**：loss 对参数量的幂律指数最大（$\alpha_N > \alpha_D > \alpha_C$）
 2. **架构细节不重要**：层数、宽度、注意力头数的具体配置对 loss 影响很小
 3. **平滑可预测**：loss 随 N/D/C 的增长非常平滑，没有明显的"相变"点
 4. **大模型更高效**：同样的算力，训练一个更大的模型（即使没训完）比训练一个小模型到收敛更好
 
-## Chinchilla Scaling Laws（2022）
+## 3. Chinchilla Scaling Laws（2022）
 
 Hoffmann et al.（DeepMind）在《Training Compute-Optimal Large Language Models》中修正了 OpenAI 的结论：
 
-### 核心修正
+### 3.1 核心修正
 
 **数据量和参数量应该同步增长**。
 
@@ -66,7 +66,7 @@ $$
 
 即：**算力翻倍时，参数量和数据量应该各增加约 41%（$2^{0.5} \approx 1.41$）**。
 
-### Chinchilla 最优
+### 3.2 Chinchilla 最优
 
 | 算力 (FLOPs) | 最优参数量 | 最优数据量 (tokens) |
 |-------------|-----------|-------------------|
@@ -79,7 +79,7 @@ $$
 
 > **Chinchilla 的影响**：Chinchilla 70B 用 1.4T tokens 训练，性能超过了 Gopher 280B（用 300B tokens 训练）——参数量只有 1/4，但因为数据量更充足，效果更好。
 
-### 实际应用中的偏离
+### 3.3 实际应用中的偏离
 
 实际训练往往**偏离 Chinchilla 最优**：
 
@@ -94,9 +94,9 @@ $$
 - 数据充足：互联网数据量远超 Chinchilla 最优所需
 - 小模型过训练的边际收益递减很慢
 
-## 计算最优训练
+## 4. 计算最优训练
 
-### 给定算力预算，如何分配？
+### 4.1 给定算力预算，如何分配？
 
 设总算力预算为 $C$ FLOPs，单位 FLOPs 的价格为 $p_C$，token 的价格为 $p_D$：
 
@@ -110,7 +110,7 @@ $$
 D_{\text{opt}} = \sqrt{\frac{C}{6N_{\text{opt}}}}
 $$
 
-### 算力估算
+### 4.2 算力估算
 
 **训练 FLOPs 估算**（前向 + 反向）：
 
@@ -131,7 +131,7 @@ $$
 
 其中 MFU（Model FLOPs Utilization）是模型算力利用率，通常 30-60%。
 
-### 实际计算示例
+### 4.3 实际计算示例
 
 训练 LLaMA-7B（7B 参数，1T tokens）：
 
@@ -146,9 +146,9 @@ FLOPs = 6 × 7×10^9 × 10^12 = 4.2 × 10^22
 电费 (A100 ~400W): 64 × 0.4kW × 61天 × 24h × 0.1$/kWh ≈ $3,700
 ```
 
-## Emergent Abilities（涌现能力）
+## 5. Emergent Abilities（涌现能力）
 
-### 什么是涌现？
+### 5.1 什么是涌现？
 
 某些能力（如思维链推理、多步算术）在小模型上完全不存在，但当模型规模超过某个阈值时**突然出现**。
 
@@ -162,11 +162,11 @@ FLOPs = 6 × 7×10^9 × 10^12 = 4.2 × 10^22
  +─────────────────────→ 模型规模
 ```
 
-### 争议
+### 5.2 争议
 
 Schaeffer et al.（2023）提出：涌现可能是**评估指标的假象**——如果用连续指标（如 Brier score）替代离散指标（如 exact match），涌现现象会消失，变成平滑的提升曲线。
 
-## Scaling Laws 对实践的指导
+## 6. Scaling Laws 对实践的指导
 
 | 决策 | Scaling Laws 的建议 |
 |------|-------------------|
@@ -176,24 +176,13 @@ Schaeffer et al.（2023）提出：涌现可能是**评估指标的假象**—�
 | 预测最终性能 | 用幂律曲线外推（准确度高） |
 | 何时停止训练 | loss 下降速度低于阈值，或达到 Chinchilla 最优 tokens |
 
-## 本项目实现
+## 7. 本仓库实现要点
 
-代码：[src/scaling.rs](../src/scaling.rs)。命令行入口：
-
-```bash
-# 预算规划 + 实测扫描 + 幂律拟合（默认三个规模 2x64,4x128,6x192，各 600 步）
-cargo run --release -- scaling
-
-# 快速看一眼（规模小、步数少）
-cargo run --release -- scaling --steps 200 --sizes 2x64,4x128,6x192 --data-multiples 1,2,4
-
-# 换算法力预算与硬件假设（如 H100 ×1024、MFU 45%），并把扫描点导成 CSV
-cargo run --release -- scaling --budget 1e23 --gpu-tflops 989 --n-gpu 1024 --mfu 0.45 --out logs/scaling.csv
-```
+代码：[src/scaling.rs](../src/scaling.rs)。**跑法与命令见第 8 节**。
 
 子命令分两半：**上半场只算不训**（解析解，毫秒级），**下半场真训**（实测拟合，分钟级）。
 
-### 1. 幂律拟合：为什么不能直接对 `log L` 做最小二乘
+### 7.1 幂律拟合：为什么不能直接对 `log L` 做最小二乘
 
 $$
 L(x) = a \cdot x^{-\alpha} + b
@@ -212,7 +201,7 @@ $$
 核对 `α` 能回到真值；`test_fit_power_law_with_zero_irreducible_loss` 验证 `b = 0` 的
 退化工况下不会把 `α` 也一起带偏。
 
-### 2. 口径统一：`C = 6ND` 里的 `N` 是**非嵌入**参数量
+### 7.2 口径统一：`C = 6ND` 里的 `N` 是**非嵌入**参数量
 
 `6 = 前向 2 + 反向 4`（每个参数一次乘加；反向对输入、对权重各 2）。而 `N` 必须取
 **非嵌入**参数量（[`params_non_embedding`](../src/scaling.rs)）：词嵌入的规模由词表决定，
@@ -229,7 +218,7 @@ Chinchilla 表、最优配比整体偏掉，且没有任何编译错误。本项
 单测 `test_param_accounting_matches_real_model` 把各结构开关（RMSNorm / SwiGLU / GQA）
 的组合都真实建一遍模型，逐项核对。
 
-### 3. 两条最优配比路线，以及它们的分歧
+### 7.3 两条最优配比路线，以及它们的分歧
 
 | 路线 | 依据 | 结果 |
 |------|------|------|
@@ -251,14 +240,14 @@ Approaches 1/2（Besiroglu et al., 2024 复现了这一点）。所以实践里�
 曲线上参数化损失的最小值**不在** `k = 1` 而在 $k^* = \sqrt{(D^*/N^*)/20}$——子命令会把
 `k*` 一起打出来，让两个口径的分歧摆在同一张表里。
 
-### 4. 训练时长与电费
+### 7.4 训练时长与电费
 
 `Hardware::estimate` 按 `T = C / (单卡峰值 × MFU × 卡数)`、`电费 = 卡数 × 功耗 × 时长 × 电价`
 估算。默认假设 A100 80GB FP16（312 TFLOPS）、64 卡、MFU 40%、400 W/卡、\$0.1/kWh，
 单测 `test_wall_clock_matches_doc_example` 复现本文档上方的例子（7B × 1T token →
 约 61 天、约 \$3700）。
 
-### 5. 实测扫描：真的训一组模型
+### 7.5 实测扫描：真的训一组模型
 
 `params_scan` 固定 token 预算、逐级放大模型（`--sizes 2x64,4x128,6x192`），
 `tokens_scan` 固定最小模型、逐级放大数据量（`--data-multiples 1,2,4,8`），
@@ -312,11 +301,42 @@ loss 之间没有可比性；训练配置由 `scan_train_config` 统一固定为
 | 3. 最优配比计算 | `scaling --budget 1e22`（同时给出 20:1 与参数化闭式解两条路线） |
 | 4. 过训练分析 | `tokens_scan`（真训）+ `overtrain`（解析预测） |
 
-## 拓展方向
+## 8. 运行与验证
+
+```bash
+# 预算规划 + 实测扫描 + 幂律拟合（默认三个规模 2x64,4x128,6x192，各 600 步）
+cargo run --release -- scaling
+
+# 快速看一眼（规模小、步数少）
+cargo run --release -- scaling --steps 200 --sizes 2x64,4x128,6x192 --data-multiples 1,2,4
+
+# 换算法力预算与硬件假设（如 H100 ×1024、MFU 45%），并把扫描点导成 CSV
+cargo run --release -- scaling --budget 1e23 --gpu-tflops 989 --n-gpu 1024 --mfu 0.45 --out logs/scaling.csv
+```
+
+数值口径由三条单测钉住：`test_fit_power_law_recovers_known_exponent`（用已知 `(a, α, b)` 造点再拟合回来）、
+`test_fit_power_law_with_zero_irreducible_loss`（`b = 0` 的退化工况）、
+`test_param_accounting_matches_real_model`（各结构开关组合真实建模型，逐项核对参数量）；
+`test_wall_clock_matches_doc_example` 复现文档上方的 7B × 1T token 例子（约 61 天、约 \$3700）。
+实测扫描的输出形状见 §7.5。
+
+## 9. 小结与下一课
+
+### 本课小结
+
+- Scaling Laws 是训练侧的第一性原理：loss 与参数量 `N`、数据量 `D`、算力 `C` 之间是**幂律**关系
+- OpenAI（2020）给出 `α_N ≈ 0.076`、`α_D ≈ 0.095`；Chinchilla（2022）修正为 `N` 与 `D` 应**同步增长**（各约 `C^0.5`）
+- 算力口径 `C ≈ 6ND`，其中 `N` 取**非嵌入**参数量；训练时长 `T = C / (单卡峰值 × MFU × 卡数)`
+- 实践里常常**故意过训练**小模型（LLaMA-3 8B 用 15T token ≈ 94× Chinchilla 最优），因为推理成本更敏感
+- 本课的价值在**方法**：预算固定、口径统一、可复现；本项目规模下的实测指数**不会**接近论文数字（§「实测扫描」里的诚实说明）
+
+### 拓展方向
 
 > 核心内容已全部实现，这里是进阶拓展。
 
-1. **幂律拟合**：在不同规模的模型上记录 loss，用对数坐标拟合 loss vs N 的幂律关系。
-2. **算力估算**：给定 GPU 型号和数量，估算训练一个 13B 模型到 Chinchilla 最优需要多少天。
-3. **最优配比计算**：给定 1e22 FLOPs 的算力预算，计算最优的参数量和数据量。
-4. **过训练分析**：在小模型上分别用 1×、2×、4×、8× Chinchilla 最优数据量训练，观察 loss 曲线和生成质量的变化。
+1. **幂律拟合**：在不同规模的模型上记录 loss，用对数坐标拟合 loss vs N 的幂律关系（本项目已落地为 `params_scan` + `fit_over_params`）。
+2. **算力估算**：给定 GPU 型号和数量，估算训练一个 13B 模型到 Chinchilla 最优需要多少天（`scaling --gpu-tflops ... --n-gpu ... --mfu ...`）。
+3. **最优配比计算**：给定 1e22 FLOPs 的算力预算，计算最优的参数量和数据量（`scaling --budget 1e22`，同时给出 20:1 与参数化闭式解两条路线）。
+4. **过训练分析**：在小模型上分别用 1×、2×、4×、8× Chinchilla 最优数据量训练，观察 loss 曲线和生成质量的变化（`tokens_scan` 真训 + `overtrain` 解析预测）。
+
+> **下一课**：[第 32 课 MoE 混合专家模型（Mixture of Experts）](32-MoE混合专家模型.md) —— Scaling Laws 说的是"加参数、加数据、加算力"，下一课换一条效率路线——用稀疏激活把参数量与计算量解绑。

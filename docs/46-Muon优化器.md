@@ -96,9 +96,7 @@ AdamW 每元素更新量 ≈ lr
 `state` / `restore_state` 提到 trait 上，`AdamW` 与 `Muon` 才能被同一套训练循环与 checkpoint
 代码统一处理。
 
----
-
-## 5. 默认路径逐位不变
+### 默认路径逐位不变
 
 - 默认 `optimizer = "adamw"`：`make_optimizer` 走 `_` 分支，`AdamW::new(max_lr, params, weight_decay)`
   与加 Muon 之前**完全一致**；
@@ -107,9 +105,17 @@ AdamW 每元素更新量 ≈ lr
 - 单测 `test_optimizer_factory_defaults_to_adamw` 钉住两点：默认配置就是 `"adamw"`；
   对未知取值也回退 `AdamW`（`validate` 会先拦下非法值，工厂这里是不 panic 的双保险）。
 
+### 代码地图
+
+| 位置 | 内容 |
+|------|------|
+| [`src/optim.rs`](../src/optim.rs) | `Muon`、`zeropower_newton_schulz`、`matmul` / `transpose`、`OptimizerState` |
+| [`src/train.rs`](../src/train.rs) | `make_optimizer` 工厂 |
+| [`src/config.rs`](../src/config.rs) | `optimizer` / `muon_momentum` / `muon_ns_steps` 字段与校验 |
+
 ---
 
-## 6. 验证方式
+## 5. 运行与验证
 
 ```bash
 # Muon 单测（NS 精确性、零梯度、闭式更新、缩放比、一维回退、冻结跳过、状态往返）
@@ -137,7 +143,7 @@ cargo test optimizer_factory
 
 | 测试 | 验证内容 |
 |------|---------|
-| `test_newton_schulz_matches_polynomial_on_orthogonal_input` | 对"最小维单位阵"输入，输出精确等于 `p⁵(1/‖Q‖_F)·Q`（见 §7.2） |
+| `test_newton_schulz_matches_polynomial_on_orthogonal_input` | 对"最小维单位阵"输入，输出精确等于 `p⁵(1/‖Q‖_F)·Q`（见 §5 常见坑第 2 条） |
 | `test_muon_zero_gradient_yields_zero_update` | 全零动量 + 零权重衰减 ⇒ 参数一动不动，且不产生 NaN（`+1e-7` 的作用） |
 | `test_muon_matrix_update_matches_closed_form` | 梯度取单位阵时，逐元素核对整条链路 `Δ = −lr·scale·p⁵(s)·I` |
 | `test_muon_scaling_uses_dimension_ratio` | 缩放因子是 `√(max(1, r/c))`：`[8,2]` 的更新范数是 `[2,8]` 的 2 倍 |
@@ -147,11 +153,9 @@ cargo test optimizer_factory
 | `test_muon_changes_training_same_seed` | 同种子对照：换 Muon 确实改变 loss，且 loss 有限 |
 | `test_optimizer_factory_defaults_to_adamw` | 默认走 AdamW；未知取值不 panic |
 
----
+### 常见坑（实测踩出来的）
 
-## 7. 两个坑（实测踩出来的）
-
-### 7.1 沿用 AdamW 的学习率，Muon 会"几乎不动"
+#### 1. 沿用 AdamW 的学习率，Muon 会"几乎不动"
 
 Muon 每元素更新量约 `lr/√cols`，比 AdamW 小 `√cols` 倍。直接套默认 `max_lr = 3e-3`，
 参数几乎不动，看起来像"没生效"。`test_muon_changes_training_same_seed` 特意把学习率设成
@@ -160,7 +164,7 @@ Muon 每元素更新量约 `lr/√cols`，比 AdamW 小 `√cols` 倍。直接�
 配置里给了 `optimizer = "muon"` 却忘了调大 `max_lr`，是一条很容易踩的暗坑：loss 曲线不会报错，
 只是学得很慢。
 
-### 7.2 5 阶 Newton–Schulz 输出不是严格 `UVᵀ`，而是 `US'Vᵀ`
+#### 2. 5 阶 Newton–Schulz 输出不是严格 `UVᵀ`，而是 `US'Vᵀ`
 
 这组 5 阶常数的设计目标是"零点斜率最大、不保证处处精确收敛到 1"，
 所以迭代完的奇异值**分散在 0.5~1.5**，输出其实写作 `US'Vᵀ`，而不是严格的 `UVᵀ`。
@@ -181,15 +185,13 @@ p(x) = 3.4445·x − 4.775·x³ + 2.0315·x⁵
 
 ---
 
-## 8. 代码地图与拓展方向
+## 6. 小结与下一课
 
-| 位置 | 内容 |
-|------|------|
-| [`src/optim.rs`](../src/optim.rs) | `Muon`、`zeropower_newton_schulz`、`matmul` / `transpose`、`OptimizerState` |
-| [`src/train.rs`](../src/train.rs) | `make_optimizer` 工厂 |
-| [`src/config.rs`](../src/config.rs) | `optimizer` / `muon_momentum` / `muon_ns_steps` 字段与校验 |
+### 本课小结
 
-拓展方向：
+Muon 把更新矩阵按谱范数正交化（Newton–Schulz 5 阶迭代），一维参数自动回退 AdamW；代价是学习率口径与 AdamW 不同——要大约 `√cols` 倍才等效。
+
+### 拓展方向
 
 - **嵌入/输出头单独走 AdamW**：本实现按**形状**分流，嵌入矩阵也是二维、也会走 Muon。
   工程上更常见的做法是把嵌入与输出头留在 AdamW（它们的梯度按行统计更有意义）；
@@ -197,3 +199,5 @@ p(x) = 3.4445·x − 4.775·x³ + 2.0315·x⁵
 - **`ns_steps` 扫描**：`muon_ns_steps = 1/3/5/10` 对照，看"正交化不足 vs 太慢"的拐点。
 - **与 WSD 组合**：换了有效步长口径后，学习率调度曲线的峰值需要重新标定（见第 44 课）。
 - **扩展到三维以上**：本实现只对二维权重正交化，其余全部回退 AdamW。
+
+> **下一课**：[第 47 课 mHC 流形约束超连接](47-mHC流形约束超连接.md) —— 把残差流拓宽成多条并行通道：mHC 用双随机矩阵耦合。

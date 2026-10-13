@@ -174,10 +174,23 @@ cargo run --release -- generate --config config/config.json --prompt "The fox" -
 
 ---
 
-## 8. 关键要点
+## 8. 小结与下一课
+
+### 本课小结
 
 - Beam Search 维护 k 个候选，每步扩展后保留 top-k
 - 得分必须是累积 **log 概率**：`sample.rs` 的 `beam_search` 先对 logits 做 `log_softmax`（减最大值做数值稳定化，`log_z = max + ln Σ exp(l − max)`，被屏蔽的 `-inf` 自然为 0），再逐 token 累加；直接用原始 logit 累加会带上尺度偏置
 - 长度惩罚 α 解决短序列天然得分高的偏置
 - 适合翻译、摘要等"精确"任务；不适合创意写作
 - 速度是采样的 k 倍（k = beam_size）
+
+### 拓展方向
+
+> 核心内容已全部实现，这里是进阶拓展。
+
+1. **扫 `--beam`**：用 `--beam 2 / 5 / 10` 跑同一个 prompt，对比生成质量与耗时——验证第 5 节"慢 k 倍"的比例。
+2. **扫 `--length-penalty`**：`0 / 0.6 / 1.0` 各跑一次，观察生成长度是否真的随 α 变长（第 4 节）。
+3. **验 log_softmax 的必要性**：临时把 `beam_search` 里的 `log_softmax` 换成直接用原始 logit 累加，对比同一 prompt 的排序结果，体会第 8 节里说的"尺度偏置"。
+4. **看 beam 的缓存分叉**：在 `Beam.cache` 的 `fork` 处加一行计数，确认同一前缀的兄弟 beam 没有各自重算一遍历史 K/V（6.3 节）。
+
+> **下一课**：[第 31 课 Scaling Laws（缩放定律）](31-Scaling-Laws.md) —— 解码策略这条线收尾，下一课跳到训练侧的第一性原理——参数量、数据量、算力与 loss 之间的幂律关系。

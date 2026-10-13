@@ -43,7 +43,7 @@ WSD（warmup-stable-decay，MiniCPM / DeepSeek 等采用）把曲线拆成三段
 
 ## 3. 三段的公式
 
-`LRScheduler` 的两条曲线**共用同一段线性 warmup**（这是刻意设计，见 §5）：
+`LRScheduler` 的两条曲线**共用同一段线性 warmup**（这是刻意设计，见 §4 的「默认路径逐位不变」）：
 
 ```text
 warmup（step < warmup_steps）：
@@ -110,9 +110,7 @@ decay  = max(round(wsd_decay_frac × span), 1)     # 至少 1 步
 > 设计取舍：抽出工厂 `lr_scheduler` 是为了让 `train` / `sft` / `finetune` 几条训练入口
 > 拿到**同一条曲线**，不会出现"主训练用 WSD、微调悄悄退回 cosine"这种不一致。
 
----
-
-## 5. 默认路径逐位不变
+### 默认路径逐位不变
 
 - 默认 `lr_schedule = "cosine"`：`lr_scheduler` 走进 `else` 分支，调用
   `LRScheduler::new(warmup_steps, total_steps, max_lr, min_lr)`——它与加 WSD 之前**完全同一条路径**。
@@ -123,9 +121,17 @@ decay  = max(round(wsd_decay_frac × span), 1)     # 至少 1 步
 - `test_wsd_warmup_matches_cosine` 进一步证明：切到 WSD 后，前 `warmup_steps` 步与 cosine
   **逐位相同**——WSD 只改 warmup 之后的段。
 
+### 代码地图
+
+| 位置 | 内容 |
+|------|------|
+| [`src/train.rs`](../src/train.rs) `LRScheduler` | 两条曲线的统一实现 + `step` / `set_step`（续训跳步） |
+| [`src/train.rs`](../src/train.rs) `lr_scheduler` | 配置 → 调度器的工厂 |
+| [`src/config.rs`](../src/config.rs) | `lr_schedule` / `wsd_decay_frac` 字段与校验 |
+
 ---
 
-## 6. 验证方式
+## 5. 运行与验证
 
 ```bash
 # WSD 相关单测（三段结构、warmup 对齐、工厂分派、退火夹取、同种子对照）
@@ -161,11 +167,9 @@ cargo test lr_scheduler
 | `test_wsd_and_cosine_identical_when_lr_flat` | `max_lr == min_lr` 时两曲线都是常值，同种子 loss 逐位相同（隔离性证明） |
 | `test_wsd_vs_cosine_same_seed_differs` | `max_lr > min_lr` 时两曲线不同，同种子 loss 也确实不同（有效性证明） |
 
----
+### 常见坑（实测踩出来的）
 
-## 7. 两个坑（实测踩出来的）
-
-### 7.1 退火步数过大会把稳定段吃掉
+#### 1. 退火步数过大会把稳定段吃掉
 
 `decay_start = max(total_steps − decay_steps, warmup_steps)` 里的 `max(...)` 是必需的：
 当 `wsd_decay_frac` 配得很大（`decay_steps ≥ total_steps − warmup_steps`）时，退火起点会被
@@ -175,7 +179,7 @@ cargo test lr_scheduler
 退火起点落在第 8 步（warmup 结尾），且曲线仍保持"warmup 之后单调不增"。
 如果这里不夹，曲线会出现先降后升的折返，训练反而更不稳。
 
-### 7.2 `max_lr == min_lr` 时两条曲线逐位相同，别拿它当"WSD 生效"的证据
+#### 2. `max_lr == min_lr` 时两条曲线逐位相同，别拿它当"WSD 生效"的证据
 
 当 `max_lr == min_lr`，cosine 与 WSD 在 warmup 之后都是**常值**，同种子的整轮训练
 必然逐位相同（`test_wsd_and_cosine_identical_when_lr_flat`）。
@@ -187,15 +191,13 @@ cargo test lr_scheduler
 
 ---
 
-## 8. 代码地图与拓展方向
+## 6. 小结与下一课
 
-| 位置 | 内容 |
-|------|------|
-| [`src/train.rs`](../src/train.rs) `LRScheduler` | 两条曲线的统一实现 + `step` / `set_step`（续训跳步） |
-| [`src/train.rs`](../src/train.rs) `lr_scheduler` | 配置 → 调度器的工厂 |
-| [`src/config.rs`](../src/config.rs) | `lr_schedule` / `wsd_decay_frac` 字段与校验 |
+### 本课小结
 
-拓展方向：
+WSD 的价值是"稳定段随便训多久、要收尾时再退火"；引入它的同时默认 cosine 路径逐位未变，两条曲线共用同一段线性 warmup。
+
+### 拓展方向
 
 - **稳定段续训**：利用"平线任意时刻可切"的性质，写一个"从稳定段 checkpoint 起、只跑退火段"
   的实验，对比同算力下 cosine 从头训的效果。
@@ -204,3 +206,5 @@ cargo test lr_scheduler
   太长浪费算力"的拐点。
 - **与 Muon 组合**：Muon 的有效步长口径与 AdamW 不同（见第 46 课），换优化器时调度曲线的峰值
   需要重新标定。
+
+> **下一课**：[第 45 课 QK-Norm](45-QK-Norm.md) —— 把注意力的 Q / K 尺度钉死：QK-Norm 逐头 RMSNorm。

@@ -164,9 +164,7 @@ HCA（Hierarchical Compressed Attention）在细块之上**再平均 `hca_block`
 - GQA 下 KV 头要按 `n_rep = n_head / n_kv_head` 展开成 Q 头的粒度再做注意力；梯度经
   `gather_rows` 的反向自动折回共享的 KV 头（单测 `test_gqa_kv_gradient_accumulates_across_heads` 验证）。
 
----
-
-## 7. 默认路径逐位不变
+### 默认路径逐位不变
 
 - 默认 `csa_block = 0`（`CsaOpts::enabled()` 为假）：`attend` 走原 `Tensor::flash_attention`，
   与加本课之前**逐位一致**；
@@ -176,9 +174,18 @@ HCA（Hierarchical Compressed Attention）在细块之上**再平均 `hca_block`
 - 只对**无 KV cache 的全量前向**（训练 / 预填）生效；带 cache 的自回归解码回退原路径
   （`use_csa = self.csa.enabled() && kv_cache.is_none()`）。
 
+### 代码地图
+
+| 位置 | 内容 |
+|------|------|
+| [`src/csa.rs`](../src/csa.rs) | `CsaOpts`、因果判据（`fine_blocks` / `coarse_blocks` / `covered_positions`）、`select_topk`、张量辅助、三层 `attention`、字节 / 算力账本 |
+| [`src/attention.rs`](../src/attention.rs) | `attend` 里按 `use_csa` 在 CSA 与 `flash_attention` 之间分派 |
+| [`src/model.rs`](../src/model.rs) | `TransformerConfig` 的三个开关字段与 `TransformerBlock` 的接线 |
+| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) | `cmd_csa` 的三节账本打印 |
+
 ---
 
-## 8. 验证方式
+## 7. 运行与验证
 
 ```bash
 # CSA 单测（覆盖不变式 / 因果性 / 块均值 / top-k / GQA / 稠密等价 / 梯度有限差分 / 账本）
@@ -203,7 +210,7 @@ cargo run --release -- csa
 }
 ```
 
-### 8.1 实测账本（`cargo run --release -- csa`，默认参数 `T=512`、`n_kv=8`、`hd=64`、`hca=4`、`top_k=8`）
+### 7.1 实测账本（`cargo run --release -- csa`，默认参数 `T=512`、`n_kv=8`、`hd=64`、`hca=4`、`top_k=8`）
 
 **第一节：覆盖不变式**（`m ∈ {2,4,8,16}`、HCA 开 / 关，检查全部 `T` 个 query）
 
@@ -257,25 +264,23 @@ cargo run --release -- csa
 | `test_ledger_is_monotone_and_sane` | 账本在 `m ≪ T` 时确实更省；`m = T` 时如实更大 |
 | `test_csa_changes_training_same_seed`（model.rs） | 同种子不新增参数、前向改变、数值有限 |
 
----
+### 常见坑（实测踩出来的）
 
-## 9. 三个坑（实测踩出来的）
-
-### 9.1 掩码必须与分数**逐行同序**，否则整行 `-inf` → `NaN`
+#### 1. 掩码必须与分数**逐行同序**，否则整行 `-inf` → `NaN`
 
 见 §5 的 ⚠️。这是本次唯一一个"测试直接报 NaN"的 bug：`mask_flat` 按"层"拼接再 `reshape`，
 与按"行"拼接的分数错位。修法是先算 `total_s = m + k + nb2`，再把每层掩码写到 `row + 偏移`。
 （`masked_softmax` 现在对整行全屏蔽会输出全 0、不再产生 `NaN`，所以同类错误今后可能**静默**
 给出错结果而不是当场报错——掩码与分数的对齐仍必须逐行核对。）
 
-### 9.2 `gather_seq` 里源序列长度 ≠ 输出序列长度
+#### 2. `gather_seq` 里源序列长度 ≠ 输出序列长度
 
 局部窗口取的是 `[gk, t, hd]` 的 K，输出却是 `[g, t, m, hd]`（GQA 下 `g ≠ gk`）；
 细压缩取的是 `[g, nb, hd]` 的块均值，输出 `[g, t, k, hd]`（`nb ≠ t`）。
 第一版把源的 `(g, t)` 与输出的 `(g, t)` 混用同一个参数，`reshape` 直接断言失败。
 正确做法是把源的 `(gx, nx)` 与输出的 `(g_out, t_out)` **分开传**。
 
-### 9.3 别把解析账本当成实测性能
+#### 3. 别把解析账本当成实测性能
 
 `csa` 子命令打印的字节与 FLOPs 都是**纸面账本**——本仓库没有为 CSA 写融合 kernel，
 算子仍是 CPU 上的一堆 `gather`/`mul`/`softmax`。这份账本能说明"压缩在原理上省了多少"，
@@ -284,16 +289,13 @@ cargo run --release -- csa
 
 ---
 
-## 10. 代码地图与拓展方向
+## 8. 小结与下一课
 
-| 位置 | 内容 |
-|------|------|
-| [`src/csa.rs`](../src/csa.rs) | `CsaOpts`、因果判据（`fine_blocks` / `coarse_blocks` / `covered_positions`）、`select_topk`、张量辅助、三层 `attention`、字节 / 算力账本 |
-| [`src/attention.rs`](../src/attention.rs) | `attend` 里按 `use_csa` 在 CSA 与 `flash_attention` 之间分派 |
-| [`src/model.rs`](../src/model.rs) | `TransformerConfig` 的三个开关字段与 `TransformerBlock` 的接线 |
-| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) | `cmd_csa` 的三节账本打印 |
+### 本课小结
 
-拓展方向：
+CSA + HCA 把"每个 query 能看多少 key"从 `T` 压到 `m + k + T/(m·h)`，并用覆盖不变式保证可见位置的并集恰为 `[0, i]`；账本上的字节与算力收益要等融合 kernel 才能兑现。
+
+### 拓展方向
 
 - **融合 kernel**：把"块均值 + 打分 + top-k + 加权求和"写成一个内核，才能真正兑现账本里的算力收益。
 - **压缩块缓存**：推理时把已完成块的 `K_c` / `V_c` 常驻，新的 token 只更新最近一个块；
@@ -302,3 +304,5 @@ cargo run --release -- csa
   把选择本身也降到亚线性。
 - **与 MLA 组合**：MLA 压 KV 的**维度**、CSA 压 KV 的**个数**，两者正交，可以叠加。
 - **可学习的压缩**：块均值是最朴素的压缩。可以换成每块一个小的线性投影，让模型自己决定"怎么压"。
+
+> **下一课**：[第 50 课 MLA 解耦 RoPE + 权重吸收](50-MLA解耦RoPE与权重吸收.md) —— 压 KV 的维度：MLA 解耦 RoPE 与权重吸收。

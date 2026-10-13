@@ -605,13 +605,17 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 ---
 
-## 11. 上线清单与后续方向
+## 11. 小结与下一课
+
+### 本课小结
 
 **当前已具备**：流式/非流式、鉴权、CORS、embeddings、请求日志与完整问答记录、队列状态、
 OpenAPI 规范（运行时端点 + `serve` 启动自动写出 `openapi/{openapi.json,openapi.yaml}`）、
 前端测试页（`web/` 随 serve 启动，§7.8，生产加 `--no-web`）、
 断开可中断、OpenAI 兼容错误体、资源上限、全量单测（`cargo test serve` 覆盖本课模块，
 总数以实际输出为准）。
+
+### 拓展方向
 
 **上生产前还要补的**（本课未做，刻意不半成品实现）：
 
@@ -633,3 +637,5 @@ OpenAPI 规范（运行时端点 + `serve` 启动自动写出 `openapi/{openapi.
    （提示：模型权重是只读的，但 KV cache 和 rng 在哪？）
 4. `Box::leak` 换 `'static` 的 interner 方案，如果改成 `Arc<[&str]>` 要动哪些
    类型签名？代价是什么？
+
+> **下一课**：[第 41 课 多模态](41-多模态.md) —— 转向多模态：手写 ViT 做图片理解、手写 VQ-VAE 把图离散成码本 token 做图片生成。

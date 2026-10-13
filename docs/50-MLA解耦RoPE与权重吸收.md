@@ -174,9 +174,7 @@ V 侧同理，利用"加权求和是线性"：
 - `c_qr` / `c_kr` **最后构造**：`mla_rope_dim = 0` 时根本不创建它们，
   保证默认配置下的随机数消耗顺序与加本课之前**逐位一致**。
 
----
-
-## 7. 默认路径逐位不变
+### 默认路径逐位不变
 
 - 默认 `mla_rope_dim = 0`：`forward_mla` 走原 MLA 路径，`c_qr`/`c_kr` 为 `None`、
   不消耗任何随机数 ⇒ 同种子下参数名与参数值逐位相同
@@ -185,9 +183,19 @@ V 侧同理，利用"加权求和是线性"：
   所以"关"的语义是干净的；
 - 解耦开启后，`mla_rope_dim` 仍然只在 **MLA 模式**（`kv_lora_rank > 0`）下有意义。
 
+### 代码地图
+
+| 位置 | 内容 |
+|------|------|
+| [`src/attention.rs`](../src/attention.rs) | `forward_mla_decoupled`（朴素可求导）/ `absorb_attention`（无梯度吸收）/ 6 个辅助函数 / 4 个账本函数 |
+| [`src/model.rs`](../src/model.rs) | `TransformerConfig` 的 `mla_rope_dim` / `mla_absorb` |
+| [`src/config.rs`](../src/config.rs) | 解耦与吸收的约束校验 |
+| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) | `cmd_mla` 三节账本 |
+| [`docs/23-GQA分组查询注意力.md`](23-GQA分组查询注意力.md) | MLA 低秩压缩 KV Cache 的基础（第 23 课「6. 延伸：MLA 低秩压缩 KV Cache（DeepSeek-V2/V3）」一节；本课补上它留的取舍——解耦 RoPE 与权重吸收） |
+
 ---
 
-## 8. 验证方式
+## 7. 运行与验证
 
 ```bash
 # 解耦 + 吸收的单测（逐位不变 / 吸收等价 / 缓存一致 / 字节账本）
@@ -217,7 +225,7 @@ cargo run --release -- mla
 | `test_mla_decoupled_cache_matches_full_recompute` | 带 latent 缓存的逐 token 增量 == 全量重算（拼接/切分无损） |
 | `test_mla_decoupled_cache_bytes` | 缓存字节 `== T·(r + n_head·hd_rope)·4`，且与解析账本同口径 |
 
-### 8.1 实测账本（`cargo run --release -- mla`，默认 `n_head=128`、`head_dim=192=128+64`、`r=512`、`T=4096`、`L=60`）
+### 7.1 实测账本（`cargo run --release -- mla`，默认 `n_head=128`、`head_dim=192=128+64`、`r=512`、`T=4096`、`L=60`）
 
 **第一节：增量缓存字节**（每层每 token，f32，K + V 两份）
 
@@ -232,7 +240,7 @@ cargo run --release -- mla
 
 放大到 `T = 4096 × 60` 层：MLA ≈ **7.97 GB** vs 全量 ≈ **45.00 GB**。
 注意压缩比随 `r` 变化**不大**——因为这里 `hd_rope` 让 `k_rope` 占了 `128×64 = 8192` 维，
-已经是瓶颈；`r` 只在分母里占一小块。这正是解耦的代价（见 §9.3）。
+已经是瓶颈；`r` 只在分母里占一小块。这正是解耦的代价（见 §7 常见坑第 3 条）。
 
 **第二节：权重吸收的解码算力**（每层、全历史 `T` 的乘加次数）
 
@@ -246,43 +254,37 @@ cargo run --release -- mla
 比值随 `T` 增长趋近 **`hd_nope = 128`**——T 越长越接近（短序列时 `qa` 预计算与投回 `W_UV`
 的常数项还占一定比例，所以 `T = 128` 时只有 64x）。
 
----
+### 常见坑（实测踩出来的）
 
-## 9. 三个坑
-
-### 9.1 解耦的前提是"K 对 latent 线性"
+#### 1. 解耦的前提是"K 对 latent 线性"
 
 吸收恒等式 `q_nope·(c·W_UK) = (q_nope·W_UKᵀ)·c` 要求 `k_nope` 是 `latent` 的**线性**函数。
 任何加在 K 上的**非线性**（比如 QK-Norm 的 RMSNorm）都会破坏它。所以
 `mla_absorb` 与 `qk_norm` 在 `config.rs` 里被显式判为互斥。
 
-### 9.2 `flash_attention` 要求 K/V 同维，而 MLA 的 V 少一段
+#### 2. `flash_attention` 要求 K/V 同维，而 MLA 的 V 少一段
 
 真实 MLA 里 `v` 只有 `hd_nope` 维，`k` 有 `head_dim = hd_nope + hd_rope` 维。
 本仓库的 `flash_attention` 要求两者同 `head_dim`，所以朴素路径给 `v` 的 rope 段**补 0**，
 吸收路径则在输出后补 0（两者口径一致，由 `test_mla_absorb_matches_naive_same_weights` 保证）。
 
-### 9.3 解耦 RoPE **不是免费的**
+#### 3. 解耦 RoPE **不是免费的**
 
 `k_rope` 由输入直接投影、逐头缓存，所以缓存里多出 `n_head · hd_rope` 一整段。
 在 V3 超参下它是 `128 × 64 = 8192` 维，**比 latent 的 512 维还大一个量级**——
-这就是 §8.1 里"压缩比对 `r` 不敏感"的原因。解耦换来的是**权重吸收的能力**
+这就是 §7.1 里"压缩比对 `r` 不敏感"的原因。解耦换来的是**权重吸收的能力**
 （以及更标准的 MLA 语义），代价是缓存里多一份逐头的位置分量。选 `hd_rope` 时要在
 "位置分辨率"与"缓存体积"之间权衡，DeepSeek-V3 取的是 `head_dim` 的三分之一。
 
 ---
 
-## 10. 代码地图与拓展方向
+## 8. 小结与下一课
 
-| 位置 | 内容 |
-|------|------|
-| [`src/attention.rs`](../src/attention.rs) | `forward_mla_decoupled`（朴素可求导）/ `absorb_attention`（无梯度吸收）/ 6 个辅助函数 / 4 个账本函数 |
-| [`src/model.rs`](../src/model.rs) | `TransformerConfig` 的 `mla_rope_dim` / `mla_absorb` |
-| [`src/config.rs`](../src/config.rs) | 解耦与吸收的约束校验 |
-| [`src/cmd/experiments.rs`](../src/cmd/experiments.rs) | `cmd_mla` 三节账本 |
-| [`docs/23-GQA分组查询注意力.md`](23-GQA分组查询注意力.md) | MLA 低秩压缩的基础（第 23 课延伸） |
+### 本课小结
 
-拓展方向：
+解耦 RoPE 让 `k_nope` 对 latent 保持线性，从而解锁权重吸收（解码时 K/V 全程不物化，算力比随 `T` 趋近 `hd_nope = 128`）；代价是缓存里多一份逐头的 `k_rope`。
+
+### 拓展方向
 
 - **吸收 + 量化**：吸收后注意力在 latent 空间完成，而 latent 正是 KV 量化（第 33 课）最该量化的对象；
   两者可叠加做"低秩 + 低比特"的 KV 缓存。
@@ -290,3 +292,5 @@ cargo run --release -- mla
 - **解耦 RoPE 的变体**：`hd_rope` 可以按层变化（浅层大、深层小），或让 `q_rope`/`k_rope`
   共享一个更小的投影。这是 V3 之后不少工作继续调的方向。
 - **与 CSA 组合**：MLA 压 KV 的**维度**、CSA（第 49 课）压 KV 的**个数**，两者正交，可叠加。
+
+> **下一课**：本课是当前路线的最后一课（十二阶段共 50 课，路线图见 [`00-学习计划.md`](00-学习计划.md)）；再往前的方向见上面的拓展方向。

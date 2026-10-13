@@ -7,7 +7,11 @@
 
 ---
 
-## 为什么需要 MoE？
+## 1. 为什么需要 MoE？
+
+> 本课按四条线展开：**为什么要 MoE**（§1）→ **原理与架构**（§2–§5：数学定义、负载均衡、真实模型对比）
+> → **实现要点**（§6）→ **本仓库实现要点**（§8：本项目落地了哪些形态、以及实测到的坑）
+> → **运行与验证**（§10：`moe` 子命令四节输出的跑法与口径）。
 
 当模型参数量从 7B 增长到 175B乃至万亿级别时，**每个 token 都经过全部参数**的 Dense 模型面临两个根本瓶颈：
 
@@ -18,7 +22,7 @@ MoE 的核心思想是**稀疏激活**——模型有很多参数（专家），
 
 > **类比**：Dense 模型像一个"全能医生"什么都要看；MoE 像一家"医院"——有内科、外科、眼科等专家，门急诊（Router）根据症状把你分到对应科室，你只占用其中一个专家的时间。
 
-## 数学定义
+## 2. 数学定义
 
 设模型有 $N$ 个专家网络 $\{E_1, E_2, ..., E_N\}$，输入为 $x$：
 
@@ -28,7 +32,7 @@ $$
 
 其中 $g(x)$ 是**门控网络（Router / Gate）**，输出一个概率分布，决定每个专家的权重。
 
-### 稀疏 MoE（Switch Transformer / Mixtral 风格）
+### 2.1 稀疏 MoE（Switch Transformer / Mixtral 风格）
 
 不是所有专家都参与——只选 Top-K 个（通常 K=1 或 K=2）：
 
@@ -39,7 +43,7 @@ $$
 - **K=1**：每个 token 只走一个专家（Switch Transformer）
 - **K=2**：每个 token 走两个专家（Mixtral 8x7B、Grok-1）
 
-## 架构详解
+## 3. 架构详解
 
 ```
 输入 x
@@ -54,7 +58,7 @@ $$
   └──→ 加权求和 → y = Σ weight_i * Expert_i(x)
 ```
 
-### 关键组件
+### 3.1 关键组件
 
 | 组件 | 说明 |
 |------|------|
@@ -62,11 +66,11 @@ $$
 | **Expert** | 通常是 FFN（SwiGLU），每个专家是独立的 MLP |
 | **Auxiliary Loss** | 辅助损失，防止路由器把所有 token 都送到同一个专家（负载均衡） |
 
-## 负载均衡（Load Balancing）
+## 4. 负载均衡（Load Balancing）
 
 MoE 最大的工程挑战是**专家负载不均**——路由器倾向于反复选同一个"好"专家（赢者通吃），导致其他专家闲置。
 
-### Switch Transformer 的辅助损失
+### 4.1 Switch Transformer 的辅助损失
 
 $$
 \mathcal{L}_{aux} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \cdot p_i
@@ -87,11 +91,11 @@ $$
 > $f$ 与 $p$ 支撑集不交时 $\sum f_i p_i = 0$，$\mathcal{L}_{aux}$ 可以低到 0。
 > 详见文末「本项目实现」里的隔离实验。
 
-### Mixtral 的实现
+### 4.2 Mixtral 的实现
 
 Mixtral 8x7B 没有显式辅助损失，而是靠 **Top-2 + softmax** 的隐式均衡（两个专家分担一个 token 的权重，自然比 Top-1 更分散）。
 
-## 真实 MoE 模型对比
+## 5. 真实 MoE 模型对比
 
 | 模型 | 专家数 | 激活专家 | 总参数 | 激活参数 | 说明 |
 |------|--------|----------|--------|----------|------|
@@ -103,9 +107,9 @@ Mixtral 8x7B 没有显式辅助损失，而是靠 **Top-2 + softmax** 的隐式�
 
 > **核心洞察**：Mixtral 8x7B 总参数 46.7B，但推理时只激活 12.9B（约 27%），性能接近 LLaMA-2 70B，但推理成本只有其约 1/5。
 
-## 实现要点
+## 6. 实现要点
 
-### 1. Router 实现
+### 6.1 Router 实现
 
 ```rust
 pub struct Router {
@@ -127,7 +131,7 @@ impl Router {
 }
 ```
 
-### 2. MoE Layer
+### 6.2 MoE Layer
 
 ```rust
 pub struct MoELayer {
@@ -148,7 +152,7 @@ impl MoELayer {
 }
 ```
 
-### 3. Token 路由的工程挑战
+### 6.3 Token 路由的工程挑战
 
 实际实现中，MoE 面临的关键工程问题是**并行效率**：
 
@@ -156,7 +160,7 @@ impl MoELayer {
 - **Token Dropping**：超过专家容量的 token 被丢弃（Switch Transformer 的做法）
 - **Capacity Factor**：每个专家处理 token 的上限，通常设为平均负载的 1.25× ～ 2×
 
-## MoE 的优缺点
+## 7. MoE 的优缺点
 
 | 优点 | 缺点 |
 |------|------|
@@ -165,13 +169,13 @@ impl MoELayer {
 | 不同专家可自发学到不同"专长" | 需要 All-to-All 通信，对网络带宽要求高 |
 | 适合大规模预训练 | 微调时容易过拟合（只更新部分专家） |
 
-## 本项目实现
+## 8. 本仓库实现要点
 
 核心代码在 [`src/moe.rs`](../src/moe.rs)，接线在 [`src/model.rs`](../src/model.rs)，
 演示命令是 `cargo run --release -- moe`（[`src/cmd/experiments.rs`](../src/cmd/experiments.rs) 的 `cmd_moe`）。
 `cargo test moe` 的单测全部与 CPU 参考实现对齐（其中若干专测 aux-loss-free 均衡偏置与共享专家）。
 
-### 公开 API
+### 8.1 公开 API
 
 | 项目 | 说明 |
 |------|------|
@@ -182,7 +186,7 @@ impl MoELayer {
 | `RouteStats` | 诊断：各专家被路由到的次数、`aux`、`imbalance()`、`dropped_ratio()` |
 | `sparse_stats` | 参数 / 激活量口径：`total_params` / `active_params` / `param_ratio` / `flops_saving`；末位参数 `n_shared` 决定共享专家 `shared_params()`（同时计入总参数与激活参数，见下文「共享专家」） |
 
-### 稀疏前向：gather → expert → weighted → scatter
+### 8.2 稀疏前向：gather → expert → weighted → scatter
 
 逐专家跑，而不是「全跑一遍再用掩码筛掉」：
 
@@ -198,7 +202,7 @@ impl MoELayer {
 全部 token 的分配都被容量丢掉时输出是全零张量，这正是「被丢弃」的正确语义（该层贡献为 0、
 残差照常直通）。
 
-### 门控口径：K = 1 的梯度陷阱
+### 8.3 门控口径：K = 1 的梯度陷阱
 
 由 `TransformerConfig.moe_switch_gate` 切换：
 
@@ -213,7 +217,7 @@ impl MoELayer {
 同一输入下重归一化 < 1e-7，原概率 > 1e-4。所以 K = 1 必须配 `switch_gate = true`，
 否则路由器只能靠辅助损失训练。
 
-### 负载均衡辅助损失：实测到的退化解
+### 8.4 负载均衡辅助损失：实测到的退化解
 
 `L_aux = α·E·Σ f_i·p_i` 的性质用 `moe` 子命令第二节的**隔离实验**验证过。这里有**三组对照**，
 从**同一个塌缩起点**（前 K 个专家的门控偏置 +3.0 ⇒ 负载全压在它们身上）出发，
@@ -246,7 +250,7 @@ K = 1 组 8.00 → 3.12 看着动了，其实是梯度顺手把路由器权重�
 这正是后续工作（DeepSeek-V3 的 loss-free 均衡偏置、expert-choice 路由）要绕开的软/硬错配，
 也是「辅助损失系数要调小」的真实原因：它压的是概率分布，不是分配结果。
 
-### aux-loss-free 均衡偏置（DeepSeek-V3）
+### 8.5 aux-loss-free 均衡偏置（DeepSeek-V3）
 
 软辅助损失的病根是"软/硬错配"：`L_aux` 压的是可导的**路由概率** `p`，而真正决定负载的是
 不可导的**硬路由** argmax。DeepSeek-V3 换了个思路：**不动损失、不动梯度，直接给每个专家加一个
@@ -312,7 +316,7 @@ count_i < target  ⇒  b_i ← b_i + γ      # 欠载的专家：抬高它的选
 `test_balance_bias_converges_load_without_gradients` 验证"只做前向 + 偏置更新、完全不碰梯度"
 也能把不均衡度显著推平。
 
-### 共享专家（DeepSeek-V2/V3）
+### 8.6 共享专家（DeepSeek-V2/V3）
 
 路由专家有个隐含问题：总有一些**所有 token 都要用的常识**（高频语法、常见搭配），
 如果每个专家都各学一遍，就是在浪费容量。共享专家的做法是：额外放 `n_shared` 个专家，
@@ -341,7 +345,7 @@ y = Σ_{e ∈ TopK} w_e · Expert_e(x)   +   Σ_{s ∈ shared} SharedExpert_s(x)
 加上共享专家输出之和，恰好等于完整前向（证明是"并行相加"）；且两个共享专家各贡献一个路由专家的
 参数量，`param_ratio()` 相对纯路由版本下降。
 
-### Router z-loss：压 logits 的幅度
+### 8.7 Router z-loss：压 logits 的幅度
 
 与 `L_aux` 互补的第二项：`L_z = β·mean(logsumexp(logits)²)`
 （`TransformerConfig.moe_z_loss_coef`，默认 0，CLI `--z-loss`）。
@@ -354,7 +358,7 @@ y = Σ_{e ∈ TopK} w_e · Expert_e(x)   +   Σ_{s ∈ shared} SharedExpert_s(x)
   手算对拍数值并断言路由器拿得到非零梯度）；
 - 与 α 项合并进 `forward_with_aux` 的第二个返回值，任一为 0 就不加。
 
-### 容量因子与 Token Dropping
+### 8.8 容量因子与 Token Dropping
 
 `capacity = ceil(cf · n·K/E)`，超出的分配按 token 顺序**先到先得**地丢弃（Switch 的做法：
 不退而求其次——否则同一 token 的去向会依赖批次里其他 token，路由变得不可预测）。
@@ -370,7 +374,7 @@ cf = 2     → 每专家容量 256        丢弃 1059/32768 = 3.23% ｜读到 to
 `cf = 1.0` 在偏斜路由上照样丢近 28%——容量按**平均负载**算，而负载根本不均。
 **推理时必须 `cf = 0`**，否则同一句话换个批大小就换个答案（`TransformerConfig` 默认就是 0）。
 
-### 参数 / 计算量口径
+### 8.9 参数 / 计算量口径
 
 ```text
 每个专家就是一个普通 FFN（SwiGLU 版 3dh+2h+d = 49728 参数，d = 64）
@@ -389,7 +393,7 @@ E=8   K=2 | 单层 总 398344 / 激活 99976（3.98× / 省 74.9% FLOPs）
 CLI 里有一处 `assert_eq!` 把「公式算出的参数」与「建层实测的参数」对账，防止公式随代码漂移。
 **MoE 省的是 FLOPs 不是显存**——卖点是「同样的 FLOPs 预算下能塞进更多参数」。
 
-### 接线方式
+### 8.10 接线方式
 
 `TransformerConfig` 新增 9 个 MoE 字段（都带 `#[serde(default)]`，旧 `config.json` 无需改动）：
 
@@ -415,7 +419,11 @@ CLI 里有一处 `assert_eq!` 把「公式算出的参数」与「建层实测�
 `scale_grad_only(a, 1/accum)` 只缩放梯度、不改数值——与交叉熵在梯度累积下的处理手法一致。
 另有 `Transformer::route_stats()`（合并各层统计，训练日志用）与 `Transformer::set_moe_capacity_factor()`。
 
-### 运行方式
+## 9. 运行与验证
+
+`moe` 子命令可以完整跑通本课的四个实验节；参数默认值与 `TransformerConfig` 的默认**逐位一致**。
+
+### 9.1 运行方式
 
 ```bash
 cargo run --release -- moe                        # 默认 E=8 K=2，端到端 300 步
@@ -451,7 +459,17 @@ cargo run --release -- moe --shared-experts 2 --bias-balance --bias-lr 0.001   #
 > 主损失只关心算得准不准、完全不关心是谁在算，未被选中的专家拿不到任何梯度（等于白占显存），
 > 而 loss 曲线看不出异常——所以必须有别的东西盯着路由分布。
 
-## 拓展方向
+## 10. 小结与下一课
+
+### 本课小结
+
+- MoE 用"稀疏激活"把参数量与计算量解绑：`total = E·expert + router` 全部驻显存，`active = K·expert + router` 才是每 token 实算的
+- 省的是 **FLOPs 不是显存**——卖点是"同样的 FLOPs 预算下能塞进更多参数"（§8.9）
+- 负载均衡是 MoE 的核心难点：辅助损失 `L_aux`、aux-loss-free 偏置、共享专家、router z-loss 都是为了让路由别塌缩
+- 本课最值钱的两条是**实测**：`moe` 子命令第二节的"退化解"（α 越大不一定越好）与端到端对照的诚实读法（小规模下 α = 0 不会塌缩，塌缩是长期动力学）
+- 所有新开关（`--shared-experts` / `--bias-balance` / `--bias-lr`）默认值与旧行为**逐位相同**
+
+### 拓展方向
 
 > 核心内容已全部实现，这里是进阶拓展。
 
@@ -465,3 +483,5 @@ cargo run --release -- moe --shared-experts 2 --bias-balance --bias-lr 0.001   #
    —— 已实现（路由侧）：`RouteStats::imbalance` / `dropped_ratio` / `merge_stats`，
    `moe` 子命令的 `print_route_report` 会逐专家打印被选次数直方图与均衡度。
    进一步的「语义功能分化」（统计每个专家高激活 token 的分布、看是否各管一类模式）仍可自己加。
+
+> **下一课**：[第 33 课 量化技术（Quantization）](33-量化技术.md) —— MoE 省的是 FLOPs，下一课换一条更直接的省法——把权重本身的比特数降下来。
