@@ -12,6 +12,44 @@ pub struct Rng {
     state: u64,
 }
 
+thread_local! {
+    /// "跳过初始化计算"开关（见 [`without_init`]）。
+    ///
+    /// 用它而不是"少调几次 rng"：状态**照常推进**，所以同一 seed 下
+    /// 构造之后的随机数流与正常构造逐位相同 —— 调用方（采样器等）的行为不受影响。
+    static INIT_SKIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 在"参数马上会被整体覆盖"的场景下跳过随机初值的**浮点计算部分**。
+///
+/// 动机（实测）：`Transformer::new` 要为每个参数调一次 `randn()`，而 `randn` 是
+/// Box–Muller（每元素一次 `ln` + `sqrt` + `cos`）。Qwen2.5-0.5B 有 4.94 亿个参数，
+/// 构造一次要 **6.5 s**——而 `generate` / `eval` / `serve` 紧接着就 `load_params`
+/// 把每个参数整体替换掉，这 6.5 s 是纯浪费（读档本身只要 0.7 s）。
+///
+/// 语义约定（与 `no_grad` 同一套路，RAII 恢复，panic 也不会卡住开关）：
+/// - **随机数流不变**：`next_u64` 照常推进，`randn` 照常消耗两次 `next_f32`；
+/// - 只是 `randn` / `next_f32` 返回 0.0，跳过 `ln`/`sqrt`/`cos` 这些真正的开销；
+/// - 因此"构造完再用同一个 rng 采样"的调用方，结果与不开开关时**逐位相同**。
+///
+/// **不要**在没有后续覆盖的路径上用它（例如从零训练）：那会让所有权重恒为 0。
+pub fn without_init<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INIT_SKIP.with(|c| c.set(self.0));
+        }
+    }
+    let prev = INIT_SKIP.with(|c| c.replace(true));
+    let _restore = Restore(prev);
+    f()
+}
+
+#[inline]
+fn init_skipped() -> bool {
+    INIT_SKIP.with(|c| c.get())
+}
+
 impl Rng {
     /// 用种子创建。种子为 0 时自动换成 1（避免状态全 0 的退化情况）。
     pub fn new(seed: u64) -> Self {
@@ -32,7 +70,12 @@ impl Rng {
 
     /// 生成 [0, 1) 的均匀浮点数
     pub fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        let bits = self.next_u64() >> 40;
+        // 跳过模式下状态已推进，但不必做浮点转换（见 [`without_init`]）
+        if init_skipped() {
+            return 0.0;
+        }
+        bits as f32 / (1u64 << 24) as f32
     }
 
     /// 生成 [lo, hi) 的均匀浮点数
@@ -47,6 +90,11 @@ impl Rng {
     pub fn randn(&mut self) -> f32 {
         let u1 = (self.next_f32()).max(1e-12);
         let u2 = self.next_f32();
+        // 跳过模式：上面两次 `next_f32` 已经把状态推进到与正常构造完全相同的位置，
+        // 这里直接返回 0.0，省掉 ln/sqrt/cos 三个超越函数（见 [`without_init`]）
+        if init_skipped() {
+            return 0.0;
+        }
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
     }
 
@@ -102,5 +150,35 @@ mod tests {
             let c = r.choice(10);
             assert!(c < 10);
         }
+    }
+
+    /// `without_init` 只能省计算，**不能改变随机数流**。
+    ///
+    /// 这是它敢用在推理入口的前提：`generate` / `serve` 先用同一个 rng 构造模型，
+    /// 再用它采样；只要消耗的 `next_u64` 次数一致，同一 seed 的生成结果就逐位不变。
+    #[test]
+    fn test_without_init_preserves_rng_stream() {
+        let mut normal = Rng::new(42);
+        let mut skipped = Rng::new(42);
+        // 模拟参数初始化：1000 次 randn（每次消耗两次 next_f32 = 两次 next_u64）
+        let v_normal: Vec<f32> = (0..1000).map(|_| normal.randn()).collect();
+        let v_skipped: Vec<f32> =
+            crate::rng::without_init(|| (0..1000).map(|_| skipped.randn()).collect());
+        assert!(
+            v_skipped.iter().all(|v| *v == 0.0),
+            "跳过模式下初值应全为 0（随后会被 checkpoint 覆盖）"
+        );
+        assert!(v_normal.iter().any(|v| *v != 0.0), "正常模式应有非零初值");
+        for i in 0..100 {
+            assert_eq!(
+                normal.next_u64(),
+                skipped.next_u64(),
+                "第 {i} 次抽取后随机数流分叉了"
+            );
+        }
+        // 开关必须恢复：离开 without_init 后 randn 重新产出真随机值
+        // （Box–Muller 恰好给出 0.0 的概率可忽略，这里用它当判据是安全的）
+        let back = skipped.randn();
+        assert!(back != 0.0, "离开 without_init 后应恢复真实初始化计算");
     }
 }

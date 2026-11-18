@@ -2022,11 +2022,24 @@ fn create() -> Option<GpuContext> {
         _ => "Other",
     };
     println!("[gpu] 已选择适配器: {} ({})", info.name, device_type);
+    // 以适配器**真正支持**的上限为基准抬到目标值（绝不越界请求）：
+    // `wgpu::Limits::default()` 是保守下限（max_buffer_size = 256 MiB），照它申请会让
+    // 519 MiB 的输出头在 6 GB 显卡上也被迫走"沿 N 分块 + CPU 按列拼回"那条兜底路径。
+    // 分块机制该只留给"适配器确实不够"的老设备。
+    //
+    // 目标值取 1 GiB 而不是 2 GiB：够放下 152k 词表/896 维的输出头（≈519 MiB），
+    // 又留足余量给同进程的其余缓冲——`fits` 护栏只能看设备声明上限、看不到真实剩余显存，
+    // 目标定得越大，"声明放得下、实际分配失败 → wgpu 校验错误 panic"的窗口就越宽。
+    let al = adapter.limits();
     let mut limits = wgpu::Limits::default();
-    let target_buf_size: u64 = 512 * 1024 * 1024;
-    if limits.max_storage_buffer_binding_size < target_buf_size {
-        limits.max_storage_buffer_binding_size = target_buf_size;
-    }
+    let target_buf_size: u64 = 1024 * 1024 * 1024;
+    let target_bind_size: u64 = 512 * 1024 * 1024;
+    limits.max_buffer_size = target_buf_size
+        .min(al.max_buffer_size)
+        .max(limits.max_buffer_size);
+    limits.max_storage_buffer_binding_size = target_bind_size
+        .min(al.max_storage_buffer_binding_size)
+        .max(limits.max_storage_buffer_binding_size);
     if limits.max_uniform_buffer_binding_size < 64 * 1024 {
         limits.max_uniform_buffer_binding_size = 64 * 1024;
     }

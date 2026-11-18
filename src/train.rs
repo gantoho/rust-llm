@@ -314,17 +314,45 @@ pub fn lr_scheduler(cfg: &TrainConfig, total_steps: usize) -> LRScheduler {
 /// 差了一位，反缩放后的梯度就不再相同，权重会一步一步悄悄分叉——
 /// 而且不报错、loss 曲线也看不出来（见 `docs/38-分布式训练.md` 的 DP 接线一节）。
 pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) {
+    let norm = grad_norm(params);
+    clip_by_norm(params, norm, max_norm);
+}
+
+/// 梯度总 L2 范数（**确定性**：参数间并行求部分和、保序合并；参数内固定块部分和）。
+///
+/// 抽出来是为了让"进度打印要看的原始范数"与"裁剪用的范数"只算一次：0.5B 模型上
+/// 一次全量扫描就是 2 GB（~57 ms），而原先每 5 s 的进度行会再串行扫一遍。
+pub fn grad_norm(params: &[Tensor]) -> f32 {
     // 范数按参数并行归约（每个参数一个独立 sum，闭包内自行 borrow），但**收集顺序
     // 固定为参数顺序**——`par_iter().map().collect()` 保序是 rayon 的明确保证
     let partials: Vec<f32> = params
         .par_iter()
         .map(|p| {
             let g = p.grad.borrow();
-            g.iter().map(|v| v * v).sum::<f32>()
+            let g_ref: &[f32] = &g;
+            // 参数**内**再按固定块求部分和、保序合并：参数间并行只对小参数有效，
+            // 而输出头一个参数就是 vocab×d（0.5B 模型 = 1.36 亿元素 / 544 MB），
+            // 单核扫一遍要 ~57 ms。块序固定 ⇒ 各 rank、各进程算出的范数逐位相同
+            // （与 `Tensor::sum` 同一套确定性口径；注意这一处是对**一次**求和的
+            //  结合顺序做了改动，跨二进制的逐位一致不再保证，但同一二进制内可复现）。
+            // 小参数（< 64K 元素）走串行：分块的任务开销比求和本身还大（默认
+            // d=128 的小模型全是这种尺寸）。
+            if g_ref.len() >= 1 << 16 {
+                let parts: Vec<f32> = g_ref
+                    .par_chunks(4096)
+                    .map(|c| c.iter().map(|v| v * v).sum::<f32>())
+                    .collect();
+                parts.iter().sum()
+            } else {
+                g_ref.iter().map(|v| v * v).sum::<f32>()
+            }
         })
         .collect();
-    let total: f32 = partials.iter().sum();
-    let norm = total.sqrt();
+    partials.iter().sum::<f32>().sqrt()
+}
+
+/// 用**已算好的**范数做裁剪（`norm <= max_norm` 时不动梯度）。
+pub fn clip_by_norm(params: &[Tensor], norm: f32, max_norm: f32) {
     if norm > max_norm {
         let scale = max_norm / norm;
         // 参数间串行、参数内按元素并行（与 optim 的更新循环同一风格）
@@ -857,6 +885,11 @@ pub fn train_transformer(
                     }
                 }
 
+                // 梯度总范数只算一次：进度打印（原始范数，末尾 `*` = 本步会触发裁剪）
+                // 与下面的裁剪共用同一个值。原先进度行自己在 `trainable.iter()` 里
+                // **串行**扫一遍全量梯度，0.5B 模型上每 5 s 白花 0.5~1 s。
+                let raw_norm = grad_norm(&trainable);
+
                 // 周期性打印进度（在 zero_grad 之前，此时梯度有效）
                 {
                     let now = std::time::Instant::now();
@@ -870,9 +903,6 @@ pub fn train_transformer(
                         // 裁剪**前**的原始梯度范数，末尾 `*` 表示本步会触发裁剪。
                         // 不能打印 min(raw, grad_clip)：那样范数恒被压在阈值上限，
                         // 梯度是否爆炸、裁剪是否频繁完全看不出来（曾经因此漏判梯度异常）。
-                        let raw_norm: f32 = trainable.iter().map(|p| {
-                            p.grad.borrow().iter().map(|g| g * g).sum::<f32>()
-                        }).sum::<f32>().sqrt();
                         let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
                         logln!(
                             "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | fwd {:.0}ms bwd {:.0}ms | {:.0}s | ~{:.0}s",
@@ -893,8 +923,8 @@ pub fn train_transformer(
                     // 坏梯度整批丢弃：不更新参数，也不推进学习率（本步没有真正发生）
                     opt.zero_grad();
                 } else {
-                    // 6. 梯度裁剪
-                    clip_grad_norm(&trainable, cfg.grad_clip);
+                    // 6. 梯度裁剪（复用上面已经算好的范数，不再扫一遍梯度）
+                    clip_by_norm(&trainable, raw_norm, cfg.grad_clip);
 
                     // 7. 更新参数（设置当前学习率）
                     let cur_lr = scheduler.lr();
@@ -973,12 +1003,11 @@ pub fn train_transformer(
                         best_val_loss,
                     );
                     if is_best && best_val_loss.is_finite() {
-                        checkpoint::save(
+                        // 与 latest 内容完全相同（同一步、同一 best_val_loss）：
+                        // 硬链接/复制，别再把 3× 参数量重新序列化一遍（见 checkpoint::link_or_copy）
+                        checkpoint::link_or_copy(
+                            &format!("{dir}/latest.ckpt"),
                             &format!("{dir}/best.ckpt"),
-                            model,
-                            &*opt,
-                            step + 1,
-                            best_val_loss,
                         );
                     }
                 }

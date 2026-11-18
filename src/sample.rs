@@ -153,13 +153,26 @@ pub fn probs_from_logits(
     }
 
     // 3. 按分数从高到低排序
+    //
+    // 排序口径必须是**全序**（否则不同实现挑出的 top-k 会不一致）：
+    // 分数降序，分数相同时按 token id 升序 —— 这正好等于原先"稳定排序 + 原下标顺序"
+    // 的结果，所以下游（top-k 截断、top-p 累加、推测解码的 p/q 对齐）逐位不变。
+    let cmp = |a: &(usize, f32), b: &(usize, f32)| match b.1.partial_cmp(&a.1) {
+        Some(o) if o != std::cmp::Ordering::Equal => o,
+        _ => a.0.cmp(&b.0), // 值相等（或 NaN）时退回原下标升序
+    };
     let mut items: Vec<(usize, f32)> = penalized.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 4. top-k：只保留前 k 个
     if opts.top_k > 0 && items.len() > opts.top_k {
+        // top-k 不需要全排序：先 O(V) 选出前 k，再只对 k 个排序。
+        // V=152k / k=40 时把 ~V·logV 次比较降成 O(V) + k·logk（采样每 token 都走这里）。
+        items.select_nth_unstable_by(opts.top_k, cmp);
         items.truncate(opts.top_k);
+        items.sort_unstable_by(cmp);
+    } else {
+        items.sort_unstable_by(cmp);
     }
+
+    // 4. top-k：只保留前 k 个（上面已截断；top_k=0 表示不限制，保留全部）
 
     // 5. softmax 得到概率
     let max = items
@@ -430,7 +443,11 @@ impl<'m, 'r> Generator<'m, 'r> {
         // 取最后一个位置的 logits
         let v = model.cfg.vocab_size;
         let n = logits.numel();
-        let last_row = &logits.data()[n - v..];
+        // 零拷贝取最后一行：`logits.data()` 会返回**整个缓冲**的副本，
+        // prefill 步 logits 是 [1, T, V]，为了最后一行要复制 T×V 个 f32
+        // （T=200 / V=152k 时 ≈121 MB/请求）。`data_ref()` 只借锁、返回切片。
+        let logits_guard = logits.data_ref();
+        let last_row = &logits_guard[n - v..];
         // 只允许"接上后仍是合法 UTF-8 前缀"的 token，否则会拼出半个字符；
         // 图片段（start→码本×P→end）还要按状态机收紧采样域：两套掩码叠加
         // （UTF-8 掩码只作用于内容词表，图片 token 落在 `get` 的 None 分支不受影响）。

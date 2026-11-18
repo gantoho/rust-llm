@@ -226,6 +226,21 @@ fn commit_atomic(f: File, tmp: &str, path: &str) {
     std::fs::rename(tmp, path).unwrap_or_else(|e| panic!("把 {tmp} 改名为 {path} 失败: {e}"));
 }
 
+/// 把 `src` 这份存档做成 `dst` 的副本：同卷优先**硬链接**（近零成本），跨卷退回复制。
+///
+/// 用在"best.ckpt 与刚写好的 latest.ckpt 内容完全相同"的场合（同一步、同一
+/// `best_val_loss`）。原先 best 是**再序列化一遍**：0.5B 模型 = 3×2 GB = 6 GB 白写，
+/// NVMe 上约 3 s，直接表现为 step 时间直方图上的一次尖峰。
+///
+/// 硬链接的安全性：`save` 走"写 `.tmp` 再 rename"（[`commit_atomic`]），rename 只替换
+/// 目录项、不改旧 inode 的内容，所以下一次写 latest 时 best 仍指向**旧的**完整档。
+pub fn link_or_copy(src: &str, dst: &str) {
+    let _ = std::fs::remove_file(dst); // 覆盖语义（Windows 的 hard_link 遇到已存在会失败）
+    if std::fs::hard_link(src, dst).is_err() {
+        std::fs::copy(src, dst).unwrap_or_else(|e| panic!("把 {src} 复制为 {dst} 失败: {e}"));
+    }
+}
+
 /// 零拷贝地把 f32 切片按字节写出（参数 / 动量共用，避免逐元素 write_all 的系统调用开销）
 fn write_f32s(f: &mut File, path: &str, data: &[f32]) {
     let bytes: &[u8] =
@@ -252,18 +267,17 @@ pub fn load_header(path: &str) -> Checkpoint {
 
 /// 只加载参数，不涉及优化器（eval / generate 用）。
 /// `model` 必须先按 checkpoint 里的配置构造好，参数按名字逐个恢复。
-/// 动量数据块会被跳过（不做解码），所以推理端不会为用不到的优化器状态花内存。
+/// 动量数据块会被跳过（不做解码、也不读进内存），所以推理端不会为用不到的优化器状态花内存。
 pub fn load_params(path: &str, model: &Transformer) -> Checkpoint {
-    let (ckpt, metas, data, _) = read_file(path);
-    restore_params(model, &metas, &data[..numel_total(&metas) * 4]);
+    let (ckpt, metas, mut f, _) = open_ckpt(path);
+    restore_params(model, &metas, &mut f, path);
     ckpt
 }
 
 /// 加载参数并恢复优化器状态（resume 用）
 pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut dyn OptimizerState) -> Checkpoint {
-    let (ckpt, metas, data, opt_t) = read_file(path);
-    let block = numel_total(&metas) * 4;
-    restore_params(model, &metas, &data[..block]);
+    let (ckpt, metas, mut f, opt_t) = open_ckpt(path);
+    restore_params(model, &metas, &mut f, path);
     // 权重 only 档（[`save_weights`]）没有 m/v 两段：按"从未更新过"从零构造，
     // 与下面词表扩展的补零同一语义——AdamW 的 m=v=0 加上偏置校正，
     // 第一步就等价于从头积累，是合法的续训起点（`opt_t` 也是 0，与零动量配对）。
@@ -277,8 +291,8 @@ pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut dyn OptimizerSta
         (zeros(), zeros())
     } else {
         (
-            decode_f32s(&metas, &data[block..block * 2]),
-            decode_f32s(&metas, &data[block * 2..]),
+            read_segment(&metas, &mut f, path),
+            read_segment(&metas, &mut f, path),
         )
     };
     // 模型参数可以多于存档（如给纯文本存档接上 vision.* 视觉参数）：多出来的参数
@@ -330,22 +344,43 @@ fn numel_total(metas: &[ParamMeta]) -> usize {
         .sum()
 }
 
-/// 按参数顺序把一段数据块解码成 `Vec<Vec<f32>>`（形状与元信息一致）
-fn decode_f32s(metas: &[ParamMeta], bytes: &[u8]) -> Vec<Vec<f32>> {
-    let mut out = Vec::with_capacity(metas.len());
-    let mut pos = 0usize;
-    for meta in metas {
-        let numel = meta.shape.iter().product::<usize>();
-        let mut data = vec![0.0f32; numel];
-        for (j, item) in data.iter_mut().enumerate() {
-            let start = pos + j * 4;
-            *item = f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+/// 按参数顺序把一段数据块读成 `Vec<Vec<f32>>`（形状与元信息一致）
+fn read_segment(metas: &[ParamMeta], f: &mut File, path: &str) -> Vec<Vec<f32>> {
+    metas
+        .iter()
+        .map(|m| read_block(f, path, m.shape.iter().product::<usize>()))
+        .collect()
+}
+
+/// 从文件流里读一块 `numel` 个 f32（**零逐元素解码**）。
+///
+/// 存档的数据段是裸 f32 小端字节（见 [`write_f32s`]），所以读回时也可以整块读进
+/// `f32` 缓冲：小端平台上直接按字节 `read_exact`，省掉"每元素一次 `from_le_bytes`
+/// + 切片边界检查"的标量循环——1.9 GB 的档上这一步原本要 1~2 s。
+fn read_block(f: &mut File, path: &str, numel: usize) -> Vec<f32> {
+    let mut data = vec![0.0f32; numel];
+    if cfg!(target_endian = "little") {
+        // SAFETY: `Vec<f32>` 的缓冲恰为 `numel*4` 字节连续内存；`read_exact` 写满后
+        // 每个元素都是合法 f32 位模式（含 NaN/Inf），不存在读到未初始化内存的路径。
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
+        f.read_exact(bytes)
+            .unwrap_or_else(|e| panic!("读取 checkpoint {path} 参数数据失败: {e}"));
+    } else {
+        // 大端平台：存档固定小端，只能逐元素解码
+        let mut buf = vec![0u8; numel * 4];
+        f.read_exact(&mut buf)
+            .unwrap_or_else(|e| panic!("读取 checkpoint {path} 参数数据失败: {e}"));
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = f32::from_le_bytes([
+                buf[i * 4],
+                buf[i * 4 + 1],
+                buf[i * 4 + 2],
+                buf[i * 4 + 3],
+            ]);
         }
-        pos += numel * 4;
-        out.push(data);
     }
-    assert_eq!(pos, bytes.len(), "优化器状态数据块长度不匹配（文件可能损坏）");
-    out
+    data
 }
 
 /// 从文件流读取并解析 checkpoint 头部（魔数 + JSON 头），返回 (header, json 长度)。
@@ -379,39 +414,36 @@ fn read_head(f: &mut File, path: &str) -> (CkptHeader, usize) {
     (header, json_len)
 }
 
-/// 读取并解析整个 checkpoint 文件：头部 + 数据块（训练档三段参数/m/v，
-/// 权重 only 档只有一段参数），数据块原样返回字节，
-/// 由调用方按需解码（推理端只解参数段，不碰动量）。
-fn read_file(path: &str) -> (Checkpoint, Vec<ParamMeta>, Vec<u8>, usize) {
+/// 打开存档、解析头部并**校验数据段总长度**，返回 (元信息, 参数表, 文件句柄, opt_t)。
+///
+/// 文件句柄停在数据段起点，调用方按参数顺序**流式**读取——不再把整个数据段
+/// （训练档 = 3× 参数量）先读进一个 `Vec<u8>` 再逐段解码。
+/// Qwen2.5-0.5B（1.9 GB 档）的加载峰值因此从"文件字节 + 一份 f32 参数"≈ 4~6 GB
+/// 降到"一份 f32 参数"≈ 2 GB，8B 级模型才有可能在这台机器上打开。
+fn open_ckpt(path: &str) -> (Checkpoint, Vec<ParamMeta>, File, usize) {
     let mut f = File::open(path).unwrap_or_else(|e| panic!("无法打开 checkpoint {path}: {e}"));
-    let (header, _json_len) = read_head(&mut f, path);
-    let weights_only = header.weights_only;
-
+    let (header, json_len) = read_head(&mut f, path);
     let ckpt = Checkpoint {
         step: header.step,
         best_val_loss: header.best_val_loss.unwrap_or(f32::INFINITY),
         model: header.model,
         lora: header.lora,
         quant: header.quant,
-        weights_only,
+        weights_only: header.weights_only,
     };
-
-    // 读取并校验数据段总长度：各段等长，段数由头部的权重 only 标记决定（1 或 3）
-    let mut data = Vec::new();
-    f.read_to_end(&mut data)
-        .unwrap_or_else(|e| panic!("读取 {path} 参数数据失败: {e}"));
+    // 校验：文件长度必须恰好等于「头 + 段数 × 每段字节数」——长度不对就是文件损坏，
+    // 与其读到一半 panic 在半路，不如在打开时就报清楚。
     let block = numel_total(&header.params) * 4;
-    let segs = if weights_only { 1 } else { 3 };
+    let segs = if header.weights_only { 1 } else { 3 };
+    let data_off = MAGIC.len() + 4 + json_len;
+    let expect_len = (data_off + block * segs) as u64;
+    let actual_len = f.metadata().map(|m| m.len()).unwrap_or(0);
     assert_eq!(
-        data.len(),
-        block * segs,
-        "checkpoint 数据段长度不匹配：期望 {} 字节（{} 段，每段 {}），实得 {}（文件可能损坏）",
-        block * segs,
-        segs,
-        block,
-        data.len()
+        actual_len, expect_len,
+        "checkpoint 数据段长度不匹配：期望 {} 字节（头 {} + {} 段，每段 {}），实得 {}（文件可能损坏）",
+        expect_len, data_off, segs, block, actual_len
     );
-    (ckpt, header.params, data, header.opt_t)
+    (ckpt, header.params, f, header.opt_t)
 }
 
 /// 词嵌入的名称。只有它允许"模型行数 > 存档行数"——
@@ -436,21 +468,24 @@ fn is_vocab_extension(name: &str, meta: &ParamMeta, t: &Tensor) -> bool {
 /// 存档接上视觉编码器），这些多出来的参数保持模型自身的初始化值，语义等同于
 /// "新增模块从零开始训练"。反过来，存档里的参数必须全部能在模型中找到，
 /// 否则就是配置不一致（如层数不同），一律报错。
-fn restore_params(model: &Transformer, metas: &[ParamMeta], bytes: &[u8]) {
+fn restore_params(model: &Transformer, metas: &[ParamMeta], f: &mut File, path: &str) {
     let named = model.named_parameters();
-    // 存档参数名 → 模型参数下标；同时校验每个参数的形状
+    // 存档参数名 → 模型参数下标：一次建 HashMap（原来是逐个 `position()`，
+    // 参数多时是 O(n²) 次字符串比较），同时校验每个参数的形状
+    let mut idx_of: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(named.len());
+    for (i, (n, _)) in named.iter().enumerate() {
+        idx_of.insert(n.as_str(), i);
+    }
     let mut slot_of_meta: Vec<usize> = Vec::with_capacity(metas.len());
     let mut covered = vec![false; named.len()];
     for meta in metas {
-        let si = named
-            .iter()
-            .position(|(n, _)| n == &meta.name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "checkpoint 参数 '{}' 在模型中不存在，请检查配置是否一致",
-                    meta.name
-                )
-            });
+        let si = *idx_of.get(meta.name.as_str()).unwrap_or_else(|| {
+            panic!(
+                "checkpoint 参数 '{}' 在模型中不存在，请检查配置是否一致",
+                meta.name
+            )
+        });
         assert!(
             !covered[si],
             "checkpoint 参数名重复：{}",
@@ -478,7 +513,10 @@ fn restore_params(model: &Transformer, metas: &[ParamMeta], bytes: &[u8]) {
             "模型参数 '{name}' 不在 checkpoint 中（仅允许缺少 vision.* 视觉参数），请检查配置是否一致"
         );
     }
-    for (mi, data) in decode_f32s(metas, bytes).into_iter().enumerate() {
+    // 流式读：一次只持有一个参数的数据块（峰值内存 = 最大参数，而不是整档文件）
+    for (mi, meta) in metas.iter().enumerate() {
+        let numel: usize = meta.shape.iter().product();
+        let data = read_block(f, path, numel);
         let (name, t) = &named[slot_of_meta[mi]];
         if t.numel() == data.len() {
             t.set_data(data);
@@ -511,6 +549,52 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("llm_ckpt_test_{tag}_{}.ckpt", std::process::id()));
         p.to_string_lossy().into_owned()
+    }
+
+    /// 加载吞吐探针（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release checkpoint::tests::probe_load_speed -- --ignored --nocapture
+    /// ```
+    /// 把"构造模型"（分配 + 初始化 1.9 GB 参数）与"读档"分开计时：读档是纯流式
+    /// `read_exact` + 整块落进 `Vec<f32>`，不再有"整文件读入 + 逐元素 from_le_bytes"。
+    #[test]
+    #[ignore]
+    fn probe_load_speed() {
+        let path = "checkpoints/qwen05/model.ckpt";
+        if !std::path::Path::new(path).exists() {
+            println!("缺少 {path}，跳过");
+            return;
+        }
+        let ck = load_header(path);
+        let mut rng = Rng::new(1);
+        let t = std::time::Instant::now();
+        let model = Transformer::new(ck.model.clone(), &mut rng);
+        let t_new = t.elapsed();
+        let mut rng2 = Rng::new(1);
+        let t = std::time::Instant::now();
+        let model_skip =
+            crate::rng::without_init(|| Transformer::new(ck.model.clone(), &mut rng2));
+        let t_new_skip = t.elapsed();
+        // 跳过初始化必须不改变随机数流（推理入口据此保证同 seed 生成结果不变）
+        assert_eq!(rng.state(), rng2.state(), "without_init 改变了随机数流");
+        drop(model_skip);
+        let t = std::time::Instant::now();
+        load_params(path, &model);
+        let t_load = t.elapsed();
+        let t = std::time::Instant::now();
+        load_params(path, &model);
+        let t_load2 = t.elapsed();
+        let params: usize = model.parameters().iter().map(|p| p.numel()).sum();
+        println!(
+            "参数 {} 个（{:.2} GB f32）| 构造（正常）{:.2}s | 构造（跳过初始化）{:.2}s | 首次读档 {:.2}s | 页缓存热再读 {:.2}s",
+            params,
+            params as f64 * 4.0 / 1e9,
+            t_new.as_secs_f64(),
+            t_new_skip.as_secs_f64(),
+            t_load.as_secs_f64(),
+            t_load2.as_secs_f64()
+        );
     }
 
     /// 构造一个"训练过几步"的模型 + 优化器：手动灌梯度并真实调 `opt.step()`，

@@ -271,13 +271,61 @@ impl BPETokenizer {
     }
 
     /// 对一段字节做 BPE 合并（`encode` 的单片实现，两种口径共用）
+    ///
+    /// **跳过"当前序列里不存在"的规则**：规则表可能极大（Qwen2.5 有 151 387 条），
+    /// 而一段 prompt 只会命中其中一两百条；逐条把整个序列扫一遍是 `O(len × merges)`，
+    /// 实测 151k merges 下 11 KB prompt 单次 encode 要 348 ms，而每个请求要 encode 4~7 次。
+    ///
+    /// 这条优化**不可能改变结果**：一条规则若没有可匹配的相邻对，它做不了任何替换，
+    /// 扫不扫都一样。维护"当前序列的相邻对**计数**"即可，命中规则才真扫一遍，
+    /// 并且计数在合并过程中**就地增量更新**（每次合并只动 5 个对）——
+    /// 绝不能"每合并一次就重建整张表"：那会把长文档的编码变成 `O(len²)`，
+    /// 训练语料全量预编码（8k merges × 十几 MB 文本）会从秒级退化成分钟级。
+    ///
+    /// 注意**不能**改成"按 rank 反复取最小对"的经典堆式 BPE：本实现是"按规则优先级
+    /// 逐条**单趟**替换"，合并出来的新对即使 rank 更靠前也不会回头再处理，
+    /// 两者对某些规则表会给出不同切分（这里保持与既有 checkpoint 的词表口径一致）。
     fn merge_piece(&self, bytes: &[u8]) -> Vec<usize> {
         let mut ids: Vec<u32> = bytes.iter().map(|&b| self.byte_id[b as usize]).collect();
+        // 相邻对打包成 u64（id 均 < 2^32）：一趟扫描得到"当前存在的对 → 出现次数"
+        #[inline]
+        fn key(a: u32, b: u32) -> u64 {
+            ((a as u64) << 32) | b as u64
+        }
+        #[inline]
+        fn inc(counts: &mut HashMap<u64, u32>, k: u64) {
+            *counts.entry(k).or_insert(0) += 1;
+        }
+        #[inline]
+        fn dec(counts: &mut HashMap<u64, u32>, k: u64) {
+            if let Some(c) = counts.get_mut(&k) {
+                *c = c.saturating_sub(1);
+            }
+        }
+        let mut counts: HashMap<u64, u32> = HashMap::with_capacity(ids.len().saturating_sub(1));
+        for w in ids.windows(2) {
+            inc(&mut counts, key(w[0], w[1]));
+        }
+        let mut out: Vec<u32> = Vec::with_capacity(ids.len());
         for &(a, b, new_id) in self.merges.iter() {
-            let mut out: Vec<u32> = Vec::with_capacity(ids.len());
+            if counts.get(&key(a, b)).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            out.clear();
+            out.reserve(ids.len());
             let mut i = 0;
             while i < ids.len() {
                 if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
+                    // 合并把 (pre, a)(a, b)(b, next) 换成 (pre, new)(new, next)
+                    if let Some(&pre) = out.last() {
+                        dec(&mut counts, key(pre, a));
+                        inc(&mut counts, key(pre, new_id));
+                    }
+                    dec(&mut counts, key(a, b));
+                    if let Some(&next) = ids.get(i + 2) {
+                        dec(&mut counts, key(b, next));
+                        inc(&mut counts, key(new_id, next));
+                    }
                     out.push(new_id);
                     i += 2;
                 } else {
@@ -285,7 +333,7 @@ impl BPETokenizer {
                     i += 1;
                 }
             }
-            ids = out;
+            std::mem::swap(&mut ids, &mut out);
         }
         ids.into_iter().map(|x| x as usize).collect()
     }
@@ -1452,6 +1500,125 @@ mod tests {
             "high-frequency 子词应被压缩，实际 {} 个 token",
             ids_low.len()
         );
+    }
+
+    /// "跳过当前序列里不存在的规则"必须与"逐条全量扫"**逐位相同**。
+    ///
+    /// 这条优化只依赖一个显然的性质（没有可匹配的相邻对 ⇒ 该规则做不了任何替换），
+    /// 但仍然值得钉死：规则表里存在互相嵌套、且合并产生的新对 rank 更靠前的情形，
+    /// 任何"顺手把算法换成按 rank 反复取最小对"的重写都会在这些输入上改变切分。
+    /// （本仓库的 encode 是"按规则优先级逐条**单趟**替换"，与 HF 的堆式 BPE
+    ///  不是同一个算法，不能互换。）
+    #[test]
+    fn test_bpe_skip_absent_rules_matches_naive_scan() {
+        // 参考实现 = 优化前的逐条全量扫描
+        fn naive(tok: &BPETokenizer, bytes: &[u8]) -> Vec<usize> {
+            let mut ids: Vec<u32> = bytes.iter().map(|&b| tok.byte_id[b as usize]).collect();
+            for &(a, b, new_id) in tok.merges.iter() {
+                let mut out: Vec<u32> = Vec::with_capacity(ids.len());
+                let mut i = 0;
+                while i < ids.len() {
+                    if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
+                        out.push(new_id);
+                        i += 2;
+                    } else {
+                        out.push(ids[i]);
+                        i += 1;
+                    }
+                }
+                ids = out;
+            }
+            ids.into_iter().map(|x| x as usize).collect()
+        }
+        let corpus = "abab abab abcabc abc zzzz qwerty low lowest newest";
+        // 多档词表：规则越少/越多，命中的规则比例不同
+        for target in [260usize, 300, 340, 420] {
+            let tok = BPETokenizer::train(corpus, target);
+            for text in [
+                "",
+                "a",
+                "ab",
+                "aaab",
+                "abababab",
+                "abcdef",
+                "zzzz",
+                "qwerty",
+                "lowest newest",
+                "中文 abc",
+            ] {
+                assert_eq!(
+                    tok.merge_piece(text.as_bytes()),
+                    naive(&tok, text.as_bytes()),
+                    "target_vocab={target} text={text:?}"
+                );
+            }
+        }
+    }
+
+    /// 分词器编码吞吐探针（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release tokenizer::tests::probe_bpe_encode_speed -- --ignored --nocapture
+    /// ```
+    /// 用仓库里的真实 Qwen2.5 词表（151 387 条 merge）量一段 11 KB 中文 prompt 的编码耗时：
+    /// 逐条规则全量扫描是 `O(len × merges)`，跳过"序列里不存在的规则"后应降到毫秒级。
+    #[test]
+    #[ignore]
+    fn probe_bpe_encode_speed() {
+        let path = "checkpoints/qwen05/tokenizer.json";
+        if !std::path::Path::new(path).exists() {
+            println!("缺少 {path}，跳过");
+            return;
+        }
+        let tok = Tokenizer::load(path);
+        let prompt = "这是一段用于测量分词器编码耗时的长文本，包含常见汉字与标点。".repeat(124);
+        let ids = tok.encode(&prompt); // 预热（也验证非空）
+        let t = std::time::Instant::now();
+        let ids2 = tok.encode(&prompt);
+        println!(
+            "encode {} 字节 -> {} token（预热 {} token），用时 {:?}",
+            prompt.len(),
+            ids2.len(),
+            ids.len(),
+            t.elapsed()
+        );
+
+        // 对照：优化前"逐条规则全量扫序列"的同一实现（同规则表、同文本）
+        let Inner::Bpe(bpe) = &tok.inner else {
+            println!("非 BPE 分词器，跳过对照");
+            return;
+        };
+        let naive_merge = |bytes: &[u8]| -> Vec<usize> {
+            let mut ids: Vec<u32> =
+                bytes.iter().map(|&b| bpe.byte_id[b as usize]).collect();
+            for &(a, b, new_id) in bpe.merges.iter() {
+                let mut out: Vec<u32> = Vec::with_capacity(ids.len());
+                let mut i = 0;
+                while i < ids.len() {
+                    if i + 1 < ids.len() && ids[i] == a && ids[i + 1] == b {
+                        out.push(new_id);
+                        i += 2;
+                    } else {
+                        out.push(ids[i]);
+                        i += 1;
+                    }
+                }
+                ids = out;
+            }
+            ids.into_iter().map(|x| x as usize).collect()
+        };
+        let t2 = std::time::Instant::now();
+        let naive: Vec<usize> = if bpe.pretok {
+            let mut out = Vec::new();
+            for piece in gpt2_pretokenize(&prompt) {
+                out.extend(naive_merge(&piece));
+            }
+            out
+        } else {
+            naive_merge(prompt.as_bytes())
+        };
+        println!("对照（逐条全量扫，优化前）用时 {:?}", t2.elapsed());
+        assert_eq!(naive, ids2, "跳过不存在规则的版本必须与逐条全量扫逐位一致");
     }
 
     #[test]

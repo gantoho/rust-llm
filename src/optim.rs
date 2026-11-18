@@ -21,9 +21,10 @@ pub trait Optimizer {
 
     /// 清零所有参数的梯度（各优化器共用同一实现）
     fn zero_grad(&self) {
-        for p in self.params() {
-            p.zero_grad();
-        }
+        // 参数之间并行：每个参数只清自己的梯度缓冲，彼此无依赖。
+        // 单线程版本在 0.5B 模型上是 ~500 MB 的纯 memset（~50–100 ms/步）。
+        let ps = self.params();
+        ps.par_iter().for_each(|p| p.zero_grad());
     }
 }
 
@@ -224,30 +225,65 @@ impl OptimizerState for AdamW {
 /// 行主序稠密矩阵乘 `C[m,n] = A[m,k] · B[k,n]`。
 ///
 /// 只用在本模块内部的 Newton–Schulz 迭代上（不参与自动求导），所以不引张量算子：
-/// 那里每个元素都是 `f32` 裸切片，走一次 `Tensor` 反而要额外分配缓存、还不好并行。
+/// 那里每个元素都是 `f32` 裸切片，走一次 `Tensor` 反而要额外分配缓存。
+///
+/// **按输出行并行**：NS 迭代的算子阶数是 `r³`（r = 权重的较小维，几百到几千），
+/// 单核三重循环在 0.5B 模型上实测 3.1 s/参数/步（Muon 的 ABS 探针，见 PERF-AUDIT）。
+/// 内层仍是"每个输出元素按 `p` 升序 axpy"，与串行版本**逐位一致**。
 fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    const MC: usize = 32; // 每个 rayon 任务处理 32 个输出行（行间无依赖）
     let mut c = vec![0.0f32; m * n];
-    for i in 0..m {
-        let arow = &a[i * k..(i + 1) * k];
-        let crow = &mut c[i * n..(i + 1) * n];
-        for (p, &av) in arow.iter().enumerate() {
-            let brow = &b[p * n..(p + 1) * n];
-            for (cv, &bv) in crow.iter_mut().zip(brow) {
-                *cv += av * bv;
+    c.par_chunks_mut(MC * n).enumerate().for_each(|(blk, cblk)| {
+        let first = blk * MC;
+        let rows = cblk.len() / n;
+        for r in 0..rows {
+            let i = first + r;
+            let arow = &a[i * k..(i + 1) * k];
+            let crow = &mut cblk[r * n..(r + 1) * n];
+            for (p, &av) in arow.iter().enumerate() {
+                let brow = &b[p * n..(p + 1) * n];
+                for (cv, &bv) in crow.iter_mut().zip(brow) {
+                    *cv += av * bv;
+                }
             }
         }
-    }
+    });
     c
 }
 
-/// 行主序转置 `[r, c] → [c, r]`
+/// `A = X·Xᵀ`（`X` 为 `[r, c]` 行主序）的直算版本。
+///
+/// 与 `matmul(&x, &transpose(&x, r, c), r, c, r)` **逐位一致**：那里的内层是
+/// `c[i][j] += X[i][p]·Xᵀ[p][j]`，而 `Xᵀ[p][j] = X[j][p]`，所以等价于
+/// `Σ_p X[i][p]·X[j][p]` 且 p 升序。省掉一次 `[r,c] → [c,r]` 的全量转置与分配，
+/// 并且按输出行并行（每行一次长度为 `c` 的点积 × `r` 个 j）。
+fn gram(x: &[f32], r: usize, c: usize) -> Vec<f32> {
+    let mut a = vec![0.0f32; r * r];
+    a.par_chunks_mut(r).enumerate().for_each(|(i, row)| {
+        let xi = &x[i * c..(i + 1) * c];
+        for (j, slot) in row.iter_mut().enumerate() {
+            let xj = &x[j * c..(j + 1) * c];
+            let mut s = 0.0f32;
+            for p in 0..c {
+                s += xi[p] * xj[p];
+            }
+            *slot = s;
+        }
+    });
+    a
+}
+
+/// 行主序转置 `[r, c] → [c, r]`（按行并行；每行写的是目标里的一段跨步行）
 fn transpose(a: &[f32], r: usize, c: usize) -> Vec<f32> {
     let mut t = vec![0.0f32; r * c];
-    for i in 0..r {
-        for j in 0..c {
-            t[j * r + i] = a[i * c + j];
-        }
-    }
+    // 按源行分块并行：目标写跨越 c 个元素一步，但每个 (i,j) 只被一个任务写
+    t.par_chunks_mut(r)
+        .enumerate()
+        .for_each(|(j, trow)| {
+            for (i, slot) in trow.iter_mut().enumerate() {
+                *slot = a[i * c + j];
+            }
+        });
     t
 }
 
@@ -279,7 +315,8 @@ fn zeropower_newton_schulz(g: &[f32], rows: usize, cols: usize, steps: usize) ->
         *v /= norm;
     }
     for _ in 0..steps {
-        let a = matmul(&x, &transpose(&x, r, c), r, c, r); // A = X Xᵀ
+        // A = X Xᵀ（直算点积，省掉每次迭代一次 [r,c]→[c,r] 转置）
+        let a = gram(&x, r, c);
         let a2 = matmul(&a, &a, r, r, r); // A²
         let b: Vec<f32> = a
             .iter()

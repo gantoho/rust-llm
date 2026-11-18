@@ -137,7 +137,13 @@ pub(crate) fn load_model_and_tokenizer(
         load_tokenizer_for_inference(tcfg, ckpt.model.vocab_size)
     };
     let mut rng = Rng::new(seed);
-    let mut model = Transformer::new(ckpt.model.clone(), &mut rng);
+    // 构造产生的随机初值马上会被下面的 `load_params` **整体覆盖**，所以跳过 `randn`
+    // 的浮点计算：0.5B 模型要为 4.94 亿个参数各算一次 ln/sqrt/cos，实测 6.5 s，
+    // 而读档本身只要 0.7 s。随机数流照常推进 ⇒ 之后用同一 rng 采样的行为逐位不变
+    // （见 [`crate::rng::without_init`]）。这里不会发生词表扩展：模型配置取自
+    // checkpoint 头部，词表大小必然一致。
+    let mut model =
+        crate::rng::without_init(|| Transformer::new(ckpt.model.clone(), &mut rng));
     // LoRA 存档：先按头部记录重放注入（冻结主干 + 每层 Q/K/V 挂适配器），再恢复参数。
     // 顺序不能反——参数是**按名字**逐个对齐的，模型里少一套 `*.lora_a` / `*.lora_b`
     // 就会在 restore_params 处断言失败（见 [`checkpoint::CkptHeader`] 的 lora 字段）。

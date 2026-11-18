@@ -680,6 +680,68 @@ fn matmul_data(
     //   比物化（2× 访存）还差一个量级，故先物化成行主序。
     //   物化按**原宽度**转（bf16 转 bf16，不借机解码）：转置是纯位搬移，
     //   与「先解码再转」数值逐位一致，bf16 还省一半访存与分配。
+    //
+    // ---- 单行快路：`batch*m == 1`（decode 的每个 Linear / 输出头）----
+    // 行并行在只有一个输出行时完全失效（`par_chunks_mut(MC*n)` 里整个输出就一块
+    // ⇒ 20 个核只用 1 个）。而且 b_t 的物理 [N,K] 布局对"单行"来说恰好是**行内连续**：
+    // 每个输出列就是一次 a·W[j] 点积，两侧都连续，既不必物化转置，也能按输出列
+    // 切给多核。累加序仍是 kk 升序 ⇒ 与通用路径逐位一致。
+    if batch == 1 && m == 1 && n >= 64 && n * k >= 1 << 20 {
+        if let MatData::F32(av) = a.data {
+            // 激活恒为 f32（bf16 只作权重存储）；左操作数是 bf16 时走下面的通用路径
+            let nt = rayon::current_num_threads().max(1);
+            let nc_t = n.div_ceil(nt * 4).max(64);
+            let mut out = vec![0.0f32; n];
+            out.par_chunks_mut(nc_t).enumerate().for_each(|(ci, ochunk)| {
+                let nb = ci * nc_t;
+                let nc = ochunk.len();
+                ochunk.fill(0.0);
+                match b.data {
+                    MatData::F32(bp) if b_t => {
+                        // 物理 [N,K]：out[j] = Σ_kk a[kk]·b[j][kk]（点积，两侧连续）
+                        for (jj, o) in ochunk.iter_mut().enumerate() {
+                            let row = &bp[(nb + jj) * k..(nb + jj) * k + k];
+                            let mut s = 0.0f32;
+                            for (kk, &bv) in row.iter().enumerate() {
+                                s += av[kk] * bv;
+                            }
+                            *o = s;
+                        }
+                    }
+                    MatData::Bf16(bp) if b_t => {
+                        for (jj, o) in ochunk.iter_mut().enumerate() {
+                            let row = &bp[(nb + jj) * k..(nb + jj) * k + k];
+                            let mut s = 0.0f32;
+                            for (kk, &bv) in row.iter().enumerate() {
+                                s += av[kk] * bf16_to_f32(bv);
+                            }
+                            *o = s;
+                        }
+                    }
+                    MatData::F32(bp) => {
+                        // 物理 [K,N]：沿列段做 axpy（读 b 连续、a 是标量广播）
+                        for kk in 0..k {
+                            let a_v = av[kk];
+                            let brow = &bp[kk * n + nb..kk * n + nb + nc];
+                            for (o, &bv) in ochunk.iter_mut().zip(brow) {
+                                *o += a_v * bv;
+                            }
+                        }
+                    }
+                    MatData::Bf16(bp) => {
+                        for kk in 0..k {
+                            let a_v = av[kk];
+                            let brow = &bp[kk * n + nb..kk * n + nb + nc];
+                            for (o, &bv) in ochunk.iter_mut().zip(brow) {
+                                *o += a_v * bf16_to_f32(bv);
+                            }
+                        }
+                    }
+                }
+            });
+            return out;
+        }
+    }
     let b_f32;
     let b_u16;
     let (a2, b2): (MatOperand<'_>, MatOperand<'_>) = if b_t {
@@ -1121,6 +1183,32 @@ fn attn_forward_ops(
 /// 原缓冲）；前向转置过（物理 `[n,k]`，如 `x @ Wᵀ` 里未物化的 `Wᵀ` 视图）时 bᵀ 的物理正好是
 /// `[k,n]` 行主序，必须按**非**转置读（`b_t = false`）。写死成 `true` 会把两种布局算串，
 /// 由 `tensor::tests::test_matmul_transposed_rhs_view` 守住。
+/// 累加 `dst[i] += src[i] * scale`（两个切片等长）。
+///
+/// 反向里"内核刚并行算完、再用单核搬进梯度槽"是最常见的一类浪费（输出头的 dW
+/// 是 1.36 亿元素，单核 9.6 GB/s 要 ~170 ms；20 核 32.5 GB/s 只要 ~50 ms）。
+///
+/// 但**小张量必须走串行**：rayon 每个任务有微秒级开销，128×128 的 da/db 分成
+/// 4 块并行反而更慢 —— 默认小模型（d=128）的训练路径全是这种尺寸，不设门槛会把
+/// 大模型省下的时间在小模型上加回去。块内仍按 i 升序累加 ⇒ 与串行逐位一致。
+#[inline]
+fn add_assign_slice(dst: &mut [f32], src: &[f32], scale: f32) {
+    const PAR_MIN: usize = 1 << 16; // 64K 元素（256 KB）：低于它分块不划算
+    if dst.len() >= PAR_MIN {
+        dst.par_chunks_mut(4096)
+            .zip(src.par_chunks(4096))
+            .for_each(|(d, s)| {
+                for (a, &b) in d.iter_mut().zip(s) {
+                    *a += b * scale;
+                }
+            });
+    } else {
+        for (a, &b) in dst.iter_mut().zip(src) {
+            *a += b * scale;
+        }
+    }
+}
+
 fn matmul_backward(
     result: &mut Tensor,
     a: &Tensor,
@@ -1160,23 +1248,20 @@ fn matmul_backward(
             drop(odb);
         // a、b 是同一张量（x@x）时梯度缓冲也是同一把锁——Mutex 不可重入，
         // 必须走单锁分支把 da/db 依次叠加进同一块缓冲
+        //
+        // 累加按块并行：da/db 刚由多核内核算出，紧接着若用单核搬一遍，输出头那种
+        // 级别的 dW（896×151936 = 1.36 亿元素 ≈ 读 2 份 + 写 1 份 1.6 GB）会白扔
+        // 100 ms 以上（实测单线程 9.6 GB/s vs 20 线程 32.5 GB/s）。每个槽位只被
+        // 自己的块写，块内顺序仍是 i 升序 ⇒ 与串行累加**逐位一致**。
         if Shared::ptr_eq(&sg, &og) {
             let mut sgm = sg.borrow_mut();
-            for i in 0..batch * m * k {
-                sgm[i] += da[i];
-            }
-            for j in 0..batch * k * n {
-                sgm[j] += db[j];
-            }
+            add_assign_slice(&mut sgm, &da, 1.0);
+            add_assign_slice(&mut sgm, &db, 1.0);
         } else {
             let mut sgm = sg.borrow_mut();
             let mut ogm = og.borrow_mut();
-            for i in 0..batch * m * k {
-                sgm[i] += da[i];
-            }
-            for j in 0..batch * k * n {
-                ogm[j] += db[j];
-            }
+            add_assign_slice(&mut sgm, &da, 1.0);
+            add_assign_slice(&mut ogm, &db, 1.0);
         }
         }),
     );
@@ -1563,7 +1648,19 @@ impl Tensor {
     /// 张量在物理缓冲中是否行主序连续（可按 numel 线性读取）。
     /// 0 维张量恒为连续；唯一非连续来源是 [`Tensor::permute`] 视图。
     pub fn is_contiguous(&self) -> bool {
-        self.strides == row_major_strides(&self.shape)
+        // 原地比较，不建 `row_major_strides` 的临时 Vec：这个谓词在**每个算子入口**
+        // （`contiguous()` / `data()` / `matmul` / `binary` …）都会被调用，单步上千次，
+        // 而 `Vec` 版本每次都要一次 malloc+free（并各写一遍 shape 长度个 usize）。
+        // 判据与 `row_major_strides(shape)` 逐项相等完全等价：从最内维往外，
+        // 期望步长依次是 1, shape[last], shape[last]*shape[last-1], ...
+        let mut expect = 1usize;
+        for d in (0..self.shape.len()).rev() {
+            if self.strides[d] != expect {
+                return false;
+            }
+            expect *= self.shape[d];
+        }
+        true
     }
 
     /// 是否是「连续张量的 2D 转置视图」：即 `permute([1,0])` 的产物（`strides = [1, 父行宽]`）。
@@ -1595,34 +1692,116 @@ impl Tensor {
         let out_data = {
             let sd = self.decode();
             let sd_ref: &[f32] = &sd;
-            let mut out_data = vec![0.0f32; total];
-            // 并行按 4096 分块：每个块只分解一次起点下标，
-            // 块内用「里程表进位」递增多维下标，避免逐元素做除法。
-            out_data.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
-                let mut r = ci * 4096;
-                let mut idx = [0usize; 8];
-                for d in (0..rank).rev() {
-                    idx[d] = r % shape[d];
-                    r /= shape[d];
-                }
-                for slot in chunk.iter_mut() {
-                    let mut off = 0usize;
-                    for d in 0..rank {
-                        off += idx[d] * strides[d];
-                    }
-                    *slot = sd_ref[off];
-                    // 里程表 +1（逻辑行主序）
-                    for d in (0..rank).rev() {
-                        idx[d] += 1;
-                        if idx[d] < shape[d] {
-                            break;
+            // ---- 快路：连续张量的 2D 转置视图（`permute([1,0])`）----
+            //
+            // 通用路径是"逐元素里程表"，对转置视图等价于每写一个元素就跨
+            // `shape[0]·4` 字节取一次（输出头 896×151936 时是每 3584 B 取 1 个 float），
+            // 实测只有 3.4 GB/s。转置是纯搬运，用 32×32 分块 + 局部缓冲把两侧
+            // 都变成连续访问后实测 14.3 GB/s（4.2×），且数值逐位不变。
+            if rank == 2 && strides[0] == 1 && strides[1] == shape[0] {
+                const BS: usize = 32;
+                let (r, c) = (shape[0], shape[1]);
+                let mut out_data = vec![0.0f32; total];
+                out_data
+                    .par_chunks_mut(BS * c)
+                    .enumerate()
+                    .for_each(|(blk, ochunk)| {
+                        let ib = blk * BS;
+                        let rows = ochunk.len() / c; // 行数（末块可能 < BS）
+                        let mut buf = [[0.0f32; BS]; BS];
+                        let mut jb = 0;
+                        while jb < c {
+                            let jn = BS.min(c - jb);
+                            // 读：src 的 [jb..jb+jn] 行 × [ib..ib+rows] 列（行内连续）
+                            for (jj, j) in (jb..jb + jn).enumerate() {
+                                let base = j * r + ib;
+                                let srow = &sd_ref[base..base + rows];
+                                for (ii, &v) in srow.iter().enumerate() {
+                                    buf[ii][jj] = v;
+                                }
+                            }
+                            // 写：out 的 [ib..ib+rows] 行 × [jb..jb+jn] 列（行内连续）
+                            for ii in 0..rows {
+                                let dst = ii * c + jb;
+                                ochunk[dst..dst + jn].copy_from_slice(&buf[ii][..jn]);
+                            }
+                            jb += BS;
                         }
-                        idx[d] = 0;
+                    });
+                drop(sd);
+                out_data
+            } else if rank >= 2 && strides[rank - 1] == 1 && shape[rank - 1] > 1 {
+                // ---- 快路：**末维在两侧都连续** ⇒ 按"连续段"整段 memcpy ----
+                //
+                // 注意力的拆头/合头正是这种形态：`[b,t,h,d] → [b,h,t,d]` 只重排前 3 维，
+                // 末维 `d` 在源和目标里都是 stride 1。通用里程表路径会把它拆成
+                // `d` 次单元素取数（每次都要算一次 4 维点积），而这里每个
+                // `(b,h,t)` 只需一次 `copy_from_slice`（d 个 f32 连续）。
+                // 纯搬运、不改元素顺序 ⇒ 数值逐位不变。
+                let run = shape[rank - 1];
+                let outer_rank = rank - 1;
+                let outer_shape = &shape[..outer_rank];
+                let outer_strides = &strides[..outer_rank];
+                let mut out_data = vec![0.0f32; total];
+                const RUNS_PER_CHUNK: usize = 128;
+                out_data
+                    .par_chunks_mut(run * RUNS_PER_CHUNK)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let mut idx = [0usize; 8];
+                        let mut r = ci * RUNS_PER_CHUNK;
+                        for d in (0..outer_rank).rev() {
+                            idx[d] = r % outer_shape[d];
+                            r /= outer_shape[d];
+                        }
+                        for out_run in chunk.chunks_mut(run) {
+                            let mut off = 0usize;
+                            for d in 0..outer_rank {
+                                off += idx[d] * outer_strides[d];
+                            }
+                            out_run.copy_from_slice(&sd_ref[off..off + run]);
+                            // 里程表 +1（外层行主序）
+                            for d in (0..outer_rank).rev() {
+                                idx[d] += 1;
+                                if idx[d] < outer_shape[d] {
+                                    break;
+                                }
+                                idx[d] = 0;
+                            }
+                        }
+                    });
+                drop(sd);
+                out_data
+            } else {
+                let mut out_data = vec![0.0f32; total];
+                // 并行按 4096 分块：每个块只分解一次起点下标，
+                // 块内用「里程表进位」递增多维下标，避免逐元素做除法。
+                out_data.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
+                    let mut r = ci * 4096;
+                    let mut idx = [0usize; 8];
+                    for d in (0..rank).rev() {
+                        idx[d] = r % shape[d];
+                        r /= shape[d];
                     }
-                }
-            });
-            drop(sd);
-            out_data
+                    for slot in chunk.iter_mut() {
+                        let mut off = 0usize;
+                        for d in 0..rank {
+                            off += idx[d] * strides[d];
+                        }
+                        *slot = sd_ref[off];
+                        // 里程表 +1（逻辑行主序）
+                        for d in (0..rank).rev() {
+                            idx[d] += 1;
+                            if idx[d] < shape[d] {
+                                break;
+                            }
+                            idx[d] = 0;
+                        }
+                    }
+                });
+                drop(sd);
+                out_data
+            }
         };
         let result = self.new_like(out_data, shape, self.requires_grad.load(Ordering::Relaxed));
         if self.req() {
@@ -1724,6 +1903,32 @@ impl Tensor {
             requires_grad: Arc::new(AtomicBool::new(requires_grad)),
         };
         if self.req() {
+            // ---- 快路：2 维转置的反向不需要"全长置换表" ----
+            //
+            // 输出头就是 `head_table().transpose()`：`[vocab, d] → [d, vocab]`。
+            // 通用路径要为它建一张 `numel` 长的 `usize` 置换表（0.5B 词表 = 1.36 亿项
+            // = **1.09 GB** 常驻），反向还要再建一张同长的逆表（**每步 1.09 GB** 的
+            // 分配 + 写入）。而 2 维转置的下标是闭式：`out[i,j] = src[j,i]`，
+            // 反向 `sg[j*C + i] += g[i*R + j]` 直接算即可，零表零分配。
+            // 纯整数下标运算 ⇒ 结果与查表版**逐位一致**。
+            if self.rank() == 2 && dims[0] == 1 && dims[1] == 0 {
+                let (r, c) = (self.shape[0], self.shape[1]); // 源是 [r, c]，视图是 [c, r]
+                let rg = result.grad.clone();
+                let sg = self.grad.clone();
+                record(&result, vec![self.clone()], Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    let g_ref: &[f32] = &g;
+                    // 按**源的行** j 并行：每个任务写 sg 的一整行（连续），
+                    // 读 g 的一列（跨步 r，与转置本身的访存形态相同）。
+                    sgm.par_chunks_mut(c).enumerate().for_each(|(j, row)| {
+                        for (i, s) in row.iter_mut().enumerate() {
+                            *s += g_ref[i * r + j];
+                        }
+                    });
+                }));
+                return result;
+            }
             // 反解 permute 的逆映射：inv[perm[i]] = i
             let mut inv = vec![0usize; self.rank()];
             for (i, &d) in dims.iter().enumerate() {
@@ -2218,7 +2423,9 @@ impl Tensor {
                 }
             });
         drop(sd);
-        let result = x.new_like(data.clone(), x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        // data 直接 move 进张量（不要 `data.clone()`：那会为"反向闭包还要用"白拷一份全长数据，
+        // 而反向根本不需要 gelu 的输出，只需要 t 与输入 x）
+        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
@@ -2228,28 +2435,27 @@ impl Tensor {
                 let g = rg.borrow();
                 let x_b = sd.decode();
                 let mut sgm = sg.borrow_mut();
-                // 提取为 Vec（Send），供 rayon 闭包安全使用
-                let g_vec: Vec<f32> = g.iter().copied().collect();
-                let x_vec: Vec<f32> = x_b.iter().copied().collect();
-                let len = g_vec.len();
-                let mut dx = vec![0.0f32; len];
-                dx.par_chunks_mut(4096)
+                // 只借切片、不做 to_vec 副本：`&[f32]` 本身是 Send+Sync，可以直接进
+                // rayon 闭包（与 layernorm 反向同一写法）。原先的 g_vec / x_vec 只是
+                // 为了绕开 `MutexGuard: !Send`，代价是每次反向多两份全长拷贝。
+                let g: &[f32] = &g;
+                let x_b: &[f32] = &x_b;
+                let len = g.len();
+                // 逐元素独立：直接并行写回梯度槽（原先先写 dx 再串行 +=，多一趟全长读写）
+                sgm.par_chunks_mut(4096)
                     .enumerate()
                     .for_each(|(ci, chunk)| {
                         let base = ci * 4096;
                         for (j, slot) in chunk.iter_mut().enumerate() {
                             let i = base + j;
                             if i >= len { break; }
-                            let x = x_vec[i];
+                            let x = x_b[i];
                             let t = tv[i];
                             let da_dx = SQRT_2_PI * (1.0 + 3.0 * COEF * x * x);
                             let dy_dx = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * da_dx;
-                            *slot = g_vec[i] * dy_dx;
+                            *slot += g[i] * dy_dx;
                         }
                     });
-                for (i, v) in dx.iter().enumerate() {
-                    sgm[i] += v;
-                }
             }));
         }
         result
@@ -2289,26 +2495,25 @@ impl Tensor {
         let gd_ref_owned: &[f32] = gd.as_deref().unwrap_or(&sd);
         let len = sd.len();
         let mut out_data = vec![0.0f32; len];
-        let mut silu_vals = vec![0.0f32; len]; // SiLU(x) = x * sigmoid(x)
+        // 只留 sigmoid 一份：silu(x) = x·σ(x) 可由 (x, σ) 逐位复算，
+        // 原先再多存一份 silu_vals 等于每层白写 79 MB（[4096,4864]）且占同样多内存。
         let mut sig_vals = vec![0.0f32; len]; // sigmoid(x)
         let sd_ref: &[f32] = &sd;
         let gd_ref: &[f32] = gd_ref_owned;
         // 并行：逐元素融合
         out_data
             .par_chunks_mut(4096)
-            .zip(silu_vals.par_chunks_mut(4096))
             .zip(sig_vals.par_chunks_mut(4096))
             .enumerate()
-            .for_each(|(ci, ((oc, sc), sg))| {
+            .for_each(|(ci, (oc, sg))| {
                 let base = ci * 4096;
-                for (j, ((o, s), sig)) in oc.iter_mut().zip(sc.iter_mut()).zip(sg.iter_mut()).enumerate() {
+                for (j, (o, sig)) in oc.iter_mut().zip(sg.iter_mut()).enumerate() {
                     let idx = base + j;
                     if idx >= len { break; }
                     let x = sd_ref[idx];
                     let sig_v = 1.0 / (1.0 + (-x).exp());
                     let silu_v = x * sig_v;
                     *sig = sig_v;
-                    *s = silu_v;
                     *o = silu_v * gd_ref[idx];
                 }
             });
@@ -2323,7 +2528,6 @@ impl Tensor {
             let sg = g_in.grad.clone();
             let xd = x.data.clone();
             let gd = g_in.data.clone();
-            let sv = silu_vals;
             let sig = sig_vals;
             record(&result, vec![x, g_in], Arc::new(move || {
                 // 梯度缓冲判同一：swiglu(x, x) 时 self 与 gate 共用同一把锁，
@@ -2336,36 +2540,46 @@ impl Tensor {
                 } else {
                     Some(gd.decode())
                 };
+                let g: &[f32] = &g;
                 let x_b: &[f32] = &x_b_guard;
                 let g_b: &[f32] = g_b_guard.as_deref().unwrap_or(&x_b_guard);
                 let len = g.len();
+                let sig: &[f32] = &sig;
                 let chunk = 4096;
                 if same_grad {
                     // 同一缓冲：∂gate = g·silu(x)，∂x = g·gate·dsigmoid，
                     // 两笔都累加进同一块内存，合成一次 +=
+                    // 逐元素独立 ⇒ 分块并行，块内顺序与串行写法逐个相同（逐位一致）
                     let mut gx = sx.borrow_mut();
-                    for start in (0..len).step_by(chunk) {
-                        let end = (start + chunk).min(len);
-                        for i in start..end {
+                    gx.par_chunks_mut(chunk).enumerate().for_each(|(ci, gxc)| {
+                        let base = ci * chunk;
+                        for (j, slot) in gxc.iter_mut().enumerate() {
+                            let i = base + j;
+                            if i >= len { break; }
                             let sig_v = sig[i];
-                            let silu_v = sv[i];
+                            let silu_v = x_b[i] * sig_v; // 与 forward 的 silu 逐位相同
                             let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
-                            gx[i] += g[i] * silu_v + g[i] * g_b[i] * dsig;
+                            *slot += g[i] * silu_v + g[i] * g_b[i] * dsig;
                         }
-                    }
+                    });
                 } else {
                     let mut gx = sx.borrow_mut();
                     let mut gg = sg.borrow_mut();
-                    for start in (0..len).step_by(chunk) {
-                        let end = (start + chunk).min(len);
-                        for i in start..end {
-                            let sig_v = sig[i];
-                            let silu_v = sv[i];
-                            gg[i] += g[i] * silu_v;
-                            let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
-                            gx[i] += g[i] * g_b[i] * dsig;
-                        }
-                    }
+                    gx.par_chunks_mut(chunk)
+                        .zip(gg.par_chunks_mut(chunk))
+                        .enumerate()
+                        .for_each(|(ci, (gxc, ggc))| {
+                            let base = ci * chunk;
+                            for (j, (xs, gs)) in gxc.iter_mut().zip(ggc.iter_mut()).enumerate() {
+                                let i = base + j;
+                                if i >= len { break; }
+                                let sig_v = sig[i];
+                                let silu_v = x_b[i] * sig_v;
+                                *gs += g[i] * silu_v;
+                                let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
+                                *xs += g[i] * g_b[i] * dsig;
+                            }
+                        });
                 }
             }));
         }
@@ -2455,9 +2669,14 @@ impl Tensor {
         // 只在"这次真有可能落到内核上"时才跳过物化：没有 GPU（或形状低于盈亏平衡点）时
         // 根本没人消费那个布局，照旧走 `contiguous()`（并行 gather）比 CPU 兜底侧的
         // b_t 转置物化更快，也更贴近改动前的行为。
+        //
+        // 例外：**单行输出**（decode，m == 1）。此时 CPU 侧的 `matmul_data` 有专门的
+        // 点积快路，直接读物理 `[N,K]`（每行连续），既不必物化整表，也能按输出列
+        // 分给多核 —— 生成路径上每 token 少一次 519 MiB 级的整表拷贝。
         let b_t = a.rank() == 2
             && other.is_transposed_2d_view()
-            && gpu_would_use_matmul(a.shape[0], a.shape[1], other.shape[1]);
+            && (a.shape[0] == 1
+                || gpu_would_use_matmul(a.shape[0], a.shape[1], other.shape[1]));
         let b = if b_t { other.clone() } else { other.contiguous() };
         if a.rank() == 2 {
             return a.matmul_2d(&b, b_t);
@@ -2870,16 +3089,41 @@ impl Tensor {
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
                 let mut gb = sb.borrow_mut();
-                // 第一遍：顺序计算 dg/db（跨行累加，无法并行）
+                // 第一遍：dγ/dβ 是**跨行**归约。按**列**切分即可并行：每列独立、
+                // 列内仍按 r 升序累加 ⇒ 与串行写法逐位一致（原注释"无法并行"
+                // 只对"按行切分"成立，那是把归约拆成了有竞争的读改写）。
                 let mut dg = vec![0.0f32; d];
                 let mut db = vec![0.0f32; d];
-                for r in 0..rows {
-                    let base = r * d;
-                    let is = inv_std[r];
-                    for j in 0..d {
-                        let dy = g[base + j];
-                        dg[j] += dy * (x_b[base + j] - mean[r]) * is;
-                        db[j] += dy;
+                let cw = (d / (rayon::current_num_threads().max(1) * 2)).max(16);
+                if rows * d >= 65_536 && cw < d {
+                    dg.par_chunks_mut(cw)
+                        .zip(db.par_chunks_mut(cw))
+                        .enumerate()
+                        .for_each(|(ci, (dgc, dbc))| {
+                            let c0 = ci * cw;
+                            for r in 0..rows {
+                                let base = r * d + c0;
+                                let is = inv_std[r];
+                                let mu = mean[r];
+                                for (k, (ag, ab)) in
+                                    dgc.iter_mut().zip(dbc.iter_mut()).enumerate()
+                                {
+                                    let dy = g[base + k];
+                                    *ag += dy * (x_b[base + k] - mu) * is;
+                                    *ab += dy;
+                                }
+                            }
+                        });
+                } else {
+                    for r in 0..rows {
+                        let base = r * d;
+                        let is = inv_std[r];
+                        let mu = mean[r];
+                        for j in 0..d {
+                            let dy = g[base + j];
+                            dg[j] += dy * (x_b[base + j] - mu) * is;
+                            db[j] += dy;
+                        }
                     }
                 }
                 for j in 0..d { gg[j] += dg[j]; gb[j] += db[j]; }
@@ -2981,13 +3225,28 @@ impl Tensor {
                 let gam: &[f32] = &gam_b;
                 let mut gx = sx.borrow_mut();
                 let mut gg = sg.borrow_mut();
-                // 第一遍：顺序计算 dg
+                // 第一遍：dγ 是跨行归约 —— 按列切分后逐列独立、列内 r 升序累加，
+                // 与串行写法逐位一致（见 layer_norm 反向的同类说明）
                 let mut dg = vec![0.0f32; d];
-                for r in 0..rows {
-                    let base = r * d;
-                    let is = ir[r];
-                    for j in 0..d {
-                        dg[j] += g[base + j] * x_b[base + j] * is;
+                let cw = (d / (rayon::current_num_threads().max(1) * 2)).max(16);
+                if rows * d >= 65_536 && cw < d {
+                    dg.par_chunks_mut(cw).enumerate().for_each(|(ci, dgc)| {
+                        let c0 = ci * cw;
+                        for r in 0..rows {
+                            let base = r * d + c0;
+                            let is = ir[r];
+                            for (k, ag) in dgc.iter_mut().enumerate() {
+                                *ag += g[base + k] * x_b[base + k] * is;
+                            }
+                        }
+                    });
+                } else {
+                    for r in 0..rows {
+                        let base = r * d;
+                        let is = ir[r];
+                        for j in 0..d {
+                            dg[j] += g[base + j] * x_b[base + j] * is;
+                        }
                     }
                 }
                 for j in 0..d { gg[j] += dg[j]; }
@@ -3347,11 +3606,12 @@ impl Tensor {
                 );
                 drop(kd_b);
                 drop(k_exp);
+                // 三笔梯度回写都走 `add_assign_slice`：大张量按块并行（dq/dk/dv 各是
+                // bh·t·hd 个元素，t=1024 时每份 ~29 MB，单核搬三遍每层白扔近 10 ms），
+                // 小张量走串行（rayon 任务开销不该压在小模型上）。
                 {
                     let mut sgm = sq.borrow_mut();
-                    for (i, v) in dq_out.iter().enumerate() {
-                        sgm[i] += v * scale;
-                    }
+                    add_assign_slice(&mut sgm, &dq_out, scale);
                 }
                 // GQA：dK/dV 是展开后（bh 组）的结果，按 n_rep 相邻副本求和折回
                 // kv_bh 组再写父梯度（n_rep==1 直接 move 零拷贝）
@@ -3361,15 +3621,11 @@ impl Tensor {
                     if n_rep > 1 { fold_repeat_grad(&dv_out, kv_bh, n_rep) } else { dv_out };
                 {
                     let mut sgm = sk.borrow_mut();
-                    for (i, v) in dk_final.iter().enumerate() {
-                        sgm[i] += v;
-                    }
+                    add_assign_slice(&mut sgm, &dk_final, 1.0);
                 }
                 {
                     let mut sgm = sv.borrow_mut();
-                    for (i, v) in dv_final.iter().enumerate() {
-                        sgm[i] += v;
-                    }
+                    add_assign_slice(&mut sgm, &dv_final, 1.0);
                 }
             }));
         }
@@ -3556,7 +3812,9 @@ impl Tensor {
         let scale = 1.0 / keep;
         let sd = x.decode();
         let len = sd.len();
+        let sd_ref: &[f32] = &sd;
         let mut mask = vec![0.0f32; len];
+        let mut out_data = vec![0.0f32; len];
         // 独立随机流：thread_local 计数器推进 + splitmix64 打散，
         // 保证同一 dropout 位点每步得到**不同**的 mask（详见 DROPOUT_STREAM 注释）。
         let mut state = DROPOUT_STREAM.with(|s| {
@@ -3569,7 +3827,9 @@ impl Tensor {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         state = (z ^ (z >> 31)) | 1; // |1 保证状态非零（xorshift 全零会退化）
-        for m in mask.iter_mut() {
+        // mask 生成是一条 xorshift 依赖链、无法并行，所以把"乘进数据"融进同一次遍历：
+        // 原先先写 mask、再单独一遍 zip 乘法，等于对 [B*T, d] 多做一趟读+写。
+        for i in 0..len {
             // xorshift64*
             state ^= state << 13;
             state ^= state >> 7;
@@ -3577,9 +3837,10 @@ impl Tensor {
             // 取高 24 位映射到 [0,1)：f32 尾数只有 24 位，
             // 若直接 `state as f32 / u64::MAX as f32` 会在两端损失分辨率
             let u = ((state >> 40) as f32) * (1.0 / 16_777_216.0);
-            *m = if u < keep { scale } else { 0.0 };
+            let m = if u < keep { scale } else { 0.0 };
+            mask[i] = m;
+            out_data[i] = sd_ref[i] * m;
         }
-        let out_data: Vec<f32> = sd.iter().zip(&mask).map(|(x, m)| x * m).collect();
         drop(sd);
 
         let result = x.new_like(out_data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
@@ -3589,9 +3850,18 @@ impl Tensor {
             record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i] * mask[i];
-                }
+                // 逐元素独立 ⇒ 按块并行（原先单核扫全长）
+                let g: &[f32] = &g;
+                let mask: &[f32] = &mask;
+                sgm.par_chunks_mut(4096)
+                    .zip(mask.par_chunks(4096))
+                    .enumerate()
+                    .for_each(|(ci, (ch, mch))| {
+                        let base = ci * 4096;
+                        for (j, (s, &m)) in ch.iter_mut().zip(mch).enumerate() {
+                            *s += g[base + j] * m;
+                        }
+                    });
             }));
         }
         result
@@ -3608,13 +3878,27 @@ impl Tensor {
         let (v, d) = (x.shape[0], x.shape[1]);
         let n = indices.len();
         let sd = x.decode();
-        let mut out_data = vec![0.0f32; n * d];
-        for (i, &idx) in indices.iter().enumerate() {
-            assert!(idx < v, "gather 索引越界：{} >= {}", idx, v);
-            for j in 0..d {
-                out_data[i * d + j] = sd[idx * d + j];
-            }
+        // 越界检查提到循环外（原先每行一次 `assert!`，且把内层行拷贝卡在
+        // "逐元素 + 边界检查"的标量循环上，编译器无法把它变成 memcpy）
+        if let Some(&bad) = indices.iter().find(|&&i| i >= v) {
+            panic!("gather 索引越界：{} >= {}", bad, v);
         }
+        let mut out_data = vec![0.0f32; n * d];
+        let sd_ref: &[f32] = &sd;
+        // 行与行互相独立 ⇒ 按行分批 + `copy_from_slice`（一次 memcpy，可向量化）。
+        // **按字节量**而不是按行分批：每行只有 d 个元素（默认配置 d=128 → 512 B），
+        // 一行一个 rayon 任务的话任务开销会盖过拷贝本身（4096 行 = 4096 个任务）。
+        let rows_per = (64 * 1024 / d).max(1); // 每任务 ~256 KB
+        out_data
+            .par_chunks_mut(d * rows_per)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                let i0 = ci * rows_per;
+                for (k, orow) in chunk.chunks_mut(d).enumerate() {
+                    let src = indices[i0 + k] * d;
+                    orow.copy_from_slice(&sd_ref[src..src + d]);
+                }
+            });
         drop(sd);
         let idx_vec = indices.to_vec();
 
@@ -3626,10 +3910,14 @@ impl Tensor {
             record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for i in 0..idx_vec.len() {
-                    let row = idx_vec[i];
-                    for j in 0..d2 {
-                        sgm[row * d2 + j] += g[i * d2 + j];
+                // 索引可能重复（同一行被多次 gather）⇒ 目标槽位会被多行命中，
+                // 不能按 i 并行。保持 i 升序串行，但把内层换成按行切片 zip，
+                // 让编译器把整行累加向量化（原先逐元素 + bounds check）。
+                for (i, &row) in idx_vec.iter().enumerate() {
+                    let gs = &g[i * d2..(i + 1) * d2];
+                    let dst = &mut sgm[row * d2..(row + 1) * d2];
+                    for (a, &b) in dst.iter_mut().zip(gs) {
+                        *a += b;
                     }
                 }
             }));
@@ -3658,10 +3946,16 @@ impl Tensor {
         let d = x.shape[1];
         let sd = x.decode();
         let mut out_data = vec![0.0f32; n_out * d];
+        if let Some(&bad) = indices.iter().find(|&&i| i >= n_out) {
+            panic!("scatter 索引越界：{} >= {}", bad, n_out);
+        }
+        // 索引可能重复 ⇒ 同一目标行会被多行累加，顺序必须按 i 升序（保持原语义）；
+        // 内层改成按行切片 zip，让编译器向量化。
         for (i, &idx) in indices.iter().enumerate() {
-            assert!(idx < n_out, "scatter 索引越界：{} >= {}", idx, n_out);
-            for j in 0..d {
-                out_data[idx * d + j] += sd[i * d + j];
+            let src = &sd[i * d..(i + 1) * d];
+            let dst = &mut out_data[idx * d..(idx + 1) * d];
+            for (o, &v) in dst.iter_mut().zip(src) {
+                *o += v;
             }
         }
         drop(sd);
@@ -3675,11 +3969,23 @@ impl Tensor {
             record(&result, vec![x], Arc::new(move || {
                 let g = rg.borrow();
                 let mut sgm = sg.borrow_mut();
-                for (i, &row) in idx_vec.iter().enumerate() {
-                    for j in 0..d2 {
-                        sgm[i * d2 + j] += g[row * d2 + j];
-                    }
-                }
+                // 前向的伴随：d_rows[i] = g[row]（与 gather 前向同形）。
+                // 每个 i 写的是**自己那一行**，行间无冲突 ⇒ 可以按行并行
+                // （即使 indices 有重复，写入位置也只取决于 i）。同样按字节量分批。
+                let g: &[f32] = &g;
+                let rows_per = (64 * 1024 / d2).max(1);
+                sgm.par_chunks_mut(d2 * rows_per)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let i0 = ci * rows_per;
+                        for (k, row_dst) in chunk.chunks_mut(d2).enumerate() {
+                            let src = idx_vec[i0 + k] * d2;
+                            let gs = &g[src..src + d2];
+                            for (a, &b) in row_dst.iter_mut().zip(gs) {
+                                *a += b;
+                            }
+                        }
+                    });
             }));
         }
         result
@@ -3812,6 +4118,46 @@ mod tests {
         assert_eq!(y_view, y_mat);
         assert_eq!(dx_view, dx_mat);
         assert_eq!(dw_view, dw_mat);
+    }
+
+    /// decode 的单行快路：`m == 1` 的 `x[1,d] @ Wᵀ`（W 物理 `[vocab,d]`）。
+    ///
+    /// CPU 上**不物化** `[d,vocab]` 转置表，而是按物理 `[vocab,d]` 逐行点积 + 按输出列
+    /// 并行（见 `Tensor::matmul` 的 `b_t` 判据与 `matmul_data` 的单行分支）。
+    /// 前向、dx、dW 三条都必须与"先物化转置再乘"**逐位一致**（累加序仍是 k 升序）。
+    #[test]
+    fn test_matmul_transposed_rhs_view_single_row() {
+        let (k, n) = (1024usize, 1024usize); // n*k = 1<<20，正好跨进单行快路的门槛
+        let x_data: Vec<f32> = (0..k).map(|i| (i % 97) as f32 * 0.01 - 0.3).collect();
+        let w_data: Vec<f32> = (0..n * k).map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5).collect();
+
+        let run = |materialize: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let x = Tensor::param(x_data.clone(), vec![1, k]);
+            let w = Tensor::param(w_data.clone(), vec![n, k]);
+            let wt = w.transpose();
+            assert!(wt.is_transposed_2d_view(), "前提：这是 2D 转置视图");
+            let rhs = if materialize { wt.contiguous() } else { wt };
+            let y = x.matmul(&rhs);
+            let out = y.data().to_vec();
+            y.sum().backward(); // 上游梯度全 1
+            (out, x.grad(), w.grad())
+        };
+        let (y_view, dx_view, dw_view) = run(false);
+        let (y_mat, dx_mat, dw_mat) = run(true);
+        assert_eq!(y_view, y_mat, "单行快路的前向必须与物化后逐位一致");
+        assert_eq!(dx_view, dx_mat, "单行快路的 dx 必须与物化后逐位一致");
+        assert_eq!(dw_view, dw_mat, "单行快路的 dW 必须与物化后逐位一致");
+
+        // 解析口径：dx = Σ_j W[j,:]（j 升序），dW[j,:] = x
+        let expect_dx: Vec<f32> = (0..k)
+            .map(|i| (0..n).map(|j| w_data[j * k + i]).sum::<f32>())
+            .collect();
+        assert_eq!(dx_view, expect_dx);
+        let mut expect_dw = Vec::with_capacity(n * k);
+        for _ in 0..n {
+            expect_dw.extend_from_slice(&x_data);
+        }
+        assert_eq!(dw_view, expect_dw);
     }
 
     #[test]
@@ -4070,6 +4416,90 @@ mod tests {
         let p = a.permute(&[1, 0]);
         assert_eq!(p.shape(), &[3, 2]);
         assert_eq!(p.data(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    /// `contiguous()` 的两条快路（2D 分块转置、末维连续时按段拷贝）必须与
+    /// "按 strides 逐元素取数"的通用口径**完全等价**。
+    ///
+    /// 这两条快路服务的正是训练/推理最热的两个形态：
+    /// - 输出头的 `[d, vocab]` 转置物化（2D 分块转置，替代逐元素里程表）；
+    /// - 注意力每层每步的拆头/合头 `[b,t,h,d] ↔ [b,h,t,d]`（末维 `d` 两侧都连续，
+    ///   每个 `(b,h,t)` 一次 `copy_from_slice` 而不是 `d` 次单元素取数）。
+    #[test]
+    fn test_contiguous_fast_paths_match_gather() {
+        // 参考实现：按逻辑行主序逐元素算物理偏移（优化前的通用路径）
+        fn gather_by_strides(t: &Tensor) -> Vec<f32> {
+            let shape = t.shape().to_vec();
+            let strides = t.strides.clone();
+            let rank = shape.len();
+            let total: usize = shape.iter().product();
+            let guard = t.data_ref();
+            let mut out = vec![0.0f32; total];
+            let mut idx = vec![0usize; rank];
+            for slot in out.iter_mut() {
+                let mut off = 0usize;
+                for d in 0..rank {
+                    off += idx[d] * strides[d];
+                }
+                *slot = guard[off];
+                for d in (0..rank).rev() {
+                    idx[d] += 1;
+                    if idx[d] < shape[d] {
+                        break;
+                    }
+                    idx[d] = 0;
+                }
+            }
+            out
+        }
+        let cases: &[(Vec<usize>, Vec<usize>)] = &[
+            // 2D 转置：非方阵、且边长不是 32 的倍数（考分块的尾部）
+            (vec![3, 5], vec![1, 0]),
+            (vec![40, 33], vec![1, 0]),
+            (vec![33, 40], vec![1, 0]),
+            // 拆头 [b,t,h,d] -> [b,h,t,d]：末维连续，走按段拷贝
+            (vec![2, 3, 4, 5], vec![0, 2, 1, 3]),
+            // 合头（对上一个结果再置换回去）
+            (vec![2, 4, 3, 5], vec![0, 2, 1, 3]),
+            // 末维被换到中间：末维不连续，只能走通用里程表
+            (vec![2, 3, 4], vec![2, 1, 0]),
+            // 3D 只换前两维：末维仍连续
+            (vec![5, 7, 9], vec![1, 0, 2]),
+        ];
+        for (shape, perm) in cases {
+            let total: usize = shape.iter().product();
+            let data: Vec<f32> = (0..total).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let t = Tensor::from_vec(data, shape.clone());
+            let view = t.permute(perm);
+            let fast = view.contiguous();
+            let slow = gather_by_strides(&view);
+            assert_eq!(
+                fast.data_ref().to_vec(),
+                slow,
+                "shape={shape:?} perm={perm:?} 的分块/分段快路必须与逐元素 gather 一致"
+            );
+        }
+    }
+
+    /// 2 维转置反向的闭式下标快路必须与"通用置换表"口径一致。
+    ///
+    /// 输出头训练时走的正是这条路（`head_table().transpose()`：`[vocab, d] → [d, vocab]`）。
+    /// 通用路径要为它建一张 `numel` 长的置换表（0.5B 词表 = 1.36 亿项 = 1.09 GB 常驻），
+    /// 反向再建一张同长的逆表（每步 1.09 GB 的分配 + 写入）。
+    #[test]
+    fn test_permute_2d_transpose_backward() {
+        let (r, c) = (3usize, 4usize); // 源 [r, c] = [3, 4]，视图 [4, 3]
+        let t = Tensor::param((0..(r * c)).map(|i| i as f32).collect(), vec![r, c]);
+        let v = t.transpose();
+        assert_eq!(v.shape(), &[c, r]);
+        // 上游梯度取非均匀值：w_flat[i*r + j] = i*r + j + 1
+        let w = Tensor::from_vec((0..(r * c)).map(|i| i as f32 + 1.0).collect(), vec![c, r]);
+        v.mul(&w).sum().backward();
+        // 期望 sg[j*c + i] += g[i*r + j]
+        let expect: Vec<f32> = (0..r)
+            .flat_map(|j| (0..c).map(move |i| (i * r + j) as f32 + 1.0))
+            .collect();
+        assert_eq!(t.grad(), expect);
     }
 
     #[test]
