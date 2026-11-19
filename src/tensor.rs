@@ -639,6 +639,203 @@ fn gpu_would_use_matmul(m: usize, k: usize, n: usize) -> bool {
     }
 }
 
+/// 当前环境是否启用显式 AVX2+FMA 矩阵乘内核（`LLM_CPU_FMA=1` 时启用）。
+///
+/// **默认关闭**：FMA 把 `a*b + c` 合成一条指令、只舍入一次，会改变浮点结果
+/// （本仓库的风格是大量断言"逐位一致"）。打开后 CPU 矩阵乘的内层指令数减半，
+/// 实测常见投影形状快 1.5~2.4×（`probe_matmul_fma_speed` 可复现）。
+///
+/// env 每次调用现读（Windows 上是一次 TEB 查表，几十 ns，相对一次矩阵乘可忽略），
+/// 这样探针能在同一进程里来回切换做 A/B。
+#[inline]
+fn cpu_fma_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::env::var_os("LLM_CPU_FMA").is_some_and(|v| v != "0")
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// 运行时检测 bf16 向量化是否可用（AVX2 + FMA）。
+///
+/// bf16 存储本身就是近似的（8 位尾数），所以这里**不需要** `LLM_CPU_FMA` 开关：
+/// 用 FMA 只会改变最后几位，与 bf16 的量化误差不在一个量级。
+#[inline]
+fn bf16_vec_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// 8 个 bf16（u16 位模式）→ 8 个 f32：`cvtepu16_epi32` 零扩展、左移 16 位、位转浮点。
+///
+/// 这正是 bf16→f32 的定义（`from_bits(x << 16)`），一次处理 8 个。
+/// 标量版 `bf16_to_f32` 在 matmul 内层会让循环**失去向量化** —— 实测那是 bf16
+/// 权重解码慢 4× 的主因（73.8 → 325.4 ms/token）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bf16x8_to_f32x8(p: *const u16) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let raw = _mm_loadu_si128(p as *const __m128i);
+    let wide = _mm256_cvtepu16_epi32(raw);
+    _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16))
+}
+
+/// 8 个 f32 的水平求和。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps(v, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_hadd_ps(s, s);
+    let s = _mm_hadd_ps(s, s);
+    _mm_cvtss_f32(s)
+}
+
+/// `Σ_kk a[kk] · bf16(b[kk])`（点积，AVX2 一次 8 个 + 水平求和）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bf16_dot_f32(a: &[f32], b: &[u16]) -> f32 {
+    use std::arch::x86_64::*;
+    let k = a.len().min(b.len());
+    let chunks = k / 8;
+    let mut acc = _mm256_setzero_ps();
+    for c in 0..chunks {
+        let av = _mm256_loadu_ps(a.as_ptr().add(c * 8));
+        let bv = bf16x8_to_f32x8(b.as_ptr().add(c * 8));
+        acc = _mm256_fmadd_ps(av, bv, acc);
+    }
+    let mut s = hsum256(acc);
+    for i in chunks * 8..k {
+        s += a[i] * bf16_to_f32(b[i]);
+    }
+    s
+}
+
+/// `acc[j] += a_v · bf16(b[j])`（axpy，AVX2 一次 8 个）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bf16_axpy_f32(acc: &mut [f32], a_v: f32, b: &[u16]) {
+    use std::arch::x86_64::*;
+    let n = acc.len().min(b.len());
+    let chunks = n / 8;
+    let av = _mm256_set1_ps(a_v);
+    for c in 0..chunks {
+        let j = c * 8;
+        let bv = bf16x8_to_f32x8(b.as_ptr().add(j));
+        let p = acc.as_mut_ptr().add(j);
+        _mm256_storeu_ps(p, _mm256_fmadd_ps(av, bv, _mm256_loadu_ps(p)));
+    }
+    for j in chunks * 8..n {
+        acc[j] += a_v * bf16_to_f32(b[j]);
+    }
+}
+
+/// bf16 点积的安全封装（运行时选向量版 / 标量版）。
+fn bf16_dot(a: &[f32], b: &[u16]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if bf16_vec_enabled() {
+        // SAFETY: 分支已确认 avx2 + fma 可用
+        return unsafe { bf16_dot_f32(a, b) };
+    }
+    let mut s = 0.0f32;
+    for (k, &bv) in b.iter().take(a.len()).enumerate() {
+        s += a[k] * bf16_to_f32(bv);
+    }
+    s
+}
+
+/// bf16 axpy 的安全封装（运行时选向量版 / 标量版）。
+fn bf16_axpy(acc: &mut [f32], a_v: f32, b: &[u16]) {
+    #[cfg(target_arch = "x86_64")]
+    if bf16_vec_enabled() {
+        // SAFETY: 分支已确认 avx2 + fma 可用
+        return unsafe { bf16_axpy_f32(acc, a_v, b) };
+    }
+    for (o, &bv) in acc.iter_mut().zip(b) {
+        *o += a_v * bf16_to_f32(bv);
+    }
+}
+
+/// 8 行 × 8 列的 AVX2+FMA 微内核：`C[8,8] += A[8,k] · B[k,8]`。
+///
+/// - A 的元素在 `a[r*a_row + kk*a_k]`：
+///   - 前向/`dx`（`a_t = false`）：A 是行主序 `[M,K]`，`(a_row, a_k) = (k, 1)`；
+///   - `dW = Aᵀ·g`（`a_t = true`）：物理 A 是 `[K,M]`，取的是它的转置，
+///     `(a_row, a_k) = (1, m)` —— 8 个"行"是内存里相邻的 8 个 float，反而更省缓存。
+/// - `b[kk*ldb + j]`（`ldb = n`：B 是物理 `[K, N]`，一次 `movups` 取 8 个连续 float）
+/// - `c[r*ldc + j]`（`ldc = n`：输出行主序，累加进已有值）
+///
+/// 8 个累加器常驻 ymm 寄存器：内层每 `kk` 只 1 次 32 B 装载 + 8 次广播 + 8 条 FMA，
+/// 足以喂满双 FMA 端口；而旧的 axpy 内核每个输出元素都要读写 `acc` 缓冲。
+/// 累加顺序仍是 `kk` 升序（只是把 `mul`+`add` 融合成 FMA，舍入点不同）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn micro_8x8_fma(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    k: usize,
+    a_row: usize,
+    a_k: usize,
+    ldb: usize,
+    ldc: usize,
+) {
+    use std::arch::x86_64::*;
+    // edition 2024 的 unsafe_op_in_unsafe_fn：`unsafe fn` 体内也要显式开块
+    unsafe {
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut acc4 = _mm256_setzero_ps();
+    let mut acc5 = _mm256_setzero_ps();
+    let mut acc6 = _mm256_setzero_ps();
+    let mut acc7 = _mm256_setzero_ps();
+    for kk in 0..k {
+        let bv = _mm256_loadu_ps(b.add(kk * ldb));
+        let ap = a.add(kk * a_k);
+        acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap), bv, acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(a_row)), bv, acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(2 * a_row)), bv, acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(3 * a_row)), bv, acc3);
+        acc4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(4 * a_row)), bv, acc4);
+        acc5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(5 * a_row)), bv, acc5);
+        acc6 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(6 * a_row)), bv, acc6);
+        acc7 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(7 * a_row)), bv, acc7);
+    }
+    let mut p;
+    p = c;
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc0));
+    p = c.add(ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc1));
+    p = c.add(2 * ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc2));
+    p = c.add(3 * ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc3));
+    p = c.add(4 * ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc4));
+    p = c.add(5 * ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc5));
+    p = c.add(6 * ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc6));
+    p = c.add(7 * ldc);
+    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc7));
+    }
+}
+
 /// 矩阵乘数据计算（GPU 优先，失败自动回退 CPU）。
 /// 行优先存储：out[B,M,N] = a[B,M,K] @ b[B,K,N]；batch=1 时即普通 2D 矩阵乘。
 /// `a_t`/`b_t` 为转置访问标志：为 true 时物理 a/b 分别是 [B,K,M]、[B,N,K]。
@@ -709,13 +906,12 @@ fn matmul_data(
                         }
                     }
                     MatData::Bf16(bp) if b_t => {
+                        // 物理 [N,K]：out[j] = Σ_kk a[kk]·bf16(b[j][kk])。
+                        // 用 AVX2 一次转换 8 个 bf16（标量 `bf16_to_f32` 会让循环
+                        // 失去向量化，实测那是 bf16 解码慢 4× 的主因）。
                         for (jj, o) in ochunk.iter_mut().enumerate() {
                             let row = &bp[(nb + jj) * k..(nb + jj) * k + k];
-                            let mut s = 0.0f32;
-                            for (kk, &bv) in row.iter().enumerate() {
-                                s += av[kk] * bf16_to_f32(bv);
-                            }
-                            *o = s;
+                            *o = bf16_dot(av, row);
                         }
                     }
                     MatData::F32(bp) => {
@@ -729,12 +925,11 @@ fn matmul_data(
                         }
                     }
                     MatData::Bf16(bp) => {
+                        // 物理 [K,N]：沿列段做 axpy（向量化转换见 `bf16_axpy`）
                         for kk in 0..k {
                             let a_v = av[kk];
                             let brow = &bp[kk * n + nb..kk * n + nb + nc];
-                            for (o, &bv) in ochunk.iter_mut().zip(brow) {
-                                *o += a_v * bf16_to_f32(bv);
-                            }
+                            bf16_axpy(ochunk, a_v, brow);
                         }
                     }
                 }
@@ -761,10 +956,102 @@ fn matmul_data(
         (a, b)
     };
     let mut out = vec![0.0f32; batch * m * n];
+
+    // ---- 可选快路：显式 AVX2+FMA 的 8×8 寄存器分块内核（`LLM_CPU_FMA=1`）----
+    //
+    // 现有 axpy 内核每个输出元素要做 `mul` + `add` 两条指令，而 AVX2 的 FMA 能合成
+    // 一条 —— 理论上限差 2×；再把 8 个累加器常驻 ymm（而不是每步读写 `acc` 缓冲），
+    // 实测在常见投影形状上快 1.5~2.4×（见 `probe_matmul_fma_speed`）。
+    //
+    // 之所以**默认关闭**：FMA 会改变舍入（`a*b+c` 只舍入一次），同一 seed 的 loss
+    // 曲线会在最后几位上与旧二进制不同，而本仓库大量断言/文档依赖"逐位一致"。
+    // 打开方式：`LLM_CPU_FMA=1`（`0` 或缺省 = 关闭）。
+    //
+    // 适用范围刻意收窄到 `batch == 1 && !a_t`：这正是 Linear/MLP/输出头前向与
+    // `dx = g @ W` 反向的形态（占训练 matmul 的大头，实测 1.6~3.3×）。
+    //
+    // **为什么不含 `a_t`（`dW = Aᵀ·g`）**：那个形态下 A 的物理布局让"8 个输出行"
+    // 落在同一/相邻 cache line、而归约步长跨 2 KB，实测落成 L3 带宽受限
+    // （`512×4096×384` 上 204 → 214 GF/s，仅 1.05×）；要吃到 FMA 的收益得先做
+    // A 打包 + 更大的寄存器块，属于另一轮 GEMM 重写。batch>1 的 3D 形态同理留给通用路径。
+    if cpu_fma_enabled() && batch == 1 && !a_t {
+        if let (MatData::F32(av), MatData::F32(bv)) = (a2.data, b2.data) {
+            // A 的访问步长：非转置时 A 是 [M,K]（行步长 k、归约步长 1）；
+            // a_t（`dW = Aᵀ·g`）时物理是 [K,M]，取的是转置 —— 行步长 1、归约步长 m。
+            let (a_row, a_k) = if a_t { (1usize, m) } else { (k, 1usize) };
+            out.par_chunks_mut(MC * n).enumerate().for_each(|(blk, out_blk)| {
+                let first_row = blk * MC;
+                let rows = out_blk.len() / n;
+                let mut nb = 0;
+                while nb < n {
+                    let nc = NC.min(n - nb);
+                    let mut c0 = 0;
+                    while c0 < nc {
+                        let cw = (nc - c0).min(8);
+                        let mut r0 = 0;
+                        while r0 < rows {
+                            let rw = (rows - r0).min(8);
+                            // A 的 8 行起点：batch==1 时全局行号就是 first_row + r0
+                            // （a_t 时物理是 [K,M]，行号即列下标，故不加 *k）
+                            let grow = first_row + r0;
+                            let a_off = if a_t { grow } else { grow * k };
+                            if rw == 8 && cw == 8 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    micro_8x8_fma(
+                                        av.as_ptr().add(a_off),
+                                        bv.as_ptr().add(nb + c0),
+                                        out_blk.as_mut_ptr().add(r0 * n + nb + c0),
+                                        k,
+                                        a_row,
+                                        a_k,
+                                        n,
+                                        n,
+                                    );
+                                }
+                            } else {
+                                // 尾块（行数或列宽不足 8）：与 axpy 内核同形的标量写法，
+                                // 累加顺序不变；只影响边界，不影响主循环。
+                                for kk in 0..k {
+                                    for r in 0..rw {
+                                        let a_v = av[a_off + r * a_row + kk * a_k];
+                                        let src = kk * n + nb + c0;
+                                        let dst = (r0 + r) * n + nb + c0;
+                                        for j in 0..cw {
+                                            out_blk[dst + j] += a_v * bv[src + j];
+                                        }
+                                    }
+                                }
+                            }
+                            r0 += 8;
+                        }
+                        c0 += 8;
+                    }
+                    nb += NC;
+                }
+            });
+            return out;
+        }
+    }
+
+    // ---- dW（`a_t`）的打包 + KC 归约分块路径 ----
+    //
+    // 与 FMA 微内核同属"快速数学"模式（`LLM_CPU_FMA=1`）：KC 归约分块会把
+    // "每个输出元素逐次累加"改成"块内先在寄存器里累加、再逐块并入"，结合顺序变了
+    // —— 即使微内核用 mul+add 也无法与旧路径逐位一致。所以它和 FMA 共用一个开关。
+    //
+    // 规模门槛：`k >= 256`（至少一个 KC 块，打包才摊得平）、`m*n >= 4096`（输出 tile
+    // 太少时并行度与面板复用都拿不到）。`LLM_MM_NO_PACKED=1` 可强制回退（同进程 A/B）。
+    if cpu_fma_enabled() && batch == 1 && a_t && k >= 256 && m * n >= 4096 {
+        if let (MatData::F32(av), MatData::F32(bv)) = (a2.data, b2.data) {
+            if std::env::var_os("LLM_MM_NO_PACKED").is_none() {
+                gemm_ta_packed(av, bv, &mut out, m, k, n);
+                return out;
+            }
+        }
+    }
+
     // 按**输出行**并行：把 (batch × m) 行拉平后交给 rayon，行与行之间无依赖。
-    // 旧实现按 batch 并行，而 Linear 会把 3D 输入展平成 2D（batch=1）调用，
-    // 于是注意力/MLP/输出头这些最重的矩阵乘全部退化成单线程三重循环，
-    // 多核完全用不上 —— 这是训练与推理的主要瓶颈。
     //
     // 循环顺序从 i-j-k 改为 i-k-j（axpy 累加）：
     // - b 的一行、out 的一行都是**连续**访问，对缓存和自动向量化友好；
@@ -782,63 +1069,259 @@ fn matmul_data(
     const MC: usize = 64; // 输出行块：一个 rayon 任务处理 64 行
     const NC: usize = 512; // 输出列块：B 切片 512×4 = 2 KB，留在 L1 被 64 行复用
 
-    out.par_chunks_mut(MC * n)
-        .enumerate()
-        .for_each(|(blk, out_blk)| {
-            let rows = out_blk.len() / n;
-            let first_row = blk * MC;
-            // 行块可能跨 batch 边界，所以每行单独算 a/b 的基址。
-            // a_t 时物理 a 是 [B,K,M]：基址落在 [b][0][row]，取数步长为 m（取逻辑列）；
-            // 否则物理 [B,M,K]：基址落在 [b][row][0]，取数步长为 1。
-            let a_stride = if a_t { m } else { 1 };
-            let mut a_bases = [0usize; MC];
-            let mut b_bases = [0usize; MC];
-            for r in 0..rows {
-                let grow = first_row + r;
-                let bi = grow / m;
-                a_bases[r] = if a_t {
-                    bi * k * m + grow % m
-                } else {
-                    (bi * m + grow % m) * k
-                };
-                b_bases[r] = bi * k * n;
-            }
-            let mut acc = vec![0.0f32; rows * NC];
-            let mut nb = 0;
-            while nb < n {
-                let nc = NC.min(n - nb);
-                acc[..rows * nc].fill(0.0);
-                for kk in 0..k {
+    // ---- 并行任务网格：行块 × 列块 ----
+    // 行块数 = ceil(batch*m / MC)。但 dW（`a_t`）的 m 是**输入维**：默认配置 m=128
+    // （2 个行块）、0.5B 的 m=896（14 个），20 个核里大半闲着 —— 这是 dW 只有
+    // 200 GF/s 而前向能到 250+ 的真因，不是算力也不是带宽。
+    // 行块填不满线程时，把输出**列**再切成若干段补足并行度：每个任务写的是
+    // `out` 的不同列，互不重叠（下面用 `split_at_mut` 把它切成互斥切片，不用 unsafe）。
+    let rows_total = batch * m;
+    let row_blocks = rows_total.div_ceil(MC).max(1);
+    let nt = rayon::current_num_threads().max(1);
+    // 调试开关：强制关掉列分块（回到"只按行块并行"的旧分解），用于同进程 A/B。
+    let col_split_off = std::env::var_os("LLM_MM_NO_COLSPLIT").is_some();
+    // 只有当**行块数远少于线程数**时才切列：
+    // - `m=128`（默认配置的 dW）：2 个行块 vs 20 线程，实测 1.8~2.9×；
+    // - `m=896`（0.5B 的 dW）：14 个行块已够铺满，再切列反而把每个任务对 B 的
+    //   "整段列扫"打散，实测掉到 0.29× —— 所以门槛取 `row_blocks * 3 < nt`。
+    let col_blocks = if col_split_off || row_blocks * 3 >= nt || n < 64 {
+        1
+    } else {
+        ((nt + row_blocks - 1) / row_blocks).min((n / 16).max(1))
+    };
+
+    if col_blocks <= 1 {
+        out.par_chunks_mut(MC * n)
+            .enumerate()
+            .for_each(|(blk, out_blk)| {
+                let rows = out_blk.len() / n;
+                let (a_bases, b_bases) = row_bases(blk * MC, rows, m, k, n, a_t);
+                let mut acc = vec![0.0f32; rows * NC];
+                let mut nb = 0;
+                while nb < n {
+                    let nc = NC.min(n - nb);
+                    axpy_tile(a2, b2, &a_bases[..rows], &b_bases[..rows], nb, k, n, if a_t { m } else { 1 }, nc, &mut acc[..rows * nc]);
                     for r in 0..rows {
-                        let a_v = a2.get(a_bases[r] + kk * a_stride);
-                        let b_off = b_bases[r] + kk * n + nb;
-                        let acc_row = &mut acc[r * nc..r * nc + nc];
-                        // f32 臂逐字保持原 zip 内核（数值零变化）；bf16 臂读 u16
-                        // 行段逐元素转换——同一 bf16_to_f32、同一 f32 累加顺序
-                        match b2.data {
-                            MatData::F32(b2f) => {
-                                let b_row = &b2f[b_off..b_off + nc];
-                                for (o, &b_v) in acc_row.iter_mut().zip(b_row) {
-                                    *o += a_v * b_v;
-                                }
-                            }
-                            MatData::Bf16(b2u) => {
-                                let b_row = &b2u[b_off..b_off + nc];
-                                for (o, &b_v) in acc_row.iter_mut().zip(b_row) {
-                                    *o += a_v * bf16_to_f32(b_v);
-                                }
-                            }
-                        }
+                        let dst = r * n + nb;
+                        out_blk[dst..dst + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
                     }
+                    nb += NC;
                 }
+            });
+        return out;
+    }
+
+    // ---- 列分块路径：把 out 按列切成 col_blocks 份（每份含所有行的一段）----
+    let bounds: Vec<(usize, usize)> = (0..col_blocks)
+        .map(|t| (t * n / col_blocks, (t + 1) * n / col_blocks))
+        .collect();
+    let mut pieces: Vec<Vec<&mut [f32]>> =
+        (0..col_blocks).map(|_| Vec::with_capacity(rows_total)).collect();
+    for row in out.chunks_mut(n) {
+        let mut rest = row;
+        for (t, b) in bounds.iter().enumerate() {
+            let (head, tail) = rest.split_at_mut(b.1 - b.0);
+            pieces[t].push(head);
+            rest = tail;
+        }
+        debug_assert!(rest.is_empty(), "列分块必须恰好切完一整行");
+    }
+    pieces.into_par_iter().enumerate().for_each(|(t, mut cols)| {
+        let (c0, c1) = bounds[t];
+        let mut acc = vec![0.0f32; MC * NC];
+        let mut r0 = 0;
+        while r0 < rows_total {
+            let rows = (rows_total - r0).min(MC);
+            let (a_bases, b_bases) = row_bases(r0, rows, m, k, n, a_t);
+            let mut nb = c0;
+            while nb < c1 {
+                let nc = NC.min(c1 - nb);
+                axpy_tile(a2, b2, &a_bases[..rows], &b_bases[..rows], nb, k, n, if a_t { m } else { 1 }, nc, &mut acc[..rows * nc]);
                 for r in 0..rows {
-                    let dst = r * n + nb;
-                    out_blk[dst..dst + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
+                    let off = nb - c0;
+                    cols[r0 + r][off..off + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
                 }
                 nb += NC;
             }
-        });
+            r0 += MC;
+        }
+    });
     out
+}
+
+/// 打包 + KC 归约分块的 `dW = Aᵀ·B` 内核（`a_t = true`、`batch = 1`、f32）。
+///
+/// 输入：`av` 是物理 `[K, M]` 行主序（A 的转置），`bv` 是 `[K, N]` 行主序，输出 `out` 是 `[M, N]`。
+///
+/// **为什么需要打包**：不打包时每个 8×8 微块都要独立流式读一遍 A/B —— 一条 64 B 的
+/// cache line 只用到 8 个 float（一半），而且同一个面板被 (m/8)×(n/8) 个微块重复读，
+/// 实测 `128×4096×384`（默认配置的 qkv dW）只有 ~105 GF/s，瓶颈是 L3 带宽而不是算力。
+/// 打包后：一条 line 被多个微块共用（面板连续、行宽 MC/NC），配合 `KC` 归约分块
+/// 让 `KC×MC` / `KC×NC` 两个面板（各 64 KB）留在 L1/L2，被整块 `MC×NC` 输出复用。
+///
+/// **数值**：每个输出元素仍按 `t` 升序累加（KC 块升序、块内 t 升序），与旧的 axpy
+/// 路径**逐位一致** —— 打包只是搬字节，不改变任何算术。
+fn gemm_ta_packed(av: &[f32], bv: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+    const MC: usize = 64; // 输出行块
+    const NC: usize = 64; // 输出列块
+    const KC: usize = 256; // 归约块：两个面板各 MC/NC×KC×4 B = 64 KB，L2 常驻
+
+    let ib_blocks = m.div_ceil(MC);
+    let jb_blocks = n.div_ceil(NC);
+
+    // 把 out 切成互不重叠的 (ib, jb) tile：先按行块取 `chunks_mut`，
+    // 再在块内按列 `split_at_mut` —— 全部是安全借用，不需要 unsafe。
+    let mut tiles: Vec<Vec<&mut [f32]>> = Vec::with_capacity(ib_blocks * jb_blocks);
+    for block in out.chunks_mut(MC * n) {
+        let rows = block.len() / n;
+        let mut per_col: Vec<Vec<&mut [f32]>> =
+            (0..jb_blocks).map(|_| Vec::with_capacity(rows)).collect();
+        for row in block.chunks_mut(n) {
+            let mut rest = row;
+            for (jb, col) in per_col.iter_mut().enumerate() {
+                let cols = (n - jb * NC).min(NC);
+                let (head, tail) = rest.split_at_mut(cols);
+                col.push(head);
+                rest = tail;
+            }
+            debug_assert!(rest.is_empty(), "列分块必须恰好切完一整行");
+        }
+        tiles.extend(per_col);
+    }
+
+    tiles
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(idx, rows_out)| {
+            let ib = idx / jb_blocks;
+            let jb = idx % jb_blocks;
+            let m0 = ib * MC;
+            let n0 = jb * NC;
+            let rows = (m - m0).min(MC);
+            let cols = (n - n0).min(NC);
+            let mut acc = vec![0.0f32; MC * NC];
+            let mut ap = vec![0.0f32; KC * MC];
+            let mut bp = vec![0.0f32; KC * NC];
+            let mut kb = 0;
+            while kb < k {
+                let kc = KC.min(k - kb);
+                // 打包：A 面板 [kc][rows]、B 面板 [kc][cols]（都是连续行段拷贝）
+                for t in 0..kc {
+                    let a_src = &av[(kb + t) * m + m0..(kb + t) * m + m0 + rows];
+                    ap[t * MC..t * MC + rows].copy_from_slice(a_src);
+                    let b_src = &bv[(kb + t) * n + n0..(kb + t) * n + n0 + cols];
+                    bp[t * NC..t * NC + cols].copy_from_slice(b_src);
+                }
+                // 微块：8 行 × 8 列，累加器留在寄存器里跑完整个 kc
+                let mut i0 = 0;
+                while i0 < rows {
+                    let iw = (rows - i0).min(8);
+                    let mut j0 = 0;
+                    while j0 < cols {
+                        let jw = (cols - j0).min(8);
+                        if iw == 8 && jw == 8 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                micro_8x8_fma(
+                                    ap.as_ptr().add(i0),
+                                    bp.as_ptr().add(j0),
+                                    acc.as_mut_ptr().add(i0 * NC + j0),
+                                    kc,
+                                    1,  // a_row：打包后 A 的 8 个"行"是相邻 float
+                                    MC, // a_k：打包后 A 的归约步长是一整行 MC
+                                    NC, // ldb
+                                    NC, // ldc
+                                );
+                            }
+                        } else {
+                            // 尾块：t 升序、行内 j 升序 —— 与微块路径逐位一致
+                            for t in 0..kc {
+                                for i in 0..iw {
+                                    let a_v = ap[t * MC + i0 + i];
+                                    for j in 0..jw {
+                                        acc[(i0 + i) * NC + j0 + j] += a_v * bp[t * NC + j0 + j];
+                                    }
+                                }
+                            }
+                        }
+                        j0 += 8;
+                    }
+                    i0 += 8;
+                }
+                kb += KC;
+            }
+            // 写回（out 初值为 0，直接覆盖）
+            for (r, dst) in rows_out.into_iter().enumerate() {
+                dst.copy_from_slice(&acc[r * NC..r * NC + cols]);
+            }
+        });
+}
+
+/// 一个行块内每一行的 A/B 基址（行块可能跨 batch 边界，所以每行单独算）。
+///
+/// - `a_t`：物理 a 是 `[B,K,M]`，基址落在 `[b][0][row]`，取数步长 m；
+/// - 否则：物理 `[B,M,K]`，基址落在 `[b][row][0]`，取数步长 1。
+fn row_bases(
+    first_row: usize,
+    rows: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    a_t: bool,
+) -> ([usize; 64], [usize; 64]) {
+    debug_assert!(rows <= 64, "行块不能超过 MC=64");
+    let mut a_bases = [0usize; 64];
+    let mut b_bases = [0usize; 64];
+    for r in 0..rows {
+        let grow = first_row + r;
+        let bi = grow / m;
+        a_bases[r] = if a_t {
+            bi * k * m + grow % m
+        } else {
+            (bi * m + grow % m) * k
+        };
+        b_bases[r] = bi * k * n;
+    }
+    (a_bases, b_bases)
+}
+
+/// 一个 (行块 × 列块) 的 axpy 内核：把 `[rows, nc]` 的结果写进 `acc`（行宽 nc）。
+///
+/// 累加顺序仍是"每个输出元素按 `kk` 升序"，行内按 j 升序 —— 与旧实现**逐位一致**。
+#[allow(clippy::too_many_arguments)]
+fn axpy_tile(
+    a2: MatOperand<'_>,
+    b2: MatOperand<'_>,
+    a_bases: &[usize],
+    b_bases: &[usize],
+    nb: usize,
+    k: usize,
+    n: usize,
+    a_stride: usize,
+    nc: usize,
+    acc: &mut [f32],
+) {
+    acc.fill(0.0);
+    for kk in 0..k {
+        for (r, &a_base) in a_bases.iter().enumerate() {
+            let a_v = a2.get(a_base + kk * a_stride);
+            let b_off = b_bases[r] + kk * n + nb;
+            let acc_row = &mut acc[r * nc..r * nc + nc];
+            // f32 臂逐字保持原 zip 内核（数值零变化）；bf16 臂读 u16 行段逐元素转换
+            match b2.data {
+                MatData::F32(b2f) => {
+                    let b_row = &b2f[b_off..b_off + nc];
+                    for (o, &b_v) in acc_row.iter_mut().zip(b_row) {
+                        *o += a_v * b_v;
+                    }
+                }
+                MatData::Bf16(b2u) => {
+                    let b_row = &b2u[b_off..b_off + nc];
+                    bf16_axpy(acc_row, a_v, b_row);
+                }
+            }
+        }
+    }
 }
 
 /// 展平批矩阵转置：[B, rows, cols] -> [B, cols, rows]（CPU 回退用，GPU 路径不需要）
@@ -3877,29 +4360,57 @@ impl Tensor {
         assert_eq!(x.rank(), 2, "gather_rows 的 table 必须为 2 维");
         let (v, d) = (x.shape[0], x.shape[1]);
         let n = indices.len();
-        let sd = x.decode();
+
         // 越界检查提到循环外（原先每行一次 `assert!`，且把内层行拷贝卡在
         // "逐元素 + 边界检查"的标量循环上，编译器无法把它变成 memcpy）
         if let Some(&bad) = indices.iter().find(|&&i| i >= v) {
             panic!("gather 索引越界：{} >= {}", bad, v);
         }
         let mut out_data = vec![0.0f32; n * d];
-        let sd_ref: &[f32] = &sd;
         // 行与行互相独立 ⇒ 按行分批 + `copy_from_slice`（一次 memcpy，可向量化）。
         // **按字节量**而不是按行分批：每行只有 d 个元素（默认配置 d=128 → 512 B），
         // 一行一个 rayon 任务的话任务开销会盖过拷贝本身（4096 行 = 4096 个任务）。
         let rows_per = (64 * 1024 / d).max(1); // 每任务 ~256 KB
-        out_data
-            .par_chunks_mut(d * rows_per)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let i0 = ci * rows_per;
-                for (k, orow) in chunk.chunks_mut(d).enumerate() {
-                    let src = indices[i0 + k] * d;
-                    orow.copy_from_slice(&sd_ref[src..src + d]);
+        // ⚠️ **bf16 表不能走 `decode()`**：那会把整张表（0.5B 模型 152k×896 = 544 MB）
+        // 每 token 复制+转换一遍，实测让解码从 73.8 掉到 374.8 ms/token（5×）。
+        // 这里直接读 u16 槽、只转换真正被取到的那 n 行。
+        // ⚠️ **bf16 表不能走 `decode()`**：那会把整张表（0.5B 模型 152k×896 = 544 MB）
+        // 每 token 复制+转换一遍，实测让解码从 73.8 掉到 374.8 ms/token（5×）。
+        // 这里直接读槽内的原始变体，只转换真正被取到的那 n 行。
+        {
+            let slot = x.data.borrow();
+            match &*slot {
+                Buffer::F32(v) => {
+                    let sd_ref: &[f32] = v.as_slice();
+                    out_data
+                        .par_chunks_mut(d * rows_per)
+                        .enumerate()
+                        .for_each(|(ci, chunk)| {
+                            let i0 = ci * rows_per;
+                            for (k, orow) in chunk.chunks_mut(d).enumerate() {
+                                let src = indices[i0 + k] * d;
+                                orow.copy_from_slice(&sd_ref[src..src + d]);
+                            }
+                        });
                 }
-            });
-        drop(sd);
+                Buffer::Bf16(v) => {
+                    let sd_ref: &[u16] = v.as_slice();
+                    out_data
+                        .par_chunks_mut(d * rows_per)
+                        .enumerate()
+                        .for_each(|(ci, chunk)| {
+                            let i0 = ci * rows_per;
+                            for (k, orow) in chunk.chunks_mut(d).enumerate() {
+                                let src = indices[i0 + k] * d;
+                                let row = &sd_ref[src..src + d];
+                                for (o, &bits) in orow.iter_mut().zip(row) {
+                                    *o = bf16_to_f32(bits);
+                                }
+                            }
+                        });
+                }
+            }
+        }
         let idx_vec = indices.to_vec();
 
         let result = x.new_like(out_data, vec![n, d], x.requires_grad.load(Ordering::Relaxed));
@@ -4158,6 +4669,221 @@ mod tests {
             expect_dw.extend_from_slice(&x_data);
         }
         assert_eq!(dw_view, expect_dw);
+    }
+
+    /// 矩阵乘内核吞吐探针（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release tensor::tests::probe_matmul_fma_speed -- --ignored --nocapture
+    /// ```
+    /// 同一进程里交替测"现有 axpy 内核"与"AVX2+FMA 8×8 寄存器分块内核"。
+    /// 两者只在末尾几位不同（FMA 少一次舍入），这里一并打印最大绝对偏差。
+    #[test]
+    #[ignore]
+    fn probe_matmul_fma_speed() {
+        // (m, k, n, a_t)：前向投影 / MLP / 输出头，以及 dW = Aᵀ·g（a_t = true）。
+        // a_t 的 m 是**输入维**（默认配置 128、0.5B 的 896），行块数远小于线程数，
+        // 所以这两行主要检验"列分块补并行度"的效果。
+        let shapes = [
+            (4096usize, 128usize, 384usize, false),
+            (4096, 512, 128, false),
+            (4096, 128, 8192, false),
+            (128, 4096, 384, true),  // 默认配置的 qkv dW
+            (128, 4096, 8192, true), // 默认配置的输出头 dW
+        ];
+        for &(m, k, n, a_t) in &shapes {
+            let a_len = m * k;
+            let ad: Vec<f32> = (0..a_len)
+                .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+                .collect();
+            let bd: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 53 % 97) as f32) * 0.01 - 0.5)
+                .collect();
+            let a = MatOperand::F32(&ad);
+            let b = MatOperand::F32(&bd);
+            let run = || {
+                let t = std::time::Instant::now();
+                let v = matmul_data(a, b, m, k, n, 1, a_t, false);
+                (t.elapsed().as_secs_f64(), v)
+            };
+            let mut measure = |on: bool| -> (f64, Vec<f32>) {
+                unsafe {
+                    if on {
+                        std::env::set_var("LLM_CPU_FMA", "1");
+                    } else {
+                        std::env::set_var("LLM_CPU_FMA", "0");
+                    }
+                }
+                let _ = run(); // 预热
+                let mut best = f64::MAX;
+                let mut last = Vec::new();
+                for _ in 0..3 {
+                    let (s, v) = run();
+                    best = best.min(s);
+                    last = v;
+                }
+                (best, last)
+            };
+            let (t_off, v_off) = measure(false);
+            let (t_on, v_on) = measure(true);
+            unsafe { std::env::remove_var("LLM_CPU_FMA") };
+            let flops = 2.0 * (m * k * n) as f64;
+            let maxdiff = v_off
+                .iter()
+                .zip(&v_on)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "{m}x{k}x{n} a_t={a_t}: 关 {:.1} GF/s | 开 {:.1} GF/s | **{:.2}×** | 两侧最大偏差 {:.2e}",
+                flops / t_off / 1e9,
+                flops / t_on / 1e9,
+                t_off / t_on,
+                maxdiff
+            );
+        }
+    }
+
+    /// 列分块并行度探针（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release tensor::tests::probe_matmul_colsplit_speed -- --ignored --nocapture
+    /// ```
+    /// 测 `dW = Aᵀ·g`（`a_t = true`）：这个形态的 `m` 是**输入维**（默认配置 128、
+    /// 0.5B 的 896），按行块并行只能切出 2~14 个任务，20 个核大半闲着。
+    /// `LLM_MM_NO_COLSPLIT=1` 可强制回到旧分解，用来在同一进程里 A/B。
+    #[test]
+    #[ignore]
+    fn probe_matmul_colsplit_speed() {
+        let shapes = [
+            (128usize, 4096usize, 384usize),
+            (128, 4096, 8192),
+            (896, 4096, 896),
+        ];
+        for &(m, k, n) in &shapes {
+            let ad: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+                .collect();
+            let bd: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 53 % 97) as f32) * 0.01 - 0.5)
+                .collect();
+            let a = MatOperand::F32(&ad);
+            let b = MatOperand::F32(&bd);
+            let run = || {
+                let t = std::time::Instant::now();
+                let v = matmul_data(a, b, m, k, n, 1, true, false);
+                (t.elapsed().as_secs_f64(), v)
+            };
+            let mut measure = |split: bool| -> (f64, Vec<f32>) {
+                unsafe {
+                    if split {
+                        std::env::remove_var("LLM_MM_NO_COLSPLIT");
+                    } else {
+                        std::env::set_var("LLM_MM_NO_COLSPLIT", "1");
+                    }
+                }
+                let _ = run();
+                let mut best = f64::MAX;
+                let mut last = Vec::new();
+                for _ in 0..3 {
+                    let (s, v) = run();
+                    best = best.min(s);
+                    last = v;
+                }
+                (best, last)
+            };
+            let (t_off, v_off) = measure(false);
+            let (t_on, v_on) = measure(true);
+            unsafe { std::env::remove_var("LLM_MM_NO_COLSPLIT") };
+            let flops = 2.0 * (m * k * n) as f64;
+            let diff = v_off
+                .iter()
+                .zip(&v_on)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "dW {m}x{k}x{n}: 只按行块 {:.1} GF/s | 加列分块 {:.1} GF/s | **{:.2}×** | 最大偏差 {:.2e}（应恒为 0）",
+                flops / t_off / 1e9,
+                flops / t_on / 1e9,
+                t_off / t_on,
+                diff
+            );
+        }
+    }
+
+    /// 打包 + KC 分块内核探针（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release tensor::tests::probe_matmul_packed_speed -- --ignored --nocapture
+    /// ```
+    /// `LLM_MM_NO_PACKED=1` 回退到通用 axpy 路径，两者输出必须**逐位相同**。
+    #[test]
+    #[ignore]
+    fn probe_matmul_packed_speed() {
+        let shapes = [
+            (128usize, 4096usize, 384usize),
+            (128, 4096, 8192),
+            (896, 4096, 896),
+            (384, 4096, 768),
+        ];
+        for &(m, k, n) in &shapes {
+            let ad: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+                .collect();
+            let bd: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 53 % 97) as f32) * 0.01 - 0.5)
+                .collect();
+            let a = MatOperand::F32(&ad);
+            let b = MatOperand::F32(&bd);
+            let run = || {
+                let t = std::time::Instant::now();
+                let v = matmul_data(a, b, m, k, n, 1, true, false);
+                (t.elapsed().as_secs_f64(), v)
+            };
+            let mut measure = |fma: bool, no_packed: bool| -> (f64, Vec<f32>) {
+                unsafe {
+                    if fma {
+                        std::env::set_var("LLM_CPU_FMA", "1");
+                    } else {
+                        std::env::set_var("LLM_CPU_FMA", "0");
+                    }
+                    if no_packed {
+                        std::env::set_var("LLM_MM_NO_PACKED", "1");
+                    } else {
+                        std::env::remove_var("LLM_MM_NO_PACKED");
+                    }
+                }
+                let _ = run();
+                let mut best = f64::MAX;
+                let mut last = Vec::new();
+                for _ in 0..3 {
+                    let (s, v) = run();
+                    best = best.min(s);
+                    last = v;
+                }
+                (best, last)
+            };
+            let (t_def, v_def) = measure(false, true); // 默认：axpy（逐位基准）
+            let (_, v_fma_only) = measure(true, true); // 只开 FMA、不打包 → 仍走 axpy
+            let (t_fast, v_fast) = measure(true, false); // 快速数学模式：打包 + KC + FMA
+            unsafe {
+                std::env::remove_var("LLM_CPU_FMA");
+                std::env::remove_var("LLM_MM_NO_PACKED");
+            }
+            let flops = 2.0 * (m * k * n) as f64;
+            let same = v_def.iter().zip(&v_fma_only).all(|(x, y)| x == y);
+            let diff = v_def
+                .iter()
+                .zip(&v_fast)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "dW {m}x{k}x{n}: 默认(axpy) {:.1} GF/s | 打包+KC+FMA {:.1} GF/s | **{:.2}×** | 仅开 FMA 仍逐位一致={same} | 打包后最大偏差 {:.2e}",
+                flops / t_def / 1e9,
+                flops / t_fast / 1e9,
+                t_def / t_fast,
+                diff
+            );
+        }
     }
 
     #[test]

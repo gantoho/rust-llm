@@ -462,6 +462,19 @@ pub(crate) struct TransformerBlock {
     aux: Shared<Option<Tensor>>,
 }
 
+/// 把若干 `[1, d]` 张量**按行**拼成 `[n, d]`。
+///
+/// 连续批处理里用它把"逐条算出来的注意力输出"合回一个批次。逐条读取、逐条释放
+/// 数据锁（不长时间持有多把锁），B 通常 ≤ 8，代价只有 `B×d` 个 float 的拷贝。
+fn concat_rows(parts: &[Tensor], d: usize) -> Tensor {
+    let mut data = Vec::with_capacity(parts.len() * d);
+    for p in parts {
+        let g = p.data_ref();
+        data.extend_from_slice(&g[..d]);
+    }
+    Tensor::from_vec(data, vec![parts.len(), d])
+}
+
 impl TransformerBlock {
     pub(crate) fn new(cfg: &TransformerConfig, rng: &mut Rng) -> Self {
         let ffn = if cfg.n_expert > 1 {
@@ -1635,6 +1648,65 @@ impl Transformer {
         self.forward_core(idx, b, t, None, None, training)
     }
 
+    /// **连续批处理的一步解码**：B 条序列各推进 1 个 token，各自带自己的 KV cache 与绝对位置。
+    ///
+    /// 与逐条 `forward()` 的差别只有**并行粒度**：
+    /// - **批量做**：embedding、LayerNorm、MLP、残差、最终输出头 —— 权重只流一遍，
+    ///   被 B 条序列共享（解码是访存带宽受限，这正是吞吐的来源）；
+    /// - **逐条做**：注意力 —— 每条序列的 cache 长度与绝对位置都不同，没法在一个
+    ///   `KVCache` 里表示；好在 t=1 时注意力只碰 `O(len)` 个元素的 K/V，代价很小。
+    ///
+    /// `bases[i]` 是第 i 条序列**当前这个 token** 的绝对位置（= 其 cache 已有的长度）。
+    /// 返回 `[B, vocab]` 的 logits。
+    ///
+    /// 限制：只支持单残差流（`n_stream == 1`）的 f32 模型；mHC 多流 / bf16 存储
+    /// 请回退到逐条 [`Transformer::forward`]。
+    pub fn decode_batch(
+        &self,
+        ids: &[usize],
+        caches: &mut [Vec<KVCache>],
+        bases: &[usize],
+    ) -> Tensor {
+        let b = ids.len();
+        let d = self.cfg.n_embd;
+        assert!(b > 0, "批大小不能为 0");
+        assert_eq!(caches.len(), b, "caches 数量必须等于批大小");
+        assert_eq!(bases.len(), b, "bases 数量必须等于批大小");
+        assert_eq!(
+            self.cfg.n_stream, 1,
+            "decode_batch 只支持单残差流（mHC 请逐条前向）"
+        );
+        // embedding：[B, d]
+        let mut x = self.tok_emb.table.gather_rows(ids);
+        assert_eq!(x.shape(), &[b, d], "embedding 输出应为 [B, d]");
+        assert!(
+            matches!(x.dtype(), crate::tensor::DType::F32),
+            "decode_batch 只支持 f32 存储（bf16 请逐条前向）"
+        );
+        for (li, block) in self.blocks.iter().enumerate() {
+            // ---- 注意力子层：ln1 批量、注意力逐条 ----
+            let h = block.ln1.forward(&x);
+            let mut parts: Vec<Tensor> = Vec::with_capacity(b);
+            for i in 0..b {
+                // [B,d] → [1,1,d]：注意力要 3 维输入
+                let hi = h.gather_rows(&[i]).reshape(vec![1, 1, d]);
+                let o = block
+                    .attn
+                    .forward(&hi, None, Some(&mut caches[i][li]), bases[i]);
+                parts.push(o.reshape(vec![1, d]));
+            }
+            let attn_out = concat_rows(&parts, d);
+            x = x.add(&attn_out);
+            // ---- MLP 子层：整批一次 ----
+            let h2 = block.ln2.forward(&x);
+            let (h2, aux) = block.ffn.forward_with_aux(&h2);
+            *block.aux.borrow_mut() = aux;
+            x = x.add(&h2);
+        }
+        let x = self.ln_f.forward(&x);
+        x.matmul(&self.head_table().transpose())
+    }
+
     /// 同 [`Transformer::forward_hidden`]，但带像素（多模态训练用）：
     /// `pixels = Some([b, 3·S·S] 首尾相接的 CHW 像素，取值 [-1,1])`。
     pub fn forward_hidden_mm(
@@ -2119,6 +2191,203 @@ mod tests {
     use crate::loss::cross_entropy_loss;
     use crate::module::{Module, zero_grad_all};
     use crate::optim::{AdamW, Optimizer};
+
+    /// 解码期权重精度探针（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release model::tests::probe_decode_bf16_speed -- --ignored --nocapture
+    /// ```
+    /// 解码是**权重带宽**受限：0.5B f32 每 token 要流 1.9 GB。bf16 存储（内存减半、
+    /// 算子的转换与累加仍是 f32）能把这段访存砍一半 —— 这里对比实测。
+    #[test]
+    #[ignore]
+    fn probe_decode_bf16_speed() {
+        use std::time::Instant;
+        let path = "checkpoints/qwen05/model.ckpt";
+        if !std::path::Path::new(path).exists() {
+            println!("缺少 {path}，跳过");
+            return;
+        }
+        let hdr = crate::checkpoint::load_header(path);
+        let mut rng = Rng::new(1);
+        let model = crate::rng::without_init(|| Transformer::new(hdr.model.clone(), &mut rng));
+        crate::checkpoint::load_params(path, &model);
+        let steps = 6usize;
+        let prefill = 8usize;
+        // 一条序列、逐 token 前向（与 serve 的非批处理路径同形）
+        let mut bench = |label: &str| -> f64 {
+            let mut cache = model.new_kv_cache();
+            let mut pos = 0usize;
+            let mut tok = 100usize;
+            for _ in 0..prefill {
+                crate::tensor::no_grad(|| model.forward(&[tok], 1, 1, Some(&mut cache), false));
+                pos += 1;
+                tok = 101;
+            }
+            let t = Instant::now();
+            for _ in 0..steps {
+                crate::tensor::no_grad(|| model.forward(&[tok], 1, 1, Some(&mut cache), false));
+                pos += 1;
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
+            println!("{label}: {ms:.1} ms/token（{:.1} tok/s，位置 {pos}）", 1e3 / ms);
+            ms
+        };
+        let f32_ms = bench("f32 权重");
+        // 原地把参数缓冲换成 u16 bf16（与 train.bf16 同一套转换）
+        let params = model.parameters();
+        for p in &params {
+            p.to_bf16();
+        }
+        let bf16_ms = bench("bf16 权重");
+        println!(
+            "→ bf16/f32 解码耗时比 = {:.2}（小于 1 表示 bf16 更快），内存 1.98 GB → 0.99 GB",
+            bf16_ms / f32_ms
+        );
+    }
+
+
+    ///
+    /// ```text
+    /// cargo test --release model::tests::probe_decode_batch_speed -- --ignored --nocapture
+    /// ```
+    /// 用仓库里真实的 Qwen2.5-0.5B 配置（不加载权重，随机初值即可测时间）对比：
+    /// - **逐条**：每步对每条序列各调一次 `forward`（现在 `serve` 的做法，串行）；
+    /// - **批量**：每步一次 `decode_batch`（注意力逐条、其余整批）。
+    /// 解码是访存带宽受限：权重流一遍本该服务整批，逐条则流 B 遍。
+    #[test]
+    #[ignore]
+    fn probe_decode_batch_speed() {
+        use std::time::Instant;
+        let path = "checkpoints/qwen05/model.ckpt";
+        if !std::path::Path::new(path).exists() {
+            println!("缺少 {path}，跳过");
+            return;
+        }
+        let hdr = crate::checkpoint::load_header(path);
+        let mut rng = Rng::new(1);
+        // 不加载权重（时间只取决于形状），但随机初始化很贵 —— 用 without_init 跳过
+        let model = crate::rng::without_init(|| Transformer::new(hdr.model.clone(), &mut rng));
+        let steps = 6usize;
+        let prefill = 8usize;
+        println!(
+            "模型：n_embd={} n_layer={} n_head={} vocab={}",
+            model.cfg.n_embd,
+            model.cfg.n_layer,
+            model.cfg.n_head,
+            model.cfg.vocab_size
+        );
+        for b in [1usize, 4, 8, 16] {
+            let mut ids: Vec<usize> = (0..b).map(|i| 100 + i).collect();
+            // ---- 逐条 ----
+            let mut caches: Vec<Vec<KVCache>> = (0..b).map(|_| model.new_kv_cache()).collect();
+            let mut bases: Vec<usize> = vec![0; b];
+            for _ in 0..prefill {
+                for i in 0..b {
+                    crate::tensor::no_grad(|| {
+                        model.forward(&[ids[i]], 1, 1, Some(&mut caches[i]), false)
+                    });
+                }
+                bases.iter_mut().for_each(|x| *x += 1);
+            }
+            let t = Instant::now();
+            for _ in 0..steps {
+                for i in 0..b {
+                    crate::tensor::no_grad(|| {
+                        model.forward(&[ids[i]], 1, 1, Some(&mut caches[i]), false)
+                    });
+                }
+                bases.iter_mut().for_each(|x| *x += 1);
+            }
+            let t_seq = t.elapsed().as_secs_f64() / steps as f64;
+
+            // ---- 批量 ----
+            let mut caches2: Vec<Vec<KVCache>> = (0..b).map(|_| model.new_kv_cache()).collect();
+            let mut bases2: Vec<usize> = vec![0; b];
+            for _ in 0..prefill {
+                crate::tensor::no_grad(|| {
+                    model.decode_batch(&ids, &mut caches2, &bases2);
+                });
+                bases2.iter_mut().for_each(|x| *x += 1);
+            }
+            let t = Instant::now();
+            for _ in 0..steps {
+                crate::tensor::no_grad(|| {
+                    model.decode_batch(&ids, &mut caches2, &bases2);
+                });
+                bases2.iter_mut().for_each(|x| *x += 1);
+            }
+            let t_bat = t.elapsed().as_secs_f64() / steps as f64;
+            println!(
+                "B={b}: 逐条 {:.1} ms/步（{:.1} tok/s）| 批量 {:.1} ms/步（{:.1} tok/s）| **{:.2}× 吞吐**",
+                t_seq * 1e3,
+                b as f64 / t_seq,
+                t_bat * 1e3,
+                b as f64 / t_bat,
+                t_seq / t_bat
+            );
+            ids[0] += 1;
+        }
+    }
+
+
+    ///
+    /// 三条序列的**前缀长度不同**（1 / 3 / 5），所以各自的 cache 长度与绝对位置都不同 ——
+    /// 这正是批处理最容易写错的地方：位置用错会让 RoPE 整体错位，cache 用错会读到别人的
+    /// K/V。容差取 1e-5：默认（非 FMA）内核下两者应**逐位相同**，开 `LLM_CPU_FMA=1`
+    /// 时 m=3 与 m=1 走的内核不同（FMA vs 单行），会有 ~1e-6 的舍入差。
+    #[test]
+    fn test_decode_batch_matches_sequential() {
+        let mut rng = Rng::new(7);
+        let cfg = TransformerConfig::tiny(64);
+        let model = Transformer::new(cfg.clone(), &mut rng);
+        let vocab = cfg.vocab_size;
+        let prefixes: [&[usize]; 3] = [&[7], &[5, 9, 11], &[3, 4, 5, 6, 12]];
+        let next = [13usize, 17, 19];
+
+        // 参考：逐条 prefill 前缀，再各自走一步
+        let mut want: Vec<Vec<f32>> = Vec::new();
+        for (i, p) in prefixes.iter().enumerate() {
+            let mut cache = model.new_kv_cache();
+            crate::tensor::no_grad(|| {
+                model.forward(p, 1, p.len(), Some(&mut cache), false);
+            });
+            let lg = crate::tensor::no_grad(|| {
+                model.forward(&[next[i]], 1, 1, Some(&mut cache), false)
+            });
+            want.push(lg.data());
+        }
+
+        // 批量：同样的前缀 prefill，然后一步 decode_batch
+        let mut caches = Vec::new();
+        let mut bases = Vec::new();
+        for p in prefixes.iter() {
+            let mut cache = model.new_kv_cache();
+            crate::tensor::no_grad(|| {
+                model.forward(p, 1, p.len(), Some(&mut cache), false);
+            });
+            bases.push(p.len()); // 当前 token 的绝对位置 = 前缀长度
+            caches.push(cache);
+        }
+        let out = crate::tensor::no_grad(|| model.decode_batch(&next, &mut caches, &bases));
+        assert_eq!(out.shape(), &[3, vocab], "decode_batch 应返回 [B, vocab]");
+        let got = out.data();
+        for i in 0..3 {
+            let a = &got[i * vocab..(i + 1) * vocab];
+            let b = &want[i];
+            let diff = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                diff < 1e-5,
+                "序列 {i}（前缀长度 {}）的 logits 与逐条前向不一致：最大偏差 {diff}",
+                prefixes[i].len()
+            );
+        }
+    }
+
 
     /// 多模态前向：
     /// 1) `pixels = None` 时 `forward_mm` 与 `forward` 逐位相同（纯文本路径零改动）；

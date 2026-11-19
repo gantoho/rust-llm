@@ -755,9 +755,43 @@ pub fn beam_search(
     let mut masked: Vec<f32> = Vec::new();
 
     for _step in 0..max_new {
+        // ---- 先把"未收尾路径"的下一个 token 分布**一次批量算出来** ----
+        // 束搜索天然是"多条等长路径同步推进"，正是批处理的最佳场景：权重只流一遍、
+        // 被 beam_size 条路径共享（解码是访存带宽受限，逐条 forward 会流 beam_size 遍）。
+        // 注意力仍逐条做（各路径的 cache 内容不同），t=1 时它只碰 O(len) 个元素。
+        let mut prefetched: Vec<Option<Vec<f32>>> = vec![None; beams.len()];
+        {
+            // 调试开关：强制逐条前向，用于同进程/同二进制的 A/B
+            let live: Vec<usize> = if std::env::var_os("LLM_MM_NO_BATCH_DECODE").is_some() {
+                Vec::new()
+            } else {
+                (0..beams.len())
+                    .filter(|&i| !beams[i].finished && beams[i].cache.is_some())
+                    .collect()
+            };
+            if live.len() >= 2 {
+                let mut caches: Vec<Vec<KVCache>> = live
+                    .iter()
+                    .map(|&i| beams[i].cache.take().expect("live 已过滤掉无 cache 的路径"))
+                    .collect();
+                let lasts: Vec<usize> = live
+                    .iter()
+                    .map(|&i| *beams[i].ids.last().expect("beam 至少含 prompt 一个 token"))
+                    .collect();
+                let bases: Vec<usize> = caches.iter().map(|c| c[0].seq_len()).collect();
+                let logits =
+                    crate::tensor::no_grad(|| model.decode_batch(&lasts, &mut caches, &bases));
+                let g = logits.data();
+                for (k, &i) in live.iter().enumerate() {
+                    prefetched[i] = Some(g[k * vocab_size..(k + 1) * vocab_size].to_vec());
+                    beams[i].cache = Some(std::mem::take(&mut caches[k]));
+                }
+            }
+        }
+
         let mut candidates: Vec<Beam> = Vec::new();
 
-        for mut beam in beams {
+        for (bi, mut beam) in beams.into_iter().enumerate() {
             // 已收尾的路径不再扩展，但保留下来参与最终比较
             if beam.finished {
                 candidates.push(beam);
@@ -766,29 +800,34 @@ pub fn beam_search(
 
             // 拿到"下一个 token"的分布：把这条路径的最后一个 token 喂进缓存。
             // 缓存覆盖 `ids[..len-1]`，喂完正好补成 `ids[..len]`，分布就是"接在 ids 之后"。
-            let row: Vec<f32> = {
-                let last = *beam.ids.last().expect("beam 至少含 prompt 一个 token");
-                let logits = match beam.cache.as_mut() {
-                    Some(cache) => crate::tensor::no_grad(|| {
-                        model.forward(&[last], 1, 1, Some(cache), false)
-                    }),
-                    // 不用缓存：整段上下文重算（慢，但没有缓存内存）
-                    None => {
-                        let start = beam.ids.len().saturating_sub(model.cfg.block_size);
-                        let ctx = &beam.ids[start..];
-                        crate::tensor::no_grad(|| model.forward(ctx, 1, ctx.len(), None, false))
+            let row: Vec<f32> = match prefetched[bi].take() {
+                // 批量已经算好这一行：只需补 UTF-8 掩码（就地改，省一次 clone）
+                Some(mut r) => {
+                    if let Some(vocab) = vocab_bytes {
+                        mask_illegal_utf8(&mut r, vocab, &pending_tail(vocab, &beam.ids));
                     }
-                };
-                let n = logits.numel();
-                let last_row = logits.data()[n - vocab_size..].to_vec();
-                match vocab_bytes {
-                    Some(vocab) => {
-                        masked.clear();
-                        masked.extend_from_slice(&last_row);
-                        mask_illegal_utf8(&mut masked, vocab, &pending_tail(vocab, &beam.ids));
-                        masked.clone()
+                    r
+                }
+                // 没有 cache（或本步只有一条路径）→ 走原来的逐条前向
+                None => {
+                    let last = *beam.ids.last().expect("beam 至少含 prompt 一个 token");
+                    let logits = match beam.cache.as_mut() {
+                        Some(cache) => crate::tensor::no_grad(|| {
+                            model.forward(&[last], 1, 1, Some(cache), false)
+                        }),
+                        // 不用缓存：整段上下文重算（慢，但没有缓存内存）
+                        None => {
+                            let start = beam.ids.len().saturating_sub(model.cfg.block_size);
+                            let ctx = &beam.ids[start..];
+                            crate::tensor::no_grad(|| model.forward(ctx, 1, ctx.len(), None, false))
+                        }
+                    };
+                    let n = logits.numel();
+                    let mut row = logits.data()[n - vocab_size..].to_vec();
+                    if let Some(vocab) = vocab_bytes {
+                        mask_illegal_utf8(&mut row, vocab, &pending_tail(vocab, &beam.ids));
                     }
-                    None => last_row,
+                    row
                 }
             };
 
@@ -878,6 +917,25 @@ pub fn beam_search(
 /// 必须用**同一套**掩码，否则目标分布 p 与草稿分布 q 的定义域不一致，
 /// 拒绝采样就不再收敛到目标分布。
 pub(crate) fn mask_illegal_utf8(logits: &mut [f32], vocab: &[Vec<u8>], pending: &[u8]) {
+    // 快路（`pending` 为空，绝大多数 token 都是这个情况）：
+    // 判定只取决于该 token **自身**是不是合法 UTF-8 前缀，于是可以：
+    // 1. 首字节是续字节（10xxxxxx）→ 单独成 token 必然拼出半个字符，直接屏蔽；
+    // 2. 其余只需 `utf8_pending(tok)` —— 不再为每个 token 拼一次
+    //    `pending ++ tok` 的缓冲（原实现每次 clear + 两次 extend，151k 词表下
+    //    每 token 15 万次小缓冲操作）。
+    if pending.is_empty() {
+        for (id, logit) in logits.iter_mut().enumerate() {
+            let Some(tok) = vocab.get(id) else { continue };
+            if tok.is_empty() {
+                continue;
+            }
+            if tok[0] & 0xC0 == 0x80 || crate::tokenizer::utf8_pending(tok).is_none() {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        return;
+    }
+    // 慢路：尾部卡着半个字符（≤3 字节），只有"能把它接完"的 token 合法。
     let mut buf: Vec<u8> = Vec::with_capacity(pending.len() + 4);
     for (id, logit) in logits.iter_mut().enumerate() {
         let Some(tok) = vocab.get(id) else { continue };
