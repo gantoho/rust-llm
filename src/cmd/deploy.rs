@@ -19,7 +19,7 @@ use super::{describe_kv, describe_stop, resolve_model_spec, stop_label};
 /// 交给 `serve::run` 起 HTTP 服务——服务进程常驻，所以这里的 `runlog::finish()`
 /// 由进程退出（Ctrl-C）时触发，而不是像 chat 那样每轮结束就收尾。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_serve(
+pub fn cmd_serve(
     config_path: &str,
     ckpt_path: Option<&str>,
     tokenizer_path: Option<&str>,
@@ -54,8 +54,14 @@ pub(crate) fn cmd_serve(
     }
     // 长度外推必须在下面读 `model.cfg.block_size` **之前**生效（同 cmd_chat），
     // 装配序列见 resolve_model_spec。
-    let (mut model, tokenizer, ckpt, ckpt_path, rope_note) =
-        resolve_model_spec(ckpt_path, tcfg, seed, tokenizer_path, merge_lora, Some(&rope_opt));
+    let (model, tokenizer, ckpt, ckpt_path, rope_note) = resolve_model_spec(
+        ckpt_path,
+        tcfg,
+        seed,
+        tokenizer_path,
+        merge_lora,
+        Some(&rope_opt),
+    );
     let block_size = model.cfg.block_size;
     if max_new >= block_size {
         logln!(
@@ -77,11 +83,20 @@ pub(crate) fn cmd_serve(
             ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
             (
                 "分词器文件",
-                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+                tokenizer_path
+                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
+                    .to_string(),
             ),
             ("模型结构", format!("{:?}", ckpt.model)),
             ("模型名（回给客户端）", model_name.clone()),
-            ("系统提示", if system.is_empty() { "无".to_string() } else { system.to_string() }),
+            (
+                "系统提示",
+                if system.is_empty() {
+                    "无".to_string()
+                } else {
+                    system.to_string()
+                },
+            ),
             ("prompt 模板", prompt_format.to_string()),
             ("每轮最大新 token", max_new.to_string()),
             ("上下文窗口", block_size.to_string()),
@@ -105,13 +120,19 @@ pub(crate) fn cmd_serve(
             ("top_p", opts.top_p.to_string()),
             (
                 "重复惩罚",
-                format!("{}（回看窗口 {}）", opts.repetition_penalty, opts.repetition_window),
+                format!(
+                    "{}（回看窗口 {}）",
+                    opts.repetition_penalty, opts.repetition_window
+                ),
             ),
             ("KV cache", describe_kv(&kv)),
             (
                 "RoPE / 上下文",
                 rope_note.clone().unwrap_or_else(|| {
-                    format!("沿用 checkpoint：窗口 {block_size}，base = {}", model.cfg.rope_base)
+                    format!(
+                        "沿用 checkpoint：窗口 {block_size}，base = {}",
+                        model.cfg.rope_base
+                    )
                 }),
             ),
             ("监听地址", format!("http://{addr}")),
@@ -126,7 +147,15 @@ pub(crate) fn cmd_serve(
                     }
                 ),
             ),
-            ("CORS", if cors { "开（浏览器页面可直连）" } else { "关" }.to_string()),
+            (
+                "CORS",
+                if cors {
+                    "开（浏览器页面可直连）"
+                } else {
+                    "关"
+                }
+                .to_string(),
+            ),
             (
                 "前端测试页",
                 if no_web {
@@ -179,7 +208,7 @@ pub(crate) fn cmd_serve(
 
 /// 交互式对话模式
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_chat(
+pub fn cmd_chat(
     config_path: &str,
     ckpt_path: Option<&str>,
     tokenizer_path: Option<&str>,
@@ -206,8 +235,14 @@ pub(crate) fn cmd_chat(
     // 长度外推必须在下面读 `model.cfg.block_size` 分配上下文预算**之前**生效：
     // 否则 `block_size` 还是训练窗口，`--max-ctx` 扩出来的空间会被白白裁掉——
     // 装配序列见 resolve_model_spec。
-    let (mut model, tokenizer, ckpt, ckpt_path, rope_note) =
-        resolve_model_spec(ckpt_path, tcfg, seed, tokenizer_path, merge_lora, Some(&rope_opt));
+    let (model, tokenizer, ckpt, ckpt_path, rope_note) = resolve_model_spec(
+        ckpt_path,
+        tcfg,
+        seed,
+        tokenizer_path,
+        merge_lora,
+        Some(&rope_opt),
+    );
     let mut rng = Rng::new(seed);
     runlog::fields(
         "本次运行参数",
@@ -216,10 +251,19 @@ pub(crate) fn cmd_chat(
             ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
             (
                 "分词器文件",
-                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+                tokenizer_path
+                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
+                    .to_string(),
             ),
             ("模型结构", format!("{:?}", ckpt.model)),
-            ("系统提示", if system.is_empty() { "无".to_string() } else { system.to_string() }),
+            (
+                "系统提示",
+                if system.is_empty() {
+                    "无".to_string()
+                } else {
+                    system.to_string()
+                },
+            ),
             ("prompt 模板", prompt_format.to_string()),
             ("每轮最大新 token", max_new.to_string()),
             ("seed", seed.to_string()),
@@ -228,13 +272,19 @@ pub(crate) fn cmd_chat(
             ("top_p", opts.top_p.to_string()),
             (
                 "重复惩罚",
-                format!("{}（回看窗口 {}）", opts.repetition_penalty, opts.repetition_window),
+                format!(
+                    "{}（回看窗口 {}）",
+                    opts.repetition_penalty, opts.repetition_window
+                ),
             ),
             ("KV cache", describe_kv(&kv)),
             (
                 "RoPE / 上下文",
                 rope_note.clone().unwrap_or_else(|| {
-                    format!("沿用 checkpoint：窗口 {}，base = {}", model.cfg.block_size, model.cfg.rope_base)
+                    format!(
+                        "沿用 checkpoint：窗口 {}，base = {}",
+                        model.cfg.block_size, model.cfg.rope_base
+                    )
                 }),
             ),
         ],
@@ -246,7 +296,11 @@ pub(crate) fn cmd_chat(
     logln!("交互式对话模式（输入文本后按回车生成，输入 :quit 退出）");
     logln!(
         "参数：temperature={} top-k={} top-p={} 重复惩罚={}（窗口 {}）",
-        opts.temperature, opts.top_k, opts.top_p, opts.repetition_penalty, opts.repetition_window
+        opts.temperature,
+        opts.top_k,
+        opts.top_p,
+        opts.repetition_penalty,
+        opts.repetition_window
     );
     if !system.is_empty() {
         logln!("系统提示：{}", system);
@@ -310,7 +364,14 @@ pub(crate) fn cmd_chat(
 
         // 构造 prompt：system + 历史 + 本轮。预算分配（system 永保 → 生成预留 → 历史）
         // 与 SFT/raw 两种模板都在 `prompt` 模块里，HTTP serve 走同一套代码。
-        let assembled = prompt::assemble(&tokenizer, system, &context_history, input, use_sft, prompt_budget);
+        let assembled = prompt::assemble(
+            &tokenizer,
+            system,
+            &context_history,
+            input,
+            use_sft,
+            prompt_budget,
+        );
         let history = assembled.history;
         if let Some((n_before, n_after)) = assembled.trimmed {
             let history_budget = assembled.history_budget;
@@ -326,7 +387,7 @@ pub(crate) fn cmd_chat(
                          想保留更多历史请调小 --max-new"
                     );
                 }
-                Some(t0) if trim_count % HISTORY_REPORT_EVERY == 0 => {
+                Some(t0) if trim_count.is_multiple_of(HISTORY_REPORT_EVERY) => {
                     logln!(
                         "[info] 已丢弃历史 {trim_count} 次（起始于第 {t0} 轮），\
                          累计丢弃 {dropped_tokens_total} token，当前保留 {n_after} token"
@@ -387,7 +448,8 @@ pub(crate) fn cmd_chat(
                     context_history.push('\n');
                 }
                 // 写成模板形态，下一轮就能被 `trim_sft_history` 按轮切开
-                context_history.push_str(&format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n{response}"));
+                context_history
+                    .push_str(&format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n{response}"));
             }
         } else {
             if !context_history.is_empty() {

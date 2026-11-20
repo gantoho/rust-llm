@@ -16,8 +16,8 @@
 use crate::attention::{KVCache, KvCacheOpts, MultiHeadAttention};
 use crate::config::LoRAConfig;
 use crate::layers::{Embedding, Linear, MLPEnum, NormLayer};
-use crate::moe::MoELayer;
 use crate::module::Module;
+use crate::moe::MoELayer;
 use crate::quant::{
     CalibOpts, CalibStats, HessianKind, LayerCalib, QBits, QuantMeta, QuantMethod, QuantOpts,
     QuantReport, QuantSummary,
@@ -409,9 +409,7 @@ impl Ffn {
     /// 稠密 SwiGLU 分支的六元组（gate/up/down 三个投影的权重与偏置），
     /// 供 GPU 常驻显存路径用；GELU 分支与 MoE 返回 None。
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    fn swiglu_weights(
-        &self,
-    ) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
+    fn swiglu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             Ffn::Dense(m) => m.swiglu_weights(),
             Ffn::Moe(_) => None,
@@ -481,9 +479,19 @@ impl TransformerBlock {
             Ffn::Moe(MoELayer::new(cfg, rng))
         } else if cfg.use_swiglu {
             // `ffn_hidden = 0` 时取默认公式（与历史逐位一致）；HF 的 intermediate_size 显式给
-            Ffn::Dense(MLPEnum::new_swiglu_full(cfg.n_embd, cfg.ffn_hidden(), cfg.mlp_bias, rng))
+            Ffn::Dense(MLPEnum::new_swiglu_full(
+                cfg.n_embd,
+                cfg.ffn_hidden(),
+                cfg.mlp_bias,
+                rng,
+            ))
         } else {
-            Ffn::Dense(MLPEnum::new_gelu_full(cfg.n_embd, cfg.ffn_hidden(), cfg.mlp_bias, rng))
+            Ffn::Dense(MLPEnum::new_gelu_full(
+                cfg.n_embd,
+                cfg.ffn_hidden(),
+                cfg.mlp_bias,
+                rng,
+            ))
         };
         let attn = {
             let mut a = MultiHeadAttention::new_full(
@@ -572,7 +580,11 @@ impl TransformerBlock {
         let h = hc_a.read(streams, b, t, d);
         let ln1_out = self.ln1.forward(&h);
         let y = self.attn.forward(&ln1_out, mask, kv_cache, base);
-        let y = if self.dropout > 0.0 { y.dropout(self.dropout, training) } else { y };
+        let y = if self.dropout > 0.0 {
+            y.dropout(self.dropout, training)
+        } else {
+            y
+        };
         let streams = hc_a.write(streams, &y);
 
         let hc_m = self
@@ -583,7 +595,11 @@ impl TransformerBlock {
         let ln2_out = self.ln2.forward(&h2);
         let (y2, aux) = self.ffn.forward_with_aux(&ln2_out);
         *self.aux.borrow_mut() = aux;
-        let y2 = if self.dropout > 0.0 { y2.dropout(self.dropout, training) } else { y2 };
+        let y2 = if self.dropout > 0.0 {
+            y2.dropout(self.dropout, training)
+        } else {
+            y2
+        };
         hc_m.write(&streams, &y2)
     }
 
@@ -616,7 +632,11 @@ impl TransformerBlock {
             None => {
                 let ln1_out = self.ln1.forward(x);
                 let h = self.attn.forward(&ln1_out, mask, kv_cache, base);
-                let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
+                let h = if self.dropout > 0.0 {
+                    h.dropout(self.dropout, training)
+                } else {
+                    h
+                };
                 x.add(&h)
             }
         };
@@ -629,9 +649,13 @@ impl TransformerBlock {
         let h = self.ln2.forward(&x);
         let (h, aux) = self.ffn.forward_with_aux(&h);
         *self.aux.borrow_mut() = aux;
-        let h = if self.dropout > 0.0 { h.dropout(self.dropout, training) } else { h };
-        let out = x.add(&h);
-        out
+        let h = if self.dropout > 0.0 {
+            h.dropout(self.dropout, training)
+        } else {
+            h
+        };
+
+        x.add(&h)
     }
 
     /// 本层是否有任一子层挂了 LoRA 适配器（两个子层的 GPU 常驻路径各自据此让路）
@@ -734,11 +758,11 @@ impl TransformerBlock {
         // 收到 None 时在此兜底物化一次 —— 常驻内核要真实 [t, t_total] buffer，
         // 而训练态无 KV cache，t_total = t，后缀因果退化为标准因果。
         let mask_guard = mask.map(|m| m.decode());
-        let mask_owned;
+        let mask_owned: std::sync::Arc<Vec<f32>>;
         let md: &[f32] = match &mask_guard {
             Some(g) => g,
             None => {
-                mask_owned = crate::tensor::causal_mask_data(t, t);
+                mask_owned = crate::tensor::causal_mask_arc(t, t);
                 &mask_owned
             }
         };
@@ -879,7 +903,11 @@ impl TransformerBlock {
                     self.dropout,
                     training,
                 )?;
-                (r, (wg, bg, wd, bd), Some((Tensor::clone(wu), Tensor::clone(bu))))
+                (
+                    r,
+                    (wg, bg, wd, bd),
+                    Some((Tensor::clone(wu), Tensor::clone(bu))),
+                )
             } else {
                 let (w1, b1, w2, b2) = self.ffn.gelu_weights()?;
                 let hid = w1.shape()[1];
@@ -927,9 +955,7 @@ impl TransformerBlock {
                         bb.accumulate_grad(&g.dbeta, 1.0);
                     }
                     // SwiGLU 独有的 up 投影梯度（GELU 分支下 w3_bwd 与 g.dw3 都是 None）
-                    if let (Some((w3, b3)), Some(dw3), Some(db3)) =
-                        (&w3_bwd, &g.dw3, &g.db3)
-                    {
+                    if let (Some((w3, b3)), Some(dw3), Some(db3)) = (&w3_bwd, &g.dw3, &g.db3) {
                         w3.accumulate_grad(dw3, 1.0);
                         b3.accumulate_grad(db3, 1.0);
                     }
@@ -1018,9 +1044,13 @@ struct Acc {
 impl Transformer {
     pub fn new(cfg: TransformerConfig, rng: &mut Rng) -> Self {
         // GQA 校验
-        let n_kv = if cfg.n_kv_head == 0 { cfg.n_head } else { cfg.n_kv_head };
+        let n_kv = if cfg.n_kv_head == 0 {
+            cfg.n_head
+        } else {
+            cfg.n_kv_head
+        };
         assert!(
-            cfg.n_head % n_kv == 0,
+            cfg.n_head.is_multiple_of(n_kv),
             "n_head（{}）必须能被 n_kv_head（{}）整除",
             cfg.n_head,
             n_kv
@@ -1042,7 +1072,9 @@ impl Transformer {
             // 保证老配置的初始化逐位不变）
             head: (!cfg.tie_embeddings).then(|| {
                 Tensor::param(
-                    (0..vocab_size * n_embd).map(|_| rng.randn() * 0.02).collect(),
+                    (0..vocab_size * n_embd)
+                        .map(|_| rng.randn() * 0.02)
+                        .collect(),
                     vec![vocab_size, n_embd],
                 )
             }),
@@ -1053,7 +1085,10 @@ impl Transformer {
             vision,
             // mHC：只在多流时构造收敛权重（n_stream = 1 走单流残差，逐位不变、不耗随机数）
             hc_collapse: (cfg.n_stream > 1).then(|| {
-                Tensor::param(crate::mhc::concentrated_logits(cfg.n_stream), vec![cfg.n_stream])
+                Tensor::param(
+                    crate::mhc::concentrated_logits(cfg.n_stream),
+                    vec![cfg.n_stream],
+                )
             }),
             quant: None,
         }
@@ -1534,10 +1569,10 @@ impl Transformer {
     pub fn moe_balance_flat(&self) -> Vec<f32> {
         let mut out = Vec::new();
         for b in &self.blocks {
-            if let Ffn::Moe(m) = &b.ffn {
-                if m.bias_balance_enabled() {
-                    out.extend_from_slice(&m.balance_bias());
-                }
+            if let Ffn::Moe(m) = &b.ffn
+                && m.bias_balance_enabled()
+            {
+                out.extend_from_slice(&m.balance_bias());
             }
         }
         out
@@ -1579,12 +1614,22 @@ impl Transformer {
     /// `train_ctx` 必须填**训练时**的窗口（`rope_train_ctx`），而不是 `new_block_size`：
     /// YaRN 按"该维度相对训练窗口转了多少圈"分段，用放大后的窗口去算会把分段整体推偏。
     /// 传 0 表示"与 `new_block_size` 相同"。
-    pub fn set_rope(&mut self, base: f32, scaling: RopeScaling, train_ctx: usize, new_block_size: usize) -> usize {
+    pub fn set_rope(
+        &mut self,
+        base: f32,
+        scaling: RopeScaling,
+        train_ctx: usize,
+        new_block_size: usize,
+    ) -> usize {
         let old = self.cfg.block_size;
         self.cfg.block_size = new_block_size;
         self.cfg.rope_base = base;
         self.cfg.rope_scaling = scaling;
-        self.cfg.rope_train_ctx = if train_ctx == 0 { new_block_size } else { train_ctx };
+        self.cfg.rope_train_ctx = if train_ctx == 0 {
+            new_block_size
+        } else {
+            train_ctx
+        };
         let spec = self.cfg.rope_spec();
         for b in &mut self.blocks {
             b.attn.rope = spec;
@@ -1775,7 +1820,7 @@ impl Transformer {
     ) -> Option<Tensor> {
         use crate::attention::{expand_kv_head, fold_kv_head_grad};
         use crate::gpu::{
-            StackArgs, StackLayerArgs, STACK_PARAMS_PER_LAYER, STACK_PARAMS_PER_LAYER_SWIGLU,
+            STACK_PARAMS_PER_LAYER, STACK_PARAMS_PER_LAYER_SWIGLU, StackArgs, StackLayerArgs,
         };
         if self.blocks.is_empty()
             || self.has_lora()
@@ -1901,11 +1946,11 @@ impl Transformer {
             // 掩码：整叠快路只在训练态（无 KV cache、base=0）被调用，t_total = t；
             // 调用方已物化时直接借用，否则在此兜底物化一次供整叠共享
             let mask_guard = mask.map(|m| m.decode());
-            let mask_owned;
+            let mask_owned: std::sync::Arc<Vec<f32>>;
             let md: &[f32] = match &mask_guard {
                 Some(g) => g,
                 None => {
-                    mask_owned = crate::tensor::causal_mask_data(t, t);
+                    mask_owned = crate::tensor::causal_mask_arc(t, t);
                     &mask_owned
                 }
             };
@@ -2012,14 +2057,22 @@ impl Transformer {
                         "样本 {s} 的占位符数量为 {n}，应为 {p}（VisionConfig.ph_first={ph} 是否与分词器一致？）"
                     );
                 }
-                assert_eq!(rows.len(), feats.shape()[0], "占位符行数与视觉特征行数不一致");
+                assert_eq!(
+                    rows.len(),
+                    feats.shape()[0],
+                    "占位符行数与视觉特征行数不一致"
+                );
                 let gathered = flat.gather_rows(&rows);
                 let delta = feats.sub(&gathered);
                 let inj = delta.scatter_add_rows(&rows, b * t);
                 flat.add(&inj).reshape(vec![b, t, d])
             }
         };
-        let x = if self.dropout > 0.0 { x.dropout(self.dropout, training) } else { x };
+        let x = if self.dropout > 0.0 {
+            x.dropout(self.dropout, training)
+        } else {
+            x
+        };
 
         // 2. 位置信息由 RoPE 提供（在注意力内部旋转 Q/K，见 MultiHeadAttention::forward）。
         //    RoPE 的基准是**绝对位置**：新 token 的绝对位置 = 缓存已见位置总数 + 窗口内下标 j。
@@ -2049,8 +2102,12 @@ impl Transformer {
             } else {
                 (seen + t).min(window)
             };
-            (crate::gpu::is_available() && kv_cache.is_none() && base == 0)
-                .then(|| Tensor::from_vec(crate::tensor::causal_mask_data(t, t_total), vec![t, t_total]))
+            (crate::gpu::is_available() && kv_cache.is_none() && base == 0).then(|| {
+                Tensor::from_vec(
+                    crate::tensor::causal_mask_data(t, t_total),
+                    vec![t, t_total],
+                )
+            })
         };
         #[cfg(not(feature = "gpu"))]
         let mask: Option<Tensor> = None;
@@ -2086,7 +2143,8 @@ impl Transformer {
             let mut streams = crate::mhc::expand_streams(&x, n);
             for (i, block) in self.blocks.iter().enumerate() {
                 let cache = kv_cache.as_mut().map(|c| &mut c[i]);
-                streams = block.forward_streams(&streams, b, t, d, mask.as_ref(), cache, base, training);
+                streams =
+                    block.forward_streams(&streams, b, t, d, mask.as_ref(), cache, base, training);
             }
             let gamma = self
                 .hc_collapse
@@ -2215,7 +2273,7 @@ mod tests {
         let steps = 6usize;
         let prefill = 8usize;
         // 一条序列、逐 token 前向（与 serve 的非批处理路径同形）
-        let mut bench = |label: &str| -> f64 {
+        let bench = |label: &str| -> f64 {
             let mut cache = model.new_kv_cache();
             let mut pos = 0usize;
             let mut tok = 100usize;
@@ -2230,7 +2288,10 @@ mod tests {
                 pos += 1;
             }
             let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
-            println!("{label}: {ms:.1} ms/token（{:.1} tok/s，位置 {pos}）", 1e3 / ms);
+            println!(
+                "{label}: {ms:.1} ms/token（{:.1} tok/s，位置 {pos}）",
+                1e3 / ms
+            );
             ms
         };
         let f32_ms = bench("f32 权重");
@@ -2245,7 +2306,6 @@ mod tests {
             bf16_ms / f32_ms
         );
     }
-
 
     ///
     /// ```text
@@ -2272,10 +2332,7 @@ mod tests {
         let prefill = 8usize;
         println!(
             "模型：n_embd={} n_layer={} n_head={} vocab={}",
-            model.cfg.n_embd,
-            model.cfg.n_layer,
-            model.cfg.n_head,
-            model.cfg.vocab_size
+            model.cfg.n_embd, model.cfg.n_layer, model.cfg.n_head, model.cfg.vocab_size
         );
         for b in [1usize, 4, 8, 16] {
             let mut ids: Vec<usize> = (0..b).map(|i| 100 + i).collect();
@@ -2330,7 +2387,6 @@ mod tests {
         }
     }
 
-
     ///
     /// 三条序列的**前缀长度不同**（1 / 3 / 5），所以各自的 cache 长度与绝对位置都不同 ——
     /// 这正是批处理最容易写错的地方：位置用错会让 RoPE 整体错位，cache 用错会读到别人的
@@ -2352,9 +2408,8 @@ mod tests {
             crate::tensor::no_grad(|| {
                 model.forward(p, 1, p.len(), Some(&mut cache), false);
             });
-            let lg = crate::tensor::no_grad(|| {
-                model.forward(&[next[i]], 1, 1, Some(&mut cache), false)
-            });
+            let lg =
+                crate::tensor::no_grad(|| model.forward(&[next[i]], 1, 1, Some(&mut cache), false));
             want.push(lg.data());
         }
 
@@ -2387,7 +2442,6 @@ mod tests {
             );
         }
     }
-
 
     /// 多模态前向：
     /// 1) `pixels = None` 时 `forward_mm` 与 `forward` 逐位相同（纯文本路径零改动）；
@@ -2428,11 +2482,19 @@ mod tests {
         // 1) 纯文本路径：pixels=None 与 forward 完全一致
         let a = model.forward_mm(&idx, b, t, None, None, false);
         let c = model.forward(&idx, b, t, None, false);
-        assert_eq!(a.data(), c.data(), "pixels=None 时 forward_mm 必须等价于 forward");
+        assert_eq!(
+            a.data(),
+            c.data(),
+            "pixels=None 时 forward_mm 必须等价于 forward"
+        );
 
         // 2) 传像素 → 输出变化（视觉特征进来了）；换一批像素 → 输出再变
         let with_img = model.forward_mm(&idx, b, t, Some(&pixels), None, false);
-        assert_ne!(with_img.data(), a.data(), "传入像素后输出没有任何变化：视觉注入没生效");
+        assert_ne!(
+            with_img.data(),
+            a.data(),
+            "传入像素后输出没有任何变化：视觉注入没生效"
+        );
         let flipped: Vec<f32> = pixels.iter().map(|v| -v).collect();
         let with_img2 = model.forward_mm(&idx, b, t, Some(&flipped), None, false);
         assert_ne!(with_img.data(), with_img2.data(), "不同像素应产生不同输出");
@@ -2527,7 +2589,10 @@ mod tests {
         let full = model.forward(&seq2, 1, seq2.len(), None, false);
         let last_full = full.data()[full.numel() - v..].to_vec();
         assert!(
-            last_one.iter().zip(&last_full).all(|(a, b)| (a - b).abs() < 1e-4),
+            last_one
+                .iter()
+                .zip(&last_full)
+                .all(|(a, b)| (a - b).abs() < 1e-4),
             "MLA 的增量推理与全量前向应给出同一位置一致的 logits"
         );
 
@@ -2562,13 +2627,25 @@ mod tests {
         let train_ctx = model.cfg.rope_train_ctx();
         let new_ctx = train_ctx * 4;
 
-        let old = model.set_rope(rope::ROPE_BASE, RopeScaling::Ntk { factor: 4.0 }, train_ctx, new_ctx);
+        let old = model.set_rope(
+            rope::ROPE_BASE,
+            RopeScaling::Ntk { factor: 4.0 },
+            train_ctx,
+            new_ctx,
+        );
         assert_eq!(old, train_ctx, "返回值应是改前的窗口");
         assert_eq!(model.cfg.block_size, new_ctx);
-        assert_eq!(model.cfg.rope_train_ctx(), train_ctx, "训练窗口不该被外推窗口覆盖");
+        assert_eq!(
+            model.cfg.rope_train_ctx(),
+            train_ctx,
+            "训练窗口不该被外推窗口覆盖"
+        );
 
         let spec = model.cfg.rope_spec();
-        assert!(!spec.is_plain(), "NTK 缩放后频率表已与 GPU 内核写死的式子不同");
+        assert!(
+            !spec.is_plain(),
+            "NTK 缩放后频率表已与 GPU 内核写死的式子不同"
+        );
         for (i, b) in model.blocks.iter().enumerate() {
             assert_eq!(b.attn.rope, spec, "第 {i} 层的频率参数没被更新");
         }
@@ -2577,9 +2654,16 @@ mod tests {
         let seq: Vec<usize> = (0..new_ctx).map(|i| i % 32).collect();
         let mut cache = model.new_kv_cache();
         let logits = model.forward(&seq, 1, seq.len(), Some(&mut cache), false);
-        assert_eq!(cache[0].seq_len(), new_ctx, "扩窗后缓存不该再按训练窗口截断");
+        assert_eq!(
+            cache[0].seq_len(),
+            new_ctx,
+            "扩窗后缓存不该再按训练窗口截断"
+        );
         assert_eq!(logits.shape(), vec![new_ctx, 32]);
-        assert!(logits.data().iter().all(|v| v.is_finite()), "超出训练窗口的位置应算出有限值");
+        assert!(
+            logits.data().iter().all(|v| v.is_finite()),
+            "超出训练窗口的位置应算出有限值"
+        );
     }
 
     /// 滑动窗口 + KV cache 一致性（第 25 课）：
@@ -2670,10 +2754,7 @@ mod tests {
             .map(|(n, _)| n)
             .filter(|n| !(n.ends_with(".lora_a") || n.ends_with(".lora_b")))
             .collect();
-        assert!(
-            bad.is_empty(),
-            "可训练集合里混进了主干参数：{bad:?}"
-        );
+        assert!(bad.is_empty(), "可训练集合里混进了主干参数：{bad:?}");
         let d = model.cfg.n_embd;
         let trainable_count: usize = model.trainable_parameters().iter().map(|p| p.numel()).sum();
         assert_eq!(trainable_count, 3 * 2 * lora.rank * d * model.cfg.n_layer);
@@ -2694,8 +2775,11 @@ mod tests {
             .filter(|(_, t)| !t.requires_grad())
             .collect();
         let frozen_before: Vec<Vec<f32>> = frozen_params.iter().map(|(_, t)| t.data()).collect();
-        let trainable_before: Vec<Vec<f32>> =
-            model.trainable_parameters().iter().map(|p| p.data()).collect();
+        let trainable_before: Vec<Vec<f32>> = model
+            .trainable_parameters()
+            .iter()
+            .map(|p| p.data())
+            .collect();
 
         // 2./3. 一次真实训练步（权重衰减给到 0.1：冻结参数若没被优化器跳过，会立刻被拉走）
         let idx = vec![1usize, 2, 3, 4, 5, 6, 7, 8];
@@ -2761,7 +2845,10 @@ mod tests {
             .iter()
             .filter(|n| !(n.contains(".c_v.") || n.contains(".mlp")))
             .collect();
-        assert!(misplaced.is_empty(), "适配层挂到了没打开的位置：{misplaced:?}");
+        assert!(
+            misplaced.is_empty(),
+            "适配层挂到了没打开的位置：{misplaced:?}"
+        );
 
         // 每层：c_v 一对 + MLP 每个投影一对（GELU 是 2 个，SwiGLU 是 3 个）
         let mlp_linears = if model.cfg.use_swiglu { 3 } else { 2 };
@@ -2860,16 +2947,19 @@ mod tests {
         let ckpt = checkpoint::load_header(&path);
         let mut rng2 = Rng::new(999);
         let mut restored = Transformer::new(ckpt.model.clone(), &mut rng2);
-        restored.apply_lora(
-            ckpt.lora.as_ref().expect("存档应带 LoRA 形态"),
-            &mut rng2,
-        );
+        restored.apply_lora(ckpt.lora.as_ref().expect("存档应带 LoRA 形态"), &mut rng2);
         checkpoint::load_params(&path, &restored);
         let _ = std::fs::remove_file(&path);
 
         for (i, (a, b)) in saved
             .iter()
-            .zip(&restored.lora_parameters().iter().map(|p| p.data()).collect::<Vec<_>>())
+            .zip(
+                &restored
+                    .lora_parameters()
+                    .iter()
+                    .map(|p| p.data())
+                    .collect::<Vec<_>>(),
+            )
             .enumerate()
         {
             assert_eq!(a, b, "第 {i} 个适配参数没被还原");
@@ -2877,7 +2967,11 @@ mod tests {
 
         restored.resume_lora();
 
-        let after: Vec<Vec<f32>> = restored.lora_parameters().iter().map(|p| p.data()).collect();
+        let after: Vec<Vec<f32>> = restored
+            .lora_parameters()
+            .iter()
+            .map(|p| p.data())
+            .collect();
         for (i, (a, b)) in saved.iter().zip(&after).enumerate() {
             assert_eq!(a, b, "resume_lora 重新初始化了第 {i} 个适配参数");
         }
@@ -2945,8 +3039,11 @@ mod tests {
                 zero_grad_all(&model);
                 loss.backward();
                 crate::gpu::probe_capture(false);
-                let grads: Vec<Vec<f32>> =
-                    model.parameters().iter().map(|p| p.grad.borrow().clone()).collect();
+                let grads: Vec<Vec<f32>> = model
+                    .parameters()
+                    .iter()
+                    .map(|p| p.grad.borrow().clone())
+                    .collect();
                 (loss.item(), grads)
             };
             let (loss_res, g_res) = run(true);
@@ -2958,7 +3055,11 @@ mod tests {
             assert_eq!(g_res.len(), g_loop.len(), "{name}：参数梯度数量不一致");
             for (i, (a, c)) in g_res.iter().zip(&g_loop).enumerate() {
                 assert_eq!(a.len(), c.len(), "{name}：第 {i} 个参数梯度长度不一致");
-                let max_err = a.iter().zip(c).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                let max_err = a
+                    .iter()
+                    .zip(c)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
                 let mag = c.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
                 assert!(
                     max_err / mag.max(1e-6) < 2e-3,
@@ -3002,44 +3103,65 @@ mod tests {
         assert!(before.is_finite(), "量化前的 loss 就不是有限值：{before}");
 
         // 1) 校准：每个投影层都要采到统计
-        let stats = model.calibrate(&tok, &[text.clone()], CalibOpts::default());
+        let stats = model.calibrate(&tok, std::slice::from_ref(&text), CalibOpts::default());
         assert!(!stats.per_layer.is_empty(), "校准应覆盖到各投影层");
         for (name, c) in &stats.per_layer {
             assert_eq!(c.n_tokens, ids.len(), "{name} 采到的 token 数不对");
             let h = c.hessian.as_ref().expect("每层都应有 Hessian");
             let a = c.act_abs_mean.as_ref().expect("每层都应有激活均值");
-            assert!(a.iter().all(|v| v.is_finite() && *v >= 0.0), "{name} 的均值不合法");
-            assert!(a.iter().any(|v| *v > 0.0), "{name} 的激活均值恒为零 = 没采到");
+            assert!(
+                a.iter().all(|v| v.is_finite() && *v >= 0.0),
+                "{name} 的均值不合法"
+            );
+            assert!(
+                a.iter().any(|v| *v > 0.0),
+                "{name} 的激活均值恒为零 = 没采到"
+            );
             assert_eq!(
                 h.dim(),
                 a.len(),
                 "{name} 的 Hessian 阶数必须等于输入维度（落错轴 = Hessian 量化的补偿方向全反）"
             );
             let d = h.diagonal();
-            assert!(d.iter().all(|v| v.is_finite()), "{name} 的 Hessian 有非有限值");
-            assert!(d.iter().any(|v| *v > 0.0), "{name} 的 Hessian 恒为零 = 没采到");
+            assert!(
+                d.iter().all(|v| v.is_finite()),
+                "{name} 的 Hessian 有非有限值"
+            );
+            assert!(
+                d.iter().any(|v| *v > 0.0),
+                "{name} 的 Hessian 恒为零 = 没采到"
+            );
         }
 
         // 2) 阈值 1024 ≫ tiny 的隐层宽度 ⇒ 必须走全矩阵（Hessian 量化的补偿信息才有来源）
         assert!(
-            stats.per_layer.iter().all(|(_, c)| c.hessian.as_ref().unwrap().is_full()),
+            stats
+                .per_layer
+                .iter()
+                .all(|(_, c)| c.hessian.as_ref().unwrap().is_full()),
             "默认阈值下 tiny 模型应存全矩阵 Hessian"
         );
         // 把阈值压到 0：整片退化成对角，且对角就是全矩阵的对角（同一套统计，只是留不留非对角）
         let diag_stats = model.calibrate(
             &tok,
-            &[text.clone()],
+            std::slice::from_ref(&text),
             CalibOpts {
                 full_hessian_max_dim: 0,
                 ..CalibOpts::default()
             },
         );
         assert!(
-            diag_stats.per_layer.iter().all(|(_, c)| !c.hessian.as_ref().unwrap().is_full()),
+            diag_stats
+                .per_layer
+                .iter()
+                .all(|(_, c)| !c.hessian.as_ref().unwrap().is_full()),
             "阈值 0 之下不该有任何层还存着全矩阵"
         );
         for ((name, full), (_, diag)) in stats.per_layer.iter().zip(diag_stats.per_layer.iter()) {
-            let (f, d) = (full.hessian.as_ref().unwrap(), diag.hessian.as_ref().unwrap());
+            let (f, d) = (
+                full.hessian.as_ref().unwrap(),
+                diag.hessian.as_ref().unwrap(),
+            );
             assert_eq!(f.dim(), d.dim(), "{name} 两种模式的对角长度应一致");
             // 对角模式省掉的正是非对角项：内存口径必须严格更小（否则这个旋钮等于没有）
             assert!(
@@ -3077,7 +3199,10 @@ mod tests {
             summary.describe()
         );
         let after = loss_of(&model);
-        println!("[模型级量化] {}｜loss {before:.4} → {after:.4}", summary.describe());
+        println!(
+            "[模型级量化] {}｜loss {before:.4} → {after:.4}",
+            summary.describe()
+        );
         assert!(
             (after - before).abs() < 0.5,
             "int8 量化后验证 loss 崩了：{before} → {after}（{}）",
@@ -3121,9 +3246,14 @@ mod tests {
             full_hessian_max_dim: 0,
             ..CalibOpts::default()
         };
-        let stats = model.calibrate(&tok, &[text.clone()], diag);
+        let stats = model.calibrate(&tok, std::slice::from_ref(&text), diag);
         // 每层的 stats 都必须是"对角"形态
-        assert!(stats.per_layer.iter().all(|(_, c)| !c.hessian.as_ref().unwrap().is_full()));
+        assert!(
+            stats
+                .per_layer
+                .iter()
+                .all(|(_, c)| !c.hessian.as_ref().unwrap().is_full())
+        );
 
         let reports = model.quantize_weights(
             QBits::Int8,
@@ -3136,7 +3266,8 @@ mod tests {
         assert!(reports.iter().all(|r| r.rel_err.is_finite()));
         // 逐位等于 RTN：把同一份权重用 RTN 再量化一遍，码值必须一模一样
         let mut rtn_model = Transformer::new(TransformerConfig::tiny(64), &mut Rng::new(7));
-        let rtn = rtn_model.quantize_weights(QBits::Int8, QuantMethod::Rtn, None, QuantOpts::default());
+        let rtn =
+            rtn_model.quantize_weights(QBits::Int8, QuantMethod::Rtn, None, QuantOpts::default());
         let hess_codes: Vec<_> = model
             .named_linears()
             .iter()
@@ -3148,7 +3279,10 @@ mod tests {
             .map(|(_, l)| l.quant.as_ref().unwrap().q.bytes().to_vec())
             .collect();
         assert_eq!(hess_codes.len(), rtn_codes.len());
-        assert_eq!(hess_codes, rtn_codes, "对角 Hessian 下 Hessian 量化应与 RTN 逐位一致");
+        assert_eq!(
+            hess_codes, rtn_codes,
+            "对角 Hessian 下 Hessian 量化应与 RTN 逐位一致"
+        );
         assert_eq!(rtn.len(), hess_codes.len());
     }
 
@@ -3272,7 +3406,10 @@ mod tests {
             out.data(),
             "开启 CSA 后前向应与 flash 路径不同"
         );
-        assert!(out.data().iter().all(|x| x.is_finite()), "CSA 前向出现非有限值");
+        assert!(
+            out.data().iter().all(|x| x.is_finite()),
+            "CSA 前向出现非有限值"
+        );
     }
 
     /// **每个 preset 都必须能跑通「前向 + 反向」**。preset 是 README/CLI 的默认入口，
@@ -3325,7 +3462,11 @@ mod tests {
         let mut cfg = TransformerConfig::tiny(32);
         cfg.n_layer = 1;
         let plain = Transformer::new(cfg, &mut Rng::new(5));
-        let names: Vec<String> = plain.named_parameters().into_iter().map(|(n, _)| n).collect();
+        let names: Vec<String> = plain
+            .named_parameters()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(
             names.iter().any(|n| n == "blocks.0.attn.c_q.bias"),
             "默认配置应带 qkv bias：{names:?}"
@@ -3357,7 +3498,10 @@ mod tests {
             !names.iter().any(|n| n.ends_with(".bias")),
             "HF 口径（LLaMA/Qwen2）不该有任何 bias 参数：{names:?}"
         );
-        assert!(names.iter().any(|n| n == "head.weight"), "不绑权重时应有 head.weight：{names:?}");
+        assert!(
+            names.iter().any(|n| n == "head.weight"),
+            "不绑权重时应有 head.weight：{names:?}"
+        );
         let gate = named
             .iter()
             .find(|(n, _)| n == "blocks.0.mlp.w_gate.weight")

@@ -25,7 +25,9 @@
 use crate::comm::DistRuntime;
 use crate::config::TrainConfig;
 use crate::data::BatchSource;
-use crate::distributed::{allreduce_mean_grads, allreduce_mean_moe_bias, mix_dp_rank, sync_overflow};
+use crate::distributed::{
+    allreduce_mean_grads, allreduce_mean_moe_bias, mix_dp_rank, sync_overflow,
+};
 use crate::loss::cross_entropy_loss_masked;
 use crate::model::Transformer;
 use crate::module::Module;
@@ -218,7 +220,13 @@ impl LRScheduler {
         min_lr: f32,
         decay_steps: usize,
     ) -> Self {
-        Self::with_wsd(warmup_steps, total_steps, max_lr, min_lr, Some(decay_steps.max(1)))
+        Self::with_wsd(
+            warmup_steps,
+            total_steps,
+            max_lr,
+            min_lr,
+            Some(decay_steps.max(1)),
+        )
     }
 
     fn with_wsd(
@@ -292,13 +300,7 @@ pub fn lr_scheduler(cfg: &TrainConfig, total_steps: usize) -> LRScheduler {
     if cfg.lr_schedule == "wsd" {
         let span = total_steps.saturating_sub(cfg.warmup_steps);
         let decay = ((cfg.wsd_decay_frac * span as f32).round() as usize).max(1);
-        LRScheduler::new_wsd(
-            cfg.warmup_steps,
-            total_steps,
-            cfg.max_lr,
-            cfg.min_lr,
-            decay,
-        )
+        LRScheduler::new_wsd(cfg.warmup_steps, total_steps, cfg.max_lr, cfg.min_lr, decay)
     } else {
         LRScheduler::new(cfg.warmup_steps, total_steps, cfg.max_lr, cfg.min_lr)
     }
@@ -357,10 +359,7 @@ pub fn clip_by_norm(params: &[Tensor], norm: f32, max_norm: f32) {
         let scale = max_norm / norm;
         // 参数间串行、参数内按元素并行（与 optim 的更新循环同一风格）
         for p in params {
-            p.grad
-                .borrow_mut()
-                .par_iter_mut()
-                .for_each(|v| *v *= scale);
+            p.grad.borrow_mut().par_iter_mut().for_each(|v| *v *= scale);
         }
     }
 }
@@ -371,7 +370,12 @@ pub fn clip_by_norm(params: &[Tensor], norm: f32, max_norm: f32) {
 /// 前向与交叉熵走训练同款 GPU 常驻路径（整叠 + 融合输出头）：no_grad 下
 /// 常驻反向闭包不登记进图（见 [`Tensor::external_scalar_loss`]），只回读一个标量，
 /// 逐算子的 580 次提交因此收敛到每批 2 次；带 SFT 掩码时输出头自动回落逐算子。
-pub fn eval_loss(model: &Transformer, loader: &dyn BatchSource, eval_iters: usize, rng: &mut Rng) -> f32 {
+pub fn eval_loss(
+    model: &Transformer,
+    loader: &dyn BatchSource,
+    eval_iters: usize,
+    rng: &mut Rng,
+) -> f32 {
     // 注意：这里**不能**清零梯度——评估点 (step+1)%eval_every==0 与梯度累积边界
     // (step+1)%accum==0 是独立条件，accum>1 时中途清零会静默丢掉半个累积窗口的梯度。
     // 评估本身是 no_grad 前向，不会写入梯度，残留梯度也不影响前向结果。
@@ -457,15 +461,7 @@ fn forward_loss(
     // 必须在 forward 之后**立刻**取走：每个 Block 只保留"最近一次前向"的那份辅助损失，
     // 下一次前向会覆盖它（见 [`crate::model::Transformer::aux_loss`]）。
     let aux = model.aux_loss();
-    let base = cross_entropy_with_head(
-        model,
-        &hidden,
-        y,
-        mask,
-        batch_size,
-        block_size,
-        accum,
-    );
+    let base = cross_entropy_with_head(model, &hidden, y, mask, batch_size, block_size, accum);
     match aux {
         None => base,
         Some(a) => base.add(&scale_grad_only(a, 1.0 / accum as f32)),
@@ -556,10 +552,9 @@ impl MetricsLogger {
         let file = path.map(|p| {
             // 日志目录（默认 logs/）不存在时自动创建，避免用户手动 mkdir
             crate::config::ensure_parent_dir(p);
-            let mut f = std::fs::File::create(p)
-                .unwrap_or_else(|e| panic!("无法创建日志文件 {p}: {e}"));
-            writeln!(f, "step,lr,train_loss,val_loss,ppl,tokens_per_sec")
-                .expect("写入日志头失败");
+            let mut f =
+                std::fs::File::create(p).unwrap_or_else(|e| panic!("无法创建日志文件 {p}: {e}"));
+            writeln!(f, "step,lr,train_loss,val_loss,ppl,tokens_per_sec").expect("写入日志头失败");
             f
         });
         MetricsLogger { file }
@@ -572,8 +567,12 @@ impl MetricsLogger {
                 Some(v) => (format!("{:.6}", v), format!("{:.2}", v.exp())),
                 None => (String::new(), String::new()),
             };
-            writeln!(f, "{},{:.8},{:.6},{},{},{:.0}", step, lr, train_loss, vl, ppl, tps)
-                .expect("写入日志失败");
+            writeln!(
+                f,
+                "{},{:.8},{:.6},{},{},{:.0}",
+                step, lr, train_loss, vl, ppl, tps
+            )
+            .expect("写入日志失败");
         }
     }
 }
@@ -611,7 +610,7 @@ pub fn train_transformer(
     dist: Option<&DistRuntime>,
 ) -> f32 {
     // 本进程是否负责落盘（rank 0 或单进程）。只用于门控**副作用**，不参与控制流。
-    let primary = dist.map_or(true, |d| d.is_primary());
+    let primary = dist.is_none_or(|d| d.is_primary());
     let params = model.parameters();
     // 真正参与训练的参数（LoRA 形态下 = 各层的适配层；普通训练 = 全部）。
     // 梯度裁剪与范数统计只该看这一组：冻结参数不产生梯度（前向走 matmul_frozen），
@@ -629,7 +628,8 @@ pub fn train_transformer(
         scheduler.set_step(start_step);
         logln!(
             "已从 {path} 恢复：step={}，best_val_loss={:.4}",
-            start_step, best_val_loss
+            start_step,
+            best_val_loss
         );
     }
 
@@ -722,7 +722,11 @@ pub fn train_transformer(
     // 指标日志：只有 rank 0 建文件。N 个副本同时往同一个 CSV 里写，每行都会被
     // 别的副本插进来（而且各自记的 step 还不一样），出来的曲线没法读。
     // 其余 rank 的 MetricsLogger 退化成空实现（`log` 是空操作）。
-    let log_path = if primary { cfg.log_file.as_deref() } else { None };
+    let log_path = if primary {
+        cfg.log_file.as_deref()
+    } else {
+        None
+    };
     let mut metrics = MetricsLogger::new(log_path);
     if let Some(path) = log_path {
         logln!("训练指标将记录到 {path}");
@@ -746,7 +750,11 @@ pub fn train_transformer(
     let mut no_improve_count = 0usize; // 早停计数器
     let patience = cfg.early_stop_patience; // 0 = 不启用
     if patience > 0 {
-        logln!("[info] 早停已启用：patience={}（连续 {} 次评估不改善则停止）", patience, patience);
+        logln!(
+            "[info] 早停已启用：patience={}（连续 {} 次评估不改善则停止）",
+            patience,
+            patience
+        );
     }
     let mut final_loss = f32::INFINITY;
     let train_t0 = std::time::Instant::now();
@@ -818,7 +826,7 @@ pub fn train_transformer(
             // 2. 前向 + 损失（梯度累积时反向按 **本窗口的微批数** 缩放，见 `accum_window`）
             let t_seg = std::time::Instant::now();
             let loss = forward_loss(
-                &model,
+                model,
                 &x,
                 &y,
                 mask.as_deref(),
@@ -854,7 +862,9 @@ pub fn train_transformer(
                 // 三步走是为了多进程：**本地检测 → 跨 DP 汇总"任一溢出" → 全体用同一个
                 // 标志推进 scale**。各副本各判各的会让 scale 分叉，而 scale 就是反缩放
                 // 系数——同一份 allreduce 出来的梯度被除以不同的数，参数更新悄悄分叉。
-                let overflow = amp.as_ref().is_some_and(|mp| mp.detect_overflow(&trainable));
+                let overflow = amp
+                    .as_ref()
+                    .is_some_and(|mp| mp.detect_overflow(&trainable));
                 let overflow = match dist {
                     Some(d) => sync_overflow(&d.dp_group(), overflow),
                     None => overflow,
@@ -899,15 +909,26 @@ pub fn train_transformer(
                         let steps_done = step - start_step + 1;
                         let steps_per_sec = steps_done as f64 / elapsed;
                         let remaining = (cfg.steps - step - 1) as f64 / steps_per_sec.max(0.001);
-                        let tps = steps_done as f64 * batch_size as f64 * block_size as f64 / elapsed;
+                        let tps =
+                            steps_done as f64 * batch_size as f64 * block_size as f64 / elapsed;
                         // 裁剪**前**的原始梯度范数，末尾 `*` 表示本步会触发裁剪。
                         // 不能打印 min(raw, grad_clip)：那样范数恒被压在阈值上限，
                         // 梯度是否爆炸、裁剪是否频繁完全看不出来（曾经因此漏判梯度异常）。
                         let clipped = if raw_norm > cfg.grad_clip { "*" } else { "" };
                         logln!(
                             "[train] step {}/{} | loss {:.4} | grad {:.2}{} | lr {:.6} | {:.1} st/s | {:.0} tok/s | fwd {:.0}ms bwd {:.0}ms | {:.0}s | ~{:.0}s",
-                            step + 1, cfg.steps, loss.item(), raw_norm, clipped, scheduler.lr(),
-                            steps_per_sec, tps, fwd_ms, bwd_ms, elapsed, remaining
+                            step + 1,
+                            cfg.steps,
+                            loss.item(),
+                            raw_norm,
+                            clipped,
+                            scheduler.lr(),
+                            steps_per_sec,
+                            tps,
+                            fwd_ms,
+                            bwd_ms,
+                            elapsed,
+                            remaining
                         );
                         // 首步结束后打印一次 GPU dispatch 开销分解（上传/提交/同步各占多少）
                         #[cfg(feature = "gpu")]
@@ -1013,7 +1034,8 @@ pub fn train_transformer(
                 }
                 // 计算 tokens/sec
                 let elapsed = train_t0.elapsed().as_secs_f64().max(1e-9);
-                let tokens_processed = (step - start_step + 1) as f64 * batch_size as f64 * block_size as f64;
+                let tokens_processed =
+                    (step - start_step + 1) as f64 * batch_size as f64 * block_size as f64;
                 let tps = tokens_processed / elapsed;
                 metrics.log(step + 1, scheduler.lr(), loss.item(), val_loss, tps);
 
@@ -1043,7 +1065,9 @@ pub fn train_transformer(
                 if should_stop {
                     logln!(
                         "早停触发：连续 {} 次评估 val_loss 未改善（best {:.4}），在 step {} 停止训练",
-                        patience, best_val_loss, step + 1
+                        patience,
+                        best_val_loss,
+                        step + 1
                     );
                     break;
                 }
@@ -1161,7 +1185,16 @@ mod tests {
         let model = Transformer::new(model_cfg, &mut rng);
         let loader = DataLoader::new(corpus, &tokenizer, 16, 4);
         let mut train_rng = Rng::new(train_cfg.seed);
-        train_transformer(&model, &tokenizer, &loader, &train_cfg, None, None, &mut train_rng, None)
+        train_transformer(
+            &model,
+            &tokenizer,
+            &loader,
+            &train_cfg,
+            None,
+            None,
+            &mut train_rng,
+            None,
+        )
     }
 
     /// 极小训练的基准训练配置（所有对照实验共用；调用方按需覆盖少数字段）。
@@ -1231,8 +1264,8 @@ mod tests {
         assert_eq!(mp.scale, 65536.0, "初始 scale 应为 2^16");
 
         let clean = Tensor::from_vec(vec![1.0, 2.0], vec![2]);
-        assert!(mp.check_and_update(&[clean.clone()]));
-        assert!(mp.check_and_update(&[clean.clone()]));
+        assert!(mp.check_and_update(std::slice::from_ref(&clean)));
+        assert!(mp.check_and_update(std::slice::from_ref(&clean)));
         assert_eq!(mp.scale, 65536.0, "未到增长间隔（3 次）不应翻倍");
         assert!(mp.check_and_update(&[clean]));
         assert_eq!(mp.scale, 131072.0, "满 3 次无溢出应翻倍");
@@ -1246,7 +1279,7 @@ mod tests {
         let g = Tensor::from_vec(vec![0.0, 0.0], vec![2]);
         *g.grad.borrow_mut() = vec![65536.0, -32768.0];
         mp.scale = 65536.0;
-        mp.unscale_gradients(&[g.clone()]);
+        mp.unscale_gradients(std::slice::from_ref(&g));
         assert_eq!(*g.grad.borrow(), vec![1.0, -0.5]);
     }
 
@@ -1262,7 +1295,10 @@ mod tests {
         // 检测不改状态：连查 3 次也不该推进增长计数
         let clean = Tensor::from_vec(vec![1.0, 2.0], vec![2]);
         for _ in 0..3 {
-            assert!(!mp.detect_overflow(&[clean.clone()]), "干净梯度不该被判为溢出");
+            assert!(
+                !mp.detect_overflow(std::slice::from_ref(&clean)),
+                "干净梯度不该被判为溢出"
+            );
         }
         assert_eq!(mp.scale, 65536.0, "detect_overflow 不能改动 scale");
 
@@ -1276,7 +1312,10 @@ mod tests {
         // 本地检测到溢出
         let broken = Tensor::from_vec(vec![0.0, 0.0], vec![2]);
         *broken.grad.borrow_mut() = vec![1.0, f32::INFINITY];
-        assert!(mp.detect_overflow(std::slice::from_ref(&broken)), "含 Inf 的梯度应被判为溢出");
+        assert!(
+            mp.detect_overflow(std::slice::from_ref(&broken)),
+            "含 Inf 的梯度应被判为溢出"
+        );
         // 汇总时发现"别的副本溢出了"：本地干净也必须按溢出处理，全体一起跳过本步
         assert!(!mp.note_overflow(true), "溢出时不该允许更新参数");
         assert_eq!(mp.scale, 65536.0, "溢出后 scale 应减半");
@@ -1366,19 +1405,24 @@ mod tests {
                     let mut probe_rng = Rng::new(tcfg.seed);
                     crate::distributed::mix_dp_rank(&mut probe_rng, r);
                     let (x0, _, _) = loader.sample_batch(&mut probe_rng);
-                    let fp = x0
-                        .iter()
-                        .fold(0u64, |h, &v| h.wrapping_mul(1_000_003).wrapping_add(v as u64));
+                    let fp = x0.iter().fold(0u64, |h, &v| {
+                        h.wrapping_mul(1_000_003).wrapping_add(v as u64)
+                    });
                     (loss, params, fp)
                 })
             })
             .collect();
 
-        let got: Vec<(f32, Vec<Vec<f32>>, u64)> =
-            hs.into_iter().map(|h| h.join().expect("工作线程 panic")).collect();
+        let got: Vec<(f32, Vec<Vec<f32>>, u64)> = hs
+            .into_iter()
+            .map(|h| h.join().expect("工作线程 panic"))
+            .collect();
         let (loss0, p0) = (got[0].0, &got[0].1);
         let (loss1, p1) = (got[1].0, &got[1].1);
-        assert!(loss0.is_finite() && loss0 > 0.0, "DP 跑完的验证 loss 应为正有限值，实际 {loss0}");
+        assert!(
+            loss0.is_finite() && loss0 > 0.0,
+            "DP 跑完的验证 loss 应为正有限值，实际 {loss0}"
+        );
         // 数据分片真的生效了：两侧吃的是**不同**的批次（否则梯度平均等于单卡那批，
         // 数据并行白跑 N 遍——这是"接了 DP 但没接数据分片"最容易漏的一处）
         assert_ne!(
@@ -1389,15 +1433,23 @@ mod tests {
         assert_eq!(p0.len(), p1.len(), "两副本的参数个数应一致");
         for (i, (a, b)) in p0.iter().zip(p1).enumerate() {
             assert_eq!(a.len(), b.len(), "第 {i} 个参数的元素数应一致");
-            let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let worst = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             assert_eq!(
-                worst, 0.0,
+                worst,
+                0.0,
                 "第 {i} 个参数在两副本上不一致（最大绝对差 {worst}，len {}）——DP 同步没生效",
                 a.len()
             );
         }
         // 参数一致 + 评估走固定的 eval_rng（批次也一致）⇒ 验证 loss 必须逐位一致
-        assert_eq!(loss0, loss1, "两副本的验证 loss 不同：参数或评估批次没有对齐");
+        assert_eq!(
+            loss0, loss1,
+            "两副本的验证 loss 不同：参数或评估批次没有对齐"
+        );
     }
 
     /// 梯度累积的窗口大小：**只有尾窗会变短**，且变短后必须按实际微批数缩放。
@@ -1471,7 +1523,10 @@ mod tests {
         };
         let mut train_rng = Rng::new(7);
         let loss = train_vqvae(&vq, &images, &tcfg, &mut train_rng);
-        assert!(loss.is_finite() && loss > 0.0, "末步 loss 应为正有限值，实际 {loss}");
+        assert!(
+            loss.is_finite() && loss > 0.0,
+            "末步 loss 应为正有限值，实际 {loss}"
+        );
         let moved = vq
             .parameters()
             .iter()
@@ -1493,7 +1548,10 @@ mod tests {
 
         // 阶段一：warmup 严格递增，末点正好踩到峰值
         for i in 0..warmup - 1 {
-            assert!(curve[i] < curve[i + 1], "warmup 段应严格递增，第 {i} 步失败");
+            assert!(
+                curve[i] < curve[i + 1],
+                "warmup 段应严格递增，第 {i} 步失败"
+            );
         }
         assert_eq!(curve[warmup - 1], max_lr, "warmup 结束应正好是 max_lr");
 
@@ -1539,7 +1597,11 @@ mod tests {
         for step in 0..warmup {
             assert_eq!(a[step], b[step], "warmup 第 {step} 步两条曲线应逐位相同");
         }
-        assert_ne!(a[total - 1], b[total - 1], "末步两条曲线应确实不同（否则没测到差别）");
+        assert_ne!(
+            a[total - 1],
+            b[total - 1],
+            "末步两条曲线应确实不同（否则没测到差别）"
+        );
     }
 
     /// cosine 默认曲线的数值快照：加 WSD 不允许改动默认路径的行为。
@@ -1551,11 +1613,11 @@ mod tests {
         let mut s = LRScheduler::new(2, 6, 1.0, 0.0);
         let curve = lr_curve(&mut s, 6);
         let expected = [
-            0.5, // warmup 1/2
-            1.0, // warmup 2/2
-            1.0, // cosine progress 0
+            0.5,         // warmup 1/2
+            1.0,         // warmup 2/2
+            1.0,         // cosine progress 0
             0.853_553_4, // progress 0.25
-            0.5, // progress 0.5
+            0.5,         // progress 0.5
             0.146_446_6, // progress 0.75
         ];
         for (step, (&got, &want)) in curve.iter().zip(expected.iter()).enumerate() {
@@ -1595,7 +1657,10 @@ mod tests {
             .filter(|&&lr| lr == 1.0)
             .count();
         assert_eq!(plateau, decay_start - 4, "稳定段应整段都是 max_lr");
-        assert!(curve[decay_start + 1] < 1.0, "退火应从 decay_start 之后开始下降");
+        assert!(
+            curve[decay_start + 1] < 1.0,
+            "退火应从 decay_start 之后开始下降"
+        );
         assert!(
             (curve[19] - (1.0 + (0.1 - 1.0) * (7.0 / 8.0))).abs() < 1e-6,
             "末步应为线性退火到 7/8 处的值，实际 {}",
@@ -1821,7 +1886,11 @@ mod tests {
     /// （`validate` 会先拦下非法值，这里是双保险：工厂本身不会 panic）。
     #[test]
     fn test_optimizer_factory_defaults_to_adamw() {
-        assert_eq!(TrainConfig::default().optimizer, "adamw", "默认优化器必须是 adamw");
+        assert_eq!(
+            TrainConfig::default().optimizer,
+            "adamw",
+            "默认优化器必须是 adamw"
+        );
         let mut rng = Rng::new(3);
         let model = Transformer::new(TransformerConfig::tiny(32), &mut rng);
         let params = model.parameters();
@@ -1856,13 +1925,23 @@ mod tests {
         let mut rng2 = Rng::new(11);
         let model = Transformer::new(mcfg, &mut rng2);
         let hd = model.cfg.n_embd / model.cfg.n_head;
-        let names: Vec<String> = model.named_parameters().into_iter().map(|(n, _)| n).collect();
+        let names: Vec<String> = model
+            .named_parameters()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert_eq!(
-            names.iter().filter(|n| n.ends_with(".attn.q_norm.gamma")).count(),
+            names
+                .iter()
+                .filter(|n| n.ends_with(".attn.q_norm.gamma"))
+                .count(),
             model.cfg.n_layer
         );
         assert_eq!(
-            names.iter().filter(|n| n.ends_with(".attn.k_norm.gamma")).count(),
+            names
+                .iter()
+                .filter(|n| n.ends_with(".attn.k_norm.gamma"))
+                .count(),
             model.cfg.n_layer
         );
         for (n, p) in model.named_parameters() {

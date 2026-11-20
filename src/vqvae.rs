@@ -72,7 +72,9 @@ impl VqConfig {
     /// 校验配置自洽（训练入口在建模型前调用）
     pub fn validate(&self) {
         assert!(
-            self.image_size > 0 && self.patch_size > 0 && self.image_size % self.patch_size == 0,
+            self.image_size > 0
+                && self.patch_size > 0
+                && self.image_size.is_multiple_of(self.patch_size),
             "image_size（{}）必须是 patch_size（{}）的整数倍",
             self.image_size,
             self.patch_size
@@ -87,7 +89,11 @@ impl VqConfig {
 pub fn unpatchify(patches: &[f32], size: usize, patch: usize) -> Vec<f32> {
     let grid = size / patch;
     let pd = 3 * patch * patch;
-    assert_eq!(patches.len(), grid * grid * pd, "patch 元素数应为 grid²·3·ps²");
+    assert_eq!(
+        patches.len(),
+        grid * grid * pd,
+        "patch 元素数应为 grid²·3·ps²"
+    );
     let mut chw = vec![0.0f32; 3 * size * size];
     for (pi, chunk) in patches.chunks(pd).enumerate() {
         let (gy, gx) = (pi / grid, pi % grid);
@@ -113,7 +119,11 @@ fn quantize(z: &[f32], codebook: &[f32], d: usize, k: usize) -> (Vec<usize>, Vec
     let n = z.len() / d;
     // ‖e_j‖² 预计算，避免每行每列重复求平方和
     let e_norm: Vec<f32> = (0..k)
-        .map(|j| (0..d).map(|t| codebook[j * d + t] * codebook[j * d + t]).sum())
+        .map(|j| {
+            (0..d)
+                .map(|t| codebook[j * d + t] * codebook[j * d + t])
+                .sum()
+        })
         .collect();
     let mut idx = Vec::with_capacity(n);
     let mut zq = vec![0.0f32; z.len()];
@@ -247,7 +257,13 @@ impl Vqvae {
         tensor::no_grad(|| {
             let flat = self.flatten_pixels(pixels, b);
             let z_e = self.encode_latent(&flat);
-            quantize(&z_e.data(), &self.codebook.data(), self.cfg.latent_dim, self.cfg.codebook_size).0
+            quantize(
+                &z_e.data(),
+                &self.codebook.data(),
+                self.cfg.latent_dim,
+                self.cfg.codebook_size,
+            )
+            .0
         })
     }
 
@@ -257,7 +273,12 @@ impl Vqvae {
     pub fn decode(&self, ids: &[usize], b: usize) -> Vec<f32> {
         tensor::no_grad(|| {
             let cfg = &self.cfg;
-            let (p, pd, d, k) = (cfg.patch_count(), cfg.patch_dim(), cfg.latent_dim, cfg.codebook_size);
+            let (p, pd, d, k) = (
+                cfg.patch_count(),
+                cfg.patch_dim(),
+                cfg.latent_dim,
+                cfg.codebook_size,
+            );
             assert_eq!(ids.len(), b * p, "id 数量应为 b·P");
             let cb = self.codebook.data();
             let mut zq = Vec::with_capacity(ids.len() * d);
@@ -270,7 +291,11 @@ impl Vqvae {
             let data = out.data();
             let mut res = Vec::with_capacity(b * 3 * cfg.image_size * cfg.image_size);
             for s in 0..b {
-                res.extend(unpatchify(&data[s * p * pd..(s + 1) * p * pd], cfg.image_size, cfg.patch_size));
+                res.extend(unpatchify(
+                    &data[s * p * pd..(s + 1) * p * pd],
+                    cfg.image_size,
+                    cfg.patch_size,
+                ));
             }
             res
         })
@@ -327,8 +352,7 @@ impl Vqvae {
 
         let mut rng = Rng::new(0);
         let model = Self::new(header.cfg, &mut rng);
-        let by_name: HashMap<String, Tensor> =
-            model.named_parameters().into_iter().collect();
+        let by_name: HashMap<String, Tensor> = model.named_parameters().into_iter().collect();
         for name in &header.names {
             let p = by_name
                 .get(name)
@@ -357,7 +381,10 @@ const MAGIC: &[u8; 6] = b"VQCP1\n";
 
 impl Module for Vqvae {
     fn parameters(&self) -> Vec<Tensor> {
-        self.named_parameters().into_iter().map(|(_, t)| t).collect()
+        self.named_parameters()
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
     }
 }
 
@@ -407,7 +434,7 @@ mod tests {
         let model = Vqvae::new(cfg.clone(), &mut rng);
         let b = 2;
         let pixels: Vec<f32> = (0..b * 3 * cfg.image_size * cfg.image_size)
-            .map(|i| ((i as f32 * 0.11).sin()))
+            .map(|i| (i as f32 * 0.11).sin())
             .collect();
 
         let ids = model.encode(&pixels, b);
@@ -430,7 +457,7 @@ mod tests {
         let model = Vqvae::new(cfg.clone(), &mut rng);
         let b = 2;
         let pixels: Vec<f32> = (0..b * 3 * cfg.image_size * cfg.image_size)
-            .map(|i| ((i as f32 * 0.13).cos() * 0.5))
+            .map(|i| (i as f32 * 0.13).cos() * 0.5)
             .collect();
 
         let loss = model.forward_loss(&pixels, b);
@@ -445,7 +472,10 @@ mod tests {
             let g = ps[name].grad();
             g.iter().map(|x| x.abs()).sum::<f32>()
         };
-        assert!(grad_of("enc1.weight") > 0.0, "编码器应有梯度（recon 经 ST + commitment）");
+        assert!(
+            grad_of("enc1.weight") > 0.0,
+            "编码器应有梯度（recon 经 ST + commitment）"
+        );
         assert!(grad_of("dec2.weight") > 0.0, "解码器应有梯度（recon）");
         assert!(grad_of("codebook") > 0.0, "码本应有梯度（codebook loss）");
     }
@@ -465,7 +495,12 @@ mod tests {
         let z_e = model.encode_latent(&flat);
         let n = z_e.shape()[0];
         let z_e_data = z_e.data();
-        let (idx, _) = quantize(&z_e_data, &model.codebook.data(), cfg.latent_dim, cfg.codebook_size);
+        let (idx, _) = quantize(
+            &z_e_data,
+            &model.codebook.data(),
+            cfg.latent_dim,
+            cfg.codebook_size,
+        );
         let loss = model
             .codebook
             .gather_rows(&idx)
@@ -475,7 +510,10 @@ mod tests {
         loss.backward();
         let enc_grad: f32 = model.enc1.weight.grad().iter().map(|x| x.abs()).sum();
         let cb_grad: f32 = model.codebook.grad().iter().map(|x| x.abs()).sum();
-        assert_eq!(enc_grad, 0.0, "codebook loss 的 z_e 已脱图，编码器不应收到梯度");
+        assert_eq!(
+            enc_grad, 0.0,
+            "codebook loss 的 z_e 已脱图，编码器不应收到梯度"
+        );
         assert!(cb_grad > 0.0, "码本应收到梯度");
     }
 

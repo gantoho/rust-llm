@@ -59,7 +59,7 @@ pub fn cross_entropy_loss_masked(
         assert!(t < d, "目标类别越界：{} >= {}", t, d);
     }
 
-    let is_sup = |i: usize| mask.map_or(true, |m| m[i]);
+    let is_sup = |i: usize| mask.is_none_or(|m| m[i]);
     // 有效位置数；全被屏蔽时用 1 兜底避免除零（此时 loss 恒为 0，不需要真的回传梯度）
     let valid = (0..b).filter(|&i| is_sup(i)).count().max(1);
 
@@ -99,37 +99,41 @@ pub fn cross_entropy_loss_masked(
         let rg = result.grad.clone();
         let sg = logits.grad.clone();
         let ld = logits.data.clone();
-        record(&result, vec![logits.clone()], Arc::new(move || {
-            let g = rg.borrow()[0];
-            // 反向重算行 softmax（不存中间张量）；不加 EPS，与 log_softmax 数值一致
-            let lb2 = ld.decode();
-            let lr2: &[f32] = &lb2;
-            let mut sgm = sg.borrow_mut();
-            let t: &[usize] = &targets_rc;
-            // 先降级为共享切片（&[bool] 是 Sync）再进并行闭包
-            let m_ref: Option<&[bool]> = mask_rc.as_ref().map(|m| m.as_slice());
-            let scale = g / valid as f32;
-            sgm.par_chunks_mut(d).enumerate().for_each(|(i, row)| {
-                let sup = m_ref.map_or(true, |m| m[i]);
-                if !sup {
-                    return; // 屏蔽位不回传梯度
-                }
-                let base = i * d;
-                let mut maxv = f32::NEG_INFINITY;
-                for j in 0..d {
-                    maxv = maxv.max(lr2[base + j]);
-                }
-                let mut sum_exp = 0.0f32;
-                for j in 0..d {
-                    sum_exp += (lr2[base + j] - maxv).exp();
-                }
-                let inv = 1.0 / sum_exp;
-                for j in 0..d {
-                    row[j] += scale * ((lr2[base + j] - maxv).exp() * inv);
-                }
-                row[t[i]] -= scale;
-            });
-        }));
+        record(
+            &result,
+            vec![logits.clone()],
+            Arc::new(move || {
+                let g = rg.borrow()[0];
+                // 反向重算行 softmax（不存中间张量）；不加 EPS，与 log_softmax 数值一致
+                let lb2 = ld.decode();
+                let lr2: &[f32] = &lb2;
+                let mut sgm = sg.borrow_mut();
+                let t: &[usize] = &targets_rc;
+                // 先降级为共享切片（&[bool] 是 Sync）再进并行闭包
+                let m_ref: Option<&[bool]> = mask_rc.as_ref().map(|m| m.as_slice());
+                let scale = g / valid as f32;
+                sgm.par_chunks_mut(d).enumerate().for_each(|(i, row)| {
+                    let sup = m_ref.is_none_or(|m| m[i]);
+                    if !sup {
+                        return; // 屏蔽位不回传梯度
+                    }
+                    let base = i * d;
+                    let mut maxv = f32::NEG_INFINITY;
+                    for j in 0..d {
+                        maxv = maxv.max(lr2[base + j]);
+                    }
+                    let mut sum_exp = 0.0f32;
+                    for j in 0..d {
+                        sum_exp += (lr2[base + j] - maxv).exp();
+                    }
+                    let inv = 1.0 / sum_exp;
+                    for j in 0..d {
+                        row[j] += scale * ((lr2[base + j] - maxv).exp() * inv);
+                    }
+                    row[t[i]] -= scale;
+                });
+            }),
+        );
     }
     result
 }

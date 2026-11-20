@@ -27,10 +27,10 @@ fn ensure_dir(dir: &str) {
 /// 改成任意嵌套路径（如 `outputs/run1/logs/train.csv`）也能自动建目录。
 /// `path` 不含目录部分（如 `train.csv`）时不做任何事。
 pub fn ensure_parent_dir(path: &str) {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            ensure_dir(&parent.to_string_lossy());
-        }
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        ensure_dir(&parent.to_string_lossy());
     }
 }
 
@@ -38,14 +38,14 @@ pub fn ensure_parent_dir(path: &str) {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainConfig {
-    pub seed: u64,                // 随机种子（复现实验）
-    pub batch_size: usize,        // 每批序列条数
-    pub steps: usize,             // 总训练步数
-    pub max_lr: f32,              // 峰值学习率
-    pub min_lr: f32,              // 最低学习率（cosine 衰减到它）
-    pub warmup_steps: usize,      // 线性预热步数
-    pub weight_decay: f32,        // AdamW 权重衰减
-    pub grad_clip: f32,           // 梯度裁剪阈值（所有参数梯度总 L2 范数的上限，大模型常用 1.0）
+    pub seed: u64,           // 随机种子（复现实验）
+    pub batch_size: usize,   // 每批序列条数
+    pub steps: usize,        // 总训练步数
+    pub max_lr: f32,         // 峰值学习率
+    pub min_lr: f32,         // 最低学习率（cosine 衰减到它）
+    pub warmup_steps: usize, // 线性预热步数
+    pub weight_decay: f32,   // AdamW 权重衰减
+    pub grad_clip: f32,      // 梯度裁剪阈值（所有参数梯度总 L2 范数的上限，大模型常用 1.0）
     /// 动态损失缩放（AMP）开关：开启后训练循环把 loss 乘 `scale` 再反向，
     /// 更新参数前先做溢出检查（梯度含 Inf/NaN 就跳过本步更新）再反缩放回真实尺度。
     /// 详见 [`crate::train::MixedPrecision`]。
@@ -99,13 +99,13 @@ pub struct TrainConfig {
     /// Muon 的 Newton–Schulz 迭代步数（默认 5），只对 `optimizer = "muon"` 生效。
     /// 步数越多正交化越充分、也越慢；5 是 Muon 论文/参考实现的推荐值。
     pub muon_ns_steps: usize,
-    pub eval_every: usize,        // 每 N 步评估一次验证集并保存 latest checkpoint
-    pub eval_iters: usize,        // 评估时采样的批数
-    pub tokenizer: String,        // "char" 字符级 / "bpe" BPE
-    pub bpe_vocab: usize,         // BPE 目标词表大小（= 256 字节 + 合并数）
-    pub train_file: String,       // 训练语料文件
+    pub eval_every: usize,  // 每 N 步评估一次验证集并保存 latest checkpoint
+    pub eval_iters: usize,  // 评估时采样的批数
+    pub tokenizer: String,  // "char" 字符级 / "bpe" BPE
+    pub bpe_vocab: usize,   // BPE 目标词表大小（= 256 字节 + 合并数）
+    pub train_file: String, // 训练语料文件
     pub val_file: Option<String>, // 验证语料文件；None 时自动从训练文本末尾切 10%
-    pub out_dir: String,          // checkpoint 输出目录（默认 checkpoints/）
+    pub out_dir: String,    // checkpoint 输出目录（默认 checkpoints/）
     /// 梯度累积步数：每 accum_steps 步小 batch 才做一次 optimizer.step()。
     /// 有效 batch_size = batch_size * accum_steps。1 = 不累积（默认）。
     pub accum_steps: usize,
@@ -229,7 +229,7 @@ impl LoRATargets {
                 other => {
                     return Err(format!(
                         "未知的 LoRA 挂载位置 `{other}`（可选：q / k / v / o / mlp / all）"
-                    ))
+                    ));
                 }
             }
         }
@@ -303,18 +303,10 @@ impl Default for TrainConfig {
 /// 完整配置：模型超参数 + 训练参数
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub model: TransformerConfig,
     pub train: TrainConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            model: TransformerConfig::default(),
-            train: TrainConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -322,8 +314,8 @@ impl Config {
     pub fn load(path: &str) -> Config {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("无法读取配置文件 {path}: {e}"));
-        let cfg: Config = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("解析配置文件 {path} 失败: {e}"));
+        let cfg: Config =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("解析配置文件 {path} 失败: {e}"));
         cfg.validate();
         cfg
     }
@@ -336,19 +328,34 @@ impl Config {
         // 训练参数
         assert!(t.steps >= 1, "train.steps 必须 >= 1");
         assert!(t.batch_size >= 1, "train.batch_size 必须 >= 1");
-        assert!(t.eval_every >= 1, "train.eval_every 必须 >= 1（用于取模求余）");
-        assert!(t.eval_iters >= 1, "train.eval_iters 必须 >= 1（用于求平均）");
+        assert!(
+            t.eval_every >= 1,
+            "train.eval_every 必须 >= 1（用于取模求余）"
+        );
+        assert!(
+            t.eval_iters >= 1,
+            "train.eval_iters 必须 >= 1（用于求平均）"
+        );
         assert!(
             t.warmup_steps <= t.steps,
             "train.warmup_steps（{}）不能大于 train.steps（{}）",
-            t.warmup_steps, t.steps
+            t.warmup_steps,
+            t.steps
         );
         assert!(t.max_lr > 0.0, "train.max_lr 必须 > 0");
         assert!(t.min_lr >= 0.0, "train.min_lr 不能为负");
-        assert!(t.min_lr <= t.max_lr, "train.min_lr（{}）不能大于 train.max_lr（{}）", t.min_lr, t.max_lr);
+        assert!(
+            t.min_lr <= t.max_lr,
+            "train.min_lr（{}）不能大于 train.max_lr（{}）",
+            t.min_lr,
+            t.max_lr
+        );
         assert!(t.weight_decay >= 0.0, "train.weight_decay 不能为负");
         assert!(t.grad_clip > 0.0, "train.grad_clip 必须 > 0");
-        assert!(t.accum_steps >= 1, "train.accum_steps 必须 >= 1（否则除零）");
+        assert!(
+            t.accum_steps >= 1,
+            "train.accum_steps 必须 >= 1（否则除零）"
+        );
         assert!(
             t.amp_init_scale_log2 <= 24,
             "train.amp_init_scale_log2（{}）不能大于 24：scale 上限就是 2^24，\
@@ -380,22 +387,47 @@ impl Config {
             t.muon_momentum
         );
         assert!(t.muon_ns_steps >= 1, "train.muon_ns_steps 必须 >= 1");
-        assert!(t.bpe_vocab >= 256, "train.bpe_vocab 必须 >= 256（字节级基础词表）");
+        assert!(
+            t.bpe_vocab >= 256,
+            "train.bpe_vocab 必须 >= 256（字节级基础词表）"
+        );
         // 模型参数
         assert!(m.n_embd >= 1, "model.n_embd 必须 >= 1");
         assert!(m.n_head >= 1, "model.n_head 必须 >= 1");
         assert!(m.n_layer >= 1, "model.n_layer 必须 >= 1");
         assert!(m.block_size >= 1, "model.block_size 必须 >= 1");
-        assert!(m.n_embd % m.n_head == 0, "model.n_embd（{}）必须能被 model.n_head（{}）整除", m.n_embd, m.n_head);
-        assert!(m.dropout >= 0.0 && m.dropout < 1.0, "model.dropout 必须在 [0, 1) 之间");
+        assert!(
+            m.n_embd.is_multiple_of(m.n_head),
+            "model.n_embd（{}）必须能被 model.n_head（{}）整除",
+            m.n_embd,
+            m.n_head
+        );
+        assert!(
+            m.dropout >= 0.0 && m.dropout < 1.0,
+            "model.dropout 必须在 [0, 1) 之间"
+        );
         if m.n_kv_head > 0 {
-            assert!(m.n_kv_head <= m.n_head, "model.n_kv_head（{}）不能大于 model.n_head（{}）", m.n_kv_head, m.n_head);
-            assert!(m.n_head % m.n_kv_head == 0, "model.n_head（{}）必须能被 model.n_kv_head（{}）整除", m.n_head, m.n_kv_head);
+            assert!(
+                m.n_kv_head <= m.n_head,
+                "model.n_kv_head（{}）不能大于 model.n_head（{}）",
+                m.n_kv_head,
+                m.n_head
+            );
+            assert!(
+                m.n_head.is_multiple_of(m.n_kv_head),
+                "model.n_head（{}）必须能被 model.n_kv_head（{}）整除",
+                m.n_head,
+                m.n_kv_head
+            );
         }
         // MLA（低秩压缩 KV cache）：0 = 关闭；开启时必须真的比 K/V 的完整维度小，
         // 否则"压缩"名不副实（缓存只会更大，还平白多一层投影）。
         if m.kv_lora_rank > 0 {
-            let n_kv = if m.n_kv_head == 0 { m.n_head } else { m.n_kv_head };
+            let n_kv = if m.n_kv_head == 0 {
+                m.n_head
+            } else {
+                m.n_kv_head
+            };
             let kv_dim = n_kv * (m.n_embd / m.n_head);
             assert!(
                 m.kv_lora_rank < kv_dim,
@@ -424,7 +456,7 @@ impl Config {
                 head_dim
             );
             assert!(
-                m.mla_rope_dim % 2 == 0,
+                m.mla_rope_dim.is_multiple_of(2),
                 "model.mla_rope_dim（{}）必须为偶数（RoPE 两两配对旋转）",
                 m.mla_rope_dim
             );
@@ -561,20 +593,15 @@ impl Config {
             "small" => Config::preset_small(),
             "medium" => Config::preset_medium(),
             "large" => Config::preset_large(),
-            other => panic!(
-                "未知预设 '{}'（可选：small / medium / large）",
-                other
-            ),
+            other => panic!("未知预设 '{}'（可选：small / medium / large）", other),
         }
     }
 
     /// 保存配置到 JSON 文件
     pub fn save(&self, path: &str) {
-        let json = serde_json::to_string_pretty(self)
-            .expect("序列化配置失败");
+        let json = serde_json::to_string_pretty(self).expect("序列化配置失败");
         ensure_parent_dir(path);
-        std::fs::write(path, json)
-            .unwrap_or_else(|e| panic!("无法写入配置文件 {path}: {e}"));
+        std::fs::write(path, json).unwrap_or_else(|e| panic!("无法写入配置文件 {path}: {e}"));
     }
 }
 
@@ -589,11 +616,23 @@ mod tests {
         let t = LoRATargets::parse(" Q , k ,V ").unwrap();
         assert_eq!(
             t,
-            LoRATargets { q: true, k: true, v: true, o: false, mlp: false }
+            LoRATargets {
+                q: true,
+                k: true,
+                v: true,
+                o: false,
+                mlp: false
+            }
         );
         assert_eq!(
             LoRATargets::parse("all").unwrap(),
-            LoRATargets { q: true, k: true, v: true, o: true, mlp: true }
+            LoRATargets {
+                q: true,
+                k: true,
+                v: true,
+                o: true,
+                mlp: true
+            }
         );
         let t = LoRATargets::parse("proj,ffn").unwrap();
         assert!(t.o && t.mlp && !t.q && !t.k && !t.v);
@@ -610,7 +649,11 @@ mod tests {
         let old: LoRAConfig = serde_json::from_str(r#"{"rank":8,"alpha":8.0}"#).unwrap();
         assert_eq!(old.rank, 8);
         assert_eq!(old.alpha, 8.0);
-        assert_eq!(old.targets, LoRATargets::default(), "旧档应回落到缺省 q/k/v");
+        assert_eq!(
+            old.targets,
+            LoRATargets::default(),
+            "旧档应回落到缺省 q/k/v"
+        );
 
         // 新档带 targets：逐个字段读回，未提到的字段同理走缺省
         let new: LoRAConfig =
@@ -618,7 +661,13 @@ mod tests {
                 .unwrap();
         assert_eq!(
             new.targets,
-            LoRATargets { q: true, k: false, v: true, o: true, mlp: false }
+            LoRATargets {
+                q: true,
+                k: false,
+                v: true,
+                o: true,
+                mlp: false
+            }
         );
 
         // 日志里的挂载位置：固定按 q,k,v,o,mlp 顺序输出

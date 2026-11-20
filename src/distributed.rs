@@ -49,7 +49,10 @@ pub struct CommLog {
 
 impl CommLog {
     fn new(ranks: usize) -> Self {
-        CommLog { rounds: 0, per_rank: vec![0; ranks] }
+        CommLog {
+            rounds: 0,
+            per_rank: vec![0; ranks],
+        }
     }
 
     /// 所有 rank 累计发送的元素总数
@@ -59,7 +62,10 @@ impl CommLog {
 
     /// 单个元素 4 字节，折算成字节数
     pub fn per_rank_bytes(&self) -> Vec<usize> {
-        self.per_rank.iter().map(|e| e * std::mem::size_of::<f32>()).collect()
+        self.per_rank
+            .iter()
+            .map(|e| e * std::mem::size_of::<f32>())
+            .collect()
     }
 
     /// 发得最多的那个 rank 的字节数——瓶颈就是它
@@ -175,7 +181,11 @@ pub(crate) fn rotate_chunks(gathered: &[f32], n: usize) -> Vec<f32> {
 impl World {
     pub fn new(size: usize) -> Self {
         assert!(size > 0, "通信域至少要有 1 个 rank");
-        World { size, log: CommLog::new(size), barriers: 0 }
+        World {
+            size,
+            log: CommLog::new(size),
+            barriers: 0,
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -225,7 +235,9 @@ impl World {
         // 阶段 1：每 rank 拿到自己负责那块的全和
         let owned = self.reduce_scatter_inner(locals);
         // 阶段 2：按 rank 顺序收集（rank r 贡献自己那块）
-        let blocks_by_rank: Vec<Vec<f32>> = owned.iter().map(|(_, d)| d.clone()).collect();
+        // 用 `into_iter()` **移出**已有块，而不是 `d.clone()` —— 少一次整缓冲拷贝
+        // （all-reduce 每步 2 GB 量级时这就是一整趟 memcpy）。
+        let blocks_by_rank: Vec<Vec<f32>> = owned.into_iter().map(|(_, d)| d).collect();
         let gathered = self.all_gather_inner(&blocks_by_rank);
         // 阶段 3：纯粹的下标换算，把块序转回原始顺序（见 rotate_chunks）
         let assembled = rotate_chunks(&gathered[0], n);
@@ -310,13 +322,20 @@ impl World {
             for r in 0..n {
                 let origin = wrap(r as isize - s - 1, n);
                 let src = outbox[wrap(r as isize - 1, n)].clone();
-                assert_eq!(src.len(), locals[origin].len(), "all_gather 要求各 rank 的块等长");
+                assert_eq!(
+                    src.len(),
+                    locals[origin].len(),
+                    "all_gather 要求各 rank 的块等长"
+                );
                 blocks[r][origin] = src;
                 self.log.per_rank[r] += blocks[r][origin].len();
             }
             self.log.rounds += 1;
         }
-        blocks.iter().map(|b| b.iter().flatten().copied().collect()).collect()
+        blocks
+            .iter()
+            .map(|b| b.iter().flatten().copied().collect())
+            .collect()
     }
 
     /// 从 `src` 广播到所有 rank。只有 `locals[src]` 的内容会被采用，
@@ -344,7 +363,9 @@ impl World {
             }
             self.log.rounds += 1;
         }
-        have.into_iter().map(|v| v.expect("广播结束时所有 rank 都应收到数据")).collect()
+        have.into_iter()
+            .map(|v| v.expect("广播结束时所有 rank 都应收到数据"))
+            .collect()
     }
 
     /// 主从广播式 allreduce：所有 rank 发给 rank 0，rank 0 求和后再发回给所有人。
@@ -384,7 +405,10 @@ impl World {
     fn check_locals(&self, locals: &[Vec<f32>]) -> usize {
         self.check_rank_count(locals);
         let len = locals[0].len();
-        assert!(locals.iter().all(|l| l.len() == len), "各 rank 的数据长度必须一致");
+        assert!(
+            locals.iter().all(|l| l.len() == len),
+            "各 rank 的数据长度必须一致"
+        );
         len
     }
 }
@@ -411,7 +435,12 @@ pub fn flatten_grads(params: &[Tensor]) -> Vec<f32> {
 /// 若这里写成累加，每同步一次梯度就翻一倍，训练会在几步之内飞出去。
 pub fn write_grads(params: &[Tensor], flat: &[f32], scale: f32) {
     let total: usize = params.iter().map(|p| p.numel()).sum();
-    assert_eq!(flat.len(), total, "扁平梯度长度与参数不匹配：{} vs {total}", flat.len());
+    assert_eq!(
+        flat.len(),
+        total,
+        "扁平梯度长度与参数不匹配：{} vs {total}",
+        flat.len()
+    );
     let mut off = 0;
     for p in params {
         let n = p.numel();
@@ -441,7 +470,12 @@ pub fn flatten_params(params: &[Tensor]) -> Vec<f32> {
 /// 换张量会变成"模型用新的、优化器更新旧的"两本账（见 [`Tensor::set_data`] 的说明）。
 pub fn write_params(params: &[Tensor], flat: &[f32]) {
     let total: usize = params.iter().map(|p| p.numel()).sum();
-    assert_eq!(flat.len(), total, "扁平参数长度与参数不匹配：{} vs {total}", flat.len());
+    assert_eq!(
+        flat.len(),
+        total,
+        "扁平参数长度与参数不匹配：{} vs {total}",
+        flat.len()
+    );
     let mut off = 0;
     for p in params {
         let n = p.numel();
@@ -458,7 +492,11 @@ pub fn write_params(params: &[Tensor], flat: &[f32]) {
 fn check_same_structure(replicas: &[Vec<Tensor>]) {
     let first = &replicas[0];
     for (r, params) in replicas.iter().enumerate() {
-        assert_eq!(params.len(), first.len(), "rank {r} 的参数个数与其他 rank 不一致");
+        assert_eq!(
+            params.len(),
+            first.len(),
+            "rank {r} 的参数个数与其他 rank 不一致"
+        );
         for (i, (a, b)) in first.iter().zip(params).enumerate() {
             assert_eq!(
                 a.shape(),
@@ -492,7 +530,9 @@ pub struct DataParallel {
 
 impl DataParallel {
     pub fn new(world_size: usize) -> Self {
-        DataParallel { world: World::new(world_size) }
+        DataParallel {
+            world: World::new(world_size),
+        }
     }
 
     /// 最近一次梯度同步的通信量
@@ -511,7 +551,12 @@ impl DataParallel {
     /// 更新完全一样；ZeRO 则要求把优化器状态也切开，那一步在下一节）。
     pub fn sync_gradients(&mut self, replicas: &[Vec<Tensor>], local_scale: f32) {
         let n = self.world.size();
-        assert_eq!(replicas.len(), n, "副本数应与通信域大小一致：{} vs {n}", replicas.len());
+        assert_eq!(
+            replicas.len(),
+            n,
+            "副本数应与通信域大小一致：{} vs {n}",
+            replicas.len()
+        );
         check_same_structure(replicas);
         let locals: Vec<Vec<f32>> = replicas.iter().map(|ps| flatten_grads(ps)).collect();
         // 求和 allreduce；每个 rank 拿到的是一份**逐位相同**的完整结果
@@ -696,8 +741,18 @@ impl ZeroOptimizer {
             .map(|(s, e)| Tensor::param(vec![0.0; e - s], vec![e - s]))
             .collect();
         // 每 rank 一个只装"自己那段"的 AdamW：状态量随分片一起缩小到 1/N
-        let opts = shards.iter().map(|t| AdamW::new(lr, vec![t.clone()], weight_decay)).collect();
-        ZeroOptimizer { stage, world: World::new(world_size), ranges, opts, shards, total }
+        let opts = shards
+            .iter()
+            .map(|t| AdamW::new(lr, vec![t.clone()], weight_decay))
+            .collect();
+        ZeroOptimizer {
+            stage,
+            world: World::new(world_size),
+            ranges,
+            opts,
+            shards,
+            total,
+        }
     }
 
     /// 每 rank 实际常驻的优化器状态字节数（m + v 各 4 字节/元素）
@@ -706,7 +761,8 @@ impl ZeroOptimizer {
             .iter()
             .map(|o| {
                 let (_, m, v) = o.state();
-                let e = m.iter().map(Vec::len).sum::<usize>() + v.iter().map(Vec::len).sum::<usize>();
+                let e =
+                    m.iter().map(Vec::len).sum::<usize>() + v.iter().map(Vec::len).sum::<usize>();
                 e * std::mem::size_of::<f32>()
             })
             .collect()
@@ -725,13 +781,25 @@ impl ZeroOptimizer {
     ///
     /// 返回每个 rank 上更新后的完整扁平参数（N 份逐位相同），由调用方
     /// [`write_params`] 写回模型继续下一步。
-    pub fn step(&mut self, params: &[Vec<f32>], grads: &[Vec<f32>], local_scale: f32) -> Vec<Vec<f32>> {
+    pub fn step(
+        &mut self,
+        params: &[Vec<f32>],
+        grads: &[Vec<f32>],
+        local_scale: f32,
+    ) -> Vec<Vec<f32>> {
         let n = self.world.size();
         assert_eq!(params.len(), n, "参数份数应与 rank 数一致");
         assert_eq!(grads.len(), n, "梯度份数应与 rank 数一致");
-        assert_eq!(grads[0].len(), self.total, "扁平梯度长度应为 {}", self.total);
+        assert_eq!(
+            grads[0].len(),
+            self.total,
+            "扁平梯度长度应为 {}",
+            self.total
+        );
         assert!(
-            params.iter().all(|p| p.len() == self.total && p == &params[0]),
+            params
+                .iter()
+                .all(|p| p.len() == self.total && p == &params[0]),
             "ZeRO 假定各 rank 手上的完整参数当前是一致的；不一致说明上一步的 \
              all-gather 没写回，或者某个 rank 偷偷自己更新了参数"
         );
@@ -805,7 +873,9 @@ pub fn contiguous_columns(out: usize, world_size: usize) -> Vec<Vec<usize>> {
 /// 列并行的"输出列"就是下一层行并行的"输入行"——两者必须落在同一个 rank 上，
 /// 两层的接缝才能不通信（这是 TP 最核心的一条设计，见 [`TensorParallelMlp`]）。
 pub fn contiguous_ranges(len: usize, world_size: usize) -> Vec<(usize, usize)> {
-    (0..world_size).map(|r| chunk_range(r, len, world_size)).collect()
+    (0..world_size)
+        .map(|r| chunk_range(r, len, world_size))
+        .collect()
 }
 
 /// 融合 QKV 权重 `[d_model, 3·d_model]`（列序 `[q | k | v]`）的列切分：
@@ -821,10 +891,13 @@ pub fn contiguous_ranges(len: usize, world_size: usize) -> Vec<(usize, usize)> {
 /// 直到输出投影（行并行）才 allreduce 一次。
 pub fn qkv_head_columns(d_model: usize, n_head: usize, world_size: usize) -> Vec<Vec<usize>> {
     assert!(
-        n_head % world_size == 0,
+        n_head.is_multiple_of(world_size),
         "head 数 {n_head} 必须能被 rank 数 {world_size} 整除，否则 head 会被切到两张卡上"
     );
-    assert!(d_model % n_head == 0, "d_model {d_model} 必须能被 head 数 {n_head} 整除");
+    assert!(
+        d_model.is_multiple_of(n_head),
+        "d_model {d_model} 必须能被 head 数 {n_head} 整除"
+    );
     let head_dim = d_model / n_head;
     let per_rank = n_head / world_size;
     (0..world_size)
@@ -849,7 +922,10 @@ fn check_columns(columns: &[Vec<usize>], out_features: usize) {
     let mut seen = vec![false; out_features];
     for (r, cols) in columns.iter().enumerate() {
         for &c in cols {
-            assert!(c < out_features, "rank {r} 负责的列 {c} 超出输出宽度 {out_features}");
+            assert!(
+                c < out_features,
+                "rank {r} 负责的列 {c} 超出输出宽度 {out_features}"
+            );
             assert!(!seen[c], "第 {c} 列被分给了多个 rank：它的梯度会被算两遍");
             seen[c] = true;
         }
@@ -861,11 +937,17 @@ fn check_columns(columns: &[Vec<usize>], out_features: usize) {
 fn check_input_ranges(ranges: &[(usize, usize)], in_features: usize) {
     let mut next = 0usize;
     for (s, e) in ranges {
-        assert_eq!(*s, next, "行切分必须首尾相接、从 0 开始：期望 {next}，实际 {s}");
+        assert_eq!(
+            *s, next,
+            "行切分必须首尾相接、从 0 开始：期望 {next}，实际 {s}"
+        );
         assert!(e > s, "空的输入分片会让这个 rank 什么都算不出来");
         next = *e;
     }
-    assert_eq!(next, in_features, "行切分没有铺满输入维度：只到 {next}，应为 {in_features}");
+    assert_eq!(
+        next, in_features,
+        "行切分没有铺满输入维度：只到 {next}，应为 {in_features}"
+    );
 }
 
 /// 把 all_gather 收上来的**按 rank 顺序拼接**的缓冲，按列索引放回完整输出里
@@ -950,7 +1032,11 @@ impl ColumnParallelLinear {
         out_features: usize,
         columns: Vec<Vec<usize>>,
     ) -> Self {
-        assert_eq!(w_full.len(), in_features * out_features, "权重元素数应为 in×out");
+        assert_eq!(
+            w_full.len(),
+            in_features * out_features,
+            "权重元素数应为 in×out"
+        );
         assert_eq!(b_full.len(), out_features, "偏置长度应为 out");
         check_columns(&columns, out_features);
         let w_shards = columns
@@ -972,7 +1058,13 @@ impl ColumnParallelLinear {
                 Tensor::param(data, vec![cols.len()])
             })
             .collect();
-        ColumnParallelLinear { columns, w_shards, b_shards, in_features, out_features }
+        ColumnParallelLinear {
+            columns,
+            w_shards,
+            b_shards,
+            in_features,
+            out_features,
+        }
     }
 
     /// 融合 QKV 的列并行层：`w_full` 为 `[d_model, 3·d_model]`（列序 q|k|v），
@@ -1026,7 +1118,11 @@ impl ColumnParallelLinear {
     /// 反向里这一步对应真机的 reduce-scatter（各 rank 把完整输出梯度里属于别人的那部分
     /// 送出去）；本模块里完整输出只有一份，于是退化成按列切片，数值完全一致。
     pub fn forward(&self, world: &mut World, x: &Tensor) -> Tensor {
-        assert_eq!(world.size(), self.world_size(), "通信域大小与切分份数必须一致");
+        assert_eq!(
+            world.size(),
+            self.world_size(),
+            "通信域大小与切分份数必须一致"
+        );
         let locals = self.forward_local(x);
         let data: Vec<Vec<f32>> = locals.iter().map(|t| t.data()).collect();
         let gathered = world.all_gather(&data);
@@ -1080,7 +1176,11 @@ impl RowParallelLinear {
         out_features: usize,
         ranges: Vec<(usize, usize)>,
     ) -> Self {
-        assert_eq!(w_full.len(), in_features * out_features, "权重元素数应为 in×out");
+        assert_eq!(
+            w_full.len(),
+            in_features * out_features,
+            "权重元素数应为 in×out"
+        );
         assert_eq!(b_full.len(), out_features, "偏置长度应为 out");
         check_input_ranges(&ranges, in_features);
         let w_shards = ranges
@@ -1216,7 +1316,11 @@ impl TensorParallelMlp {
                 e - s
             );
         }
-        TensorParallelMlp { fc1, fc2, world: World::new(world_size) }
+        TensorParallelMlp {
+            fc1,
+            fc2,
+            world: World::new(world_size),
+        }
     }
 
     pub fn log(&self) -> &CommLog {
@@ -1278,7 +1382,10 @@ pub struct Schedule {
 impl Schedule {
     /// GPipe：先跑完所有 micro-batch 的前向，再依次反向
     pub fn gpipe(micro_batches: usize, stages: usize) -> Self {
-        assert!(micro_batches > 0 && stages > 0, "micro-batch 数与段数都必须为正");
+        assert!(
+            micro_batches > 0 && stages > 0,
+            "micro-batch 数与段数都必须为正"
+        );
         let mut steps = Vec::with_capacity(2 * micro_batches * stages);
         for i in 0..micro_batches {
             for s in 0..stages {
@@ -1299,7 +1406,10 @@ impl Schedule {
     /// 稳态里的"前向进来一个、反向送走一个"就是它的名字。注意 `M <= p-1` 时
     /// 没有可重叠的活，1F1B 退化成 GPipe——所以用 1F1B 的前提是 M 至少和 p 同量级。
     pub fn one_forward_one_backward(micro_batches: usize, stages: usize) -> Self {
-        assert!(micro_batches > 0 && stages > 0, "micro-batch 数与段数都必须为正");
+        assert!(
+            micro_batches > 0 && stages > 0,
+            "micro-batch 数与段数都必须为正"
+        );
         let mut steps = Vec::with_capacity(2 * micro_batches * stages);
         let warm = (stages - 1).min(micro_batches);
         let mut oldest = 0usize; // 下一个该被送走的（最老的）micro-batch
@@ -1362,11 +1472,23 @@ impl Schedule {
         // 每个 micro-batch 在每段上前向、反向各**恰好一次**：少一次就是有段没算，
         // 多一次就是重复累加梯度，两种都不会报错，只会把模型悄悄训歪
         for i in 0..micro_batches {
-            assert_eq!(seen_fwd[i], stages, "第 {i} 个 micro-batch 的前向次数应等于段数");
-            assert_eq!(seen_bwd[i], stages, "第 {i} 个 micro-batch 的反向次数应等于段数");
+            assert_eq!(
+                seen_fwd[i], stages,
+                "第 {i} 个 micro-batch 的前向次数应等于段数"
+            );
+            assert_eq!(
+                seen_bwd[i], stages,
+                "第 {i} 个 micro-batch 的反向次数应等于段数"
+            );
         }
         assert_eq!(live, 0, "调度跑完时所有 micro-batch 的激活都应已释放");
-        Schedule { micro_batches, stages, steps, peak_in_flight, peak_boundary_buffers }
+        Schedule {
+            micro_batches,
+            stages,
+            steps,
+            peak_in_flight,
+            peak_boundary_buffers,
+        }
     }
 }
 
@@ -1461,7 +1583,10 @@ impl Pipeline {
         }
 
         RunReport {
-            outputs: out.into_iter().map(|o| o.expect("每个 micro-batch 都应跑完")).collect(),
+            outputs: out
+                .into_iter()
+                .map(|o| o.expect("每个 micro-batch 都应跑完"))
+                .collect(),
             peak_in_flight,
             peak_boundary_buffers,
         }
@@ -1551,7 +1676,11 @@ impl DistConfig {
     /// 或同一个 NVLink 域里就行；把 dp 放低位的话，TP 队友会散在整个集群里，
     /// 每层那两次 allreduce 都要跨机，通信立刻成为瓶颈。
     pub fn coord(&self, rank: usize) -> RankCoord {
-        assert!(rank < self.world_size(), "rank {rank} 超出通信域大小 {}", self.world_size());
+        assert!(
+            rank < self.world_size(),
+            "rank {rank} 超出通信域大小 {}",
+            self.world_size()
+        );
         RankCoord {
             tp: rank % self.tp,
             dp: (rank / self.tp) % self.dp,
@@ -1568,7 +1697,9 @@ impl DistConfig {
     /// **层内通信只在这一组里发生**。
     pub fn tp_group(&self, rank: usize) -> Vec<usize> {
         let c = self.coord(rank);
-        (0..self.tp).map(|tp| self.rank_of(RankCoord { tp, ..c })).collect()
+        (0..self.tp)
+            .map(|tp| self.rank_of(RankCoord { tp, ..c }))
+            .collect()
     }
 
     /// 与本 rank 同属一个 DP 组的 rank：tp/pp 坐标相同、dp 坐标走满一圈。
@@ -1576,14 +1707,9 @@ impl DistConfig {
     /// 吃的是不同的数据。
     pub fn dp_group(&self, rank: usize) -> Vec<usize> {
         let c = self.coord(rank);
-        (0..self.dp).map(|dp| self.rank_of(RankCoord { dp, ..c })).collect()
-    }
-
-    /// 与本 rank 同属一个 PP 组的 rank：tp/dp 坐标相同、pp 坐标走满一圈。
-    /// **stage 间只传边界激活**（点对点），这一组圈出的是同一条流水线上的邻居。
-    pub fn pp_group(&self, rank: usize) -> Vec<usize> {
-        let c = self.coord(rank);
-        (0..self.pp).map(|pp| self.rank_of(RankCoord { pp, ..c })).collect()
+        (0..self.dp)
+            .map(|dp| self.rank_of(RankCoord { dp, ..c }))
+            .collect()
     }
 
     /// 本 rank 流水线里的上游 stage（`None` = 第一段，输入直接来自数据）
@@ -1693,7 +1819,9 @@ mod tests {
     /// 造 `n` 份长度为 `len` 的随机本地数据
     fn random_locals(n: usize, len: usize, seed: u64) -> Vec<Vec<f32>> {
         let mut rng = Rng::new(seed);
-        (0..n).map(|_| (0..len).map(|_| rng.randn()).collect()).collect()
+        (0..n)
+            .map(|_| (0..len).map(|_| rng.randn()).collect())
+            .collect()
     }
 
     /// 按位求和
@@ -1708,7 +1836,13 @@ mod tests {
     }
 
     fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
-        assert_eq!(got.len(), want.len(), "{what}：长度 {} vs {}", got.len(), want.len());
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{what}：长度 {} vs {}",
+            got.len(),
+            want.len()
+        );
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!(
                 (g - w).abs() <= tol,
@@ -1729,9 +1863,17 @@ mod tests {
                 let got = world.all_reduce_sum(&locals);
                 assert_eq!(got.len(), n);
                 for (r, g) in got.iter().enumerate() {
-                    assert_close(g, &want, 1e-6, &format!("n={n} len={len} rank {r} 的 allreduce"));
+                    assert_close(
+                        g,
+                        &want,
+                        1e-6,
+                        &format!("n={n} len={len} rank {r} 的 allreduce"),
+                    );
                     // 各 rank 的结果必须**逐位**相同，否则后续参数更新会分叉
-                    assert_eq!(g, &got[0], "n={n} len={len} 时 rank {r} 的结果与 rank 0 不一致");
+                    assert_eq!(
+                        g, &got[0],
+                        "n={n} len={len} 时 rank {r} 的结果与 rank 0 不一致"
+                    );
                 }
             }
         }
@@ -1739,7 +1881,7 @@ mod tests {
 
     /// 选一个能制造余数的长度
     fn len_for(n: usize) -> usize {
-        if n % 2 == 0 { 10 } else { 11 }
+        if n.is_multiple_of(2) { 10 } else { 11 }
     }
 
     #[test]
@@ -1764,7 +1906,11 @@ mod tests {
 
         let naive = world.all_reduce_sum_naive(&locals);
         let naive_log = world.log().clone();
-        assert_eq!(naive_log.per_rank[0], (n - 1) * len, "主从广播里 rank 0 要下发 N-1 份");
+        assert_eq!(
+            naive_log.per_rank[0],
+            (n - 1) * len,
+            "主从广播里 rank 0 要下发 N-1 份"
+        );
         assert_eq!(naive_log.per_rank[1], len);
         assert_eq!(
             naive_log.max_rank_bytes(),
@@ -1782,7 +1928,12 @@ mod tests {
 
         // 两种实现结果一致
         assert_close(&ring[0], &naive[0], 1e-6, "环形与主从广播的 allreduce");
-        assert_close(&ring[0], &sum_of(&locals), 1e-6, "环形 allreduce 与直接求和");
+        assert_close(
+            &ring[0],
+            &sum_of(&locals),
+            1e-6,
+            "环形 allreduce 与直接求和",
+        );
     }
 
     #[test]
@@ -1798,7 +1949,12 @@ mod tests {
         for (r, (c, data)) in owned.iter().enumerate() {
             assert_eq!(*c, (r + 1) % n, "rank {r} 应持有第 {} 块", (r + 1) % n);
             let (s, e) = chunk_range(*c, len, n);
-            assert_close(data, &want[s..e], 1e-6, &format!("rank {r} 持有的第 {c} 块"));
+            assert_close(
+                data,
+                &want[s..e],
+                1e-6,
+                &format!("rank {r} 持有的第 {c} 块"),
+            );
             seen.push(*c);
         }
         seen.sort();
@@ -1835,7 +1991,10 @@ mod tests {
             let mut world = World::new(n);
             let got = world.broadcast(src, &locals);
             for (r, g) in got.iter().enumerate() {
-                assert_eq!(g, &locals[src], "rank {r} 收到的广播内容应等于 rank {src} 的数据");
+                assert_eq!(
+                    g, &locals[src],
+                    "rank {r} 收到的广播内容应等于 rank {src} 的数据"
+                );
             }
             if n > 1 {
                 assert_eq!(world.log().rounds, n - 1);
@@ -1853,7 +2012,11 @@ mod tests {
         assert!(world.log().total_sent() > 0);
         world.barrier();
         assert_eq!(world.barriers(), 1);
-        assert_eq!(world.log(), &CommLog::new(2), "屏障之后是新阶段，通信量重新计数");
+        assert_eq!(
+            world.log(),
+            &CommLog::new(2),
+            "屏障之后是新阶段，通信量重新计数"
+        );
     }
 
     // ---------- 数据并行 ----------
@@ -1886,7 +2049,13 @@ mod tests {
     }
 
     /// 一个 batch 的平均交叉熵
-    fn batch_loss(model: &Transformer, ids: &[usize], targets: &[usize], b: usize, t: usize) -> Tensor {
+    fn batch_loss(
+        model: &Transformer,
+        ids: &[usize],
+        targets: &[usize],
+        b: usize,
+        t: usize,
+    ) -> Tensor {
         assert_eq!(ids.len(), b * t, "ids 个数应与 b×t 一致");
         assert_eq!(targets.len(), b * t, "targets 个数应与 b×t 一致");
         let logits = model.forward(ids, b, t, None, false);
@@ -1910,7 +2079,9 @@ mod tests {
         opt_full.step();
 
         // DP 组：两份**同初值**副本，各吃一半数据
-        let replicas: Vec<Transformer> = (0..world_size).map(|_| tiny_transformer(vocab, seed)).collect();
+        let replicas: Vec<Transformer> = (0..world_size)
+            .map(|_| tiny_transformer(vocab, seed))
+            .collect();
         for r in 1..world_size {
             assert_eq!(
                 replicas[r].parameters()[0].data(),
@@ -1927,7 +2098,11 @@ mod tests {
 
         let mut dp = DataParallel::new(world_size);
         dp.sync_gradients(&per_rank, 1.0);
-        assert_eq!(dp.log().rounds, 2 * (world_size - 1), "一次梯度同步 = 两阶段环形 allreduce");
+        assert_eq!(
+            dp.log().rounds,
+            2 * (world_size - 1),
+            "一次梯度同步 = 两阶段环形 allreduce"
+        );
 
         // 同步后的梯度应与"单卡全 batch 一次算完"的梯度一致
         assert_close(
@@ -1943,7 +2118,12 @@ mod tests {
             opt.step();
         }
         for (i, (a, b)) in full_params.iter().zip(&per_rank[0]).enumerate() {
-            assert_close(&b.data(), &a.data(), 1e-5, &format!("一步更新后第 {i} 个参数"));
+            assert_close(
+                &b.data(),
+                &a.data(),
+                1e-5,
+                &format!("一步更新后第 {i} 个参数"),
+            );
         }
         for r in 1..world_size {
             for (i, p) in per_rank[r].iter().enumerate() {
@@ -2001,10 +2181,13 @@ mod tests {
 
         // 参照组：vanilla DP（每个 rank 一份完整优化器状态）
         let ref_losses: Vec<f32> = {
-            let replicas: Vec<Transformer> = (0..n).map(|_| tiny_transformer(vocab, seed)).collect();
+            let replicas: Vec<Transformer> =
+                (0..n).map(|_| tiny_transformer(vocab, seed)).collect();
             let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
-            let mut opts: Vec<AdamW> =
-                per_rank.iter().map(|p| AdamW::new(lr, p.clone(), wd)).collect();
+            let mut opts: Vec<AdamW> = per_rank
+                .iter()
+                .map(|p| AdamW::new(lr, p.clone(), wd))
+                .collect();
             let mut dp = DataParallel::new(n);
             let mut losses = Vec::new();
             for _ in 0..steps {
@@ -2032,7 +2215,8 @@ mod tests {
         };
 
         for stage in [ZeroStage::One, ZeroStage::Two] {
-            let replicas: Vec<Transformer> = (0..n).map(|_| tiny_transformer(vocab, seed)).collect();
+            let replicas: Vec<Transformer> =
+                (0..n).map(|_| tiny_transformer(vocab, seed)).collect();
             let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
             let total: usize = per_rank[0].iter().map(|p| p.numel()).sum();
             let mut zero = ZeroOptimizer::new(stage, n, total, lr, wd);
@@ -2128,7 +2312,11 @@ mod tests {
 
     impl FullMlp {
         fn forward(&self, x: &Tensor) -> Tensor {
-            x.matmul(&self.w1).add(&self.b1).gelu().matmul(&self.w2).add(&self.b2)
+            x.matmul(&self.w1)
+                .add(&self.b1)
+                .gelu()
+                .matmul(&self.w2)
+                .add(&self.b2)
         }
     }
 
@@ -2155,12 +2343,21 @@ mod tests {
         let mut tp = TensorParallelMlp::from_full(&w1, &b1, &w2, &b2, d, hidden, n);
         let x_tp = Tensor::param(x_data.clone(), vec![b, d]);
         let y_tp = tp.forward(&x_tp);
-        assert_close(&y_tp.data(), &y_full.data(), 1e-5, "TP MLP 前向 vs 单卡 MLP 前向");
+        assert_close(
+            &y_tp.data(),
+            &y_full.data(),
+            1e-5,
+            "TP MLP 前向 vs 单卡 MLP 前向",
+        );
         y_tp.mul(&y_tp).sum().backward();
 
         // 整个 MLP 只有行并行那一次 allreduce：列并行的接缝上是**零通信**
         let chunk = b * d / n;
-        assert_eq!(tp.log().rounds, 2 * (n - 1), "前向通信 = 一次环形 allreduce");
+        assert_eq!(
+            tp.log().rounds,
+            2 * (n - 1),
+            "前向通信 = 一次环形 allreduce"
+        );
         assert_eq!(
             tp.log().per_rank,
             vec![2 * (n - 1) * chunk; n],
@@ -2197,10 +2394,20 @@ mod tests {
                 &format!("rank {r} 的 dW2"),
             );
         }
-        assert_close(&tp.fc2().bias().grad(), &db2, 1e-5, "行并行的 db2（allreduce 之后只加一次）");
+        assert_close(
+            &tp.fc2().bias().grad(),
+            &db2,
+            1e-5,
+            "行并行的 db2（allreduce 之后只加一次）",
+        );
         // dx：每个 rank 只算出了"自己那几列对 x 的贡献"，自动微分把它们累加成完整 dx
         // ——这一步就是真机上列并行的**反向 allreduce**
-        assert_close(&x_tp.grad(), &x_full.grad(), 1e-5, "dx（TP 的反向 allreduce 结果）");
+        assert_close(
+            &x_tp.grad(),
+            &x_full.grad(),
+            1e-5,
+            "dx（TP 的反向 allreduce 结果）",
+        );
     }
 
     #[test]
@@ -2224,7 +2431,9 @@ mod tests {
             for h in 0..n_head {
                 let base = seg * d + h * head_dim;
                 assert!(
-                    owner[base..base + head_dim].iter().all(|o| *o == owner[base]),
+                    owner[base..base + head_dim]
+                        .iter()
+                        .all(|o| *o == owner[base]),
                     "第 {seg} 段第 {h} 个 head 被切到了两张卡上"
                 );
             }
@@ -2233,7 +2442,12 @@ mod tests {
         for r in 0..n {
             let heads: std::collections::BTreeSet<usize> =
                 columns[r].iter().map(|c| (c % d) / head_dim).collect();
-            assert_eq!(heads.len(), n_head / n, "rank {r} 应负责 {} 个 head", n_head / n);
+            assert_eq!(
+                heads.len(),
+                n_head / n,
+                "rank {r} 应负责 {} 个 head",
+                n_head / n
+            );
         }
 
         // 前向：融合 QKV 的输出（all_gather 按列拼回）必须等于单卡一次 matmul
@@ -2307,7 +2521,11 @@ mod tests {
             y_ref = l.forward(&y_ref);
         }
         // 全 batch 的均方误差：1/B · Σ y²（B = 总行数）
-        y_ref.mul(&y_ref).sum().mul_scalar(1.0 / total_rows as f32).backward();
+        y_ref
+            .mul(&y_ref)
+            .sum()
+            .mul_scalar(1.0 / total_rows as f32)
+            .backward();
 
         // 每个 micro-batch 的损失之和 = 全 batch 的损失，缩放因子也按同一个分母给
         let loss_of = |y: &Tensor| y.mul(y).sum().mul_scalar(1.0 / total_rows as f32);
@@ -2315,7 +2533,11 @@ mod tests {
         // GPipe 组：p 段，M 个 micro-batch
         let gpipe_layers = layer_chain(p, d, seed);
         for (a, b) in ref_layers.iter().zip(&gpipe_layers) {
-            assert_eq!(a.weight.data(), b.weight.data(), "流水线与单卡的初值必须一致");
+            assert_eq!(
+                a.weight.data(),
+                b.weight.data(),
+                "流水线与单卡的初值必须一致"
+            );
         }
         let gpipe = Pipeline::new(gpipe_layers, Schedule::gpipe(m, p));
         let gpipe_inputs: Vec<Tensor> = (0..m)
@@ -2328,17 +2550,35 @@ mod tests {
 
         // 前向：各 micro-batch 的输出按原顺序拼起来，必须等于单卡整批的输出
         let got: Vec<f32> = gpipe_report.outputs.iter().flat_map(|t| t.data()).collect();
-        assert_close(&got, &y_ref.data(), 1e-5, "GPipe 输出（micro-batch 拼回）vs 单卡整批");
+        assert_close(
+            &got,
+            &y_ref.data(),
+            1e-5,
+            "GPipe 输出（micro-batch 拼回）vs 单卡整批",
+        );
 
         // 反向：每层的权重/偏置梯度 == 单卡梯度（micro-batch 的梯度自动累加）
         for (s, (a, b)) in ref_layers.iter().zip(gpipe.stages()).enumerate() {
             let (pa, pb) = (a.parameters(), b.parameters());
-            assert_close(&pb[0].grad(), &pa[0].grad(), 1e-5, &format!("第 {s} 段权重梯度"));
-            assert_close(&pb[1].grad(), &pa[1].grad(), 1e-5, &format!("第 {s} 段偏置梯度"));
+            assert_close(
+                &pb[0].grad(),
+                &pa[0].grad(),
+                1e-5,
+                &format!("第 {s} 段权重梯度"),
+            );
+            assert_close(
+                &pb[1].grad(),
+                &pa[1].grad(),
+                1e-5,
+                &format!("第 {s} 段偏置梯度"),
+            );
         }
 
         // 1F1B 组：同一份初值、同一批输入，只换调度
-        let onef1b = Pipeline::new(layer_chain(p, d, seed), Schedule::one_forward_one_backward(m, p));
+        let onef1b = Pipeline::new(
+            layer_chain(p, d, seed),
+            Schedule::one_forward_one_backward(m, p),
+        );
         let onef1b_inputs: Vec<Tensor> = (0..m)
             .map(|i| {
                 let lo = i * per_micro * d;
@@ -2348,16 +2588,28 @@ mod tests {
         let onef1b_report = onef1b.run(&onef1b_inputs, loss_of);
 
         // 两种调度算出来的东西必须**完全一样**——调度只影响"什么时候算"，不影响"算成什么"
-        let got2: Vec<f32> = onef1b_report.outputs.iter().flat_map(|t| t.data()).collect();
+        let got2: Vec<f32> = onef1b_report
+            .outputs
+            .iter()
+            .flat_map(|t| t.data())
+            .collect();
         assert_close(&got2, &got, 1e-5, "1F1B 输出 vs GPipe 输出");
         assert_close(&got2, &y_ref.data(), 1e-5, "1F1B 输出 vs 单卡整批");
         for (s, (a, b)) in gpipe.stages().iter().zip(onef1b.stages()).enumerate() {
             let (pa, pb) = (a.parameters(), b.parameters());
-            assert_close(&pb[1].grad(), &pa[1].grad(), 1e-5, &format!("第 {s} 段偏置梯度：1F1B vs GPipe"));
+            assert_close(
+                &pb[1].grad(),
+                &pa[1].grad(),
+                1e-5,
+                &format!("第 {s} 段偏置梯度：1F1B vs GPipe"),
+            );
         }
 
         // 差别在驻留：GPipe 压着全部 M 个 micro-batch，1F1B 只压 p 个
-        assert_eq!(gpipe_report.peak_in_flight, m, "GPipe 的驻留峰值就是 micro-batch 数");
+        assert_eq!(
+            gpipe_report.peak_in_flight, m,
+            "GPipe 的驻留峰值就是 micro-batch 数"
+        );
         assert_eq!(onef1b_report.peak_in_flight, p, "1F1B 的驻留峰值由段数决定");
         assert!(
             onef1b_report.peak_in_flight < gpipe_report.peak_in_flight,
@@ -2370,9 +2622,18 @@ mod tests {
         assert_eq!(onef1b_report.peak_boundary_buffers, p * (p - 1));
         // 调度表自身给出的画像与实测一致（说明"省"是计划里就算出来的，不是碰巧）
         assert_eq!(gpipe.schedule().peak_in_flight, gpipe_report.peak_in_flight);
-        assert_eq!(gpipe.schedule().peak_boundary_buffers, gpipe_report.peak_boundary_buffers);
-        assert_eq!(onef1b.schedule().peak_in_flight, onef1b_report.peak_in_flight);
-        assert_eq!(onef1b.schedule().peak_boundary_buffers, onef1b_report.peak_boundary_buffers);
+        assert_eq!(
+            gpipe.schedule().peak_boundary_buffers,
+            gpipe_report.peak_boundary_buffers
+        );
+        assert_eq!(
+            onef1b.schedule().peak_in_flight,
+            onef1b_report.peak_in_flight
+        );
+        assert_eq!(
+            onef1b.schedule().peak_boundary_buffers,
+            onef1b_report.peak_boundary_buffers
+        );
 
         // 事件表的完整性：每个 (micro-batch, 段) 前向、反向各恰好一次
         for sch in [gpipe.schedule(), onef1b.schedule()] {
@@ -2381,7 +2642,11 @@ mod tests {
             for i in 0..m {
                 for s in 0..p {
                     assert_eq!(count(Step::Forward(i, s)), 1, "({i}, {s}) 的前向应恰好一次");
-                    assert_eq!(count(Step::Backward(i, s)), 1, "({i}, {s}) 的反向应恰好一次");
+                    assert_eq!(
+                        count(Step::Backward(i, s)),
+                        1,
+                        "({i}, {s}) 的反向应恰好一次"
+                    );
                 }
             }
         }
@@ -2420,13 +2685,27 @@ mod tests {
             let mut owner: Vec<Option<usize>> = vec![None; layers * columns];
             for tp_i in 0..tp {
                 for pp_i in 0..pp {
-                    let r = cfg.rank_of(RankCoord { dp: 0, tp: tp_i, pp: pp_i });
+                    let r = cfg.rank_of(RankCoord {
+                        dp: 0,
+                        tp: tp_i,
+                        pp: pp_i,
+                    });
                     let plan = cfg.plan(r, layers, columns, batch);
-                    assert_eq!(plan.coord, RankCoord { dp: 0, tp: tp_i, pp: pp_i });
+                    assert_eq!(
+                        plan.coord,
+                        RankCoord {
+                            dp: 0,
+                            tp: tp_i,
+                            pp: pp_i
+                        }
+                    );
                     for l in plan.layers.0..plan.layers.1 {
                         for &c in &plan.columns {
                             let cell = l * columns + c;
-                            assert!(owner[cell].is_none(), "层 {l} 第 {c} 列被两个 rank 同时持有");
+                            assert!(
+                                owner[cell].is_none(),
+                                "层 {l} 第 {c} 列被两个 rank 同时持有"
+                            );
                             owner[cell] = Some(r);
                         }
                     }
@@ -2443,7 +2722,11 @@ mod tests {
                     let plans: Vec<RankPlan> = (0..dp)
                         .map(|d| {
                             cfg.plan(
-                                cfg.rank_of(RankCoord { dp: d, tp: tp_i, pp: pp_i }),
+                                cfg.rank_of(RankCoord {
+                                    dp: d,
+                                    tp: tp_i,
+                                    pp: pp_i,
+                                }),
                                 layers,
                                 columns,
                                 batch,
@@ -2460,11 +2743,19 @@ mod tests {
             // 4) 数据在 dp 轴上不重不漏，且在 (tp, pp) 内是复制的
             let mut covered = vec![0usize; batch];
             for d in 0..dp {
-                let r0 = cfg.rank_of(RankCoord { dp: d, tp: 0, pp: 0 });
+                let r0 = cfg.rank_of(RankCoord {
+                    dp: d,
+                    tp: 0,
+                    pp: 0,
+                });
                 let b0 = cfg.plan(r0, layers, columns, batch).batch;
                 for tp_i in 0..tp {
                     for pp_i in 0..pp {
-                        let r = cfg.rank_of(RankCoord { dp: d, tp: tp_i, pp: pp_i });
+                        let r = cfg.rank_of(RankCoord {
+                            dp: d,
+                            tp: tp_i,
+                            pp: pp_i,
+                        });
                         assert_eq!(
                             cfg.plan(r, layers, columns, batch).batch,
                             b0,
@@ -2499,8 +2790,16 @@ mod tests {
 
             // 6) 流水线沿 pp 方向是一条链：首段没有上游、末段没有下游
             if pp > 1 {
-                let first = cfg.rank_of(RankCoord { dp: 0, tp: 0, pp: 0 });
-                let last = cfg.rank_of(RankCoord { dp: 0, tp: 0, pp: pp - 1 });
+                let first = cfg.rank_of(RankCoord {
+                    dp: 0,
+                    tp: 0,
+                    pp: 0,
+                });
+                let last = cfg.rank_of(RankCoord {
+                    dp: 0,
+                    tp: 0,
+                    pp: pp - 1,
+                });
                 assert_eq!(cfg.prev_stage(first), None);
                 assert_eq!(cfg.next_stage(last), None);
                 let mut cur = first;
@@ -2517,11 +2816,23 @@ mod tests {
             for r in 0..n {
                 let plan = cfg.plan(r, layers, columns, batch);
                 let s = plan.summary(&cfg);
-                assert!(s.contains(&format!("rank {r}/")), "报告里应含 rank 编号：{s}");
+                assert!(
+                    s.contains(&format!("rank {r}/")),
+                    "报告里应含 rank 编号：{s}"
+                );
                 let c = plan.coord;
-                assert!(s.contains(&format!("[dp {} tp {} pp {}]", c.dp, c.tp, c.pp)), "{s}");
-                assert!(s.contains(&format!("层 [{}, {})", plan.layers.0, plan.layers.1)), "{s}");
-                assert!(s.contains(&format!("样本 [{}, {})", plan.batch.0, plan.batch.1)), "{s}");
+                assert!(
+                    s.contains(&format!("[dp {} tp {} pp {}]", c.dp, c.tp, c.pp)),
+                    "{s}"
+                );
+                assert!(
+                    s.contains(&format!("层 [{}, {})", plan.layers.0, plan.layers.1)),
+                    "{s}"
+                );
+                assert!(
+                    s.contains(&format!("样本 [{}, {})", plan.batch.0, plan.batch.1)),
+                    "{s}"
+                );
             }
         }
     }
@@ -2535,8 +2846,10 @@ mod tests {
     /// 在给定环境变量下执行 `f`，结束后（含 panic 展开）原样还原。
     fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<(String, Option<String>)> =
-            vars.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
         for (k, v) in vars {
             match v {
                 // edition 2024：set_var/remove_var 会影响同进程的其它线程，必须 unsafe
@@ -2561,12 +2874,22 @@ mod tests {
     fn test_dist_config_from_env_reads_world_and_axes() {
         // 什么环境变量都没有 = 单进程（普通训练路径）
         with_env(
-            &[("WORLD_SIZE", None), ("DIST_TP", None), ("DIST_PP", None), ("DIST_DP", None)],
+            &[
+                ("WORLD_SIZE", None),
+                ("DIST_TP", None),
+                ("DIST_PP", None),
+                ("DIST_DP", None),
+            ],
             || assert_eq!(DistConfig::from_env(), DistConfig::new(1, 1, 1)),
         );
         // 只给 WORLD_SIZE：纯数据并行（dp = world）
         with_env(
-            &[("WORLD_SIZE", Some("3")), ("DIST_TP", None), ("DIST_PP", None), ("DIST_DP", None)],
+            &[
+                ("WORLD_SIZE", Some("3")),
+                ("DIST_TP", None),
+                ("DIST_PP", None),
+                ("DIST_DP", None),
+            ],
             || assert_eq!(DistConfig::from_env(), DistConfig::new(3, 1, 1)),
         );
         // tp、pp 由启动器给出，dp 自动推导
@@ -2646,7 +2969,11 @@ mod tests {
         let untouched = Rng::new(1234);
         let mut rank0 = Rng::new(1234);
         mix_dp_rank(&mut rank0, 0);
-        assert_eq!(rank0.state(), untouched.state(), "dp_rank = 0 不该扰动 rng 状态");
+        assert_eq!(
+            rank0.state(),
+            untouched.state(),
+            "dp_rank = 0 不该扰动 rng 状态"
+        );
 
         // 各副本必须落到不同轨道：撞在一起就意味着它们吃的是同一批数据，
         // 梯度平均等于单卡那批的梯度，数据并行白跑 N 遍。
@@ -2654,7 +2981,10 @@ mod tests {
         for dp in 0..8usize {
             let mut r = Rng::new(1234);
             mix_dp_rank(&mut r, dp);
-            assert!(states.insert(r.state()), "dp_rank {dp} 与前面的副本撞到了同一个 rng 状态");
+            assert!(
+                states.insert(r.state()),
+                "dp_rank {dp} 与前面的副本撞到了同一个 rng 状态"
+            );
         }
         assert_eq!(states.len(), 8);
 

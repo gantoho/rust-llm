@@ -137,7 +137,7 @@ mod tests {
         let mut r = Rng::new(1);
         for _ in 0..1000 {
             let v = r.uniform(-1.0, 1.0);
-            assert!(v >= -1.0 && v < 1.0);
+            assert!((-1.0..1.0).contains(&v));
             let n = r.randn();
             assert!(n.is_finite());
         }

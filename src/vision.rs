@@ -17,7 +17,7 @@
 //! 批量时按样本首尾相接）；patch 按**行主序**遍历（左上 → 右 → 下）。
 
 use crate::layers::{Linear, NormLayer};
-use crate::model::{TransformerBlock, TransformerConfig, LN_EPS};
+use crate::model::{LN_EPS, TransformerBlock, TransformerConfig};
 use crate::rng::Rng;
 use crate::tensor::Tensor;
 use serde::{Deserialize, Serialize};
@@ -73,13 +73,21 @@ impl VisionConfig {
     /// 校验配置自洽（训练入口在建模型前调用，早失败早报错）
     pub fn validate(&self) {
         assert!(
-            self.image_size > 0 && self.patch_size > 0 && self.image_size % self.patch_size == 0,
+            self.image_size > 0
+                && self.patch_size > 0
+                && self.image_size.is_multiple_of(self.patch_size),
             "image_size（{}）必须是 patch_size（{}）的整数倍",
             self.image_size,
             self.patch_size
         );
-        assert!(self.n_embd % self.n_head == 0, "ViT 的 n_embd 必须能被 n_head 整除");
-        assert!(self.ph_first > 0, "VisionConfig.ph_first 未设置：模型不知道占位符 id");
+        assert!(
+            self.n_embd.is_multiple_of(self.n_head),
+            "ViT 的 n_embd 必须能被 n_head 整除"
+        );
+        assert!(
+            self.ph_first > 0,
+            "VisionConfig.ph_first 未设置：模型不知道占位符 id"
+        );
     }
 }
 
@@ -124,11 +132,14 @@ fn rgb_image(chw: &[f32], size: usize) -> image::RgbImage {
     let mut raw = vec![0u8; 3 * size * size];
     for c in 0..3 {
         for i in 0..size * size {
-            let v = (chw[c * size * size + i] * 127.5 + 127.5).round().clamp(0.0, 255.0);
+            let v = (chw[c * size * size + i] * 127.5 + 127.5)
+                .round()
+                .clamp(0.0, 255.0);
             raw[i * 3 + c] = v as u8;
         }
     }
-    image::RgbImage::from_raw(size as u32, size as u32, raw).expect("RgbImage::from_raw 失败：长度已校验过")
+    image::RgbImage::from_raw(size as u32, size as u32, raw)
+        .expect("RgbImage::from_raw 失败：长度已校验过")
 }
 
 /// CHW、[-1,1] → PNG（`image_size` × `image_size`）
@@ -227,7 +238,9 @@ impl VisionEncoder {
             patch_embed: Linear::new(vcfg.patch_dim(), vcfg.n_embd, rng),
             // 位置 embedding 用小正态初始化（经典 ViT 做法）
             pos: Tensor::param(normal(p * vcfg.n_embd, 0.02, rng), vec![p, vcfg.n_embd]),
-            blocks: (0..vcfg.n_layer).map(|_| TransformerBlock::new(&block_cfg, rng)).collect(),
+            blocks: (0..vcfg.n_layer)
+                .map(|_| TransformerBlock::new(&block_cfg, rng))
+                .collect(),
             // 全 0 = 所有 patch 互相可见（真正的双向注意力），见字段文档
             attn_mask: Tensor::from_vec(vec![0.0f32; p * p], vec![p, p]),
             ln: NormLayer::new(vcfg.n_embd, LN_EPS, main_cfg.use_rmsnorm),
@@ -252,12 +265,19 @@ impl VisionEncoder {
         for s in 0..b {
             let off = s * 3 * vcfg.image_size * vcfg.image_size;
             let end = off + 3 * vcfg.image_size * vcfg.image_size;
-            flat.extend(patchify(&pixels[off..end], vcfg.image_size, vcfg.patch_size));
+            flat.extend(patchify(
+                &pixels[off..end],
+                vcfg.image_size,
+                vcfg.patch_size,
+            ));
         }
         // 像素是常量输入（无需对输入求导），用 from_vec；梯度从 Linear 权重那侧进入。
         // Block 期望 3-D [B,T,D]，这里直接把 b 当 batch、P 当序列长
         let x = Tensor::from_vec(flat, vec![b, p, vcfg.patch_dim()]);
-        let x = self.patch_embed.forward(&x).reshape(vec![b, p, vcfg.n_embd]);
+        let x = self
+            .patch_embed
+            .forward(&x)
+            .reshape(vec![b, p, vcfg.n_embd]);
 
         // 2. 位置 embedding：pos 是 [P,d]，按样本重复铺成 [b·P,d] 再还原成 3-D。
         //    用 gather_rows 而不是复制成常量 —— 复制成常量的话 pos 永远拿不到梯度，
@@ -365,7 +385,9 @@ mod tests {
         let size = vcfg.image_size;
         let (ps, grid) = (vcfg.patch_size, vcfg.image_size / vcfg.patch_size);
 
-        let base: Vec<f32> = (0..3 * size * size).map(|i| ((i % 7) as f32) / 7.0 - 0.5).collect();
+        let base: Vec<f32> = (0..3 * size * size)
+            .map(|i| ((i % 7) as f32) / 7.0 - 0.5)
+            .collect();
         // 只在**最后一个 patch**（右下角）上加偏移
         let mut tweaked = base.clone();
         for c in 0..3 {

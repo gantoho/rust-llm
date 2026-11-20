@@ -81,10 +81,13 @@ pub struct ServeCfg {
     pub vision: Option<crate::vision::VisionConfig>,
 }
 
-/// 独占的模型核心：一次只有一个线程能碰到它
+/// 模型核心：模型与分词器用 `Arc` 共享，`rng` 仍是独占的。
+///
+/// C6 铺路：`Transformer::forward` 全部是 `&self`，所以生成过程可以**不持锁**跑，
+/// 未来多个 slot 共用同一份权重做批处理。锁只用于"取快照 + 派生 rng"，不再包住整段生成。
 struct Core {
-    model: Transformer,
-    tokenizer: Tokenizer,
+    model: std::sync::Arc<Transformer>,
+    tokenizer: std::sync::Arc<Tokenizer>,
     /// 不带 `seed` 的请求共用它（同服务实例下连续请求的随机性来源）
     rng: Rng,
 }
@@ -107,6 +110,10 @@ struct State {
     cfg: ServeCfg,
     core: Mutex<Core>,
     stats: Stats,
+    /// C9：前缀 KV 缓存（最近一次请求的 prompt 缓存快照），命中即 fork 复用
+    prefix_cache: Mutex<Option<(Vec<usize>, Vec<crate::attention::KVCache>)>>,
+    /// C6 ③：批处理引擎（一个驱动线程 + 提交队列）
+    engine: Arc<BatchEngine>,
     /// VQ-VAE（`{out_dir}/vq.ckpt`）：模型采出完整图片段时解码回像素，
     /// 内嵌成 data URI 随 `message.image_url` 回给客户端。纯文本模型为 `None`
     vq: Option<crate::vqvae::Vqvae>,
@@ -164,12 +171,16 @@ fn intern_stops(items: &[String]) -> Result<&'static [&'static str], ApiError> {
         return Ok(*hit);
     }
     if intern.slices.len() >= MAX_STOP_SLICES {
-        return Err(bad(format!("本次进程见过的不同 stop 组合已达上限 {MAX_STOP_SLICES}")));
+        return Err(bad(format!(
+            "本次进程见过的不同 stop 组合已达上限 {MAX_STOP_SLICES}"
+        )));
     }
     let mut ptrs = Vec::with_capacity(items.len());
     for s in items {
         if intern.strings.len() >= MAX_STOP_STRINGS && !intern.strings.contains_key(s) {
-            return Err(bad(format!("本次进程见过的不同 stop 字符串已达上限 {MAX_STOP_STRINGS}")));
+            return Err(bad(format!(
+                "本次进程见过的不同 stop 字符串已达上限 {MAX_STOP_STRINGS}"
+            )));
         }
         // get 返回 `&&'static str`（哈希表存的是引用），闭包返回 `&'static str`，
         // 两边类型对不上，只能 match 分开出（不能靠 unwrap_or_else 合流）
@@ -200,11 +211,19 @@ struct ApiError {
 }
 
 fn bad(message: impl Into<String>) -> ApiError {
-    ApiError { status: 400, kind: "invalid_request_error", message: message.into() }
+    ApiError {
+        status: 400,
+        kind: "invalid_request_error",
+        message: message.into(),
+    }
 }
 
 fn server_err(message: impl Into<String>) -> ApiError {
-    ApiError { status: 500, kind: "server_error", message: message.into() }
+    ApiError {
+        status: 500,
+        kind: "server_error",
+        message: message.into(),
+    }
 }
 
 impl ApiError {
@@ -229,13 +248,198 @@ impl ApiError {
 ///   HTTP 线程上炸了会让整个进程退；转成 500 客户端才知道是输入的问题；
 /// - **锁中毒**：上面那条 panic 发生时 Mutex 会被标记中毒，下一个人得能把锁打开
 ///   （`into_inner`），否则服务从此不可用。
-fn with_core<R>(state: &Arc<State>, f: impl FnOnce(&mut Core) -> R) -> Result<R, ApiError> {
+// ==================== C6 ③：批处理引擎 ====================
+
+/// 一条序列的一步解码提交
+struct BatchSubmit {
+    id: usize,
+    base: usize,
+    cache: Vec<crate::attention::KVCache>,
+    tx: std::sync::mpsc::Sender<(Vec<f32>, Vec<crate::attention::KVCache>)>,
+}
+
+/// 批处理引擎：提交队列 + 一个驱动线程
+///
+/// 语义：`step()` 提交"下一步要喂的 token + 它的 cache"，阻塞等回 `(logits 行, cache)`。
+/// 驱动线程把几乎同时到达的提交凑成一批，用 `Transformer::decode_batch` 一次算完 ——
+/// 权重只流一遍，被整批序列共享（解码是访存带宽受限，这是吞吐的来源）。
+struct BatchEngine {
+    q: Mutex<Vec<BatchSubmit>>,
+    cv: std::sync::Condvar,
+    /// 当前在 step() 里等待的请求数：>1 才值得开聚合窗口
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl BatchEngine {
+    fn new() -> Self {
+        BatchEngine {
+            q: Mutex::new(Vec::new()),
+            cv: std::sync::Condvar::new(),
+            active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn step(
+        &self,
+        id: usize,
+        base: usize,
+        cache: Vec<crate::attention::KVCache>,
+    ) -> Option<(Vec<f32>, Vec<crate::attention::KVCache>)> {
+        use std::sync::atomic::Ordering;
+        self.active.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+            q.push(BatchSubmit {
+                id,
+                base,
+                cache,
+                tx,
+            });
+        }
+        self.cv.notify_one();
+        // 超时只为兜底（驱动线程不会死，除非 decode_batch panic）
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .ok();
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        out
+    }
+}
+
+/// 起一个驱动线程：聚合提交 → 一次 `decode_batch` → 逐条回传
+fn spawn_batch_engine(engine: Arc<BatchEngine>, model: Arc<Transformer>) {
+    const MAX_BATCH: usize = 16;
+    const GATHER: std::time::Duration = std::time::Duration::from_millis(5);
+    thread::spawn(move || loop {
+        let mut batch: Vec<BatchSubmit> = {
+            let mut q = engine.q.lock().unwrap_or_else(|e| e.into_inner());
+            while q.is_empty() {
+                q = engine.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+            // 短暂聚合窗口：让几乎同时到达的提交凑成一批
+            let waiting = engine.active.load(std::sync::atomic::Ordering::Relaxed);
+            let gather = if waiting > 1 { GATHER } else { std::time::Duration::ZERO };
+            let deadline = Instant::now() + gather;
+            while q.len() < MAX_BATCH {
+                if q.len() >= waiting.max(1) {
+                    break;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let (g, t) = engine
+                    .cv
+                    .wait_timeout(q, left)
+                    .unwrap_or_else(|e| e.into_inner());
+                q = g;
+                if t.timed_out() {
+                    break;
+                }
+            }
+            std::mem::take(&mut *q)
+        };
+        if batch.is_empty() {
+            continue;
+        }
+        let ids: Vec<usize> = batch.iter().map(|s| s.id).collect();
+        let bases: Vec<usize> = batch.iter().map(|s| s.base).collect();
+        let mut caches: Vec<Vec<crate::attention::KVCache>> = (0..batch.len())
+            .map(|i| std::mem::take(&mut batch[i].cache))
+            .collect();
+        let logits = crate::tensor::no_grad(|| model.decode_batch(&ids, &mut caches, &bases));
+        let v = model.cfg.vocab_size;
+        let data = logits.data();
+        for (i, s) in batch.into_iter().enumerate() {
+            let row = data[i * v..(i + 1) * v].to_vec();
+            let cache = std::mem::take(&mut caches[i]);
+            let _ = s.tx.send((row, cache));
+        }
+    });
+}
+
+/// 走批处理引擎推进一步；不该进批的步骤（prefill / prefix 补段）退回逐条 `step()`
+fn batched_step(state: &State, g: &mut crate::sample::Generator<'_, '_>) -> bool {
+    let Some((id, base)) = g.batch_feed() else {
+        return g.step();
+    };
+    let Some(cache) = g.take_cache() else {
+        return g.step();
+    };
+    match state.engine.step(id, base, cache) {
+        Some((row, cache)) => {
+            g.put_cache(cache);
+            g.step_row(&row)
+        }
+        // 引擎异常（超时）：保守收尾，不让请求挂死
+        None => false,
+    }
+}
+/// C9：与缓存比公共前缀，命中就 fork 一份并回滚到公共长度（None = 不命中）。
+fn take_prefix_cache(
+    state: &Arc<State>,
+    ids: &[usize],
+) -> Option<Vec<crate::attention::KVCache>> {
+    let guard = state.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let (cached_ids, caches) = guard.as_ref()?;
+    let lcp = ids
+        .iter()
+        .zip(cached_ids.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    // 只保留前 n-1 个 token：最后一个 token 要留给首次 forward 取 logits
+    let lcp = lcp.min(ids.len().saturating_sub(1));
+    if lcp < 8 {
+        return None; // 前缀太短，复用不划算
+    }
+    let mut out: Vec<crate::attention::KVCache> = caches.iter().map(|c| c.fork()).collect();
+    for c in out.iter_mut() {
+        let keep = c.seq_len().min(lcp);
+        if c.seq_len() > keep {
+            c.rollback(c.seq_len() - keep);
+        }
+    }
+    Some(out)
+}
+
+/// C9：把本轮 prompt 的缓存快照裁回 prompt 长度后存起来（下次同前缀请求复用）。
+fn store_prefix_cache(
+    state: &Arc<State>,
+    ids: &[usize],
+    snap: Option<Vec<crate::attention::KVCache>>,
+) {
+    let Some(mut caches) = snap else { return };
+    // 只存前 n-1 个 token 的 K/V：最后一个 token 必须留给下次的首次 forward
+    // （否则它会既在缓存里、又被重喂一遍，logits 就变了）。
+    let keep = ids.len().saturating_sub(1);
+    if keep == 0 {
+        return;
+    }
+    for c in caches.iter_mut() {
+        if c.seq_len() > keep {
+            c.rollback(c.seq_len() - keep);
+        }
+    }
+    *state.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((ids[..keep].to_vec(), caches));
+}
+fn with_model<R>(
+    state: &Arc<State>,
+    f: impl FnOnce(&Transformer, &Tokenizer, Rng) -> R,
+) -> Result<R, ApiError> {
     state.stats.queued.fetch_add(1, Ordering::SeqCst);
     let mut core = state.core.lock().unwrap_or_else(|e| e.into_inner());
     state.stats.queued.fetch_sub(1, Ordering::SeqCst);
     state.stats.running.fetch_add(1, Ordering::SeqCst);
     let guard = RunGuard(&state.stats);
-    let res = catch_unwind(AssertUnwindSafe(|| f(&mut core)));
+    // C6：取快照后就**不持锁**了 —— forward 全是 &self，模型/分词器可以共享。
+    // 共享 rng 只用来派生本次请求的种子，避免把一把可变 rng 借给整段生成。
+    let model = Arc::clone(&core.model);
+    let tokenizer = Arc::clone(&core.tokenizer);
+    let seed = core.rng.next_u64();
+    drop(core);
+    let res = catch_unwind(AssertUnwindSafe(|| f(&model, &tokenizer, Rng::new(seed))));
     drop(guard);
     res.map_err(|_| {
         server_err("生成过程发生 panic：输入可能含分词器词表外的字符（如 emoji 或生僻字）")
@@ -275,7 +479,10 @@ fn with_cors<R: Read>(state: &Arc<State>, resp: Response<R>) -> Response<R> {
     }
     resp.with_header(header("Access-Control-Allow-Origin", "*"))
         .with_header(header("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
-        .with_header(header("Access-Control-Allow-Headers", "Content-Type, Authorization"))
+        .with_header(header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        ))
         .with_header(header("Access-Control-Max-Age", "600"))
 }
 
@@ -285,7 +492,8 @@ fn with_cors<R: Read>(state: &Arc<State>, resp: Response<R>) -> Response<R> {
 /// `data_length=Some(len)` 让 tiny_http 走 `Content-Length` 而不是 chunked。
 fn reply_json(req: Request, state: &Arc<State>, status: u16, body: &Value) -> u16 {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|e| {
-        format!(r#"{{"error":{{"message":"响应序列化失败：{e}","type":"server_error"}}}}"#).into_bytes()
+        format!(r#"{{"error":{{"message":"响应序列化失败：{e}","type":"server_error"}}}}"#)
+            .into_bytes()
     });
     let len = bytes.len();
     let resp = Response::new(
@@ -349,7 +557,11 @@ fn read_body(req: &mut Request) -> Result<String, ApiError> {
 }
 
 fn too_large() -> ApiError {
-    ApiError { status: 413, kind: "invalid_request_error", message: format!("请求体超过 {MAX_BODY} 字节") }
+    ApiError {
+        status: 413,
+        kind: "invalid_request_error",
+        message: format!("请求体超过 {MAX_BODY} 字节"),
+    }
 }
 
 /// 生成一个随机 API key（`sk-` + 32 位十六进制，共 128 bit 熵）
@@ -365,7 +577,9 @@ pub fn random_api_key() -> String {
     use std::hash::{BuildHasher, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
     let pid = std::process::id() as u64;
     let mut out = String::with_capacity(3 + 32);
     out.push_str("sk-");
@@ -436,7 +650,9 @@ fn prepare_vision(
         return Ok((input.to_string(), None));
     };
     let Some(vcfg) = vcfg else {
-        return Err(bad("当前模型没有视觉塔（config 的 model.vision 缺席），无法接受图片输入"));
+        return Err(bad(
+            "当前模型没有视觉塔（config 的 model.vision 缺席），无法接受图片输入",
+        ));
     };
     let text = if input.contains(crate::tokenizer::IMAGE_LITERAL) {
         input.to_string()
@@ -449,7 +665,9 @@ fn prepare_vision(
                 bad("data URI 缺少 `,` 分隔符（形如 data:image/png;base64,<base64>）")
             })?;
             if !head.to_ascii_lowercase().contains("base64") {
-                return Err(bad("message.image_url 目前只支持 base64 编码（`;base64,`）"));
+                return Err(bad(
+                    "message.image_url 目前只支持 base64 编码（`;base64,`）",
+                ));
             }
             tail
         }
@@ -561,8 +779,7 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
             200,
             "application/json; charset=utf-8",
             // 规范是给人读、给 Postman/Apifox 导入的，缩进输出便于阅读与 git diff
-            serde_json::to_string_pretty(&openapi_spec(&state.cfg))
-                .unwrap_or_else(|_| "{}".into()),
+            serde_json::to_string_pretty(&openapi_spec(&state.cfg)).unwrap_or_else(|_| "{}".into()),
         ),
         "/openapi.yaml" if is_get => reply_text(
             req,
@@ -612,7 +829,11 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
         _ if is_get || is_post => reply_err(
             req,
             state,
-            ApiError { status: 404, kind: "not_found", message: format!("未知路径 {path}") },
+            ApiError {
+                status: 404,
+                kind: "not_found",
+                message: format!("未知路径 {path}"),
+            },
         ),
         _ => {
             // 先取方法名再移动 `req`：参数从左到右求值，写在 reply_err 实参里会"先 move 后借用"
@@ -1243,7 +1464,11 @@ fn yaml_str(s: &str) -> String {
         && !s.eq_ignore_ascii_case("on")
         && !s.eq_ignore_ascii_case("off")
         && s.parse::<f64>().is_err();
-    if plain_ok { s.to_string() } else { serde_json::to_string(s).unwrap_or_else(|_| "null".into()) }
+    if plain_ok {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_else(|_| "null".into())
+    }
 }
 
 /// 对象键：同样按裸写/引号规则判断（键也可能被解析成数字）
@@ -1251,12 +1476,16 @@ fn yaml_key(k: &str) -> String {
     let plain_ok = !k.is_empty()
         && !k.contains(':')
         && !k.contains('#')
-        && k.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        && k.chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
         && k.parse::<f64>().is_err();
-    if plain_ok { k.to_string() } else { serde_json::to_string(k).unwrap_or_else(|_| "null".into()) }
+    if plain_ok {
+        k.to_string()
+    } else {
+        serde_json::to_string(k).unwrap_or_else(|_| "null".into())
+    }
 }
-
-
 
 /// 一次已校验过的对话请求
 struct ChatJob {
@@ -1293,17 +1522,26 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
     let obj = v.as_object().ok_or_else(|| bad("请求体必须是 JSON 对象"))?;
 
     // ---- messages ----
-    let msgs_val = obj.get("messages").ok_or_else(|| bad("缺少 messages 字段"))?;
-    let arr = msgs_val.as_array().ok_or_else(|| bad("messages 必须是数组"))?;
+    let msgs_val = obj
+        .get("messages")
+        .ok_or_else(|| bad("缺少 messages 字段"))?;
+    let arr = msgs_val
+        .as_array()
+        .ok_or_else(|| bad("messages 必须是数组"))?;
     if arr.is_empty() {
         return Err(bad("messages 不能为空"));
     }
     if arr.len() > MAX_MESSAGES {
-        return Err(bad(format!("messages 最多 {MAX_MESSAGES} 条，收到 {} 条", arr.len())));
+        return Err(bad(format!(
+            "messages 最多 {MAX_MESSAGES} 条，收到 {} 条",
+            arr.len()
+        )));
     }
     let mut msgs: Vec<(String, String)> = Vec::with_capacity(arr.len());
     for m in arr {
-        let m = m.as_object().ok_or_else(|| bad("messages 的元素必须是对象"))?;
+        let m = m
+            .as_object()
+            .ok_or_else(|| bad("messages 的元素必须是对象"))?;
         let role = m
             .get("role")
             .and_then(Value::as_str)
@@ -1334,12 +1572,19 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
             }
             Some(s.clone())
         }
-        Some(_) => return Err(bad("message.image_url 必须是字符串（data URI 或裸 base64）")),
+        Some(_) => {
+            return Err(bad(
+                "message.image_url 必须是字符串（data URI 或裸 base64）",
+            ));
+        }
     };
 
     // 历史条数 = 非 system 消息去掉末条 user（问答日志用，只记条数不记全文）
-    let history_turns =
-        msgs.iter().filter(|(r, _)| !matches!(r.as_str(), "system" | "developer")).count() - 1;
+    let history_turns = msgs
+        .iter()
+        .filter(|(r, _)| !matches!(r.as_str(), "system" | "developer"))
+        .count()
+        - 1;
     let (system, history, input) = split_messages(&msgs, cfg.use_sft);
 
     // ---- 采样参数（逐个覆盖服务级默认值）----
@@ -1367,14 +1612,18 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         sample.top_p = p as f32;
     }
     if let Some(v) = obj.get("repetition_penalty") {
-        let r = v.as_f64().ok_or_else(|| bad("repetition_penalty 必须是数字"))?;
+        let r = v
+            .as_f64()
+            .ok_or_else(|| bad("repetition_penalty 必须是数字"))?;
         if !(0.1..=10.0).contains(&r) {
             return Err(bad("repetition_penalty 取值范围是 [0.1, 10]"));
         }
         sample.repetition_penalty = r as f32;
     }
     if let Some(v) = obj.get("repetition_window") {
-        let w = v.as_u64().ok_or_else(|| bad("repetition_window 必须是非负整数"))?;
+        let w = v
+            .as_u64()
+            .ok_or_else(|| bad("repetition_window 必须是非负整数"))?;
         if w > 100_000 {
             return Err(bad("repetition_window 最大 100000"));
         }
@@ -1533,7 +1782,11 @@ fn qa_log_block(job: &ChatJob, r: &QaOutcome) -> (String, Vec<(&'static str, Str
     } else {
         format!("{} 条", job.history_turns)
     };
-    let output = if r.output.is_empty() { "（空）".to_string() } else { r.output.to_string() };
+    let output = if r.output.is_empty() {
+        "（空）".to_string()
+    } else {
+        r.output.to_string()
+    };
     let finish = match r.reason {
         Some(x) => crate::stop_label(x),
         None => "未正常收尾（见备注）".to_string(),
@@ -1549,7 +1802,11 @@ fn qa_log_block(job: &ChatJob, r: &QaOutcome) -> (String, Vec<(&'static str, Str
     let mut items: Vec<(&'static str, String)> = vec![
         (
             "system",
-            if r.system.is_empty() { "（无）".to_string() } else { r.system.to_string() },
+            if r.system.is_empty() {
+                "（无）".to_string()
+            } else {
+                r.system.to_string()
+            },
         ),
         ("历史", history),
         ("输入", job.input.clone()),
@@ -1620,11 +1877,21 @@ fn b64encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for c in bytes.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1642,32 +1909,60 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
     let kv = state.cfg.kv;
     let mut owned_rng = job.seed.map(Rng::new);
 
-    let produced = with_core(state, |core| {
+    let produced = with_model(state, |model, tokenizer, shared_rng| {
         // 拆开字段借用：`Generator` 同时要 `&Transformer` / `&Tokenizer` 和 `&mut Rng`，
         // 直接借 `core` 会因为"一个可变 + 两个共享"打架
-        let Core { model, tokenizer, rng: shared_rng } = core;
-        let a = prompt::assemble(tokenizer, &system, &job.history, &input, use_sft, prompt_budget);
+        let mut shared_rng = shared_rng;
+        let a = prompt::assemble(
+            tokenizer,
+            &system,
+            &job.history,
+            &input,
+            use_sft,
+            prompt_budget,
+        );
         let rng = match owned_rng.as_mut() {
             Some(r) => r,
-            None => shared_rng,
+            None => &mut shared_rng,
         };
-        let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
+        // C9：前缀 KV 复用 —— 与本轮 prompt 比公共前缀，命中就 fork + 回滚，跳过那段 prefill
+        let mut ids: Vec<usize> = tokenizer.bos_id().into_iter().collect();
+        ids.extend(tokenizer.encode(&a.prompt));
+        let reuse = take_prefix_cache(state, &ids);        let mut g = Generator::new(
+            model,
+            tokenizer,
+            &a.prompt,
+            max_tokens,
+            &job.sample,
+            kv,
+            rng,
+        );
         // 图片理解：像素已在锁外解码好，这里只是挂上（prefill 时视觉塔覆写占位符）
         if let Some(px) = pixels.as_ref() {
             g = g.with_pixels(px.clone());
         }
+        if let Some(c) = reuse { g = g.with_cache(c); }
         let n_prompt = g.prompt_tokens();
         // 与 `g.run()` 等价的手写循环：多拿一个「prefill 结束」的计时点（见 DecodeTimer）
         let mut timer = DecodeTimer::new();
-        while g.step() {
+        while batched_step(state, &mut g) {
             timer.tick();
         }
+        store_prefix_cache(state, &ids, g.cache_snapshot());
         let n_gen = g.generated_tokens();
         let rate = timer.rate(n_gen);
         // 图片生成：完整的码本段先留下（VQ 解码在锁外做，别占着模型锁）
         let imgs = g.generated_images();
         let out = g.into_output();
-        (out.generated, imgs, n_prompt, n_gen, out.reason, a.trimmed, rate)
+        (
+            out.generated,
+            imgs,
+            n_prompt,
+            n_gen,
+            out.reason,
+            a.trimmed,
+            rate,
+        )
     });
     // 出错也要留一条问答记录：题目在、答案没了，日志里得能查到这条请求的下文
     let (text, imgs, n_prompt, n_gen, reason, trimmed, rate) = match produced {
@@ -1693,9 +1988,7 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
     let image_url = generated_image_uri(state.vq.as_ref(), &imgs);
 
     if let Some((before, after)) = trimmed {
-        logln!(
-            "[serve] 历史超出输入预算：{before} → {after} token（预算 {prompt_budget}）"
-        );
+        logln!("[serve] 历史超出输入预算：{before} → {after} token（预算 {prompt_budget}）");
     }
 
     // 问答正文只写日志文件（控制台仍只有上面那行接口日志）
@@ -1835,18 +2128,35 @@ fn stream_reply(req: Request, state: &Arc<State>, job: ChatJob) -> u16 {
     let st = Arc::clone(state);
     thread::spawn(move || stream_generate(st, tx, job));
 
-    let resp = Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "text/event-stream; charset=utf-8"),
-            header("Cache-Control", "no-cache"),
-        ],
-        SsePipe { rx, buf: Vec::new(), pos: 0 },
-        None, // 无长度 → HTTP/1.1 走 chunked，边生成边发
-        None,
-    );
-    // 这里会阻塞到整条流写完（或客户端断开）
-    let _ = req.respond(with_cors(state, resp));
+    // C8：**绕开 tiny_http 的响应写出**。实测它会把整个 body 缓冲到生成结束才 flush
+    // （0.5B / 13 帧摊在 0.92 s 里，客户端却到 0.92 s 才收到第一个字节）。
+    // `into_writer()` 给的是裸 stream，这里自己写 HTTP/1.1 头 + chunked 帧，每帧 flush。
+    let cors = state.cfg.cors;
+    let mut w = req.into_writer();
+    let mut head = String::with_capacity(256);
+    head.push_str("HTTP/1.1 200 OK\r\n");
+    head.push_str("Content-Type: text/event-stream; charset=utf-8\r\n");
+    head.push_str("Cache-Control: no-cache\r\n");
+    head.push_str("Transfer-Encoding: chunked\r\n");
+    head.push_str("Connection: close\r\n");
+    if cors {
+        head.push_str("Access-Control-Allow-Origin: *\r\n");
+    }
+    head.push_str("\r\n");
+    if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
+        return 200;
+    }
+    for frame in rx.iter() {
+        let mut chunk = Vec::with_capacity(frame.len() + 16);
+        chunk.extend_from_slice(format!("{:X}\r\n", frame.len()).as_bytes());
+        chunk.extend_from_slice(&frame);
+        chunk.extend_from_slice(b"\r\n");
+        if w.write_all(&chunk).is_err() || w.flush().is_err() {
+            return 200; // 客户端断开：直接收手，生成线程会因 tx 断开而停
+        }
+    }
+    let _ = w.write_all(b"0\r\n\r\n");
+    let _ = w.flush();
     200
 }
 
@@ -1855,7 +2165,12 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     let id = job.id.clone();
     // 第一帧先声明角色：OpenAI 客户端靠它拿到 assistant 角色
     if tx
-        .send(sse(&delta_chunk(&state, &id, json!({ "role": "assistant", "content": "" }), None)))
+        .send(sse(&delta_chunk(
+            &state,
+            &id,
+            json!({ "role": "assistant", "content": "" }),
+            None,
+        )))
         .is_err()
     {
         return;
@@ -1892,15 +2207,30 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
             }
         };
 
-    let res = with_core(&state, |core| {
-        let Core { model, tokenizer, rng: shared_rng } = core;
-        let a = prompt::assemble(tokenizer, &system, &job.history, &input, use_sft, prompt_budget);
+    let res = with_model(&state, |model, tokenizer, shared_rng| {
+        let mut shared_rng = shared_rng;
+        let a = prompt::assemble(
+            tokenizer,
+            &system,
+            &job.history,
+            &input,
+            use_sft,
+            prompt_budget,
+        );
         let trimmed = a.trimmed;
         let rng = match owned_rng.as_mut() {
             Some(r) => r,
-            None => shared_rng,
+            None => &mut shared_rng,
         };
-        let mut g = Generator::new(model, tokenizer, &a.prompt, max_tokens, &job.sample, kv, rng);
+        let mut g = Generator::new(
+            model,
+            tokenizer,
+            &a.prompt,
+            max_tokens,
+            &job.sample,
+            kv,
+            rng,
+        );
         // 图片理解：像素已在锁外解码好，这里只是挂上（prefill 时视觉塔覆写占位符）
         if let Some(px) = pixels.as_ref() {
             g = g.with_pixels(px.clone());
@@ -1908,12 +2238,19 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
         let n_prompt = g.prompt_tokens();
 
         let mut timer = DecodeTimer::new();
-        while g.step() {
+        while batched_step(&state, &mut g) {
             timer.tick();
             // send 失败 = 接收端（响应流）已 drop = 客户端断开：
             // 立刻停生成，别在一个没人听的请求上烧 CPU
             if let Some(delta) = g.next_text()
-                && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": delta }), None))).is_err()
+                && tx
+                    .send(sse(&delta_chunk(
+                        &state,
+                        &id,
+                        json!({ "content": delta }),
+                        None,
+                    )))
+                    .is_err()
             {
                 let n_gen = g.generated_tokens();
                 let text = g.into_output().generated;
@@ -1937,8 +2274,24 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
         let imgs = g.generated_images();
         let out = g.into_output();
         let aborted = !tail.is_empty()
-            && tx.send(sse(&delta_chunk(&state, &id, json!({ "content": tail }), None))).is_err();
-        StreamOutcome { n_prompt, n_gen, reason: out.reason, text: out.generated, trimmed, aborted, rate, imgs }
+            && tx
+                .send(sse(&delta_chunk(
+                    &state,
+                    &id,
+                    json!({ "content": tail }),
+                    None,
+                )))
+                .is_err();
+        StreamOutcome {
+            n_prompt,
+            n_gen,
+            reason: out.reason,
+            text: out.generated,
+            trimmed,
+            aborted,
+            rate,
+            imgs,
+        }
     });
 
     let outcome = match res {
@@ -1965,7 +2318,10 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
         }
     };
     if outcome.aborted {
-        logln!("[serve] 客户端提前断开，生成已中止（{} token）", outcome.n_gen);
+        logln!(
+            "[serve] 客户端提前断开，生成已中止（{} token）",
+            outcome.n_gen
+        );
         // 中断也记一条：只写已生成的部分，收尾原因标为「未正常收尾」
         log_qa(
             &job,
@@ -1987,7 +2343,14 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     // 图片生成：锁外解码成 data URI，在 finish 帧**之前**发一个 image_url delta 帧
     // （客户端在 `delta.image_url` 里拿到真图，与非流式 `message.image_url` 同源）
     if let Some(uri) = generated_image_uri(state.vq.as_ref(), &outcome.imgs)
-        && tx.send(sse(&delta_chunk(&state, &id, json!({ "image_url": uri }), None))).is_err()
+        && tx
+            .send(sse(&delta_chunk(
+                &state,
+                &id,
+                json!({ "image_url": uri }),
+                None,
+            )))
+            .is_err()
     {
         return;
     }
@@ -2003,7 +2366,9 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     let _ = tx.send(b"data: [DONE]\n\n".to_vec());
     logln!(
         "[serve] 流式完成 {}：{} token（{}）",
-        id, outcome.n_gen, crate::stop_label(outcome.reason)
+        id,
+        outcome.n_gen,
+        crate::stop_label(outcome.reason)
     );
     // 问答正文只写日志文件（控制台仍只有上面那行接口日志）
     log_qa(
@@ -2024,12 +2389,14 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
 ///
 /// `Read` 的语义决定了一切：读到 `Ok(0)` 就是 EOF，所以 channel 关闭时直接返回 0，
 /// 响应自然收尾（chunked 流以 `0\r\n\r\n` 结束）。
+#[cfg(test)]
 struct SsePipe {
     rx: Receiver<Vec<u8>>,
     buf: Vec<u8>,
     pos: usize,
 }
 
+#[cfg(test)]
 impl Read for SsePipe {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
@@ -2092,8 +2459,7 @@ fn run_embeddings(state: &Arc<State>, body: &str) -> Result<Value, ApiError> {
     };
 
     let block_size = state.cfg.block_size;
-    let (rows, prompt_tokens) = with_core(state, |core| {
-        let Core { model, tokenizer, .. } = core;
+    let (rows, prompt_tokens) = with_model(state, |model, tokenizer, shared_rng| {
         let vocab = model.cfg.vocab_size;
         let mut rows: Vec<Vec<f64>> = Vec::with_capacity(items.len());
         let mut prompt_tokens = 0usize;
@@ -2197,12 +2563,19 @@ pub fn spawn_web_frontend(api_port: u16, web_port: u16, api_key: Option<&str>) {
     }
     candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web"));
 
-    let Some(web_dir) = candidates.into_iter().find(|p| p.join("package.json").is_file()) else {
+    let Some(web_dir) = candidates
+        .into_iter()
+        .find(|p| p.join("package.json").is_file())
+    else {
         logln!("[serve] 未找到 web/ 前端工程，跳过测试页（用 --no-web 可去掉本提示）");
         return;
     };
     // 直接用 node 拉 vite 的 bin，避开 Windows 上 npm 是 npm.cmd 而 Command 找不到的问题
-    let vite_bin = web_dir.join("node_modules").join("vite").join("bin").join("vite.js");
+    let vite_bin = web_dir
+        .join("node_modules")
+        .join("vite")
+        .join("bin")
+        .join("vite.js");
     if !vite_bin.is_file() {
         logln!(
             "[serve] web/ 依赖未安装，跳过测试页：cd {} && npm install",
@@ -2228,7 +2601,9 @@ pub fn spawn_web_frontend(api_port: u16, web_port: u16, api_key: Option<&str>) {
 
     match child {
         Ok(mut child) => {
-            logln!("[serve] 前端测试页已启动：http://localhost:{web_port}（代理 API → 127.0.0.1:{api_port}）");
+            logln!(
+                "[serve] 前端测试页已启动：http://localhost:{web_port}（代理 API → 127.0.0.1:{api_port}）"
+            );
             thread::spawn(move || {
                 // 收割子进程；异常退出时打一行日志（如端口被占）
                 if let Ok(status) = child.wait()
@@ -2250,7 +2625,12 @@ pub fn spawn_web_frontend(api_port: u16, web_port: u16, api_key: Option<&str>) {
 ///
 /// `vq` = VQ-VAE 存档（`{out_dir}/vq.ckpt`，`None` 表示纯文本模型）：
 /// 采样出完整图片段时用它解码成 PNG 内嵌回包。
-pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer, vq: Option<crate::vqvae::Vqvae>) -> ! {
+pub fn run(
+    cfg: ServeCfg,
+    model: Transformer,
+    tokenizer: Tokenizer,
+    vq: Option<crate::vqvae::Vqvae>,
+) -> ! {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let seed = cfg.seed;
     let model_name = cfg.model_name.clone();
@@ -2259,10 +2639,19 @@ pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer, vq: Option<c
     let api_key = cfg.api_key.clone();
     let cors_on = cfg.cors;
 
+    let engine_handle = Arc::new(BatchEngine::new());
+
     let state = Arc::new(State {
         cfg,
-        core: Mutex::new(Core { model, tokenizer, rng: Rng::new(seed) }),
+        core: Mutex::new(Core {
+            model: std::sync::Arc::new(model),
+            tokenizer: std::sync::Arc::new(tokenizer),
+            rng: Rng::new(seed),
+        }),
         stats: Stats::default(),
+
+        engine: engine_handle,
+        prefix_cache: Mutex::new(None),
         vq,
         created: now_unix(),
         started: Instant::now(),
@@ -2272,7 +2661,14 @@ pub fn run(cfg: ServeCfg, model: Transformer, tokenizer: Tokenizer, vq: Option<c
 
     logln!("[serve] 已监听 http://{addr}");
     logln!("[serve] 模型 {model_name}（上下文窗口 {block_size}）");
+    // C6 ③：启动时起一个批处理驱动线程（整个进程只一个，防线程泄漏）
+    {
+        let m = std::sync::Arc::clone(&state.core.lock().unwrap_or_else(|e| e.into_inner()).model);
+        spawn_batch_engine(std::sync::Arc::clone(&state.engine), m);
+    }
     // 图片输入通路状态：与 main 的 runlog 行同源，控制台一眼能看出能不能传图
+    {
+    }
     match &state.cfg.vision {
         Some(v) => logln!(
             "[serve] 视觉塔已启用（输入 {}px、patch {}px）：message.image_url 可用",
@@ -2346,7 +2742,10 @@ mod tests {
     }
 
     fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(r, c)| (r.to_string(), c.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
     }
 
     #[test]
@@ -2354,7 +2753,10 @@ mod tests {
         let k = random_api_key();
         assert!(k.starts_with("sk-"), "key 必须带 sk- 前缀：{k}");
         assert_eq!(k.len(), 3 + 32, "sk- + 32 位十六进制：{k}");
-        assert!(k[3..].chars().all(|c| c.is_ascii_hexdigit()), "后缀必须是十六进制：{k}");
+        assert!(
+            k[3..].chars().all(|c| c.is_ascii_hexdigit()),
+            "后缀必须是十六进制：{k}"
+        );
         // 连取两次不能撞车：撞车等于两台/两次服务共用一个 key
         assert_ne!(k, random_api_key());
     }
@@ -2401,11 +2803,7 @@ mod tests {
 
     #[test]
     fn split_merges_multiple_system_messages() {
-        let m = msgs(&[
-            ("system", "s1"),
-            ("developer", "s2"),
-            ("user", "q"),
-        ]);
+        let m = msgs(&[("system", "s1"), ("developer", "s2"), ("user", "q")]);
         let (system, history, input) = split_messages(&m, true);
         assert_eq!(system, "s1\ns2");
         assert_eq!(history, "");
@@ -2432,19 +2830,55 @@ mod tests {
         // 末条不是 user
         assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"a"}]}"#, &c).is_err());
         // 未知 role
-        assert!(parse_chat(r#"{"messages":[{"role":"tool","content":"x"},{"role":"user","content":"q"}]}"#, &c).is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"tool","content":"x"},{"role":"user","content":"q"}]}"#,
+                &c
+            )
+            .is_err()
+        );
         // content 不是字符串
-        assert!(parse_chat(r#"{"messages":[{"role":"user","content":[{"type":"text","text":"q"}]}]}"#, &c).is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":[{"type":"text","text":"q"}]}]}"#,
+                &c
+            )
+            .is_err()
+        );
         // n != 1
         assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"n":2}"#, &c).is_err());
         // max_tokens = 0
-        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"max_tokens":0}"#, &c).is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":"q"}],"max_tokens":0}"#,
+                &c
+            )
+            .is_err()
+        );
         // 越界 temperature
-        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"temperature":9}"#, &c).is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":"q"}],"temperature":9}"#,
+                &c
+            )
+            .is_err()
+        );
         // 越界 top_p
-        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"top_p":0}"#, &c).is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":"q"}],"top_p":0}"#,
+                &c
+            )
+            .is_err()
+        );
         // 非法 stop 元素
-        assert!(parse_chat(r#"{"messages":[{"role":"user","content":"q"}],"stop":[1]}"#, &c).is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":"q"}],"stop":[1]}"#,
+                &c
+            )
+            .is_err()
+        );
     }
 
     /// `message.image_url` 的解析规则：只认末条 user，null 当没带，非字符串/空串 400
@@ -2461,9 +2895,11 @@ mod tests {
         // 不带字段 / 显式 null → 纯文本请求
         let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c).unwrap();
         assert!(job.image.is_none());
-        let job =
-            parse_chat(r#"{"messages":[{"role":"user","content":"q","image_url":null}]}"#, &c)
-                .unwrap();
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q","image_url":null}]}"#,
+            &c,
+        )
+        .unwrap();
         assert!(job.image.is_none());
 
         // 中间消息带图不算数（只认末条 user）
@@ -2477,16 +2913,20 @@ mod tests {
         assert!(job.image.is_none());
 
         // 非字符串 / 空串 → 400
-        assert!(parse_chat(
-            r#"{"messages":[{"role":"user","content":"q","image_url":123}]}"#,
-            &c
-        )
-        .is_err());
-        assert!(parse_chat(
-            r#"{"messages":[{"role":"user","content":"q","image_url":""}]}"#,
-            &c
-        )
-        .is_err());
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":"q","image_url":123}]}"#,
+                &c
+            )
+            .is_err()
+        );
+        assert!(
+            parse_chat(
+                r#"{"messages":[{"role":"user","content":"q","image_url":""}]}"#,
+                &c
+            )
+            .is_err()
+        );
     }
 
     /// 输入图解码：补训练格式、像素归一化、各类坏输入回 400 而不是 panic
@@ -2502,16 +2942,24 @@ mod tests {
 
         // 真图（64px PNG，与 VisionConfig::default 对齐）→ 3×64×64、值域 [-1,1]
         let vcfg = crate::vision::VisionConfig::default();
-        let px_in: Vec<f32> = (0..3 * 64 * 64).map(|i| (i % 255) as f32 / 127.5 - 1.0).collect();
+        let px_in: Vec<f32> = (0..3 * 64 * 64)
+            .map(|i| (i % 255) as f32 / 127.5 - 1.0)
+            .collect();
         let png = crate::vision::encode_png(&px_in, 64);
         let uri = format!("data:image/png;base64,{}", b64encode(&png));
 
         let (t, px) = prepare_vision(Some(&vcfg), "这是什么颜色？", Some(&uri)).unwrap();
         // 问题被补成训练时的理解样本格式 `图:<|image|>{问题}`
-        assert_eq!(t, format!("图:{}这是什么颜色？", crate::tokenizer::IMAGE_LITERAL));
+        assert_eq!(
+            t,
+            format!("图:{}这是什么颜色？", crate::tokenizer::IMAGE_LITERAL)
+        );
         let px = px.unwrap();
         assert_eq!(px.len(), 3 * 64 * 64);
-        assert!(px.iter().all(|v| (-1.0..=1.0).contains(v)), "像素必须在 [-1,1]");
+        assert!(
+            px.iter().all(|v| (-1.0..=1.0).contains(v)),
+            "像素必须在 [-1,1]"
+        );
 
         // 已自带占位符：不重复补前缀
         let q = format!("看图{}说颜色", crate::tokenizer::IMAGE_LITERAL);
@@ -2565,7 +3013,10 @@ mod tests {
     #[test]
     fn parse_chat_default_max_tokens_clamped_to_block_size() {
         // 夹具 max_new = 200 > block_size = 64：缺省路径必须被钳到 64
-        let c = ServeCfg { block_size: 64, ..cfg(true) };
+        let c = ServeCfg {
+            block_size: 64,
+            ..cfg(true)
+        };
         let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c).unwrap();
         assert_eq!(job.max_tokens, 64, "缺省 max_tokens 必须钳到 block_size");
         // 显式路径语义不变：给 200（> block_size）同样钳到 64
@@ -2582,7 +3033,10 @@ mod tests {
         assert_eq!(job.max_tokens, 200);
 
         // block_size = 0 的兜底与既有 `.max(1)` 写法一致
-        let c0 = ServeCfg { block_size: 0, ..cfg(true) };
+        let c0 = ServeCfg {
+            block_size: 0,
+            ..cfg(true)
+        };
         let job = parse_chat(r#"{"messages":[{"role":"user","content":"q"}]}"#, &c0).unwrap();
         assert_eq!(job.max_tokens, 1);
     }
@@ -2660,10 +3114,18 @@ mod tests {
         assert_eq!(field(&items, "输出"), "答案");
         assert_eq!(field(&items, "收尾"), "采到 EOS");
         let params = field(&items, "采样参数");
-        for want in ["temperature=0.8", "seed=7", "max_tokens=200", "repetition_penalty="] {
+        for want in [
+            "temperature=0.8",
+            "seed=7",
+            "max_tokens=200",
+            "repetition_penalty=",
+        ] {
             assert!(params.contains(want), "采样参数缺 {want}：{params}");
         }
-        assert_eq!(field(&items, "用量"), "prompt 10 + completion 4 = 14 token，42.5 tok/s");
+        assert_eq!(
+            field(&items, "用量"),
+            "prompt 10 + completion 4 = 14 token，42.5 tok/s"
+        );
         // 正常收尾不该带备注
         assert!(items.iter().all(|(k, _)| *k != "备注"));
     }
@@ -2714,7 +3176,7 @@ mod tests {
     #[test]
     fn stop_interner_rejects_oversized_input() {
         assert!(intern_stops(&[String::new()]).is_err());
-        assert!(intern_stops(&[ "x".repeat(MAX_STOP_LEN + 1) ]).is_err());
+        assert!(intern_stops(&["x".repeat(MAX_STOP_LEN + 1)]).is_err());
         let many: Vec<String> = (0..MAX_STOPS + 1).map(|i| format!("s{i}")).collect();
         assert!(intern_stops(&many).is_err());
     }
@@ -2722,7 +3184,11 @@ mod tests {
     #[test]
     fn sse_pipe_reads_frames_then_hits_eof() {
         let (tx, rx) = sync_channel::<Vec<u8>>(4);
-        let mut pipe = SsePipe { rx, buf: Vec::new(), pos: 0 };
+        let mut pipe = SsePipe {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        };
 
         tx.send(b"hello".to_vec()).unwrap();
         tx.send(b"world".to_vec()).unwrap();
@@ -2791,11 +3257,18 @@ mod tests {
         }
         // 全局默认要鉴权；不鉴权的端点必须显式清空，否则导入工具会强制要求带 key
         for p in ["/health", "/v1/status", "/openapi.json", "/openapi.yaml"] {
-            assert_eq!(spec["paths"][p]["get"]["security"], json!([]), "{p} 应不鉴权");
+            assert_eq!(
+                spec["paths"][p]["get"]["security"],
+                json!([]),
+                "{p} 应不鉴权"
+            );
         }
         // 鉴权端点不写 security → 沿用全局 bearerAuth
         assert!(spec["paths"]["/v1/chat/completions"]["post"]["security"].is_null());
-        assert_eq!(spec["components"]["securitySchemes"]["bearerAuth"]["scheme"], "bearer");
+        assert_eq!(
+            spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer"
+        );
     }
 
     #[test]
@@ -2805,16 +3278,31 @@ mod tests {
         assert_eq!(req["required"][0], "messages");
         let props = &req["properties"];
         // 这些上限必须和 parse_chat 的逐字段校验一字不差，否则文档会骗人
-        assert_eq!(props["messages"]["maxItems"].as_u64(), Some(MAX_MESSAGES as u64));
-        assert_eq!(props["stop"]["oneOf"][1]["maxItems"].as_u64(), Some(MAX_STOPS as u64));
-        assert_eq!(props["stop"]["oneOf"][1]["items"]["maxLength"].as_u64(), Some(MAX_STOP_LEN as u64));
+        assert_eq!(
+            props["messages"]["maxItems"].as_u64(),
+            Some(MAX_MESSAGES as u64)
+        );
+        assert_eq!(
+            props["stop"]["oneOf"][1]["maxItems"].as_u64(),
+            Some(MAX_STOPS as u64)
+        );
+        assert_eq!(
+            props["stop"]["oneOf"][1]["items"]["maxLength"].as_u64(),
+            Some(MAX_STOP_LEN as u64)
+        );
         assert_eq!(props["temperature"]["maximum"].as_f64(), Some(5.0));
         assert_eq!(props["top_k"]["maximum"].as_u64(), Some(10_000));
         assert_eq!(props["repetition_penalty"]["minimum"].as_f64(), Some(0.1));
-        assert_eq!(props["repetition_window"]["maximum"].as_u64(), Some(100_000));
+        assert_eq!(
+            props["repetition_window"]["maximum"].as_u64(),
+            Some(100_000)
+        );
         assert_eq!(props["n"]["const"], json!(1));
         let emb = &spec["components"]["schemas"]["EmbeddingRequest"]["properties"]["input"];
-        assert_eq!(emb["oneOf"][2]["maxItems"].as_u64(), Some(MAX_EMBED_BATCH as u64));
+        assert_eq!(
+            emb["oneOf"][2]["maxItems"].as_u64(),
+            Some(MAX_EMBED_BATCH as u64)
+        );
     }
 
     #[test]
@@ -2839,15 +3327,15 @@ mod tests {
         // 它必须能过真实的入参校验，否则一点 Send 就是 400（编出 n≠1、
         // 或 messages 以 assistant 结尾这类“看着合法”的坏例子）
         let spec = openapi_spec(&cfg(false));
-        let chat_ex = &spec["paths"]["/v1/chat/completions"]["post"]["requestBody"]
-            ["content"]["application/json"]["example"];
+        let chat_ex = &spec["paths"]["/v1/chat/completions"]["post"]["requestBody"]["content"]["application/json"]
+            ["example"];
         assert!(!chat_ex.is_null(), "chat 缺 example，导入工具只能自己瞎编");
         let job = parse_chat(&chat_ex.to_string(), &cfg(false))
             .unwrap_or_else(|e| panic!("chat example 过不了 parse_chat：{}", e.message));
         assert_eq!(job.input, "用一句话介绍 Transformer。");
 
-        let emb_ex = &spec["paths"]["/v1/embeddings"]["post"]["requestBody"]
-            ["content"]["application/json"]["example"];
+        let emb_ex = &spec["paths"]["/v1/embeddings"]["post"]["requestBody"]["content"]["application/json"]
+            ["example"];
         assert!(!emb_ex.is_null(), "embeddings 缺 example");
         // input 只接受 string / number / string[]（run_embeddings 逐项解析）
         let input = &emb_ex["input"];

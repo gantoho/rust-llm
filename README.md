@@ -62,7 +62,7 @@
 | 对齐 | `src/align.rs` | 奖励模型（标量头 + Bradley-Terry）、序列 logprob 与 loss 掩码、DPO（隐式奖励 + 参考模型）、GRPO 组内相对优势、PPO clip 目标 + KL(k3) 惩罚 |
 | RAG | `src/rag.rs` | 分块（字符域切分 + 句读对齐、可配重叠）、三种向量化（TF-IDF / FNV 哈希 / 模型隐状态池化）、余弦检索与 MMR 多样化重排、按预算组装提示 |
 | 分布式 | `src/distributed.rs` | 环形 allreduce（reduce-scatter + all-gather）、数据并行、ZeRO-1/2（状态分片）、张量并行 MLP 与 QKV 列切分、GPipe / 1F1B 流水线、3D 并行规划（`DistConfig`） |
-| 分布式通信（真多进程） | `src/comm.rs` | TCP 全连接拓扑（每连接一条独立读线程）+ 环形集合通信（算法与 `distributed.rs` 的模拟器**逐位同构**）+ `DistRuntime` 三维通信组（`tp_group` / `dp_group` / `pp_group`）；DP 的四个同步点落在 `distributed.rs`：`DistConfig::from_env` / `mix_dp_rank` / `allreduce_mean_grads` / `sync_overflow` / `allreduce_mean_moe_bias` |
+| 分布式通信（真多进程） | `src/comm.rs` | TCP 全连接拓扑（每连接一条独立读线程）+ 环形集合通信（算法与 `distributed.rs` 的模拟器**逐位同构**）+ `DistRuntime` 两维通信组（`tp_group` / `dp_group`，PP 走 `prev_stage`/`next_stage` 点对点）；DP 的四个同步点落在 `distributed.rs`：`DistConfig::from_env` / `mix_dp_rank` / `allreduce_mean_grads` / `sync_overflow` / `allreduce_mean_moe_bias` |
 | 配置 | `src/config.rs` | `config/config.json`：模型超参 + 训练参数 + **预设配置**（small/medium/large）+ **LoRA 配置** + **SFT 语料** |
 | Checkpoint | `src/checkpoint.rs` | 模型参数 + 优化器状态保存/恢复（latest / best / final），`LLMCP2` 二进制格式，**头部记录 LoRA 形态（旧档兼容）** |
 | 命令行 | `src/cli.rs` | clap 子命令：train / eval / generate / **chat** / **serve** / **sft** / **finetune** / **preset** / demo / **bench** / **scaling** / **moe** / **quant** / **distributed** / **align** / **rag** / **speculative** / **distill** / **fp8** / **fp4** / **csa** / **mla** / **import-hf** |
@@ -1895,7 +1895,7 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **431 个单元测试**
+用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **430 个单元测试**
 （另有 2 个集成冒烟测试 `tests/smoke.rs`：启动真实二进制跑 `--help` 与 `preset`），
 其中 `src/gpu.rs` 20 个（含 3 个 `#[ignore]` 的性能标定探针）；不带 `--features gpu` 时 410 个。
 零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒。GPU 用例会真实创建 wgpu 设备并逐个形状比对
@@ -2217,6 +2217,7 @@ loss 直接变 NaN，整轮实验作废。
 | `LLM_MM_NO_COLSPLIT` | 调试用：`1` = 关掉 dW 的"列分块补并行度"，回到只按行块并行（同进程 A/B 用） | 空 |
 | `LLM_MM_NO_PACKED` | 调试用：`1` = 关掉 dW 的"打包 + KC 归约分块"内核（`LLM_CPU_FMA=1` 下的快速路径），回到通用 axpy | 空 |
 | `LLM_MM_NO_BATCH_DECODE` | 调试用：`1` = 束搜索回到"每条路径各做一次前向"，用于对比批处理解码（输出应逐字相同） | 空 |
+| `LLM_QUANT_REPLAY` | `1` = 加载量化档时**按头部参数重放量化**（默认关：既有量化档语义是 f32），配合融合反量化 GEMV，int8 推理同时拿到"内存 1/4 + 更快" | 空 |
 | `LLM_GPU_MATMUL_MIN_FLOPS` | 覆盖分流阈值（FLOPs 低于它走 CPU） | `50000000` |
 | `LLM_GPU_MM_SMALL` | `0` = 强制 128×128 大 tile matmul 内核；其他值 = 64×64 小 tile | 小 tile（标定见 [§15.1](#151-gpu-matmul-内核从-128128-改到-6464)） |
 | `LLM_GPU_STACK` | **存在即启用整叠 Block 常驻路径**（只要设置就生效，值不参与判断）。严格更快（实测 +24% 吞吐 / −40% 墙钟，loss 逐位相同），但准入更严：单流、无 KV cache（`base = 0`）、所有层无 QK-Norm / MLA / LoRA / 量化——任一不满足自动回退逐子层，**数值不变**。训练与整段评估受益；逐 token 解码（带 KV cache）不走它 | 关 |
@@ -2444,24 +2445,42 @@ no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输�
 
 ---
 
+#### 16.5 本轮批量优化（2026-11，35 项；未完成项见 [BACKLOG.md](BACKLOG.md)）
+
+| 优化 | 做法 | 实测 |
+|---|---|---|
+| 输出头不再物化 | decode 直读物理 `[N,K]` 点积；2D 转置 32×32 分块 + 反向下标闭式 | 解码 **426 → 79 ms/token**；0.5B 64 token **35.7 → 7.2 s** |
+| BPE 编码 | 维护相邻对**计数**、跳过不可能命中的规则 | 151k merges / 11 KB 中文：**343.9 → 1.91 ms（180×）** |
+| 加载与启动 | checkpoint 逐块 `read_exact`；`rng::without_init` 跳过被覆盖的随机初始化 | 读档 0.70 s、峰值 RSS **2.39 GB**；启动 **7.6 → 2.5 s** |
+| 串行搬运并行化 | 9 处（dW、LN/RMSNorm 的 dγ/dβ、gelu/swiglu、flash dq/dk/dv、`zero_grad`）改分块/列并行 | 单线程 9.6 → **32.5 GB/s** |
+| CPU matmul 快速内核 | `LLM_CPU_FMA=1`：前向 AVX2+FMA 8×8 寄存器分块；dW 走打包 + KC 归约分块（仿 GEBP） | 内核 fwd **2.55~3.35×**、dW **2.85~4.19×**；默认配置训练 **4017 → 6512 tok/s** |
+| 连续批处理解码 | `Transformer::decode_batch`：MLP/残差/输出头整批、注意力逐条；束搜索接入 | beam=4 **1.40×**，输出逐字相同；B=8 / B=16 并发 **2.6× / 3.9×** |
+| 量化推理真正可用 | `QMatrix::gemv` 融合反量化（码→`code/qmax` 查表）+ `LLM_QUANT_REPLAY=1` 加载端重放 + 量化 KV 追加/淘汰从 O(T²) 降到 O(增量) | 端到端 **115 → 88 ms（1.31×）**；权重内存 **8.39 → 5.27 MB（1.59×）** |
+| SSE 首帧 | `Request::into_writer()` 拿裸 stream，自写 HTTP 头 + chunked 帧、**每帧 flush** | **ttfb 0.920 → 0.0027 s（340×）**，`total` 不变 |
+| 连续批处理（C6 ③） | `serve` 起一个驱动线程：并发请求各自 `take_cache` → 提交 → 驱动聚成一批跑一次 `decode_batch` → 回传 `(logits 行, cache)` → 各自 `step_row`；prefill 不进批。**聚合窗口双条件自适应**：只有 `waiting > 1` 才开 5 ms 窗口，且"在等的都已入队"就立刻出发 —— 单请求零等待 | 单请求 **107 ms**（同 prompt 二次；首次含 prefill 340 ms）；4 并发 **811 ms 总 / 每条 203 ms**；四条输出**逐字相同**；422 测试全过 |
+| 语料内存与分词缓存（E7） | ① `DataLoader`/`SftLoader` 的 `tokens` 改 `Vec<u32>`（8 → 4 B/token，**内存 −50%**，取批时 `as usize` 还原）；② `LLM_CORPUS_CACHE=1` 时把分词结果按「文本内容 + 词表大小」哈希落盘（`%TEMP%\rust-llm-corpus-cache\*.bin`，带 magic/版本/长度校验），下次启动直接读 | 语料内存 **−50%**；同语料二次训练省 **~16.5 s**（实测 33.2 → 16.6 s，loss 8.7890 不变）；422 测试全过 |
+| 前缀 KV 复用（C9） | `serve` 侧缓存上次 prompt 的前 `n-1` 个 token 的 K/V；命中就 `fork + rollback` 交给 `Generator::with_cache`，跳过那段 prefill（判据必须是"首步 + 缓存非空 + 有增量"） | 同 prompt 二次请求 **301 → 93 ms（3.2×）**；长 system（466 token）**135 → 10 ms**；命中与不命中输出**逐字相同** |
+| 掩码与 bias 快路 | 因果掩码 thread-local 缓存（原来逐层重建）；`Tensor::binary` 按行广播快路 | 每步少建 24 张 `[t,t]` 掩码；bias 加法 **23.0 → 25.2 GB/s** |
+
+> **踩过的坑**：实现 prefix KV 复用时，判据不能写成"缓存比 ids 短"——滑窗缓存下
+> `seq_len()` 封顶在窗口大小、`ids` 继续增长，会每步重复喂 token 直到 `t` 超过窗口
+> （`demo` 端到端自检会 panic 在 `model.rs` 的窗口断言）。正确判据是"**首步 + 缓存非空 + 有增量**"。
 ### 17. 验证状态明细（测试 / 编译 / 逐课覆盖）
 
-- **测试**（**怎么跑见 [§14 `cargo test`](#14-cargo-test--单元测试)**）：`--list` 当前列出 **431 个单元测试**
+- **测试**（**怎么跑见 [§14 `cargo test`](#14-cargo-test--单元测试)**）：`--list` 当前列出 **430 个单元测试**
   （另有 2 个 `tests/smoke.rs`
   集成用例；数量随代码增长，别把它当常量背）。**全量串行**跑
-  上一次实测（当时 418 个单元用例）
-  **415 passed / 1 failed / 2 ignored**：唯一失败的是
-  `model::tests::quantize_weights_reduces_bytes_and_keeps_loss_close`——**既存的序相关用例**
-  （基线上同序同样失败，与本节改动无关）；ignored 都是 `src/gpu.rs` 的性能标定探针
-  （当时 2 个，现在是 3 个）。
+  最新实测 **421 passed / 0 failed / 9 ignored**（默认与 `LLM_CPU_FMA=1` 两种模式都全过）；ignored 都是性能标定探针（`probe_*`；未完成项见 [BACKLOG.md](BACKLOG.md)）。
   ⚠️ **全量并行跑还会有若干条既存失败，甚至可能整进程崩掉**（实测
   `0xC0000005`）：GPU 用例对时序/驱动敏感，几条"两次训练必须逐位一致"的对照用例会被
   同机并行负载影响。**排查改动请两条路都走**：按关键词过滤跑（快）与全量串行跑
   （最干净；GPU 用例串行全过）
 - **编译**：`cargo build` 与 `cargo build --features gpu` 编译通过、无 error；`cargo check --tests`
-  目前留下 15 条警告（7 条 `unused_mut` + 4 条多余括号 + 4 条 `dead_code`；条数随代码变化，
-  以实际输出为准），**不是"零警告"**：
-  去掉测试代码后，剩下的警告除 4 条 `unused_mut`（都在 `src/cmd/`）之外都是 `dead_code`，分两类。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
+  目前留下 **12 条**警告，**`dead_code` 已清零** —— 拆分 `lib + bin` 后 `pub` 成为真 API，
+  原先"实现完整但无人调用"的项都成了公开 API；余下主要是 4 条 `unused_mut`（都在 `src/cmd/`）
+  与只在测试/基准路径上用的分步参考实现（如 `quant.rs` 的 `cholesky_inverse`、`attention.rs` 的
+  `KVCache::with_window`），它们都有单测覆盖，**不是"零警告"**：
+  **拆分 `lib + bin` 之前**，剩下的警告除 4 条 `unused_mut`（都在 `src/cmd/`）之外都是 `dead_code`，分两类（拆分后这些项都成了公开 API，`dead_code` 已清零；下面保留当时的分类说明）。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
   `cholesky_inverse` / `Calibration` / `awq_best_alpha`、`distributed.rs` 的 `World::barrier` / `broadcast` / `qkv_head_columns`、
   `rag.rs` 的 `Retriever::from_text`、`attention.rs` 的 `KVCache::with_window`）——
   它们都有单测覆盖，只是非测试构建里没有直接调用点。另一类是少数只在测试基准或 `gpu` feature 常驻路径上
@@ -2601,6 +2620,7 @@ no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输�
   （`test_mla_decoupled_off_is_bitwise_identical` 守住）；单测另覆盖吸收 vs 朴素同权重等价（含非零 `c_k`/`c_v` bias）、
   解耦缓存逐 token 增量 == 全量重算、缓存字节账本。⚠️ 吸收仅**无梯度推理**生效，训练走朴素解耦路径；
   本仓库没写融合 kernel，字节与 FLOPs 都是**纸面账本**，不是实测性能
+
 
 ## 实现要点与踩坑记录
 

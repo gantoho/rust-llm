@@ -82,6 +82,79 @@ fn read_all(files: &[String]) -> String {
 ///
 /// 训练文本与验证文本各自包一层：两份文本是两个独立文档，中间不该让模型
 /// 把"训练集结尾"和"验证集开头"当成连续上下文（那正是验证 loss 虚低的一种来源）。
+// ===== E7 后半：语料分词结果落盘缓存（LLM_CORPUS_CACHE=1 时开启）=====
+//
+// 键 = 语料文本内容 + 分词器词表大小（FNV-1a 64）；文件格式：
+//   "RLLMC1" + u16 版本 + u32 token 数 + 小端 u32 序列
+// 命中就跳过整段分词，直接把 token 流读回来（大语料上从"分钟"降到"毫秒"）。
+
+fn corpus_cache_path(kind: &str, tokenizer: &Tokenizer, texts: &[&str]) -> Option<std::path::PathBuf> {
+    if std::env::var("LLM_CORPUS_CACHE").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut put = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    put(kind.as_bytes());
+    put(&(tokenizer.vocab_size() as u64).to_le_bytes());
+    for t in texts {
+        put(&(t.len() as u64).to_le_bytes());
+        put(t.as_bytes());
+    }
+    let dir = std::env::temp_dir().join("rust-llm-corpus-cache");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join(format!("{h:016x}.bin")))
+}
+
+fn read_cached_tokens(path: &std::path::Path) -> Option<Vec<u32>> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.len() < 12 || &raw[..6] != b"RLLMC1" {
+        return None;
+    }
+    let n = u32::from_le_bytes(raw[8..12].try_into().ok()?) as usize;
+    if raw.len() != 12 + n * 4 {
+        return None;
+    }
+    Some(
+        raw[12..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+fn write_cached_tokens(path: &std::path::Path, tokens: &[u32]) {
+    let mut raw = Vec::with_capacity(12 + tokens.len() * 4);
+    raw.extend_from_slice(b"RLLMC1");
+    raw.extend_from_slice(&1u16.to_le_bytes());
+    raw.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for &t in tokens {
+        raw.extend_from_slice(&t.to_le_bytes());
+    }
+    let _ = std::fs::write(path, raw);
+}
+
+/// 分词（带缓存）：命中缓存直接返回，否则编码后回写。
+fn encode_cached(kind: &str, tokenizer: &Tokenizer, texts: &[&str]) -> Vec<u32> {
+    let path = corpus_cache_path(kind, tokenizer, texts);
+    if let Some(p) = path.as_deref() {
+        if let Some(v) = read_cached_tokens(p) {
+            return v;
+        }
+    }
+    let mut out = Vec::new();
+    for t in texts {
+        out.extend(encode_document(tokenizer, t).into_iter().map(|x| x as u32));
+    }
+    if let Some(p) = path.as_deref() {
+        write_cached_tokens(p, &out);
+    }
+    out
+}
 fn encode_document(tokenizer: &Tokenizer, text: &str) -> Vec<usize> {
     let mut ids = Vec::new();
     if let Some(bos) = tokenizer.bos_id() {
@@ -107,7 +180,7 @@ fn resolve_files(path: &str) -> Vec<String> {
         let mut entries: Vec<_> = std::fs::read_dir(path)
             .unwrap_or_else(|e| panic!("无法读取目录 {path}: {e}"))
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "txt"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
             .collect();
         entries.sort_by_key(|e| e.path());
         let files: Vec<String> = entries
@@ -124,7 +197,7 @@ fn resolve_files(path: &str) -> Vec<String> {
 /// 极简通配符展开：只支持路径最后一段里的**单个** `*`（如 `data/corpus/zh_dialogue_*.txt`）。
 /// 为这一个用途引入 glob 依赖不划算，手写二十行足够。
 fn expand_glob(pattern: &str) -> Vec<String> {
-    let (dir, name) = match pattern.rfind(|c| c == '/' || c == '\\') {
+    let (dir, name) = match pattern.rfind(['/', '\\']) {
         Some(i) => (&pattern[..i], &pattern[i + 1..]),
         None => (".", pattern),
     };
@@ -152,7 +225,7 @@ fn expand_glob(pattern: &str) -> Vec<String> {
 /// - `tokens[..val_start]`：训练区（`sample_batch` 在这里随机采样）
 /// - `tokens[val_start..]`：验证区（`eval_batch` 在这里采样，用于评估）
 pub struct DataLoader {
-    tokens: Vec<usize>,
+    tokens: Vec<u32>,
     block_size: usize,
     batch_size: usize,
     val_start: usize,
@@ -171,7 +244,7 @@ impl DataLoader {
         );
         let len = tokens.len();
         DataLoader {
-            tokens,
+            tokens: tokens.into_iter().map(|x| x as u32).collect(),
             block_size,
             batch_size,
             val_start: len,
@@ -188,8 +261,8 @@ impl DataLoader {
         block_size: usize,
         batch_size: usize,
     ) -> Self {
-        let tokens = encode_document(tokenizer, train_text);
-        let val_tokens = val_text.map(|v| encode_document(tokenizer, v));
+        let tokens = encode_cached("pretrain", tokenizer, &[train_text]);
+        let val_tokens = val_text.map(|v| encode_cached("pretrain-val", tokenizer, &[v]));
         Self::from_encoded(tokens, val_tokens, block_size, batch_size)
     }
 
@@ -207,17 +280,17 @@ impl DataLoader {
         assert!(!docs.is_empty(), "训练文档列表为空，无语料可加载");
         let mut tokens = Vec::new();
         for doc in docs {
-            tokens.extend(encode_document(tokenizer, doc));
+            tokens.extend(encode_cached("docs", tokenizer, &[doc.as_str()]));
         }
-        let val_tokens = val_doc.map(|v| encode_document(tokenizer, v));
+        let val_tokens = val_doc.map(|v| encode_cached("docs-val", tokenizer, &[v]));
         Self::from_encoded(tokens, val_tokens, block_size, batch_size)
     }
 
     /// [`from_texts`](Self::from_texts) / [`from_documents`](Self::from_documents) 共用的
     /// 训练/验证切分逻辑：入参是已经编码好的训练流与可选验证流。
     fn from_encoded(
-        mut tokens: Vec<usize>,
-        val_tokens: Option<Vec<usize>>,
+        mut tokens: Vec<u32>,
+        val_tokens: Option<Vec<u32>>,
         block_size: usize,
         batch_size: usize,
     ) -> Self {
@@ -250,7 +323,7 @@ impl DataLoader {
             "验证语料太短，无法切出完整序列"
         );
         DataLoader {
-            tokens,
+            tokens: tokens.into_iter().map(|x| x as u32).collect(),
             block_size,
             batch_size,
             val_start,
@@ -282,8 +355,8 @@ impl DataLoader {
         for _ in 0..self.batch_size {
             let start = lo + rng.choice(max_start);
             for j in 0..self.block_size {
-                x.push(self.tokens[start + j]);
-                y.push(self.tokens[start + j + 1]);
+                x.push(self.tokens[start + j] as usize);
+                y.push(self.tokens[start + j + 1] as usize);
             }
         }
         (x, y)
@@ -501,7 +574,10 @@ pub fn parse_dialogues(text: &str) -> Vec<SftTurns> {
         .collect();
     labels.sort_unstable();
     labels.dedup();
-    let n_role = non_empty.iter().filter(|l| split_label(l).is_some()).count();
+    let n_role = non_empty
+        .iter()
+        .filter(|l| split_label(l).is_some())
+        .count();
     let allow_names = labels.len() == 2 && n_role * 10 >= non_empty.len() * 9;
 
     let mut out: Vec<SftTurns> = Vec::new();
@@ -585,7 +661,7 @@ fn build_sft_stream(tokenizer: &Tokenizer, convs: &[SftTurns]) -> (Vec<usize>, V
         supervised: bool,
     ) {
         let ids = tokenizer.encode(text);
-        sup.extend(std::iter::repeat(supervised).take(ids.len()));
+        sup.extend(std::iter::repeat_n(supervised, ids.len()));
         tokens.extend(ids);
     }
     let eos = tokenizer.eos_id();
@@ -595,16 +671,40 @@ fn build_sft_stream(tokenizer: &Tokenizer, convs: &[SftTurns]) -> (Vec<usize>, V
             sup.push(false);
         }
         for (user, assistant) in conv {
-            push(tokenizer, &mut tokens, &mut sup, &format!("{SFT_USER}\n{user}\n"), false);
-            push(tokenizer, &mut tokens, &mut sup, &format!("{SFT_ASSISTANT}\n"), false);
-            push(tokenizer, &mut tokens, &mut sup, &format!("{assistant}\n"), true);
+            push(
+                tokenizer,
+                &mut tokens,
+                &mut sup,
+                &format!("{SFT_USER}\n{user}\n"),
+                false,
+            );
+            push(
+                tokenizer,
+                &mut tokens,
+                &mut sup,
+                &format!("{SFT_ASSISTANT}\n"),
+                false,
+            );
+            push(
+                tokenizer,
+                &mut tokens,
+                &mut sup,
+                &format!("{assistant}\n"),
+                true,
+            );
         }
         match eos {
             Some(id) => {
                 tokens.push(id);
                 sup.push(true);
             }
-            None => push(tokenizer, &mut tokens, &mut sup, &format!("{SFT_END}\n"), true),
+            None => push(
+                tokenizer,
+                &mut tokens,
+                &mut sup,
+                &format!("{SFT_END}\n"),
+                true,
+            ),
         }
     }
     (tokens, sup)
@@ -627,7 +727,7 @@ fn window_mask(sup: &[bool], start: usize, block_size: usize) -> Vec<bool> {
 /// 因此一个窗口里可能横跨几段对话、也可能从提问中途开始，掩码会照实
 /// 把这些位置标成"不计 loss"。
 pub struct SftLoader {
-    tokens: Vec<usize>,
+    tokens: Vec<u32>,
     /// 与 `tokens` 等长：第 p 个位置是否为监督目标
     sup: Vec<bool>,
     /// 解析出的对话段数（仅用于日志）
@@ -673,7 +773,7 @@ impl SftLoader {
             "SFT 验证区里没有任何监督位置，val_loss 会恒为 0；请增加对话语料或调小验证比例"
         );
         SftLoader {
-            tokens,
+            tokens: tokens.into_iter().map(|x| x as u32).collect(),
             sup,
             num_conversations: convs.len(),
             block_size,
@@ -728,8 +828,8 @@ impl SftLoader {
         for _ in 0..self.batch_size {
             let start = lo + rng.choice(max_start);
             for j in 0..self.block_size {
-                x.push(self.tokens[start + j]);
-                y.push(self.tokens[start + j + 1]);
+                x.push(self.tokens[start + j] as usize);
+                y.push(self.tokens[start + j + 1] as usize);
             }
             mask.extend(window_mask(&self.sup, start, self.block_size));
         }
@@ -851,8 +951,8 @@ impl VlmLoader {
                 continue;
             }
             let tag = format!("{path} 第 {} 行", li + 1);
-            let v: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("{tag} JSON 解析失败: {e}"));
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{tag} JSON 解析失败: {e}"));
             let image = v
                 .get("image")
                 .and_then(|t| t.as_str())
@@ -873,10 +973,7 @@ impl VlmLoader {
                     .unwrap_or_else(|| panic!("{tag} 的 conversations 项缺 string 字段 content"));
                 match role {
                     "human" | "user" => {
-                        assert!(
-                            pending.is_none(),
-                            "{tag}：连续两条提问，未收到回答"
-                        );
+                        assert!(pending.is_none(), "{tag}：连续两条提问，未收到回答");
                         pending = Some(content.to_string());
                     }
                     "gpt" | "assistant" => {
@@ -888,10 +985,7 @@ impl VlmLoader {
                     other => panic!("{tag}：未知角色 '{other}'（应为 human/user/gpt/assistant）"),
                 }
             }
-            assert!(
-                pending.is_none(),
-                "{tag}：最后一条提问没有对应回答"
-            );
+            assert!(pending.is_none(), "{tag}：最后一条提问没有对应回答");
             assert!(!conv.is_empty(), "{tag}：conversations 为空");
 
             // 图片与占位符一一对应：少了 <|image|> 前向注入无处下手，多了会溢出
@@ -916,14 +1010,20 @@ impl VlmLoader {
             );
 
             let img = base.join(image);
-            let px = crate::vision::load_image(img.to_str().expect("image 路径不是合法 UTF-8"), image_size);
+            let px = crate::vision::load_image(
+                img.to_str().expect("image 路径不是合法 UTF-8"),
+                image_size,
+            );
             seqs.push(tokens);
             sups.push(sup);
             pixels.push(px);
         }
 
         let n = seqs.len();
-        assert!(n >= 2, "VLM 语料至少要有 2 条样本（1 训练 + 1 验证），实际 {n} 条：{path}");
+        assert!(
+            n >= 2,
+            "VLM 语料至少要有 2 条样本（1 训练 + 1 验证），实际 {n} 条：{path}"
+        );
         // 末尾约 10% 作验证区，至少留 1 条、至少留 1 条训练
         let val_start = (((n as f64) * 0.9) as usize).clamp(1, n - 1);
         let train_tokens = seqs[..val_start].iter().map(|s| s.len()).sum();
@@ -954,7 +1054,11 @@ impl VlmLoader {
         if total == 0 {
             return 0.0;
         }
-        let sup: usize = self.sups.iter().map(|s| s.iter().filter(|b| **b).count()).sum();
+        let sup: usize = self
+            .sups
+            .iter()
+            .map(|s| s.iter().filter(|b| **b).count())
+            .sum();
         sup as f64 / total as f64
     }
 
@@ -987,7 +1091,10 @@ impl VlmLoader {
             };
             let l = seq.len();
             // l == 1 时没有可预测的目标；l > block_size+1 在 from_jsonl 已拦截
-            assert!(l >= 2, "{tag}区第 {i} 条样本只有 1 个 token，无法构成 (x, y) 对");
+            assert!(
+                l >= 2,
+                "{tag}区第 {i} 条样本只有 1 个 token，无法构成 (x, y) 对"
+            );
             for j in 0..t {
                 if j + 1 < l {
                     x.push(seq[j]);
@@ -1023,8 +1130,7 @@ impl VlmLoader {
     pub fn attach_generation(&mut self, vq: &crate::vqvae::Vqvae, tokenizer: &Tokenizer) {
         let im = tokenizer
             .image_tokens()
-            .expect("生成序列要求分词器已 attach_image_tokens")
-            .clone();
+            .expect("生成序列要求分词器已 attach_image_tokens");
         assert!(
             im.cb_count > 0,
             "生成序列要求 attach_image_tokens 传入 codebook_size > 0"
@@ -1206,7 +1312,10 @@ mod tests {
         // 而不是靠语料里高频的字符组合去暗示（老分词器没有特殊 token 时才退回 SFT_END）
         let last = sup.iter().rposition(|b| *b).unwrap();
         assert_eq!(tokens[last], tok.eos_id().unwrap(), "监督区以 EOS 收尾");
-        assert_eq!(tok.decode_verbose(&tokens[first..=last]), format!("你也好\n{EOS_LITERAL}"));
+        assert_eq!(
+            tok.decode_verbose(&tokens[first..=last]),
+            format!("你也好\n{EOS_LITERAL}")
+        );
     }
 
     /// 老分词器（没有特殊 token）必须退回文本结束标记，不能凭空造出 BOS/EOS。
@@ -1225,7 +1334,10 @@ mod tests {
         // 掩码必须取「目标位置」的监督标记：这一位错了，学出来的东西形式对但内容是错的
         let sup = vec![false, true, false, true, true, false];
         assert_eq!(window_mask(&sup, 1, 3), vec![false, true, true]);
-        assert_eq!(window_mask(&sup, 0, 5), sup.iter().skip(1).copied().collect::<Vec<_>>());
+        assert_eq!(
+            window_mask(&sup, 0, 5),
+            sup.iter().skip(1).copied().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1241,7 +1353,7 @@ mod tests {
         let (tokens, sup) = build_sft_stream(&tok, &convs);
         let n = tokens.len();
         let loader = SftLoader {
-            tokens,
+            tokens: tokens.into_iter().map(|x| x as u32).collect(),
             sup,
             num_conversations: convs.len(),
             block_size: 4,
@@ -1271,7 +1383,7 @@ mod tests {
         let block_size = 4;
         let val_start = 5;
         let loader = SftLoader {
-            tokens: (0..val_start + block_size + 1).map(|i| i % 7).collect(),
+            tokens: (0..val_start + block_size + 1).map(|i| (i % 7) as u32).collect(),
             sup: vec![true; val_start + block_size + 1],
             num_conversations: 1,
             block_size,
@@ -1285,7 +1397,13 @@ mod tests {
         assert_eq!(y.len(), 3 * block_size);
         assert!(mask.is_some());
         // 三个窗口都只能从 val_start 起，右端恰好用满验证区
-        assert_eq!(&x[..block_size], &loader.tokens[val_start..val_start + block_size]);
+        assert_eq!(
+            &x[..block_size],
+            &loader.tokens[val_start..val_start + block_size]
+                .iter()
+                .map(|&v| v as usize)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1306,14 +1424,18 @@ mod tests {
             .iter()
             .map(|d| bos.map_or(0, |_| 1) + tok.encode(d).len() + eos.map_or(0, |_| 1))
             .sum();
-        assert_eq!(loader.tokens.len(), expected, "token 流应是各文档打包后的总长");
+        assert_eq!(
+            loader.tokens.len(),
+            expected,
+            "token 流应是各文档打包后的总长"
+        );
         // 每份文档的边界处必须是 EOS→BOS（若分词器有特殊 token）
         if let (Some(b), Some(e)) = (bos, eos) {
             let mut pos = 0usize;
             for d in &docs {
                 let len = 1 + tok.encode(d).len() + 1;
-                assert_eq!(loader.tokens[pos], b, "文档应以 BOS 开头");
-                assert_eq!(loader.tokens[pos + len - 1], e, "文档应以 EOS 结尾");
+                assert_eq!(loader.tokens[pos] as usize, b, "文档应以 BOS 开头");
+                assert_eq!(loader.tokens[pos + len - 1] as usize, e, "文档应以 EOS 结尾");
                 pos += len;
             }
         }

@@ -3,7 +3,10 @@
 use crate::cli::RopeArgs;
 use crate::comm::DistRuntime;
 use crate::config::Config;
-use crate::data::{BatchSource, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, VlmLoader, load_documents, load_text, load_texts};
+use crate::data::{
+    BatchSource, DataLoader, SFT_ASSISTANT, SFT_END, SFT_USER, SftLoader, VlmLoader,
+    load_documents, load_text, load_texts,
+};
 use crate::model::{Transformer, TransformerConfig};
 use crate::module::Module;
 use crate::quant::{CalibOpts, HessOpts, QBits, QuantMethod, QuantOpts};
@@ -20,7 +23,10 @@ use crate::runlog;
 use crate::sample;
 use crate::train;
 
-use super::{build_tokenizer, describe_kv, load_model_and_tokenizer, maybe_merge_lora, read_text, resolve_ckpt, resolve_model_spec, truncate_chars};
+use super::{
+    build_tokenizer, describe_kv, load_model_and_tokenizer, maybe_merge_lora, read_text,
+    resolve_ckpt, resolve_model_spec, truncate_chars,
+};
 
 /// 命令行上的权重位宽名字 -> 枚举（`quant` 子命令用；这里不存在"不量化"的选项，
 /// 因为不量化就不该走这个子命令）
@@ -55,7 +61,7 @@ fn bool_from_name(flag: &str, name: &str) -> bool {
 }
 
 /// 训练：`train --config config/config.json [--resume ckpt]`
-pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
+pub fn cmd_train(config_path: &str, resume: Option<&str>) {
     runlog::announce("train");
     runlog::fields(
         "本次运行参数",
@@ -76,7 +82,7 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
     // 同步的（小 rank 拨大 rank），各进程在这里互相等对方监听就绪。
     let dist = DistRuntime::from_env_if_distributed();
     // 只有 rank 0 负责落盘（分词器 / 指标 / checkpoint），见 `train_transformer`。
-    let primary = dist.as_ref().map_or(true, |d| d.is_primary());
+    let primary = dist.as_ref().is_none_or(|d| d.is_primary());
     if let Some(d) = dist.as_ref() {
         let rank = d.comm.rank();
         let c = d.cfg.coord(rank);
@@ -128,11 +134,7 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
         let p = vcfg.patch_count();
         // K = VQ 码本大小：模型配置了 model.vq 就一并挂上码本 token（图像生成通路），
         // 否则 K=0 只做理解。挂载必须发生在保存分词器/计算词表之前。
-        let k = model_cfg
-            .vq
-            .as_ref()
-            .map(|v| v.codebook_size)
-            .unwrap_or(0);
+        let k = model_cfg.vq.as_ref().map(|v| v.codebook_size).unwrap_or(0);
         let im = tokenizer
             .attach_image_tokens(p, k)
             .expect("分词器没有特殊 token，无法挂载图片区间");
@@ -144,7 +146,10 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
                 im.cb_first
             );
         } else {
-            logln!("图片 token 已挂载：P={p} 个占位符，ph_first={}（K=0，仅图片理解）", im.ph_first);
+            logln!(
+                "图片 token 已挂载：P={p} 个占位符，ph_first={}（K=0，仅图片理解）",
+                im.ph_first
+            );
         }
     }
 
@@ -152,7 +157,9 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
     // 多进程下只有 rank 0 落盘：N 个副本写同一个 tokenizer.json 会互相覆盖，
     // 更糟的是**边写边被读**——别的 rank 若正在加载就会读到半截 JSON。
     // 各 rank 手里的分词器仍由同一份语料、同一个种子独立构建，内容逐位相同。
-    let tok_path = tcfg.tokenizer_file.clone()
+    let tok_path = tcfg
+        .tokenizer_file
+        .clone()
         .unwrap_or_else(|| format!("{}/tokenizer.json", tcfg.out_dir));
     if primary {
         tokenizer.save(&tok_path);
@@ -191,14 +198,20 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
             ),
             (
                 "分词器",
-                format!("{}（词表 {}）→ {tok_path}", tokenizer.kind(), tokenizer.vocab_size()),
+                format!(
+                    "{}（词表 {}）→ {tok_path}",
+                    tokenizer.kind(),
+                    tokenizer.vocab_size()
+                ),
             ),
             ("模型结构", format!("{model_cfg:?}")),
             ("模型参数", format!("{param_count}")),
             ("输出目录", tcfg.out_dir.clone()),
             (
                 "指标 CSV",
-                tcfg.log_file.clone().unwrap_or_else(|| "不记录".to_string()),
+                tcfg.log_file
+                    .clone()
+                    .unwrap_or_else(|| "不记录".to_string()),
             ),
         ],
     );
@@ -275,7 +288,7 @@ pub(crate) fn cmd_train(config_path: &str, resume: Option<&str>) {
 }
 
 /// 评估：在验证集上计算 loss 与困惑度
-pub(crate) fn cmd_eval(
+pub fn cmd_eval(
     config_path: &str,
     ckpt_path: Option<&str>,
     tokenizer_path: Option<&str>,
@@ -301,7 +314,9 @@ pub(crate) fn cmd_eval(
             ("checkpoint", ckpt_path.to_string()),
             (
                 "分词器文件",
-                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+                tokenizer_path
+                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
+                    .to_string(),
             ),
             ("评估批数", tcfg.eval_iters.to_string()),
             (
@@ -318,8 +333,14 @@ pub(crate) fn cmd_eval(
     );
     // 路径在 runlog 之前已解析过，这里传 `Some(&*ckpt_path)` 是同一路径的幂等解析；
     // eval 不做长度外推，`rope_opt` 传 `None`（末两项直接丢弃）。
-    let (mut model, tokenizer, ckpt, _, _) =
-        resolve_model_spec(Some(&*ckpt_path), tcfg, tcfg.seed, tokenizer_path, merge_lora, None);
+    let (model, tokenizer, ckpt, _, _) = resolve_model_spec(
+        Some(&*ckpt_path),
+        tcfg,
+        tcfg.seed,
+        tokenizer_path,
+        merge_lora,
+        None,
+    );
 
     // 按口径选 loader：SFT 模型必须用对话口径评估——纯文本口径既没对上训练分布，
     // 也没算回答段的监督 loss，跨口径的 loss 没有可比性。
@@ -332,7 +353,8 @@ pub(crate) fn cmd_eval(
                     panic!("--template sft 需要对话语料：用 --sft-file，或在 {config_path} 里设置 train.sft_file")
                 });
             let texts = load_texts(&paths);
-            let mut l = SftLoader::from_texts(&texts, &tokenizer, ckpt.model.block_size, tcfg.batch_size);
+            let mut l =
+                SftLoader::from_texts(&texts, &tokenizer, ckpt.model.block_size, tcfg.batch_size);
             l.set_mask_response(mask_response);
             Box::new(l)
         }
@@ -381,7 +403,7 @@ const DEFAULT_CALIB_DIR: &str = "data/corpus/";
 /// 进程里重建量化（见 [`checkpoint::requantize_after_load`]），没必要为此污染格式。
 /// 存档头里的 `quant` 字段负责记住"当初是怎么量化的"。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_quant(
+pub fn cmd_quant(
     config_path: &str,
     ckpt_path: Option<&str>,
     tokenizer_path: Option<&str>,
@@ -438,7 +460,9 @@ pub(crate) fn cmd_quant(
             ),
             (
                 "校准预算",
-                format!("{calib_samples} 个窗口 × 上下文长度（硬上限 {calib_tokens} token，0 = 不设限）"),
+                format!(
+                    "{calib_samples} 个窗口 × 上下文长度（硬上限 {calib_tokens} token，0 = 不设限）"
+                ),
             ),
             (
                 "AWQ alpha",
@@ -452,10 +476,19 @@ pub(crate) fn cmd_quant(
                 },
             ),
             ("输出", out_path.clone()),
-            ("量化前后对比", if do_eval { "是" } else { "否（加 --eval 开启）" }.to_string()),
+            (
+                "量化前后对比",
+                if do_eval {
+                    "是"
+                } else {
+                    "否（加 --eval 开启）"
+                }
+                .to_string(),
+            ),
         ],
     );
-    let (mut model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed, tokenizer_path);
+    let (mut model, tokenizer, ckpt) =
+        load_model_and_tokenizer(&ckpt_path, tcfg, tcfg.seed, tokenizer_path);
     // LoRA 存档必须先合并：量化会跳过挂着适配器的层（见 [`Linear::quantize_weight`]），
     // 不合并的话报告只会打印"N 层被跳过"，等于什么都没做。
     if model.has_lora() {
@@ -600,7 +633,7 @@ pub(crate) fn cmd_quant(
 
 /// 生成：`generate --config config/config.json --ckpt ckpt --prompt "..."`
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_generate(
+pub fn cmd_generate(
     config_path: &str,
     ckpt_path: Option<&str>,
     tokenizer_path: Option<&str>,
@@ -621,8 +654,14 @@ pub(crate) fn cmd_generate(
     let tcfg = &cfg.train;
     // 装配序列（解析路径 → 加载 → 合并 LoRA → RoPE 覆盖）见 resolve_model_spec；
     // RoPE 覆盖已在 runlog 打「模型结构」之前生效。
-    let (mut model, tokenizer, ckpt, ckpt_path, rope_note) =
-        resolve_model_spec(ckpt_path, tcfg, seed, tokenizer_path, merge_lora, Some(&rope_opt));
+    let (model, tokenizer, ckpt, ckpt_path, rope_note) = resolve_model_spec(
+        ckpt_path,
+        tcfg,
+        seed,
+        tokenizer_path,
+        merge_lora,
+        Some(&rope_opt),
+    );
     let mut rng = Rng::new(seed);
     runlog::fields(
         "本次运行参数",
@@ -631,20 +670,21 @@ pub(crate) fn cmd_generate(
             ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
             (
                 "分词器文件",
-                tokenizer_path.unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）").to_string(),
+                tokenizer_path
+                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
+                    .to_string(),
             ),
             ("模型结构", format!("{:?}", ckpt.model)),
             ("prompt", format!("{prompt:?}")),
-            (
-                "图片理解输入",
-                image.unwrap_or("无（纯文本）").to_string(),
-            ),
+            ("图片理解输入", image.unwrap_or("无（纯文本）").to_string()),
             ("max_new", max_new.to_string()),
             ("seed", seed.to_string()),
             (
                 "生成方式",
                 match beam {
-                    Some(b) => format!("Beam Search（beam_size={b}，length_penalty={length_penalty}）"),
+                    Some(b) => {
+                        format!("Beam Search（beam_size={b}，length_penalty={length_penalty}）")
+                    }
                     None => "采样".to_string(),
                 },
             ),
@@ -653,13 +693,19 @@ pub(crate) fn cmd_generate(
             ("top_p", opts.top_p.to_string()),
             (
                 "重复惩罚",
-                format!("{}（回看窗口 {}）", opts.repetition_penalty, opts.repetition_window),
+                format!(
+                    "{}（回看窗口 {}）",
+                    opts.repetition_penalty, opts.repetition_window
+                ),
             ),
             ("KV cache", describe_kv(&kv)),
             (
                 "RoPE / 上下文",
                 rope_note.clone().unwrap_or_else(|| {
-                    format!("沿用 checkpoint：窗口 {}，base = {}", model.cfg.block_size, model.cfg.rope_base)
+                    format!(
+                        "沿用 checkpoint：窗口 {}，base = {}",
+                        model.cfg.block_size, model.cfg.rope_base
+                    )
                 }),
             ),
         ],
@@ -677,7 +723,9 @@ pub(crate) fn cmd_generate(
         }
         logln!(
             "Beam Search 生成（beam_size={} length_penalty={}，{}）：",
-            beam_size, length_penalty, describe_kv(&kv)
+            beam_size,
+            length_penalty,
+            describe_kv(&kv)
         );
         sample::beam_search(
             &model,
@@ -718,11 +766,23 @@ pub(crate) fn cmd_generate(
                 );
             }
         }
-        let mut g = sample::Generator::new(&model, &tokenizer, &full_prompt, max_new, &opts, kv, &mut rng);
+        let mut g = sample::Generator::new(
+            &model,
+            &tokenizer,
+            &full_prompt,
+            max_new,
+            &opts,
+            kv,
+            &mut rng,
+        );
         if let Some(path) = image {
             let vcfg = model.cfg.vision.as_ref().unwrap();
             let px = crate::vision::load_image(path, vcfg.image_size);
-            logln!("[image] 已加载 {path}（{}×{}，CHW [-1,1]）", vcfg.image_size, vcfg.image_size);
+            logln!(
+                "[image] 已加载 {path}（{}×{}，CHW [-1,1]）",
+                vcfg.image_size,
+                vcfg.image_size
+            );
             g = g.with_pixels(px);
         }
         g.run();
@@ -739,10 +799,16 @@ pub(crate) fn cmd_generate(
             let px = vq.decode(ids, 1);
             let path = format!("{}/gen_image_{i}.png", tcfg.out_dir);
             crate::vision::save_image(&px, vq.cfg.image_size, &path);
-            logln!("[image] 生成图片已保存：{path}（{} 个码本 token）", ids.len());
+            logln!(
+                "[image] 生成图片已保存：{path}（{} 个码本 token）",
+                ids.len()
+            );
         }
     }
-    runlog::append(&format!("[done] 输出总长 {} 字符（含 prompt）", out.chars().count()));
+    runlog::append(&format!(
+        "[done] 输出总长 {} 字符（含 prompt）",
+        out.chars().count()
+    ));
     runlog::finish();
 }
 
@@ -772,7 +838,9 @@ fn sft_schedule(
     /// 步数上限相当于多少个 epoch
     const MAX_EPOCHS: usize = 400;
 
-    let eval_every = cfg_eval_every.min(steps_per_epoch * EVAL_EVERY_EPOCHS).max(1);
+    let eval_every = cfg_eval_every
+        .min(steps_per_epoch * EVAL_EVERY_EPOCHS)
+        .max(1);
     let steps = if steps_given {
         cfg_steps
     } else {
@@ -785,7 +853,7 @@ fn sft_schedule(
 ///
 /// 与 `train` 的区别只有数据与 loss：样本是对话，且**只有回答段参与 loss**
 ///（提问与角色标记被掩码屏蔽，见 [`data::SftLoader`]）。训练循环本身完全共用。
-pub(crate) fn cmd_sft(
+pub fn cmd_sft(
     config_path: &str,
     pretrained_path: &str,
     sft_file: Option<&str>,
@@ -820,9 +888,7 @@ pub(crate) fn cmd_sft(
         .map(str::to_string)
         .or_else(|| cfg.train.sft_file.clone())
         .unwrap_or_else(|| {
-            panic!(
-                "未指定 SFT 语料：用 --sft-file，或在 {config_path} 里设置 train.sft_file"
-            )
+            panic!("未指定 SFT 语料：用 --sft-file，或在 {config_path} 里设置 train.sft_file")
         });
 
     // 输出目录默认加 `-sft` 后缀：绝不能直接写回 tcfg.out_dir，
@@ -904,7 +970,10 @@ pub(crate) fn cmd_sft(
                 format!("{} / {}（{lr_source}）", tcfg.steps, tcfg.max_lr),
             ),
             ("输出目录", out_dir.clone()),
-            ("prompt 模板", format!("{SFT_USER} … {SFT_ASSISTANT} … {SFT_END}")),
+            (
+                "prompt 模板",
+                format!("{SFT_USER} … {SFT_ASSISTANT} … {SFT_END}"),
+            ),
         ],
     );
 
@@ -965,7 +1034,7 @@ pub(crate) fn cmd_sft(
 /// 缺省**重挂一套**（旧的增量丢弃，只继承主干），加 `--resume-lora` 则**链式续训**
 /// 存档里那套（保留已学的增量），后者不能再传 rank / alpha / targets。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_finetune(
+pub fn cmd_finetune(
     config_path: &str,
     pretrained_path: &str,
     lora_rank: Option<usize>,
@@ -996,7 +1065,10 @@ pub(crate) fn cmd_finetune(
             "--resume-lora 的结构由存档决定，不能再传 --lora-rank / --lora-alpha / --lora-targets"
         );
         model.resume_lora();
-        let l = model.lora.clone().expect("resume_lora 之后 model.lora 必有值");
+        let l = model
+            .lora
+            .clone()
+            .expect("resume_lora 之后 model.lora 必有值");
         (l.rank, l.alpha, l.targets.to_string())
     } else {
         // 基线形态来自配置文件（老代码里这一块是死字段：CLI 的默认值无条件盖过它，写进
@@ -1062,11 +1134,7 @@ pub(crate) fn cmd_finetune(
     }
 
     let total_params: usize = model.parameters().iter().map(|p| p.numel()).sum();
-    let trainable_params: usize = model
-        .trainable_parameters()
-        .iter()
-        .map(|p| p.numel())
-        .sum();
+    let trainable_params: usize = model.trainable_parameters().iter().map(|p| p.numel()).sum();
     // 打印**实测**参数（不是按公式预估）：可训练集合就是 trainable_parameters，
     // 和"主干冻结是否真的生效"是同一件事，估错了这里会立刻露馅。
     logln!(
@@ -1100,14 +1168,20 @@ pub(crate) fn cmd_finetune(
                 format!(
                     "rank {rank_used} / alpha {alpha_used}（alpha/rank = {:.4}）｜挂载 {targets_used}｜{}",
                     alpha_used / rank_used as f32,
-                    if resume_lora { "链式续训（沿用存档的适配层）" } else { "新挂一套适配层" }
+                    if resume_lora {
+                        "链式续训（沿用存档的适配层）"
+                    } else {
+                        "新挂一套适配层"
+                    }
                 ),
             ),
             ("总参数", total_params.to_string()),
             (
                 "可训练参数（适配层）",
-                format!("{trainable_params}（{:.3}%）",
-                    100.0 * trainable_params as f32 / total_params.max(1) as f32),
+                format!(
+                    "{trainable_params}（{:.3}%）",
+                    100.0 * trainable_params as f32 / total_params.max(1) as f32
+                ),
             ),
             ("SFT 语料", sft_paths.clone()),
             ("输出目录", out_dir.clone()),
@@ -1116,7 +1190,12 @@ pub(crate) fn cmd_finetune(
 
     let sft_texts = load_texts(&sft_paths);
 
-    let loader = SftLoader::from_texts(&sft_texts, &tokenizer, ckpt.model.block_size, tcfg.batch_size);
+    let loader = SftLoader::from_texts(
+        &sft_texts,
+        &tokenizer,
+        ckpt.model.block_size,
+        tcfg.batch_size,
+    );
     logln!(
         "SFT 语料：{} 段对话，打包 {} token | 监督位置（回答段）占 {:.1}%",
         loader.num_conversations(),
@@ -1137,7 +1216,11 @@ pub(crate) fn cmd_finetune(
     // 分词器一并放进输出目录，这个目录就是自包含的，推理时不必再指回预训练目录
     tokenizer.save(&format!("{out_dir}/tokenizer.json"));
 
-    let what = if resume_lora { "链式续训" } else { "LoRA 微调" };
+    let what = if resume_lora {
+        "链式续训"
+    } else {
+        "LoRA 微调"
+    };
     runlog::append(&format!("{what}结束：best val loss = {best:.4}"));
     logln!("{what}完成，best val loss = {best:.4}");
     logln!(
@@ -1152,14 +1235,18 @@ pub(crate) fn cmd_finetune(
 }
 
 /// 生成预设配置文件
-pub(crate) fn cmd_preset(name: &str, output: &str) {
+pub fn cmd_preset(name: &str, output: &str) {
     let cfg = Config::from_preset(name);
     cfg.save(output);
     println!("已生成 '{}' 预设配置到 {}", name, output);
-    println!("  模型：n_embd={} n_head={} n_layer={} block_size={}",
-        cfg.model.n_embd, cfg.model.n_head, cfg.model.n_layer, cfg.model.block_size);
-    println!("  训练：steps={} batch_size={} max_lr={}", 
-        cfg.train.steps, cfg.train.batch_size, cfg.train.max_lr);
+    println!(
+        "  模型：n_embd={} n_head={} n_layer={} block_size={}",
+        cfg.model.n_embd, cfg.model.n_head, cfg.model.n_layer, cfg.model.block_size
+    );
+    println!(
+        "  训练：steps={} batch_size={} max_lr={}",
+        cfg.train.steps, cfg.train.batch_size, cfg.train.max_lr
+    );
     if cfg.model.use_rmsnorm {
         println!("  架构：LLaMA 风格（RMSNorm + SwiGLU + GQA）");
     } else {
@@ -1176,7 +1263,7 @@ pub(crate) fn cmd_preset(name: &str, output: &str) {
 /// - 灌数据由 [`crate::hf::assign_named_parameters`] 对账（缺一个、形状不符、多一个都报错）；
 /// - 落盘复用 [`checkpoint::save_weights`]，于是导入产物就是一份普通权重档——
 ///   训练、推理、量化、LoRA 全都能直接吃，**没有"HF 专用"的运行时代码**。
-pub(crate) fn cmd_import_hf(
+pub fn cmd_import_hf(
     model_dir: &str,
     output: &str,
     tokenizer: Option<&str>,
@@ -1190,8 +1277,8 @@ pub(crate) fn cmd_import_hf(
     // 骨架：用 0 号种子构造即可——所有参数马上会被导入数据整体覆盖
     let mut rng = Rng::new(0);
     let model = Transformer::new(hf.cfg.clone(), &mut rng);
-    let n = crate::hf::assign_named_parameters(&model, &hf.tensors)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let n =
+        crate::hf::assign_named_parameters(&model, &hf.tensors).unwrap_or_else(|e| panic!("{e}"));
     checkpoint::save_weights(output, &model, 0, f32::INFINITY);
     let mb = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
     println!("  已写出 {n} 个参数 → {output}（{mb:.1} MB，权重 only 档）");
@@ -1212,7 +1299,10 @@ pub(crate) fn cmd_import_hf(
         });
         let tok = Tokenizer::load_hf(tk).unwrap_or_else(|e| panic!("分词器导入失败：{e}"));
         tok.save(&out);
-        println!("  分词器 → {out}（词表 {} 个 token，HF 口径）", tok.vocab_size());
+        println!(
+            "  分词器 → {out}（词表 {} 个 token，HF 口径）",
+            tok.vocab_size()
+        );
     } else {
         println!(
             "  提示：未给 --tokenizer，推理时请自备分词器；\
@@ -1228,7 +1318,7 @@ pub(crate) fn cmd_import_hf(
 /// 目的：优化改动前后在同一台机器、同一套参数下对比，不必跑完整训练。
 /// 模型/数据/步数全部写死，只受 `--steps`、`--gen-tokens` 影响，
 /// 因此两次运行的差异只来自代码本身。
-pub(crate) fn cmd_bench(steps: usize, gen_tokens: usize) {
+pub fn cmd_bench(steps: usize, gen_tokens: usize) {
     use std::time::Instant;
 
     println!("=== 性能基准（bench）===");
@@ -1267,7 +1357,9 @@ pub(crate) fn cmd_bench(steps: usize, gen_tokens: usize) {
         ..config::TrainConfig::default()
     };
     let t0 = Instant::now();
-    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None);
+    train::train_transformer(
+        &model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None,
+    );
     let train_secs = t0.elapsed().as_secs_f64();
     let train_tokens = steps * batch * gcfg.block_size;
     println!(

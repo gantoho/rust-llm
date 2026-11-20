@@ -338,7 +338,7 @@ pub fn kd_loss(student_logits: &Tensor, soft: &SoftTargets, mask: Option<&[bool]
         assert_eq!(m.len(), rows, "mask 长度应与 logits 行数一致");
     }
 
-    let is_sup = |i: usize| mask.map_or(true, |m| m[i]);
+    let is_sup = |i: usize| mask.is_none_or(|m| m[i]);
     let valid = (0..rows).filter(|&i| is_sup(i)).count().max(1);
     // 温度先落成局部 `f32`：反向闭包要 `'static`，不能再借用 `soft`
     let temperature = soft.cfg.temperature;
@@ -400,7 +400,7 @@ pub fn kd_loss(student_logits: &Tensor, soft: &SoftTargets, mask: Option<&[bool]
                 let m_ref: Option<&[bool]> = mask_rc.as_ref().map(|m| m.as_slice());
                 let mut sgm = sg.borrow_mut();
                 sgm.par_chunks_mut(vocab).enumerate().for_each(|(i, row)| {
-                    if !m_ref.map_or(true, |m| m[i]) {
+                    if !m_ref.is_none_or(|m| m[i]) {
                         return; // 屏蔽位不回传梯度
                     }
                     let base = i * vocab;
@@ -457,8 +457,8 @@ mod tests {
     use crate::module::Module;
     use crate::optim::{AdamW, Optimizer};
     use crate::rng::Rng;
-    use crate::tokenizer::Tokenizer;
     use crate::tensor::no_grad;
+    use crate::tokenizer::Tokenizer;
 
     /// 造一份"logits → 手算 softmax"的参考实现，用于核对软标签
     fn manual_softmax(logits: &[f32], rows: usize, vocab: usize, t: f32) -> Vec<f32> {
@@ -494,10 +494,7 @@ mod tests {
             let soft = SoftTargets::from_logits(&lg, cfg);
             let want = manual_softmax(&logits, rows, vocab, t);
             for (i, (&a, &b)) in soft.probs().iter().zip(want.iter()).enumerate() {
-                assert!(
-                    (a - b).abs() < 1e-6,
-                    "T={t} 第 {i} 个概率不符：{a} vs {b}"
-                );
+                assert!((a - b).abs() < 1e-6, "T={t} 第 {i} 个概率不符：{a} vs {b}");
             }
             // 行和必须归一
             for i in 0..rows {
@@ -518,7 +515,10 @@ mod tests {
             .mean_entropy()
         };
         let (e1, e2, e4) = (ent(1.0), ent(2.0), ent(4.0));
-        assert!(e1 < e2 && e2 < e4, "熵应随温度上升：{e1:.4} < {e2:.4} < {e4:.4}");
+        assert!(
+            e1 < e2 && e2 < e4,
+            "熵应随温度上升：{e1:.4} < {e2:.4} < {e4:.4}"
+        );
     }
 
     /// top-k 截断：恰好 k 个非零、下标就是最大的 k 个、截断后仍归一。
@@ -586,10 +586,8 @@ mod tests {
             alpha: 0.5,
             top_k: 0,
         };
-        let soft = SoftTargets::from_logits(
-            &Tensor::from_vec(logits.clone(), vec![rows, vocab]),
-            cfg,
-        );
+        let soft =
+            SoftTargets::from_logits(&Tensor::from_vec(logits.clone(), vec![rows, vocab]), cfg);
         // `param` 而非 `from_vec`：只有 requires_grad = true 的叶子才会收到梯度
         let student = Tensor::param(logits.clone(), vec![rows, vocab]);
         let loss = kd_loss(&student, &soft, None);
@@ -705,10 +703,8 @@ mod tests {
             alpha,
             top_k: 0,
         };
-        let soft = SoftTargets::from_logits(
-            &Tensor::from_vec(teacher.clone(), vec![rows, vocab]),
-            cfg,
-        );
+        let soft =
+            SoftTargets::from_logits(&Tensor::from_vec(teacher.clone(), vec![rows, vocab]), cfg);
 
         // α 只影响两项的加权，不影响软标签本身 —— 所以改 α 只需重建一个 config
         let grad_of = |alpha: f32, hard_only: bool| -> Vec<f32> {
@@ -718,8 +714,10 @@ mod tests {
             } else {
                 let mut c = cfg;
                 c.alpha = alpha;
-                let s =
-                    SoftTargets::from_logits(&Tensor::from_vec(teacher.clone(), vec![rows, vocab]), c);
+                let s = SoftTargets::from_logits(
+                    &Tensor::from_vec(teacher.clone(), vec![rows, vocab]),
+                    c,
+                );
                 kd_loss(&st, &s, None)
             };
             l.backward();
@@ -855,7 +853,12 @@ mod tests {
 
     /// 从 id 序列里随机切若干 `block` 长的窗口，拼成一个 batch：
     /// 返回扁平化的 `x`（`[B·T]`）与 `y`（右移一位）。
-    fn sample(ids: &[usize], block: usize, batch: usize, rng: &mut Rng) -> (Vec<usize>, Vec<usize>) {
+    fn sample(
+        ids: &[usize],
+        block: usize,
+        batch: usize,
+        rng: &mut Rng,
+    ) -> (Vec<usize>, Vec<usize>) {
         assert!(ids.len() > block + 1, "语料太短，切不出一个窗口");
         let mut x = Vec::with_capacity(batch * block);
         let mut y = Vec::with_capacity(batch * block);

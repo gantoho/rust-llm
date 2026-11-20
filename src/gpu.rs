@@ -11,10 +11,10 @@
 //! if gpu::is_available() { println!("GPU: {}", gpu::name()); }
 //! ```
 
+use pollster::block_on;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use pollster::block_on;
 
 /// matmul 最小规模阈值：FLOPs = 2·m·k·n·batch 低于该值时走 CPU。
 /// GPU 一次 dispatch 的固定开销（上传/调度/同步/下载）~10ms，CPU 做 256×256 矩阵乘只需 ~0.1ms。
@@ -92,7 +92,9 @@ static CHUNK_NOTE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// GPU dispatch 诊断记录（采集前 `DIAG_MAX` 次调用，在训练首步结束后统一打印）
 struct GpuDispatchDiag {
-    x: u32, y: u32, z: u32,
+    x: u32,
+    y: u32,
+    z: u32,
     out_len: usize,
     total_ms: f64,
     upload_ms: f64,
@@ -145,9 +147,27 @@ static BUF_NEW_LAST: Mutex<(usize, u64)> = Mutex::new((0, 0));
 pub mod opk {
     pub const N: usize = 21;
     pub const NAMES: [&str; N] = [
-        "matmul", "softmax_fwd", "softmax_bwd", "lm_ce", "ln_fwd", "ln_bwd_x", "ln_bwd_gb",
-        "gelu_fwd", "gelu_bwd", "bias_drop_res", "dropout_bwd", "col_sum", "heads_split",
-        "heads_join", "add", "scale", "relu", "swiglu_fwd", "swiglu_bwd", "add_bias", "other",
+        "matmul",
+        "softmax_fwd",
+        "softmax_bwd",
+        "lm_ce",
+        "ln_fwd",
+        "ln_bwd_x",
+        "ln_bwd_gb",
+        "gelu_fwd",
+        "gelu_bwd",
+        "bias_drop_res",
+        "dropout_bwd",
+        "col_sum",
+        "heads_split",
+        "heads_join",
+        "add",
+        "scale",
+        "relu",
+        "swiglu_fwd",
+        "swiglu_bwd",
+        "add_bias",
+        "other",
     ];
     pub const MATMUL: u8 = 0;
     pub const SOFTMAX_FWD: u8 = 1;
@@ -247,11 +267,7 @@ fn mm_ablated(m: usize, k: usize, n: usize, bs: usize) -> bool {
             2 => n,
             _ => bs,
         };
-        if ge {
-            x >= v
-        } else {
-            x <= v
-        }
+        if ge { x >= v } else { x <= v }
     })
 }
 
@@ -321,7 +337,9 @@ fn flush_recorder_diag_log() {
     // 但把"这一步究竟录了哪些内核、各多少次"摆出来，配合 `LLM_GPU_ABLATE=<类别>`
     // 逐类摘除看步时差，就能定位到具体是哪类内核在吃时间。
     let steps = (log.len() as f64 / 11.0).max(1.0);
-    let mut mix: Vec<(usize, usize)> = (0..opk::N).map(|k| (k, log.iter().map(|d| d.kinds[k]).sum())).collect();
+    let mut mix: Vec<(usize, usize)> = (0..opk::N)
+        .map(|k| (k, log.iter().map(|d| d.kinds[k]).sum()))
+        .collect();
     mix.sort_by(|a, b| b.1.cmp(&a.1));
     let shown: Vec<String> = mix
         .iter()
@@ -353,7 +371,10 @@ fn flush_recorder_diag_log() {
     let ab = ablate_kinds();
     if !ab.is_empty() {
         let names: Vec<&str> = ab.iter().map(|k| opk::NAMES[*k as usize]).collect();
-        println!("[gpu]   ⚠ 消融中：{} 的 dispatch 未录制，步时不可与基线比较数值", names.join(","));
+        println!(
+            "[gpu]   ⚠ 消融中：{} 的 dispatch 未录制，步时不可与基线比较数值",
+            names.join(",")
+        );
     }
     if let Ok(spec) = std::env::var("LLM_GPU_ABLATE_MM") {
         println!("[gpu]   ⚠ 形状消融中：{spec} 的 matmul 未录制，步时不可与基线比较数值");
@@ -406,10 +427,14 @@ pub fn flush_diag_log() {
     );
     println!(
         "[gpu]   操作数上传 {:.1}ms ({:.0}%) | 参数上传 {:.1}ms ({:.0}%) | 绑定+编码+提交 {:.1}ms ({:.0}%) | poll+回读 {:.1}ms ({:.0}%)",
-        avg_operand, avg_operand / avg_total * 100.0,
-        avg_upload, avg_upload / avg_total * 100.0,
-        avg_dispatch, avg_dispatch / avg_total * 100.0,
-        avg_sync, avg_sync / avg_total * 100.0,
+        avg_operand,
+        avg_operand / avg_total * 100.0,
+        avg_upload,
+        avg_upload / avg_total * 100.0,
+        avg_dispatch,
+        avg_dispatch / avg_total * 100.0,
+        avg_sync,
+        avg_sync / avg_total * 100.0,
     );
     // poll+回读 再拆：map_async 调用本身 / poll(Wait) 等 GPU / get_mapped_range / 拷回 Vec。
     // 用来分清「等内核做完」与「传输慢」，两者的对策完全不同。
@@ -419,10 +444,14 @@ pub fn flush_diag_log() {
     let avg_copy = avg(|d| d.copy_ms);
     println!(
         "[gpu]   回读细分：map_async {:.1}ms ({:.0}%) | poll(Wait) {:.1}ms ({:.0}%) | get_mapped_range {:.1}ms ({:.0}%) | 拷回 Vec {:.1}ms ({:.0}%)",
-        avg_map, avg_map / avg_sync * 100.0,
-        avg_poll, avg_poll / avg_sync * 100.0,
-        avg_view, avg_view / avg_sync * 100.0,
-        avg_copy, avg_copy / avg_sync * 100.0,
+        avg_map,
+        avg_map / avg_sync * 100.0,
+        avg_poll,
+        avg_poll / avg_sync * 100.0,
+        avg_view,
+        avg_view / avg_sync * 100.0,
+        avg_copy,
+        avg_copy / avg_sync * 100.0,
     );
     let bytes: u64 = log.iter().map(|d| d.out_len as u64 * 4).sum();
     let sync_s: f64 = log.iter().map(|d| d.sync_ms).sum::<f64>() / 1000.0;
@@ -438,14 +467,12 @@ pub fn flush_diag_log() {
     let mut groups: std::collections::HashMap<(usize, u32, u32, u32), (usize, f64)> =
         std::collections::HashMap::new();
     for d in &log {
-        let e = groups
-            .entry((d.out_len, d.x, d.y, d.z))
-            .or_insert((0, 0.0));
+        let e = groups.entry((d.out_len, d.x, d.y, d.z)).or_insert((0, 0.0));
         e.0 += 1;
         e.1 += d.total_ms;
     }
     let mut gs: Vec<_> = groups.into_iter().collect();
-    gs.sort_by(|a, b| (b.0 .0 as u64 * b.1 .0 as u64).cmp(&(a.0 .0 as u64 * a.1 .0 as u64)));
+    gs.sort_by(|a, b| (b.0.0 as u64 * b.1.0 as u64).cmp(&(a.0.0 as u64 * a.1.0 as u64)));
     println!("[gpu]   回读量按形状分组（前 8 大）：");
     for ((out_len, x, y, z), (cnt, ms)) in gs.iter().take(8) {
         println!(
@@ -453,7 +480,10 @@ pub fn flush_diag_log() {
             *out_len as f64 / 1e6,
             cnt,
             *out_len as f64 * 4.0 / 1e6 * *cnt as f64,
-            x, y, z, ms,
+            x,
+            y,
+            z,
+            ms,
         );
     }
 }
@@ -1736,7 +1766,14 @@ pub fn init() {
     if let Ok(v) = std::env::var("LLM_GPU_MM_SMALL") {
         let f = if v == "0" { 0 } else { 1 };
         MM_SMALL_FORCE.store(f, Ordering::Relaxed);
-        println!("[gpu] matmul tile 被环境变量强制为{}", if f == 0 { "大 (128×128)" } else { "小 (64×64)" });
+        println!(
+            "[gpu] matmul tile 被环境变量强制为{}",
+            if f == 0 {
+                "大 (128×128)"
+            } else {
+                "小 (64×64)"
+            }
+        );
     }
     let ctx = std::thread::Builder::new()
         .name("gpu-init".into())
@@ -1903,7 +1940,9 @@ pub fn matmul_would_use_gpu(m: usize, k: usize, n: usize, batch: usize) -> bool 
 
 /// GPU 逐元素缩放：out[i] = a[i] * s
 pub fn scale(a: &[f32], s: f32) -> Option<Vec<f32>> {
-    GPU.get().and_then(|g| g.as_ref()).and_then(|g| g.scale(a, s))
+    GPU.get()
+        .and_then(|g| g.as_ref())
+        .and_then(|g| g.scale(a, s))
 }
 
 /// GPU 逐元素相加：out[i] = a[i] + b[i]（要求等长）
@@ -1970,7 +2009,10 @@ fn create() -> Option<GpuContext> {
             wgpu::DeviceType::Cpu => "Cpu",
             _ => "Other",
         };
-        println!("[gpu] 适配器 {}: {} ({}, {:?})", i, info.name, device_type, info.backend);
+        println!(
+            "[gpu] 适配器 {}: {} ({}, {:?})",
+            i, info.name, device_type, info.backend
+        );
     }
     // 排序：独显优先，其次集成显卡
     adapters.sort_by(|a, b| {
@@ -2085,17 +2127,16 @@ fn create() -> Option<GpuContext> {
         source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SHADER)),
     });
 
-    let make_pipeline =
-        |device: &wgpu::Device, layout: &wgpu::PipelineLayout, entry: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(layout),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
+    let make_pipeline = |device: &wgpu::Device, layout: &wgpu::PipelineLayout, entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
 
     // matmul：a, b, out, params（4 个绑定）
     let matmul_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2116,7 +2157,11 @@ fn create() -> Option<GpuContext> {
     // 一元运算（scale / relu）：a, out, params（3 个绑定）
     let unary_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("unary_layout"),
-        entries: &[storage_entry(0, true), storage_entry(2, false), uniform_entry(3)],
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ],
     });
     let unary_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("unary_pl"),
@@ -2199,9 +2244,18 @@ fn create() -> Option<GpuContext> {
     // 每个内核用到的绑定集合不同（读写权限也不同），逐一定制布局；
     // 参数 uniform 固定 binding 3，由 `batch_dispatch` 自动补上。
     let elem_layouts: Vec<wgpu::BindGroupLayout> = [
-        ("elem_a_layout", vec![(0u32, true), (1, true), (2, true), (4, false)]),
-        ("elem_b_layout", vec![(0, true), (1, true), (2, true), (4, false), (5, false)]),
-        ("elem_c_layout", vec![(0, true), (1, true), (4, false), (5, false)]),
+        (
+            "elem_a_layout",
+            vec![(0u32, true), (1, true), (2, true), (4, false)],
+        ),
+        (
+            "elem_b_layout",
+            vec![(0, true), (1, true), (2, true), (4, false), (5, false)],
+        ),
+        (
+            "elem_c_layout",
+            vec![(0, true), (1, true), (4, false), (5, false)],
+        ),
         ("elem_d_layout", vec![(0, true), (1, true), (4, false)]),
         ("elem_e_layout", vec![(0, true), (4, false)]),
     ]
@@ -2540,7 +2594,12 @@ impl GpuContext {
 
     /// 把 B 的每一块按布局写进 `chunks`（新建时用新块，内容变了时用原有块原地重传）。
     /// 切法与逐次上传路径共用 [`b_chunk_elements`]，两条路的字节必须一致。
-    fn resident_write_chunks(&self, layout: &ResLayout, b: &[f32], chunks: &[wgpu::Buffer]) -> bool {
+    fn resident_write_chunks(
+        &self,
+        layout: &ResLayout,
+        b: &[f32],
+        chunks: &[wgpu::Buffer],
+    ) -> bool {
         let n: usize = layout.cols.iter().sum();
         let mut stage: Vec<f32> = Vec::new();
         let mut idx = 0usize;
@@ -2694,12 +2753,7 @@ impl GpuContext {
                     &self.matmul_layout,
                     &[(&buf_a, 0), (&buf_b, 1), (&buf_out, 2)],
                     [
-                        bc as u32,
-                        m as u32,
-                        k as u32,
-                        w as u32,
-                        a_t as u32,
-                        b_t as u32,
+                        bc as u32, m as u32, k as u32, w as u32, a_t as u32, b_t as u32,
                     ],
                     m.div_ceil(tile) as u32,
                     w.div_ceil(tile) as u32,
@@ -2795,7 +2849,12 @@ impl GpuContext {
         batch: GpuBatch,
         outs: &[(wgpu::Buffer, usize)],
     ) -> (Option<Vec<Vec<f32>>>, bool, f64, f64) {
-        let GpuBatch { enc, keep_groups, mut keep_bufs, .. } = batch;
+        let GpuBatch {
+            enc,
+            keep_groups,
+            mut keep_bufs,
+            ..
+        } = batch;
         let mut enc = enc;
         let refs: Vec<(&wgpu::Buffer, usize)> = outs.iter().map(|(b, l)| (b, *l)).collect();
         let Some(rb) = Readback::record_raw(self, &mut enc, &refs) else {
@@ -2914,11 +2973,8 @@ impl GpuContext {
         d: usize,
         mask_numel: usize,
     ) -> Option<Vec<f32>> {
-        if rows == 0
-            || d == 0
-            || mask_numel == 0
-            || rows * d < SOFTMAX_MIN_ELEMS
-            || rows > 65535 // 每行一个 workgroup，受单维 65535 上限约束
+        if rows == 0 || d == 0 || mask_numel == 0 || rows * d < SOFTMAX_MIN_ELEMS || rows > 65535
+        // 每行一个 workgroup，受单维 65535 上限约束
         {
             return None; // 太小：GPU 固定开销不划算（如推理单 token），回退 CPU
         }
@@ -2947,7 +3003,13 @@ impl GpuContext {
     }
 
     /// 掩码 softmax 反向：g 为输出梯度 [rows,d]，p 为前向概率 [rows,d]。
-    fn softmax_mask_backward(&self, g: &[f32], p: &[f32], rows: usize, d: usize) -> Option<Vec<f32>> {
+    fn softmax_mask_backward(
+        &self,
+        g: &[f32],
+        p: &[f32],
+        rows: usize,
+        d: usize,
+    ) -> Option<Vec<f32>> {
         if rows == 0 || d == 0 || rows * d < SOFTMAX_MIN_ELEMS || rows > 65535 {
             return None;
         }
@@ -2996,7 +3058,10 @@ impl GpuContext {
     /// 判据与 wgpu 的校验**同源**，按池里真正创建的字节数（size class 上取整之后）判 ——
     /// 只看 `len * 4` 会漏掉上取整那几十 KiB（`size_class` 对 >64 KiB 按 64 KiB 对齐）。
     fn can_alloc(&self, len: usize, kind: u8) -> bool {
-        fits(self.alloc_limit(kind), size_class((len * 4) as u64) as usize)
+        fits(
+            self.alloc_limit(kind),
+            size_class((len * 4) as u64) as usize,
+        )
     }
 
     /// 记录一次「显存放不下 → 回退 CPU」。
@@ -3093,7 +3158,9 @@ impl GpuContext {
         let usage = match kind {
             KIND_READ => wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             KIND_OUT => {
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC
             }
             KIND_UNIFORM => wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             _ => wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -3192,9 +3259,10 @@ impl GpuContext {
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let diag_t_map = diag_t.elapsed();
-        let _ = self
-            .device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
         let diag_t_poll = diag_t.elapsed();
         let view = match slice.get_mapped_range() {
             Ok(v) => v,
@@ -3204,9 +3272,8 @@ impl GpuContext {
             }
         };
         let diag_t_view = diag_t.elapsed();
-        let result = unsafe {
-            std::slice::from_raw_parts(view.as_ptr() as *const f32, out_len).to_vec()
-        };
+        let result =
+            unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, out_len).to_vec() };
         let diag_t_copy = diag_t.elapsed();
         drop(view);
         readback.unmap();
@@ -3217,7 +3284,9 @@ impl GpuContext {
             // 这里的"同步"只覆盖 map+poll+拷回三段，不含随后的 unmap/归还 buffer
             let sync = diag_t_copy - diag_t_submit;
             GPU_DIAG_LOG.lock().unwrap().push(GpuDispatchDiag {
-                x, y, z,
+                x,
+                y,
+                z,
                 out_len,
                 total_ms: total.as_secs_f64() * 1000.0,
                 upload_ms: diag_t_upload.as_secs_f64() * 1000.0,
@@ -3513,7 +3582,11 @@ impl ResLayout {
         while b0 < self.batch {
             let bc = self.batch_chunk.min(self.batch - b0);
             for &w in &self.cols {
-                v.push(if self.whole { self.elems } else { bc * self.k * w });
+                v.push(if self.whole {
+                    self.elems
+                } else {
+                    bc * self.k * w
+                });
             }
             b0 += bc;
         }
@@ -3732,7 +3805,9 @@ impl GpuContext {
         GpuBatch {
             enc: self
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("batch") }),
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("batch"),
+                }),
             keep_groups: Vec::new(),
             keep_bufs: Vec::new(),
             dispatches: 0,
@@ -3864,7 +3939,9 @@ impl GpuContext {
             pipe,
             &self.matmul_layout,
             &[(a, 0), (b, 1), (out, 2)],
-            [bs as u32, m as u32, k as u32, n as u32, a_t as u32, b_t as u32],
+            [
+                bs as u32, m as u32, k as u32, n as u32, a_t as u32, b_t as u32,
+            ],
             m.div_ceil(tile) as u32,
             n.div_ceil(tile) as u32,
             bs as u32,
@@ -3877,11 +3954,17 @@ impl GpuContext {
             // 本批有申请放不下设备（见 [`GpuBatch::oversize`]）：整批作废，不提交。
             return;
         }
-        let GpuBatch { enc, keep_groups, mut keep_bufs, .. } = batch;
+        let GpuBatch {
+            enc,
+            keep_groups,
+            mut keep_bufs,
+            ..
+        } = batch;
         self.queue.submit([enc.finish()]);
-        let _ = self
-            .device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
         // GPU 已跑完，bind group 可以丢；buffer 归还池供后续回读/复用
         drop(keep_groups);
         for buf in keep_bufs.drain(..) {
@@ -3918,20 +4001,7 @@ pub struct GpuHandle {
     len: usize,
 }
 
-impl GpuHandle {
-    /// 回读为 CPU 向量 —— **这是一个同步点**，会等 GPU 把当前队列跑完。
-    pub fn read(&self) -> Option<Vec<f32>> {
-        let ctx = GPU.get().and_then(|g| g.as_ref())?;
-        let mut enc = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("read") });
-        let rb = Readback::record(ctx, &mut enc, &[self])?;
-        ctx.queue.submit([enc.finish()]);
-        let out = rb.collect()?;
-        ctx.drain_pending();
-        out.into_iter().next()
-    }
-}
+impl GpuHandle {}
 
 impl Drop for GpuHandle {
     /// 析构时不直接回池，只挂到 [`PENDING`]；入池由每个 poll(Wait) 之后的
@@ -3996,8 +4066,7 @@ impl Readback {
         let mut cur: Vec<usize> = Vec::new();
         let mut cur_elems = 0usize;
         for (i, &(_, len)) in spans.iter().enumerate() {
-            if !cur.is_empty()
-                && !fits(limit, size_class(((cur_elems + len) * 4) as u64) as usize)
+            if !cur.is_empty() && !fits(limit, size_class(((cur_elems + len) * 4) as u64) as usize)
             {
                 groups.push(std::mem::take(&mut cur));
                 cur_elems = 0;
@@ -4040,7 +4109,11 @@ impl Readback {
 
     /// 等待并取出数据（提交之后调用）
     fn collect(self) -> Option<Vec<Vec<f32>>> {
-        let Readback { stages, spans, total } = self;
+        let Readback {
+            stages,
+            spans,
+            total,
+        } = self;
         let ctx = GPU.get().and_then(|g| g.as_ref())?;
         if total == 0 {
             // 全是空句柄：不必碰显存，直接给出一串空 Vec（与旧实现的行为一致）
@@ -4051,13 +4124,15 @@ impl Readback {
         for slice in &slices {
             slice.map_async(wgpu::MapMode::Read, |_| {});
         }
-        let _ = ctx
-            .device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = ctx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
         let mut all = vec![0.0f32; total];
         for (stage, slice) in stages.iter().zip(&slices) {
             let view = slice.get_mapped_range().ok()?;
-            let data = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, stage.elems) };
+            let data =
+                unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, stage.elems) };
             for &(i, off) in &stage.items {
                 let (go, len) = spans[i];
                 all[go..go + len].copy_from_slice(&data[off..off + len]);
@@ -4114,7 +4189,10 @@ impl GpuRecorder {
     /// 会回退 CPU 重算，数值不受影响。
     fn oversize_handle(&mut self, len: usize) -> GpuHandle {
         self.batch.oversize = true;
-        GpuHandle { buf: self.ctx.placeholder.clone(), len }
+        GpuHandle {
+            buf: self.ctx.placeholder.clone(),
+            len,
+        }
     }
 
     /// 上传 CPU 数据到显存，得到常驻句柄
@@ -4129,7 +4207,10 @@ impl GpuRecorder {
             self.ctx.queue.write_buffer(&buf, 0, bytemuck_bytes(data));
             self.upload_bytes += data.len() * 4;
         }
-        GpuHandle { buf, len: data.len() }
+        GpuHandle {
+            buf,
+            len: data.len(),
+        }
     }
 
     /// 把中间结果交给录制器保活，避免在 submit 之前析构
@@ -4156,8 +4237,18 @@ impl GpuRecorder {
             return self.oversize_handle(len);
         };
         let out = GpuHandle { buf, len };
-        self.ctx
-            .batch_matmul(&mut self.batch, &a.buf, &b.buf, &out.buf, m, k, n, bs, a_t, b_t);
+        self.ctx.batch_matmul(
+            &mut self.batch,
+            &a.buf,
+            &b.buf,
+            &out.buf,
+            m,
+            k,
+            n,
+            bs,
+            a_t,
+            b_t,
+        );
         out
     }
 
@@ -4381,7 +4472,14 @@ impl GpuRecorder {
     }
 
     /// 录制广播加偏置：`out[i] = a[i] + bias[i % cols]`（SwiGLU up 支路先融偏置）
-    fn add_bias(&mut self, a: &GpuHandle, bias: &GpuHandle, out: &GpuHandle, len: usize, cols: usize) {
+    fn add_bias(
+        &mut self,
+        a: &GpuHandle,
+        bias: &GpuHandle,
+        out: &GpuHandle,
+        len: usize,
+        cols: usize,
+    ) {
         self.ctx.batch_dispatch(
             &mut self.batch,
             &self.ctx.add_bias_pipe,
@@ -4500,14 +4598,7 @@ impl GpuRecorder {
             &self.ctx.dropout_bwd_pipe,
             &self.ctx.elem_e_layout,
             &[(&g.buf, 0), (&out.buf, 4)],
-            [
-                len as u32,
-                0,
-                dropout.to_bits(),
-                seed,
-                training as u32,
-                0,
-            ],
+            [len as u32, 0, dropout.to_bits(), seed, training as u32, 0],
             n_workgroups(len),
             1,
             1,
@@ -4562,7 +4653,14 @@ impl GpuRecorder {
             &self.ctx.heads_split_pipe,
             &self.ctx.elem_d_layout,
             &[(&a.buf, 0), (&bias.buf, 1), (&out.buf, 4)],
-            [b as u32, t as u32, h as u32, hd as u32, mode, scale.to_bits()],
+            [
+                b as u32,
+                t as u32,
+                h as u32,
+                hd as u32,
+                mode,
+                scale.to_bits(),
+            ],
             n_workgroups(pairs),
             1,
             1,
@@ -4588,7 +4686,14 @@ impl GpuRecorder {
             &self.ctx.heads_join_pipe,
             &self.ctx.elem_e_layout,
             &[(&a.buf, 0), (&out.buf, 4)],
-            [b as u32, t as u32, h as u32, hd as u32, mode, scale.to_bits()],
+            [
+                b as u32,
+                t as u32,
+                h as u32,
+                hd as u32,
+                mode,
+                scale.to_bits(),
+            ],
             n_workgroups(pairs),
             1,
             1,
@@ -4604,7 +4709,10 @@ impl GpuRecorder {
             self.ctx.queue.write_buffer(&buf, 0, bytemuck_bytes(data));
             self.upload_bytes += data.len() * 4;
         }
-        GpuHandle { buf, len: data.len() }
+        GpuHandle {
+            buf,
+            len: data.len(),
+        }
     }
 
     /// 提交整批，把 `outs` 回读给 CPU（回读拷贝也录进同一个 encoder → 一次 submit、一次 poll）。
@@ -4617,8 +4725,21 @@ impl GpuRecorder {
             // 一起被丢弃，没有任何一次 `create_buffer` / `write_buffer` 会因为超限被调用。
             return None;
         }
-        let GpuRecorder { ctx, batch, keep, t0, upload_bytes } = self;
-        let GpuBatch { enc, keep_groups, mut keep_bufs, dispatches, kinds, .. } = batch;
+        let GpuRecorder {
+            ctx,
+            batch,
+            keep,
+            t0,
+            upload_bytes,
+        } = self;
+        let GpuBatch {
+            enc,
+            keep_groups,
+            mut keep_bufs,
+            dispatches,
+            kinds,
+            ..
+        } = batch;
         let mut enc = enc;
         let rb = Readback::record(ctx, &mut enc, outs)?;
         // 诊断：本批回读字节数（与逐算子路径同一口径，便于对照）
@@ -4927,12 +5048,11 @@ impl AttnLayerResident {
         // 3) 拆回按头布局：dO = dmerged（纯搬运，不读偏置）
         //    布局里 binding 1 必须给一块合法 buffer，mode 2 不会读它 → 拿 x 占位
         let do_ = rec.empty(bn * t * hd, KIND_OUT);
-        rec.heads_split(
-            &dmerged, &self.x, &do_, b, t, h, hd, HEADS_MODE_PLAIN, 1.0,
-        );
+        rec.heads_split(&dmerged, &self.x, &do_, b, t, h, hd, HEADS_MODE_PLAIN, 1.0);
         // 4) 注意力反向：dV → dP → dS → dQ/dK
-        let (dq, dk, dv) =
-            record_attn_bwd(&mut rec, &self.p, &self.q, &self.k, &self.v, &do_, bn, t, t, hd);
+        let (dq, dk, dv) = record_attn_bwd(
+            &mut rec, &self.p, &self.q, &self.k, &self.v, &do_, bn, t, t, hd,
+        );
         // 5) 合并回 [rows, d]：RoPE 用转置旋转回传，Q 的 1/√head_dim 也在这里乘回
         let dq_pre = rec.empty(rows * d, KIND_OUT);
         rec.heads_join(&dq, &dq_pre, b, t, h, hd, 1, scale);
@@ -4957,7 +5077,16 @@ impl AttnLayerResident {
         rec.add(&sum2, &dv_pre, &dln, rows * d);
         // 8) 归一化反向（LayerNorm / RMSNorm 同一套内核）
         let dxln = rec.empty(rows * d, KIND_OUT);
-        rec.ln_bwd_x(&dln, &self.x, &self.stats, &dxln, &self.gamma, rows, d, self.is_rms);
+        rec.ln_bwd_x(
+            &dln,
+            &self.x,
+            &self.stats,
+            &dxln,
+            &self.gamma,
+            rows,
+            d,
+            self.is_rms,
+        );
         let dgamma = rec.empty(d, KIND_OUT);
         let dbeta = rec.empty(d, KIND_OUT);
         rec.ln_bwd_gb(&dln, &self.x, &self.stats, &dgamma, &dbeta, rows, d);
@@ -5025,7 +5154,9 @@ pub struct AttnLayerArgs<'a> {
 }
 
 pub fn attn_layer_forward(a: &AttnLayerArgs) -> Option<AttnLayerResident> {
-    let AttnLayerArgs { b, t, d, n_head, .. } = *a;
+    let AttnLayerArgs {
+        b, t, d, n_head, ..
+    } = *a;
     if b == 0 || t == 0 || d == 0 || n_head == 0 || d % n_head != 0 {
         return None;
     }
@@ -5087,11 +5218,41 @@ pub fn attn_layer_forward(a: &AttnLayerArgs) -> Option<AttnLayerResident> {
     let v_pre = rec.matmul(&xn, false, &hwv, false, rows, d, d, 1);
     // 按头重排 + 偏置（Q/K 顺带 RoPE；缩放放在 Q 上，softmax 内核就不必带 scale）
     let q = rec.empty(bn * t * head_dim, KIND_OUT);
-    rec.heads_split(&q_pre, &hbq, &q, b, t, n_head, head_dim, HEADS_MODE_ROPE, scale);
+    rec.heads_split(
+        &q_pre,
+        &hbq,
+        &q,
+        b,
+        t,
+        n_head,
+        head_dim,
+        HEADS_MODE_ROPE,
+        scale,
+    );
     let k = rec.empty(bn * t * head_dim, KIND_OUT);
-    rec.heads_split(&k_pre, &hbk, &k, b, t, n_head, head_dim, HEADS_MODE_ROPE, 1.0);
+    rec.heads_split(
+        &k_pre,
+        &hbk,
+        &k,
+        b,
+        t,
+        n_head,
+        head_dim,
+        HEADS_MODE_ROPE,
+        1.0,
+    );
     let v = rec.empty(bn * t * head_dim, KIND_OUT);
-    rec.heads_split(&v_pre, &hbv, &v, b, t, n_head, head_dim, HEADS_MODE_BIAS, 1.0);
+    rec.heads_split(
+        &v_pre,
+        &hbv,
+        &v,
+        b,
+        t,
+        n_head,
+        head_dim,
+        HEADS_MODE_BIAS,
+        1.0,
+    );
     // S = Q'·Kᵀ → P = softmax(S + mask) → O = P·V
     let (p, o) = record_attn_fwd(&mut rec, &q, &k, &v, &hm, bn, t, t, head_dim);
     // 合并头 → 输出投影 → dropout → 残差
@@ -5100,7 +5261,17 @@ pub fn attn_layer_forward(a: &AttnLayerArgs) -> Option<AttnLayerResident> {
     let y = rec.matmul(&merged, false, &hwp, false, rows, d, d, 1);
     let out = rec.empty(rows * d, KIND_OUT);
     let seed = DROPOUT_SEED.fetch_add(1, Ordering::Relaxed) as u32 ^ 0x9e37_79b9;
-    rec.bias_dropout_residual(&y, &hbp, &hx, &out, rows * d, d, a.dropout, seed, a.training);
+    rec.bias_dropout_residual(
+        &y,
+        &hbp,
+        &hx,
+        &out,
+        rows * d,
+        d,
+        a.dropout,
+        seed,
+        a.training,
+    );
     let out_host = rec.submit_and_read(&[&out])?.into_iter().next()?;
     Some(AttnLayerResident {
         out: out_host,
@@ -5213,7 +5384,15 @@ pub fn lm_head_ce(
     rec.keep(ht);
     let loss_rows = rec.submit_and_read(&[&row_loss])?.into_iter().next()?;
     let loss = loss_rows.iter().sum::<f32>() / rows as f32;
-    Some(LmHeadResident { loss, dlogits, x: hx, w: hw, rows, d, vocab })
+    Some(LmHeadResident {
+        loss,
+        dlogits,
+        x: hx,
+        w: hw,
+        rows,
+        d,
+        vocab,
+    })
 }
 
 // ==================== MLP 子层常驻显存（前向 / 反向各一次提交） ====================
@@ -5339,7 +5518,16 @@ impl MlpResident {
         };
         // 8) 归一化反向（LayerNorm / RMSNorm 同一套内核）：对输入的 dx 与对 γ/β 的梯度
         let dxln = rec.empty(rows * d, KIND_OUT);
-        rec.ln_bwd_x(&dxn, &self.x, &self.stats, &dxln, &self.gamma, rows, d, self.is_rms);
+        rec.ln_bwd_x(
+            &dxn,
+            &self.x,
+            &self.stats,
+            &dxln,
+            &self.gamma,
+            rows,
+            d,
+            self.is_rms,
+        );
         let dgamma = rec.empty(d, KIND_OUT);
         let dbeta = rec.empty(d, KIND_OUT);
         rec.ln_bwd_gb(&dxn, &self.x, &self.stats, &dgamma, &dbeta, rows, d);
@@ -5363,7 +5551,17 @@ impl MlpResident {
         let db3 = if has3 { Some(it.next()?) } else { None };
         // 残差直通：∂out/∂x 的那一份就是 dout 本身，与 LayerNorm 回传的那份相加
         let dx: Vec<f32> = dxln.iter().zip(dout).map(|(a, b)| a + b).collect();
-        Some(MlpGrads { dx, dw1, db1, dw2, db2, dgamma, dbeta, dw3, db3 })
+        Some(MlpGrads {
+            dx,
+            dw1,
+            db1,
+            dw2,
+            db2,
+            dgamma,
+            dbeta,
+            dw3,
+            db3,
+        })
     }
 }
 
@@ -5546,7 +5744,17 @@ pub fn mlp_swiglu_forward(
     let y2 = rec.matmul(&act, false, &hw_down, false, rows, hid, d, 1);
     let out = rec.empty(rows * d, KIND_OUT);
     let seed = DROPOUT_SEED.fetch_add(1, Ordering::Relaxed) as u32 ^ 0x9e37_79b9;
-    rec.bias_dropout_residual(&y2, &hb_down, &hx, &out, rows * d, d, dropout, seed, training);
+    rec.bias_dropout_residual(
+        &y2,
+        &hb_down,
+        &hx,
+        &out,
+        rows * d,
+        d,
+        dropout,
+        seed,
+        training,
+    );
     let out_host = rec.submit_and_read(&[&out])?.into_iter().next()?;
     Some(MlpResident {
         out: out_host,
@@ -5770,11 +5978,26 @@ fn record_attn_sublayer_fwd(
     let seed = DROPOUT_SEED.fetch_add(1, Ordering::Relaxed) as u32 ^ 0x9e37_79b9;
     rec.bias_dropout_residual(&y, &hbp, &hx, &out, rows * d, d, dropout, seed, training);
     // 前向用完就不再需要的句柄：交给录制器保活到 submit（encoder 仍引用它们的显存）
-    for h in [hb, hwq, hbq, hwk, hbk, hwv, hbv, hbp, q_pre, k_pre, v_pre, o, y] {
+    for h in [
+        hb, hwq, hbq, hwk, hbk, hwv, hbv, hbp, q_pre, k_pre, v_pre, o, y,
+    ] {
         rec.keep(h);
     }
     (
-        AttnSublayer { x: hx, xn, stats, gamma: hg, q, k, v, p, merged, wproj: hwp, seed, is_rms },
+        AttnSublayer {
+            x: hx,
+            xn,
+            stats,
+            gamma: hg,
+            q,
+            k,
+            v,
+            p,
+            merged,
+            wproj: hwp,
+            seed,
+            is_rms,
+        },
         out,
     )
 }
@@ -5839,7 +6062,23 @@ fn record_mlp_sublayer_fwd(
     if let Some(h) = hb3 {
         rec.keep(h);
     }
-    (MlpSublayer { x: hx, xn, z, act, stats, w1: hw1, w2: hw2, w3: hw3, u, gamma: hg, seed, is_rms }, out)
+    (
+        MlpSublayer {
+            x: hx,
+            xn,
+            z,
+            act,
+            stats,
+            w1: hw1,
+            w2: hw2,
+            w3: hw3,
+            u,
+            gamma: hg,
+            seed,
+            is_rms,
+        },
+        out,
+    )
 }
 
 /// 整叠 Block 常驻显存前向：所有子层录进**一次提交**，只有整叠输出回读。
@@ -5847,7 +6086,20 @@ fn record_mlp_sublayer_fwd(
 /// 不适用时返回 None，调用方回退逐 Block 路径（数值行为不变）：
 /// 形状/规模不满足、各层形状不一致、GPU 不可用。
 pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
-    let StackArgs { x, mask, layers, b, t, d, n_head, eps, is_rms, swiglu, dropout, training } = *a;
+    let StackArgs {
+        x,
+        mask,
+        layers,
+        b,
+        t,
+        d,
+        n_head,
+        eps,
+        is_rms,
+        swiglu,
+        dropout,
+        training,
+    } = *a;
     if layers.is_empty() || b == 0 || t == 0 || d == 0 || n_head == 0 || d % n_head != 0 {
         return None;
     }
@@ -5915,7 +6167,15 @@ pub fn stack_forward(a: &StackArgs) -> Option<StackResident> {
     let mut mlp = Vec::with_capacity(layers.len());
     for la in layers {
         let (ah, a_out) = record_attn_sublayer_fwd(
-            &mut rec, hx, la, &hmask, (b, t, d, n_head), eps, is_rms, dropout, training,
+            &mut rec,
+            hx,
+            la,
+            &hmask,
+            (b, t, d, n_head),
+            eps,
+            is_rms,
+            dropout,
+            training,
         );
         attn.push(ah);
         let (mh, m_out) = record_mlp_sublayer_fwd(
@@ -5966,7 +6226,17 @@ fn record_attn_sublayer_bwd(
     rec.col_sum(&dpre, &dbproj, rows, d);
     // 3) 拆回按头布局：dO = dmerged（纯搬运，不读偏置，binding 1 拿 x 占位）
     let do_ = rec.empty(bn * t * hd, KIND_OUT);
-    rec.heads_split(&dmerged, &h.x, &do_, b, t, n_head, hd, HEADS_MODE_PLAIN, 1.0);
+    rec.heads_split(
+        &dmerged,
+        &h.x,
+        &do_,
+        b,
+        t,
+        n_head,
+        hd,
+        HEADS_MODE_PLAIN,
+        1.0,
+    );
     // 4) 注意力反向：dV → dP → dS → dQ/dK
     let (dq, dk, dv) = record_attn_bwd(rec, &h.p, &h.q, &h.k, &h.v, &do_, bn, t, t, hd);
     // 5) 合并回 [rows, d]：RoPE 用转置旋转回传，Q 的 1/√head_dim 也在这里乘回
@@ -6001,7 +6271,9 @@ fn record_attn_sublayer_bwd(
     //    于是这一份梯度不必回读 CPU 再由上一层传回来
     let dx = rec.empty(rows * d, KIND_OUT);
     rec.add(&dxln, dout, &dx, rows * d);
-    for h in [dpre, dmerged, do_, dq, dk, dv, dq_pre, dk_pre, dv_pre, sum2, dln, dxln] {
+    for h in [
+        dpre, dmerged, do_, dq, dk, dv, dq_pre, dk_pre, dv_pre, sum2, dln, dxln,
+    ] {
         rec.keep(h);
     }
     (
@@ -6118,11 +6390,23 @@ impl StackResident {
             (0..self.attn.len()).map(|_| None).collect();
         for i in (0..self.attn.len()).rev() {
             let (d_mlp_in, g_mlp) = record_mlp_sublayer_bwd(
-                &mut rec, &self.mlp[i], &dcur, self.b, self.t, self.d, hid, self.dropout,
+                &mut rec,
+                &self.mlp[i],
+                &dcur,
+                self.b,
+                self.t,
+                self.d,
+                hid,
+                self.dropout,
                 self.training,
             );
             let (d_prev, g_attn) = record_attn_sublayer_bwd(
-                &mut rec, &self.attn[i], &d_mlp_in, dims, self.dropout, self.training,
+                &mut rec,
+                &self.attn[i],
+                &d_mlp_in,
+                dims,
+                self.dropout,
+                self.training,
             );
             // 上一棒的两个上游梯度句柄前向已用尽：保活到 submit
             rec.keep(dcur);
@@ -6154,7 +6438,10 @@ impl StackResident {
         let outs = rec.submit_and_read(&flat)?;
         let mut it = outs.into_iter();
         let dx = it.next()?;
-        Some(StackGrads { dx, grads: it.collect() })
+        Some(StackGrads {
+            dx,
+            grads: it.collect(),
+        })
     }
 }
 
@@ -6234,8 +6521,7 @@ pub fn probe_report() {
     const BIG_OUT_BYTES: u64 = 32 << 20;
     // 显存护栏：录制到的形状里可能有本设备装不下的大表（如 [rows, vocab] 的 logits）。
     // 这种形状直接跳过 —— 探针是标定用的，没必要为了它 panic。
-    let (Some(buf_a), Some(buf_b)) =
-        (g.take_buf(max_a, KIND_IN), g.take_buf(max_b, KIND_IN))
+    let (Some(buf_a), Some(buf_b)) = (g.take_buf(max_a, KIND_IN), g.take_buf(max_b, KIND_IN))
     else {
         println!("[gpu-probe] 录制到的形状里有超出设备显存上限的操作数，跳过回放标定");
         return;
@@ -6259,9 +6545,15 @@ pub fn probe_report() {
         let cnt = groups[&(m, k, n, bs, a_t, b_t)];
         // 输出只要装得下这个形状就够：按形状取精确尺寸，用完即还，避免多个 134MB 同时驻留
         let out_len = m * n * bs;
-        let rot = if out_len as u64 * 4 > BIG_OUT_BYTES { ROT_BIG } else { ROT_SMALL };
+        let rot = if out_len as u64 * 4 > BIG_OUT_BYTES {
+            ROT_BIG
+        } else {
+            ROT_SMALL
+        };
         // 放不下这个形状的输出就跳过它（见上面的显存护栏说明）
-        let Some(outs) = (0..rot).map(|_| g.take_buf(out_len, KIND_OUT)).collect::<Option<Vec<_>>>()
+        let Some(outs) = (0..rot)
+            .map(|_| g.take_buf(out_len, KIND_OUT))
+            .collect::<Option<Vec<_>>>()
         else {
             continue;
         };
@@ -6310,7 +6602,10 @@ pub fn probe_report() {
         total_ms,
         total_flops / 1e9 / (total_ms / 1000.0).max(1e-9),
     );
-    println!("[gpu-probe]   matmul 每步合计 {:.0}ms，按形状拆：", total_ms / steps as f64);
+    println!(
+        "[gpu-probe]   matmul 每步合计 {:.0}ms，按形状拆：",
+        total_ms / steps as f64
+    );
     for (ms, (m, k, n, bs, a_t, b_t), cnt, gf) in rows.iter().take(18) {
         println!(
             "[gpu-probe]     {:>7.1}ms/步 | {:>5.1}% | m={m:<5} k={k:<5} n={n:<5} b={bs:<3} \
@@ -6373,19 +6668,18 @@ pub fn probe_fma() {
         1,
     );
     let t = std::time::Instant::now();
-    if g
-        .run(
-            &g.fma_pipe,
-            &g.unary_layout,
-            &[(&buf_in, 0), (&out, 2)],
-            [ITERS, 0, 0, 0, 0, 0],
-            &out,
-            256,
-            GROUPS,
-            1,
-            1,
-        )
-        .is_none()
+    if g.run(
+        &g.fma_pipe,
+        &g.unary_layout,
+        &[(&buf_in, 0), (&out, 2)],
+        [ITERS, 0, 0, 0, 0, 0],
+        &out,
+        256,
+        GROUPS,
+        1,
+        1,
+    )
+    .is_none()
     {
         return;
     }
@@ -6459,8 +6753,14 @@ mod tests {
         };
         let lim = g.device.limits();
         assert_eq!(g.max_buffer_size, lim.max_buffer_size);
-        assert_eq!(g.max_storage_binding_size, lim.max_storage_buffer_binding_size);
-        assert_eq!(g.max_uniform_binding_size, lim.max_uniform_buffer_binding_size);
+        assert_eq!(
+            g.max_storage_binding_size,
+            lim.max_storage_buffer_binding_size
+        );
+        assert_eq!(
+            g.max_uniform_binding_size,
+            lim.max_uniform_buffer_binding_size
+        );
         assert_eq!(g.alloc_limit(KIND_READ), lim.max_buffer_size);
         assert_eq!(
             g.alloc_limit(KIND_UNIFORM),
@@ -6537,13 +6837,13 @@ mod tests {
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
         // (m, k, n, batch, a_t, b_t)
         let shapes: &[(usize, usize, usize, usize, bool, bool)] = &[
-            (256, 64, 64, 1, false, false),   // 2D，全 128 倍数
-            (256, 256, 64, 1, false, false),  // 2D 反向形状
-            (32, 16, 32, 32, false, false),   // 3D 批量（注意力 scores）
-            (32, 32, 16, 32, false, false),   // 3D 批量（attn·v）
-            (32, 24, 40, 8, false, false),    // 非 128 倍数边界（demo_gpu 用）
-            (100, 100, 100, 1, false, false), // 非 128 倍数
-            (140, 24, 132, 2, false, false),  // 刚好跨过 128 tile 边界
+            (256, 64, 64, 1, false, false),    // 2D，全 128 倍数
+            (256, 256, 64, 1, false, false),   // 2D 反向形状
+            (32, 16, 32, 32, false, false),    // 3D 批量（注意力 scores）
+            (32, 32, 16, 32, false, false),    // 3D 批量（attn·v）
+            (32, 24, 40, 8, false, false),     // 非 128 倍数边界（demo_gpu 用）
+            (100, 100, 100, 1, false, false),  // 非 128 倍数
+            (140, 24, 132, 2, false, false),   // 刚好跨过 128 tile 边界
             (2048, 256, 256, 1, false, false), // 大矩阵（训练 QKV 投影规模）
             // 反向传播：∂a = g @ bᵀ（b 转置读）、∂b = aᵀ @ g（a 转置读）
             (32, 32, 16, 32, false, true),
@@ -6554,10 +6854,15 @@ mod tests {
             (64, 48, 36, 4, true, true), // 双重转置（防御性，正常反向不会同时转）
         ];
         for &(m, k, n, batch, a_t, b_t) in shapes {
-            let a: Vec<f32> = (0..m * k * batch).map(|i| (i as f32 * 0.01).sin()).collect();
-            let b: Vec<f32> = (0..k * n * batch).map(|i| (i as f32 * 0.013).cos()).collect();
-            let g = matmul(&a, &b, m, k, n, batch, a_t, b_t)
-                .unwrap_or_else(|| panic!("m={m} k={k} n={n} batch={batch} a_t={a_t} b_t={b_t} 应走 GPU"));
+            let a: Vec<f32> = (0..m * k * batch)
+                .map(|i| (i as f32 * 0.01).sin())
+                .collect();
+            let b: Vec<f32> = (0..k * n * batch)
+                .map(|i| (i as f32 * 0.013).cos())
+                .collect();
+            let g = matmul(&a, &b, m, k, n, batch, a_t, b_t).unwrap_or_else(|| {
+                panic!("m={m} k={k} n={n} batch={batch} a_t={a_t} b_t={b_t} 应走 GPU")
+            });
             let c = cpu_matmul(&a, &b, m, k, n, batch, a_t, b_t);
             let max_err = g
                 .iter()
@@ -6582,8 +6887,16 @@ mod tests {
         // 修复前它是"整单回退 CPU"（生成 ~9 s/token），现在必须能切成 3 块在 GPU 上算
         let plan = chunk_plan(9, 896, 151_936, 1, LIM, E).expect("真实形状必须能分块");
         assert_eq!(plan.batch_chunk, 1, "大表与 batch 无关，不该去切 batch");
-        assert_eq!(plan.cols.len(), 3, "256 MiB / (896 列 × 4B) ≈ 3 块：{plan:?}");
-        assert_eq!(plan.cols.iter().sum::<usize>(), 151_936, "列块必须恰好覆盖 n");
+        assert_eq!(
+            plan.cols.len(),
+            3,
+            "256 MiB / (896 列 × 4B) ≈ 3 块：{plan:?}"
+        );
+        assert_eq!(
+            plan.cols.iter().sum::<usize>(),
+            151_936,
+            "列块必须恰好覆盖 n"
+        );
         assert_eq!(plan.cols, vec![50646, 50645, 50645], "均分（块宽差 ≤ 1）");
         assert_eq!(plan.dispatches(1), 3);
         for &w in &plan.cols {
@@ -6593,7 +6906,13 @@ mod tests {
         // ---- 整块正好放下 ⇒ 单块（且 `is_whole` 为真 = 零额外拷贝，行为与分块前一致）----
         // m=4 k=8 n=64：A 128B / B 2 KiB / out 1 KiB，size class 都上取整到 4 KiB
         let plan = chunk_plan(4, 8, 64, 1, 4096, E).expect("恰好放得下");
-        assert_eq!(plan, ChunkPlan { batch_chunk: 1, cols: vec![64] });
+        assert_eq!(
+            plan,
+            ChunkPlan {
+                batch_chunk: 1,
+                cols: vec![64]
+            }
+        );
         assert!(plan.is_whole(64, 1));
         assert_eq!(plan.dispatches(1), 1);
         // 只差 1 字节：上取整后顶过上限 → 连一块都放不下 → None（护栏照旧把整单交给 CPU）
@@ -6604,12 +6923,18 @@ mod tests {
         assert_eq!(plan.cols, vec![256, 256]);
         assert!(!plan.is_whole(512, 1));
         assert_eq!(plan.dispatches(1), 2);
-        assert_eq!(chunk_plan(4, 8, 501, 1, 8192, E).unwrap().cols, vec![251, 250]);
+        assert_eq!(
+            chunk_plan(4, 8, 501, 1, 8192, E).unwrap().cols,
+            vec![251, 250]
+        );
 
         // ---- A 自己就超限 ⇒ 切 batch（B 与 batch 无关，切 batch 救的是 A 与输出）----
         // m=128 k=64 batch=4：A=128 KiB > 64 KiB；bc=2 时 A 恰好 64 KiB 放得下
         let plan = chunk_plan(128, 64, 32, 4, 65536, E).expect("应切 batch");
-        assert_eq!(plan.batch_chunk, 2, "整批 A 放不下 → 分两档 batch：{plan:?}");
+        assert_eq!(
+            plan.batch_chunk, 2,
+            "整批 A 放不下 → 分两档 batch：{plan:?}"
+        );
         assert_eq!(plan.cols, vec![32], "列方向一块就够，不该无谓地切 N");
         assert_eq!(plan.dispatches(4), 2);
 
@@ -6626,17 +6951,28 @@ mod tests {
         let plan = chunk_plan(1, 1000, 100_000, 1, 1_572_864, E).expect("应能分块");
         assert_eq!(plan.cols.len(), 255);
         assert!(plan.cols.len() <= MM_CHUNK_MAX);
-        assert!(plan.cols.iter().all(|&w| w >= MM_CHUNK_MIN_COLS), "{plan:?}");
+        assert!(
+            plan.cols.iter().all(|&w| w >= MM_CHUNK_MIN_COLS),
+            "{plan:?}"
+        );
         assert_eq!(plan.cols.iter().sum::<usize>(), 100_000);
 
         // ---- 形状退化：不给方案（调用方本来也不会拿这些形状进来）----
         for bad in [(0, 8, 8, 1), (4, 0, 8, 1), (4, 8, 0, 1), (4, 8, 8, 0)] {
-            assert_eq!(chunk_plan(bad.0, bad.1, bad.2, bad.3, LIM, E), None, "{bad:?}");
+            assert_eq!(
+                chunk_plan(bad.0, bad.1, bad.2, bad.3, LIM, E),
+                None,
+                "{bad:?}"
+            );
         }
         // n 比最小列宽还窄：只有"整条 N 一块放得下"才算有解（上面 4×8×64 那条）。
         // 连整条都放不下时**不细分**——为几十列切几块，dispatch 固定开销比计算还贵 → 回退 CPU
         assert_eq!(chunk_plan(5, 24, 70, 1, 4096, E), None);
-        assert!(chunk_plan(5, 24, 70, 1, 1 << 30, E).unwrap().is_whole(70, 1));
+        assert!(
+            chunk_plan(5, 24, 70, 1, 1 << 30, E)
+                .unwrap()
+                .is_whole(70, 1)
+        );
     }
 
     /// **分块结果 == 不分块结果，逐位相同**（`assert_eq!`，不放任何容差）。
@@ -6807,8 +7143,12 @@ mod tests {
             return;
         };
         let (m, k, n, batch, b_t) = (8usize, 256usize, 8192usize, 1usize, false);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 53) as f32 * 0.021).sin()).collect();
-        let b: Vec<f32> = (0..n * k).map(|i| ((i % 71) as f32 * 0.013).cos()).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 53) as f32 * 0.021).sin())
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 71) as f32 * 0.013).cos())
+            .collect();
         let plan = chunk_plan(m, k, n, batch, 1 << 20, 4).expect("1 MiB 上限下应当能分块");
         assert!(plan.cols.len() >= 4, "这个用例要切出足够多的块：{plan:?}");
         // ---- (a) 逐块 submit + poll：改动前的写法（`matmul_planned` 里曾经就是这段）----
@@ -6824,8 +7164,18 @@ mod tests {
             g.queue.write_buffer(&buf_a, 0, bytemuck_bytes(&a));
             let mut c0 = 0usize;
             for &w in &plan.cols {
-                let b_chunk =
-                    b_chunk_elements(&b, &mut stage, plan.is_whole(n, batch), b_t, n, k, 0, batch, c0, w);
+                let b_chunk = b_chunk_elements(
+                    &b,
+                    &mut stage,
+                    plan.is_whole(n, batch),
+                    b_t,
+                    n,
+                    k,
+                    0,
+                    batch,
+                    c0,
+                    w,
+                );
                 let buf_b = g.take_buf(b_chunk.len(), KIND_IN).unwrap();
                 g.queue.write_buffer(&buf_b, 0, bytemuck_bytes(b_chunk));
                 let out_len = batch * m * w;
@@ -6900,11 +7250,15 @@ mod tests {
         // B = n×k = 1024×512 个 f32 = 2 MiB ≥ RESIDENT_MIN_BYTES（64 KiB）
         let (m, k, n) = (8usize, 512usize, 1024usize);
         let w = Tensor::from_vec(
-            (0..n * k).map(|i| ((i % 97) as f32 * 0.011).sin()).collect(),
+            (0..n * k)
+                .map(|i| ((i % 97) as f32 * 0.011).sin())
+                .collect(),
             vec![n, k],
         );
         let x = Tensor::from_vec(
-            (0..m * k).map(|i| ((i % 89) as f32 * 0.017).cos()).collect(),
+            (0..m * k)
+                .map(|i| ((i % 89) as f32 * 0.017).cos())
+                .collect(),
             vec![m, k],
         );
         let r1 = x.matmul(&w.transpose()).data();
@@ -6940,10 +7294,14 @@ mod tests {
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
         reset_resident_cache();
         let (m, k, n) = (8usize, 512usize, 1024usize);
-        let w_data: Vec<f32> = (0..n * k).map(|i| ((i % 97) as f32 * 0.011).sin()).collect();
+        let w_data: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 97) as f32 * 0.011).sin())
+            .collect();
         let w = Tensor::from_vec(w_data.clone(), vec![n, k]);
         let x = Tensor::from_vec(
-            (0..m * k).map(|i| ((i % 89) as f32 * 0.017).cos()).collect(),
+            (0..m * k)
+                .map(|i| ((i % 89) as f32 * 0.017).cos())
+                .collect(),
             vec![m, k],
         );
         let x_data = x.data();
@@ -6962,7 +7320,10 @@ mod tests {
         new_data[n * k - 1] += 0.75;
         w.set_data(new_data.clone());
         let got = x.matmul(&w.transpose()).data();
-        assert_ne!(got, old, "改了权重之后结果必须随之变化（绝不能命中旧常驻内容）");
+        assert_ne!(
+            got, old,
+            "改了权重之后结果必须随之变化（绝不能命中旧常驻内容）"
+        );
         // 证据 1：与"从未缓存过的同内容张量"逐位相同
         let fresh = Tensor::from_vec(new_data.clone(), vec![n, k]);
         let want = x.matmul(&fresh.transpose()).data();
@@ -6993,7 +7354,10 @@ mod tests {
         let again = x.matmul(&w.transpose()).data();
         assert_eq!(got2, again, "没有写入时连续调用必须逐位一致");
         let (_h, _mi, _b, updates, _s, _bytes, _e) = resident_stats();
-        assert!(updates >= 2, "两次写入都应当触发原地重传：updates={updates}");
+        assert!(
+            updates >= 2,
+            "两次写入都应当触发原地重传：updates={updates}"
+        );
         reset_resident_cache();
     }
 
@@ -7103,7 +7467,11 @@ mod tests {
                     .iter()
                     .zip(mrow)
                     .fold(f32::NEG_INFINITY, |a, (&v, &m)| a.max(v + m));
-                let sum: f32 = row.iter().zip(mrow).map(|(&v, &m)| (v + m - mx).exp()).sum();
+                let sum: f32 = row
+                    .iter()
+                    .zip(mrow)
+                    .map(|(&v, &m)| (v + m - mx).exp())
+                    .sum();
                 for j in 0..d {
                     let want = ((row[j] + mrow[j] - mx).exp()) / sum;
                     let err = (g[r * d + j] - want).abs();
@@ -7136,8 +7504,7 @@ mod tests {
             .collect();
         let targets: Vec<usize> = (0..rows).map(|i| (i * 7) % vocab).collect();
 
-        let res = lm_head_ce(&x, &w, &targets, rows, d, vocab)
-            .expect("该形状应走常驻显存路径");
+        let res = lm_head_ce(&x, &w, &targets, rows, d, vocab).expect("该形状应走常驻显存路径");
 
         // ---- 纯循环参考：前向 logits → logsumexp → CE，以及 dlogits ----
         let mut logits = vec![0.0f32; rows * vocab];
@@ -7289,21 +7656,36 @@ mod tests {
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
         // 每个形状跑两遍：LayerNorm 与 RMSNorm（同一套内核、只切模式位）。
         // RMSNorm 下喂进去的 `beta` 仍是非零向量，内核应把它整个丢弃。
-        let cases: Vec<(usize, usize, usize, bool)> =
-            [(48usize, 32usize, 64usize), (40, 300, 260)]
-                .into_iter()
-                .flat_map(|(r, d, h)| [(r, d, h, false), (r, d, h, true)])
-                .collect();
+        let cases: Vec<(usize, usize, usize, bool)> = [(48usize, 32usize, 64usize), (40, 300, 260)]
+            .into_iter()
+            .flat_map(|(r, d, h)| [(r, d, h, false), (r, d, h, true)])
+            .collect();
         for &(rows, d, hid, is_rms) in &cases {
             let (dropout, eps) = (0.1f32, 1e-5f32);
-            let x: Vec<f32> = (0..rows * d).map(|i| ((i % 37) as f32 * 0.021).sin()).collect();
-            let gamma: Vec<f32> = (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos()).collect();
-            let beta: Vec<f32> = (0..d).map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin()).collect();
-            let w1: Vec<f32> = (0..d * hid).map(|i| ((i % 53) as f32 * 0.017).sin() * 0.3).collect();
-            let b1: Vec<f32> = (0..hid).map(|j| 0.02 * ((j % 7) as f32 * 0.5).cos()).collect();
-            let w2: Vec<f32> = (0..d * hid).map(|i| ((i % 47) as f32 * 0.019).cos() * 0.2).collect();
-            let b2: Vec<f32> = (0..d).map(|j| 0.01 * ((j % 5) as f32 * 0.7).sin()).collect();
-            let dout: Vec<f32> = (0..rows * d).map(|i| ((i % 29) as f32 * 0.023).sin()).collect();
+            let x: Vec<f32> = (0..rows * d)
+                .map(|i| ((i % 37) as f32 * 0.021).sin())
+                .collect();
+            let gamma: Vec<f32> = (0..d)
+                .map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos())
+                .collect();
+            let beta: Vec<f32> = (0..d)
+                .map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin())
+                .collect();
+            let w1: Vec<f32> = (0..d * hid)
+                .map(|i| ((i % 53) as f32 * 0.017).sin() * 0.3)
+                .collect();
+            let b1: Vec<f32> = (0..hid)
+                .map(|j| 0.02 * ((j % 7) as f32 * 0.5).cos())
+                .collect();
+            let w2: Vec<f32> = (0..d * hid)
+                .map(|i| ((i % 47) as f32 * 0.019).cos() * 0.2)
+                .collect();
+            let b2: Vec<f32> = (0..d)
+                .map(|j| 0.01 * ((j % 5) as f32 * 0.7).sin())
+                .collect();
+            let dout: Vec<f32> = (0..rows * d)
+                .map(|i| ((i % 29) as f32 * 0.023).sin())
+                .collect();
 
             let res = mlp_forward(
                 &x, &gamma, &beta, &w1, &b1, &w2, &b2, rows, d, hid, eps, is_rms, dropout, true,
@@ -7342,7 +7724,11 @@ mod tests {
             let out_ref: Vec<f32> = (0..rows * d)
                 .map(|i| x[i] + ref_drop_scale(i, dropout, seed, true) * (y2[i] + b2[i % d]))
                 .collect();
-            assert_close(&format!("out({rows},{d},{hid},rms={is_rms})"), &res.out, &out_ref);
+            assert_close(
+                &format!("out({rows},{d},{hid},rms={is_rms})"),
+                &res.out,
+                &out_ref,
+            );
 
             // ---- 反向参考 ----
             let dypre: Vec<f32> = (0..rows * d)
@@ -7351,7 +7737,9 @@ mod tests {
             let db2_ref = ref_col_sum(&dypre, rows, d);
             let dact = cpu_matmul(&dypre, &w2, rows, d, hid, 1, false, true);
             let dw2_ref = cpu_matmul(&act, &dypre, hid, rows, d, 1, true, false);
-            let dz: Vec<f32> = (0..rows * hid).map(|i| dact[i] * ref_gelu_grad(z[i])).collect();
+            let dz: Vec<f32> = (0..rows * hid)
+                .map(|i| dact[i] * ref_gelu_grad(z[i]))
+                .collect();
             let db1_ref = ref_col_sum(&dz, rows, hid);
             let dxn = cpu_matmul(&dz, &w1, rows, hid, d, 1, false, true);
             let dw1_ref = cpu_matmul(&xn, &dz, d, rows, hid, 1, true, false);
@@ -7420,27 +7808,46 @@ mod tests {
             return;
         }
         MATMUL_MIN_FLOPS.store(0, Ordering::Relaxed);
-        let cases: Vec<(usize, usize, usize, bool)> =
-            [(48usize, 32usize, 64usize), (40, 300, 260)]
-                .into_iter()
-                .flat_map(|(r, d, h)| [(r, d, h, false), (r, d, h, true)])
-                .collect();
+        let cases: Vec<(usize, usize, usize, bool)> = [(48usize, 32usize, 64usize), (40, 300, 260)]
+            .into_iter()
+            .flat_map(|(r, d, h)| [(r, d, h, false), (r, d, h, true)])
+            .collect();
         for &(rows, d, hid, is_rms) in &cases {
             let (dropout, eps) = (0.1f32, 1e-5f32);
-            let x: Vec<f32> = (0..rows * d).map(|i| ((i % 37) as f32 * 0.021).sin()).collect();
-            let gamma: Vec<f32> = (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos()).collect();
-            let beta: Vec<f32> = (0..d).map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin()).collect();
-            let w_gate: Vec<f32> = (0..d * hid).map(|i| ((i % 53) as f32 * 0.017).sin() * 0.3).collect();
-            let b_gate: Vec<f32> = (0..hid).map(|j| 0.02 * ((j % 7) as f32 * 0.5).cos()).collect();
-            let w_up: Vec<f32> = (0..d * hid).map(|i| ((i % 47) as f32 * 0.019).cos() * 0.2).collect();
-            let b_up: Vec<f32> = (0..hid).map(|j| 0.03 * ((j % 5) as f32 * 0.7).sin()).collect();
-            let w_down: Vec<f32> = (0..d * hid).map(|i| ((i % 41) as f32 * 0.023).sin() * 0.25).collect();
-            let b_down: Vec<f32> = (0..d).map(|j| 0.01 * ((j % 5) as f32 * 0.7).sin()).collect();
-            let dout: Vec<f32> = (0..rows * d).map(|i| ((i % 29) as f32 * 0.023).sin()).collect();
+            let x: Vec<f32> = (0..rows * d)
+                .map(|i| ((i % 37) as f32 * 0.021).sin())
+                .collect();
+            let gamma: Vec<f32> = (0..d)
+                .map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos())
+                .collect();
+            let beta: Vec<f32> = (0..d)
+                .map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin())
+                .collect();
+            let w_gate: Vec<f32> = (0..d * hid)
+                .map(|i| ((i % 53) as f32 * 0.017).sin() * 0.3)
+                .collect();
+            let b_gate: Vec<f32> = (0..hid)
+                .map(|j| 0.02 * ((j % 7) as f32 * 0.5).cos())
+                .collect();
+            let w_up: Vec<f32> = (0..d * hid)
+                .map(|i| ((i % 47) as f32 * 0.019).cos() * 0.2)
+                .collect();
+            let b_up: Vec<f32> = (0..hid)
+                .map(|j| 0.03 * ((j % 5) as f32 * 0.7).sin())
+                .collect();
+            let w_down: Vec<f32> = (0..d * hid)
+                .map(|i| ((i % 41) as f32 * 0.023).sin() * 0.25)
+                .collect();
+            let b_down: Vec<f32> = (0..d)
+                .map(|j| 0.01 * ((j % 5) as f32 * 0.7).sin())
+                .collect();
+            let dout: Vec<f32> = (0..rows * d)
+                .map(|i| ((i % 29) as f32 * 0.023).sin())
+                .collect();
 
             let res = mlp_swiglu_forward(
-                &x, &gamma, &beta, &w_gate, &b_gate, &w_up, &b_up, &w_down, &b_down,
-                rows, d, hid, eps, is_rms, dropout, true,
+                &x, &gamma, &beta, &w_gate, &b_gate, &w_up, &b_up, &w_down, &b_down, rows, d, hid,
+                eps, is_rms, dropout, true,
             )
             .expect("该形状应走常驻显存路径");
             let seed = res.seed;
@@ -7480,7 +7887,11 @@ mod tests {
             let out_ref: Vec<f32> = (0..rows * d)
                 .map(|i| x[i] + ref_drop_scale(i, dropout, seed, true) * (y2[i] + b_down[i % d]))
                 .collect();
-            assert_close(&format!("swiglu out({rows},{d},{hid},rms={is_rms})"), &res.out, &out_ref);
+            assert_close(
+                &format!("swiglu out({rows},{d},{hid},rms={is_rms})"),
+                &res.out,
+                &out_ref,
+            );
 
             // ---- 反向参考 ----
             let dypre: Vec<f32> = (0..rows * d)
@@ -7567,7 +7978,6 @@ mod tests {
         let freq = 10000f32.powf((2 * p) as f32 / hd as f32);
         // 与 rope.rs 的 `build_cos_sin_tab` 同一个式子
         // （否则参考与被测项各算一套三角函数，比出来的差值里混进了实现差异）
-        let _ = freq;
         r as f32 / freq
     }
 
@@ -7698,8 +8108,7 @@ mod tests {
                 for h in 0..n_head {
                     let grp = b_idx * n_head + h;
                     for jj in 0..hd {
-                        merged[(b_idx * t + r) * d + h * hd + jj] =
-                            o[(grp * t + r) * hd + jj];
+                        merged[(b_idx * t + r) * d + h * hd + jj] = o[(grp * t + r) * hd + jj];
                     }
                 }
             }
@@ -7716,7 +8125,14 @@ mod tests {
             .collect();
         (
             out,
-            RefAttnCache { xn, q, k, v, p, merged },
+            RefAttnCache {
+                xn,
+                q,
+                k,
+                v,
+                p,
+                merged,
+            },
         )
     }
 
@@ -7741,14 +8157,24 @@ mod tests {
         let (bn, rows, half) = (b * n_head, b * t, hd / 2);
         let (dropout, eps) = (0.1f32, 1e-5f32);
 
-        let x: Vec<f32> = (0..rows * d).map(|i| ((i % 37) as f32 * 0.021).sin()).collect();
-        let gamma: Vec<f32> = (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos()).collect();
-        let beta: Vec<f32> = (0..d).map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin()).collect();
+        let x: Vec<f32> = (0..rows * d)
+            .map(|i| ((i % 37) as f32 * 0.021).sin())
+            .collect();
+        let gamma: Vec<f32> = (0..d)
+            .map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3).cos())
+            .collect();
+        let beta: Vec<f32> = (0..d)
+            .map(|j| 0.05 * ((j % 11) as f32 * 0.2).sin())
+            .collect();
         let mk_w = |s: f32| -> Vec<f32> {
-            (0..d * d).map(|i| ((i % 53) as f32 * 0.017 * s).sin() * 0.3).collect()
+            (0..d * d)
+                .map(|i| ((i % 53) as f32 * 0.017 * s).sin() * 0.3)
+                .collect()
         };
         let mk_b = |s: f32| -> Vec<f32> {
-            (0..d).map(|j| 0.02 * ((j % 7) as f32 * 0.5 * s).cos()).collect()
+            (0..d)
+                .map(|j| 0.02 * ((j % 7) as f32 * 0.5 * s).cos())
+                .collect()
         };
         let (wq, bq) = (mk_w(1.0), mk_b(1.0));
         let (wk, bk) = (mk_w(1.3), mk_b(1.7));
@@ -7763,7 +8189,9 @@ mod tests {
                 }
             }
         }
-        let dout: Vec<f32> = (0..rows * d).map(|i| ((i % 29) as f32 * 0.023).sin()).collect();
+        let dout: Vec<f32> = (0..rows * d)
+            .map(|i| ((i % 29) as f32 * 0.023).sin())
+            .collect();
 
         let res = attn_layer_forward(&AttnLayerArgs {
             x: &x,
@@ -7790,9 +8218,10 @@ mod tests {
         .expect("该形状应走常驻显存路径");
         let seed = res.seed;
 
-        let (out_ref, c) =
-            ref_attn_layer_fwd(&x, &gamma, &beta, &wq, &bq, &wk, &bk, &wv, &bv, &wproj,
-                               &bproj, &mask, b, t, d, n_head, eps, is_rms, dropout, seed, true);
+        let (out_ref, c) = ref_attn_layer_fwd(
+            &x, &gamma, &beta, &wq, &bq, &wk, &bk, &wv, &bv, &wproj, &bproj, &mask, b, t, d,
+            n_head, eps, is_rms, dropout, seed, true,
+        );
         assert_close(&tag("attn.out"), &res.out, &out_ref);
 
         // ---- 反向参考 ----
@@ -8053,7 +8482,16 @@ mod tests {
         // 挑有代表性的形状：启发式要改的几个 + 明确不该改的对照组。
         // 输出 buffer 轮转 2 块，连 logits（134MB）也塞得进 2GB 显存。
         for (name, m, k, n, bs, a_t, b_t, reps) in [
-            ("PV         fwd", 512usize, 512usize, 32usize, 32usize, false, false, 4usize),
+            (
+                "PV         fwd",
+                512usize,
+                512usize,
+                32usize,
+                32usize,
+                false,
+                false,
+                4usize,
+            ),
             ("dV         bwd", 512, 512, 32, 32, true, false, 4),
             ("QK^T       fwd", 512, 32, 512, 32, false, true, 4),
             ("QKV/c_proj fwd", 4096, 128, 128, 1, false, false, 8),
@@ -8098,7 +8536,18 @@ mod tests {
                     let t = std::time::Instant::now();
                     let mut bt = g.batch_begin();
                     for j in 0..reps {
-                        g.batch_matmul(&mut bt, &buf_a, &buf_b, &outs[j % 2], m, k, n, bs, a_t, b_t);
+                        g.batch_matmul(
+                            &mut bt,
+                            &buf_a,
+                            &buf_b,
+                            &outs[j % 2],
+                            m,
+                            k,
+                            n,
+                            bs,
+                            a_t,
+                            b_t,
+                        );
                     }
                     g.batch_finish(bt);
                     ms[slot] += t.elapsed().as_secs_f64() / ROUNDS as f64;
@@ -8158,9 +8607,13 @@ mod tests {
                 let a: Vec<f32> = (0..bs * ar * ac).map(|_| next()).collect();
                 let b: Vec<f32> = (0..bs * br * bc).map(|_| next()).collect();
                 MM_SMALL_FORCE.store(0, Ordering::Relaxed);
-                let rb = g.matmul(&a, &b, m, k, n, bs, a_t, b_t).expect("大 tile 路径");
+                let rb = g
+                    .matmul(&a, &b, m, k, n, bs, a_t, b_t)
+                    .expect("大 tile 路径");
                 MM_SMALL_FORCE.store(1, Ordering::Relaxed);
-                let rs = g.matmul(&a, &b, m, k, n, bs, a_t, b_t).expect("小 tile 路径");
+                let rs = g
+                    .matmul(&a, &b, m, k, n, bs, a_t, b_t)
+                    .expect("小 tile 路径");
                 MM_SMALL_FORCE.store(-1, Ordering::Relaxed);
                 assert_eq!(rb.len(), rs.len(), "输出长度不一致 m={m} k={k} n={n}");
                 for (i, (x, y)) in rb.iter().zip(rs.iter()).enumerate() {
@@ -8214,9 +8667,8 @@ mod tests {
         is_rms: bool,
         swiglu: bool,
     ) {
-        let tag = |n: &str| {
-            format!("{n}[L{n_layer},{b},{t},{d},{n_head},rms={is_rms},swiglu={swiglu}]")
-        };
+        let tag =
+            |n: &str| format!("{n}[L{n_layer},{b},{t},{d},{n_head},rms={is_rms},swiglu={swiglu}]");
         let (rows, eps, hid) = (b * t, 1e-5f32, 4 * d);
         // 每层 16/18 个参数，顺序与 `StackLayerArgs` 一致
         let pp = if swiglu {
@@ -8228,30 +8680,57 @@ mod tests {
             .map(|li| {
                 let o = li as f32 * 0.37;
                 let mk_w = |s: f32| -> Vec<f32> {
-                    (0..d * d).map(|i| ((i % 53) as f32 * 0.017 * s + o).sin() * 0.3).collect()
+                    (0..d * d)
+                        .map(|i| ((i % 53) as f32 * 0.017 * s + o).sin() * 0.3)
+                        .collect()
                 };
                 let mk_b = |s: f32| -> Vec<f32> {
-                    (0..d).map(|j| 0.02 * ((j % 7) as f32 * 0.5 * s + o).cos()).collect()
+                    (0..d)
+                        .map(|j| 0.02 * ((j % 7) as f32 * 0.5 * s + o).cos())
+                        .collect()
                 };
-                let w1: Vec<f32> =
-                    (0..d * hid).map(|i| ((i % 41) as f32 * 0.019 + o).sin() * 0.25).collect();
-                let b1: Vec<f32> = (0..hid).map(|j| 0.02 * ((j % 5) as f32 + o).cos()).collect();
-                let w2: Vec<f32> =
-                    (0..hid * d).map(|i| ((i % 47) as f32 * 0.013 + o).sin() * 0.25).collect();
+                let w1: Vec<f32> = (0..d * hid)
+                    .map(|i| ((i % 41) as f32 * 0.019 + o).sin() * 0.25)
+                    .collect();
+                let b1: Vec<f32> = (0..hid)
+                    .map(|j| 0.02 * ((j % 5) as f32 + o).cos())
+                    .collect();
+                let w2: Vec<f32> = (0..hid * d)
+                    .map(|i| ((i % 47) as f32 * 0.013 + o).sin() * 0.25)
+                    .collect();
                 let b2: Vec<f32> = (0..d).map(|j| 0.02 * ((j % 3) as f32 + o).cos()).collect();
-                let g1: Vec<f32> =
-                    (0..d).map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3 + o).cos()).collect();
-                let g2: Vec<f32> =
-                    (0..d).map(|j| 1.0 + 0.1 * ((j % 11) as f32 * 0.2 + o).cos()).collect();
+                let g1: Vec<f32> = (0..d)
+                    .map(|j| 1.0 + 0.1 * ((j % 13) as f32 * 0.3 + o).cos())
+                    .collect();
+                let g2: Vec<f32> = (0..d)
+                    .map(|j| 1.0 + 0.1 * ((j % 11) as f32 * 0.2 + o).cos())
+                    .collect();
                 let mut vs = vec![
-                    g1, mk_b(0.5), mk_w(1.0), mk_b(1.0), mk_w(1.3), mk_b(1.7), mk_w(0.7),
-                    mk_b(2.3), mk_w(1.1), mk_b(0.9), g2, mk_b(0.6), w1, b1, w2, b2,
+                    g1,
+                    mk_b(0.5),
+                    mk_w(1.0),
+                    mk_b(1.0),
+                    mk_w(1.3),
+                    mk_b(1.7),
+                    mk_w(0.7),
+                    mk_b(2.3),
+                    mk_w(1.1),
+                    mk_b(0.9),
+                    g2,
+                    mk_b(0.6),
+                    w1,
+                    b1,
+                    w2,
+                    b2,
                 ];
                 if swiglu {
                     // 尾部追加 up 投影一对（槽 16/17），与 StackLayerArgs 的 w3/b3 对齐
-                    let w3: Vec<f32> =
-                        (0..d * hid).map(|i| ((i % 43) as f32 * 0.023 + o).sin() * 0.25).collect();
-                    let b3: Vec<f32> = (0..hid).map(|j| 0.02 * ((j % 6) as f32 + o).cos()).collect();
+                    let w3: Vec<f32> = (0..d * hid)
+                        .map(|i| ((i % 43) as f32 * 0.023 + o).sin() * 0.25)
+                        .collect();
+                    let b3: Vec<f32> = (0..hid)
+                        .map(|j| 0.02 * ((j % 6) as f32 + o).cos())
+                        .collect();
                     vs.push(w3);
                     vs.push(b3);
                 }
@@ -8267,8 +8746,12 @@ mod tests {
                 }
             }
         }
-        let x: Vec<f32> = (0..rows * d).map(|i| ((i % 37) as f32 * 0.021).sin()).collect();
-        let dout: Vec<f32> = (0..rows * d).map(|i| ((i % 29) as f32 * 0.023).sin()).collect();
+        let x: Vec<f32> = (0..rows * d)
+            .map(|i| ((i % 37) as f32 * 0.021).sin())
+            .collect();
+        let dout: Vec<f32> = (0..rows * d)
+            .map(|i| ((i % 29) as f32 * 0.023).sin())
+            .collect();
 
         // ---- 参考：逐子层常驻路径串起来 ----
         let mut xr = x.clone();

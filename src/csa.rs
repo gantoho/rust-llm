@@ -200,7 +200,11 @@ pub(crate) fn concat_last(parts: &[Tensor]) -> Tensor {
         .iter()
         .map(|t| {
             assert_eq!(t.rank(), rank);
-            assert_eq!(&t.shape()[..rank - 1], prefix.as_slice(), "concat_last 前缀不一致");
+            assert_eq!(
+                &t.shape()[..rank - 1],
+                prefix.as_slice(),
+                "concat_last 前缀不一致"
+            );
             t.shape()[rank - 1]
         })
         .collect();
@@ -267,7 +271,7 @@ pub fn attention(
     let (g, t, hd) = (q.shape()[0], q.shape()[1], q.shape()[2]);
     let m = o.block;
     assert!(m >= 2, "CSA 只在 block >= 2 时启用");
-    assert!(n_head > 0 && n_kv_head > 0 && n_head % n_kv_head == 0);
+    assert!(n_head > 0 && n_kv_head > 0 && n_head.is_multiple_of(n_kv_head));
     let n_rep = n_head / n_kv_head;
     let b = g / n_head;
     let gk = b * n_kv_head;
@@ -438,7 +442,11 @@ mod tests {
     use crate::rng::Rng;
 
     fn opts(block: usize, top_k: usize, hca: usize) -> CsaOpts {
-        CsaOpts { block, top_k, hca_block: hca }
+        CsaOpts {
+            block,
+            top_k,
+            hca_block: hca,
+        }
     }
 
     // ---- 一、覆盖不变式 / 因果性 ----
@@ -464,7 +472,10 @@ mod tests {
             for h in [0usize, 2] {
                 for i in 0..30 {
                     let cov = covered_positions(i, m, h);
-                    assert!(cov.iter().all(|&p| p <= i), "m={m} h={h} i={i} 出现未来位置");
+                    assert!(
+                        cov.iter().all(|&p| p <= i),
+                        "m={m} h={h} i={i} 出现未来位置"
+                    );
                 }
             }
         }
@@ -635,21 +646,29 @@ mod tests {
         let (b, h, t, hd) = (1usize, 2usize, 8usize, 3usize);
         let mut rng = Rng::new(23);
         let q = Tensor::param(
-            (0..b * h * t * hd).map(|_| rng.next_f32() * 2.0 - 1.0).collect(),
+            (0..b * h * t * hd)
+                .map(|_| rng.next_f32() * 2.0 - 1.0)
+                .collect(),
             vec![b * h, t, hd],
         );
         let k = Tensor::param(
-            (0..b * h * t * hd).map(|_| rng.next_f32() * 2.0 - 1.0).collect(),
+            (0..b * h * t * hd)
+                .map(|_| rng.next_f32() * 2.0 - 1.0)
+                .collect(),
             vec![b * h, t, hd],
         );
         let v = Tensor::param(
-            (0..b * h * t * hd).map(|_| rng.next_f32() * 2.0 - 1.0).collect(),
+            (0..b * h * t * hd)
+                .map(|_| rng.next_f32() * 2.0 - 1.0)
+                .collect(),
             vec![b * h, t, hd],
         );
         let o = opts(4, 0, 2);
 
         // 用固定权重把输出聚合成标量，再反向
-        let w: Vec<f32> = (0..b * h * t * hd).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let w: Vec<f32> = (0..b * h * t * hd)
+            .map(|i| 0.5 + (i % 7) as f32 * 0.1)
+            .collect();
         let w = Tensor::from_vec(w.clone(), vec![b * h, t, hd]);
         let loss = attention(&q, &k, &v, h, h, &o).mul(&w).sum();
         q.zero_grad();

@@ -24,7 +24,7 @@ const MLP_RATIO: usize = 4;
 /// 与真实建层共用同一个公式——两处各写一遍，改一处忘另一处就会让算力估算与
 /// Chinchilla 配比表整体偏掉，而且不会有任何编译错误提醒。
 pub fn swiglu_hidden(d: usize) -> usize {
-    ((2 * MLP_RATIO * d + 2) / 3 + 255) & !255
+    ((2 * MLP_RATIO * d).div_ceil(3) + 255) & !255
 }
 
 /// 线性层：y = x @ W + b
@@ -72,13 +72,11 @@ impl Linear {
         Self::new_with_bias(in_features, out_features, true, rng)
     }
 
-    /// 创建**不带偏置**的线性层（HF 的 LLaMA / Qwen2 用得上）：
-    /// `bias` 字段留一个零张量占位，但前向不加它、参数表不列它。
-    pub fn new_no_bias(in_features: usize, out_features: usize, rng: &mut Rng) -> Self {
-        Self::new_with_bias(in_features, out_features, false, rng)
-    }
-
-    /// `new` / `new_no_bias` 的公共实现（随机数消耗顺序与是否带 bias 无关，保证可复现）
+    /// `new` 与"无偏置层"的公共实现（随机数消耗顺序与是否带 bias 无关，保证可复现）。
+    ///
+    /// 无偏置场景（HF 的 LLaMA / Qwen2：`o_proj` / `mlp` 都不带 bias）传 `use_bias = false`：
+    /// `bias` 字段仍留一个零张量占位，但前向不加它、参数表也不列它 ——
+    /// 量化 / LoRA / 分布式那些直接读 `.bias` 的代码因此一行都不用改。
     pub fn new_with_bias(
         in_features: usize,
         out_features: usize,
@@ -168,7 +166,10 @@ impl Linear {
             2 => x.clone(),
             3 => x.reshape(vec![x.shape()[0] * x.shape()[1], x.shape()[2]]),
             // 公开库 API：维度不合法给可读错误（带实际维度信息）
-            r => panic!("Linear 输入必须为 2D 或 3D，实际是 {r}D（形状 {:?}）", x.shape()),
+            r => panic!(
+                "Linear 输入必须为 2D 或 3D，实际是 {r}D（形状 {:?}）",
+                x.shape()
+            ),
         };
         // 校准钩子：存的是展平后的 [tokens, in_features]——Hessian 量化的 `XᵀX` 与 AWQ 的
         // `mean|x|` 都按"行 = 一个 token"累加，用 2D 视图能省掉下游再一次展平。
@@ -198,14 +199,21 @@ impl Linear {
                      训练会静默地毫无进展。请在 no_grad 下推理，或先 Transformer::dequantize_weights() \
                      把权重烘焙回 f32"
                 );
-                let w = Tensor::from_vec(self.dequant_folded(), vec![dims.0, dims.1]);
-                match &qw.input_scale {
-                    Some(s) => {
-                        let unfolded = awq_unfold_input(&x.data_ref(), x.shape()[1], s);
-                        let xu = Tensor::from_vec(unfolded, x.shape().to_vec());
-                        xu.matmul_frozen(&w)
+                // C10：单行（decode）直接吃量化码，**不把整表还原成 f32**。
+                // 与下面"dequant_folded + matmul_frozen"逐位一致（见 quant::gemv 的对拍测试），
+                // 但权重访存降到 1/4（int8）或 1/8（int4）。
+                if x.shape()[0] == 1 && qw.input_scale.is_none() {
+                    Tensor::from_vec(qw.q.gemv(&x.data_ref()), vec![1, dims.1])
+                } else {
+                    let w = Tensor::from_vec(self.dequant_folded(), vec![dims.0, dims.1]);
+                    match &qw.input_scale {
+                        Some(s) => {
+                            let unfolded = awq_unfold_input(&x.data_ref(), x.shape()[1], s);
+                            let xu = Tensor::from_vec(unfolded, x.shape().to_vec());
+                            xu.matmul_frozen(&w)
+                        }
+                        None => x.matmul_frozen(&w),
                     }
-                    None => x.matmul_frozen(&w),
                 }
             }
             None => {
@@ -218,7 +226,11 @@ impl Linear {
         };
         // 无 bias 的层（HF 的 LLaMA / Qwen2 的 o_proj、mlp 等）跳过这一步：
         // 不是"加零"而是**根本不做加法**，省掉一次全量广播加法与一个计算图节点。
-        let mut y = if self.use_bias { base.add(&self.bias) } else { base };
+        let mut y = if self.use_bias {
+            base.add(&self.bias)
+        } else {
+            base
+        };
         // LoRA 增量：Δy = (α/r)·(x @ Aᵀ) @ Bᵀ。初始 B = 0 时 Δy = 0，前向与普通线性层逐位相同
         if let Some(lora) = &self.lora {
             y = y.add(&lora.forward(&x));
@@ -293,7 +305,11 @@ impl Linear {
                 let real_hess = h.is_some_and(|h| h.is_full());
                 QuantWeight::new(
                     q,
-                    if real_hess { QuantMethod::Hess } else { QuantMethod::Rtn },
+                    if real_hess {
+                        QuantMethod::Hess
+                    } else {
+                        QuantMethod::Rtn
+                    },
                 )
             }
             QuantMethod::Awq => {
@@ -648,10 +664,7 @@ impl Module for SwiGLUMLP {
 
 /// 统一的 MLP 层枚举：支持经典风格 GELU MLP 和 LLaMA 风格 SwiGLU MLP
 pub enum MLPEnum {
-    GELU {
-        linear1: Linear,
-        linear2: Linear,
-    },
+    GELU { linear1: Linear, linear2: Linear },
     SwiGLU(SwiGLUMLP),
 }
 
@@ -740,9 +753,7 @@ impl MLPEnum {
     /// SwiGLU 分支的 `(W_gate, b_gate, W_up, b_up, W_down, b_down)`；
     /// GELU 分支返回 None（走 [`MLPEnum::gelu_weights`]）
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    pub fn swiglu_weights(
-        &self,
-    ) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
+    pub fn swiglu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             MLPEnum::SwiGLU(s) => Some((
                 &s.w_gate.weight,
@@ -1008,7 +1019,10 @@ mod tests {
     fn test_lora_zero_init_keeps_forward_identical() {
         let mut rng = Rng::new(1);
         let mut lin = Linear::new(8, 5, &mut rng);
-        let x = Tensor::from_vec((0..16).map(|i| (i as f32 * 0.3).sin()).collect(), vec![2, 8]);
+        let x = Tensor::from_vec(
+            (0..16).map(|i| (i as f32 * 0.3).sin()).collect(),
+            vec![2, 8],
+        );
         let before = lin.forward(&x).data();
         lin.attach_lora(4, 4.0, &mut rng);
         assert_eq!(lin.forward(&x).data(), before, "B=0 时 LoRA 增量必须为 0");
@@ -1062,10 +1076,22 @@ mod tests {
             p.grad.borrow_mut().iter_mut().for_each(|g| *g = 1.0);
         }
         opt.step();
-        assert_eq!(lin.weight.data(), vec![1.0, 2.0, 3.0, 4.0], "冻结权重被更新了");
+        assert_eq!(
+            lin.weight.data(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            "冻结权重被更新了"
+        );
         assert_eq!(lin.bias.data(), vec![0.0, 0.0], "冻结 bias 被更新了");
         // 适配层：初始化全零的 b 经过一步更新后不再是零
-        assert!(lin.lora.as_ref().unwrap().b.data().iter().any(|v| *v != 0.0));
+        assert!(
+            lin.lora
+                .as_ref()
+                .unwrap()
+                .b
+                .data()
+                .iter()
+                .any(|v| *v != 0.0)
+        );
     }
 
     /// 合并：`W ← W + (α/r)·Aᵀ·Bᵀ`，且必须**就地**改 `weight` 的数据。
@@ -1085,7 +1111,10 @@ mod tests {
 
         // W = [[1,2],[3,4]]，ΔW 是 [out,in] = [[1,1],[1,1]]，加的是它的转置 ⇒ [[2,3],[4,5]]
         assert_eq!(weight_handle.data(), vec![2.0, 3.0, 4.0, 5.0]);
-        assert!(lin.lora.is_none(), "合并后不能留着适配器，否则增量会被算两次");
+        assert!(
+            lin.lora.is_none(),
+            "合并后不能留着适配器，否则增量会被算两次"
+        );
         assert_eq!(lin.forward(&x).data(), before, "合并前后前向应一致");
 
         // 没挂适配器的层调它应当是纯空操作
@@ -1159,7 +1188,10 @@ mod tests {
             .zip(&before)
             .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         let mag = before.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        assert!(drift < mag * 0.05, "int8 量化不该造成这么大的偏差：{drift} vs {mag}");
+        assert!(
+            drift < mag * 0.05,
+            "int8 量化不该造成这么大的偏差：{drift} vs {mag}"
+        );
 
         // AWQ 路径：权重被折叠了 s 倍，前向必须把输入除回去，否则结果整体错位
         let mut awq = Linear::new(k, n, &mut rng);
@@ -1219,7 +1251,11 @@ mod tests {
             )
             .expect("普通 Linear 必须能量化");
 
-        assert_eq!(lin.weight.numel(), 1, "f32 权重必须被换成占位张量，而不是留着副本");
+        assert_eq!(
+            lin.weight.numel(),
+            1,
+            "f32 权重必须被换成占位张量，而不是留着副本"
+        );
         assert_eq!(lin.weight.shape(), &[1]);
         assert_eq!(lin.dims(), (k, n), "逻辑维度必须仍能从量化表示里读出来");
         assert_eq!(report.f32_bytes, k * n * 4);
@@ -1252,7 +1288,10 @@ mod tests {
         let mut rng = Rng::new(21);
         let (m, k, n) = (16, 64, 48);
         let lin = Linear::new(k, n, &mut rng);
-        let x = Tensor::from_vec((0..m * k).map(|i| (i as f32 * 0.21).sin() * 1.5).collect(), vec![m, k]);
+        let x = Tensor::from_vec(
+            (0..m * k).map(|i| (i as f32 * 0.21).sin() * 1.5).collect(),
+            vec![m, k],
+        );
         let y0 = crate::tensor::no_grad(|| lin.forward(&x).data());
         let mag = y0.iter().fold(0.0f32, |m, v| m.max(v.abs()));
 
@@ -1329,7 +1368,10 @@ mod tests {
             let mut lin = Linear::new(k, n, rng);
             lin.weight.set_data(w.clone());
             let opts = if method == QuantMethod::Hess {
-                QuantOpts { hess: HessOpts::default(), ..Default::default() }
+                QuantOpts {
+                    hess: HessOpts::default(),
+                    ..Default::default()
+                }
             } else {
                 QuantOpts::default()
             };
@@ -1364,7 +1406,10 @@ mod tests {
             diagonal, rtn_code,
             "对角 Hessian 下 Hessian 量化在数学上退化成 RTN，必须逐位一致"
         );
-        assert_ne!(full, rtn_code, "全矩阵 Hessian 没被用上：Hessian 量化的码值与 RTN 一字不差");
+        assert_ne!(
+            full, rtn_code,
+            "全矩阵 Hessian 没被用上：Hessian 量化的码值与 RTN 一字不差"
+        );
 
         // 该层没有校准统计时也必须能跑（退回 RTN），而不是报错
         assert_eq!(
@@ -1413,13 +1458,18 @@ mod tests {
 
         // α 不给 ⇒ 走网格搜索，选出的 α 必须落在默认网格上
         let mut searched = Linear::new(k, n, &mut rng);
-        let act: Vec<f32> = (0..k).map(|j| 0.1 + 4.0f32.powi(j as i32 % 5 - 2)).collect();
+        let act: Vec<f32> = (0..k)
+            .map(|j| 0.1 + 4.0f32.powi(j as i32 % 5 - 2))
+            .collect();
         let r2 = searched
             .quantize_weight(
                 "awq.weight",
                 QBits::Int4,
                 QuantMethod::Awq,
-                &QuantOpts { awq_alpha: None, ..Default::default() },
+                &QuantOpts {
+                    awq_alpha: None,
+                    ..Default::default()
+                },
                 Some(&LayerCalib {
                     hessian: None,
                     act_abs_mean: Some(act),
@@ -1457,15 +1507,16 @@ mod tests {
 
         // 先合并再量化就正常了
         lin.merge_lora();
-        assert!(lin
-            .quantize_weight(
+        assert!(
+            lin.quantize_weight(
                 "lora.weight",
                 QBits::Int8,
                 QuantMethod::Rtn,
                 &QuantOpts::default(),
                 None
             )
-            .is_some());
+            .is_some()
+        );
     }
 
     /// 在求导模式下用量化层必须**明确报错**，而不是静默地不产生 dW 让训练白跑。
@@ -1518,7 +1569,11 @@ mod tests {
         }
         // 关键区分：若弄反了顺序（先合并再量化），权重里会留着量化格点的痕迹；
         // 这里 1.992… 而不是 2.0，正说明落在 f32 域里、没有二次取整
-        assert!((w[0] - 2.0).abs() > 1e-3, "结果看起来像被重新量化过了：{}", w[0]);
+        assert!(
+            (w[0] - 2.0).abs() > 1e-3,
+            "结果看起来像被重新量化过了：{}",
+            w[0]
+        );
         // x = [1, 0] ⇒ y = 权重的第一行（in = 2, out = 2）
         let x = Tensor::from_vec(vec![1.0, 0.0], vec![1, 2]);
         let y = lin.forward(&x).data();

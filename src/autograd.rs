@@ -61,7 +61,7 @@ thread_local! {
     /// `borrow_mut()` 本表，`RefCell` 不可重入 ⇒ 同线程二次可变借位直接 panic
     /// （旧全局 Mutex 版是死锁，语义守约不变、失败方式更显式）。
     /// 已登记的闭包只读写 `Shared` 梯度/数据缓冲（全库接线点均已核查）。
-    static TAPE: RefCell<Vec<TapeEntry>> = RefCell::new(Vec::new());
+    static TAPE: RefCell<Vec<TapeEntry>> = const { RefCell::new(Vec::new()) };
 }
 
 /// 把惰性分配的空 grad 缓冲补齐到全长（no_grad 构造的张量进图的兜底）。
@@ -309,4 +309,3 @@ mod tests {
         clear_tape();
     }
 }
-

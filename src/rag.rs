@@ -47,7 +47,13 @@ pub fn l2_normalize(v: &mut [f32]) {
 /// 直接算 `dot / (|a||b|)` 的话，查询里全是语料没见过的词时向量全零，
 /// `0/0` 会变成 NaN，而 NaN 参与排序会让整个结果顺序变成未定义的乱序。
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "余弦相似度要求两向量同维：{} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "余弦相似度要求两向量同维：{} vs {}",
+        a.len(),
+        b.len()
+    );
     let na = l2_norm(a);
     let nb = l2_norm(b);
     if na == 0.0 || nb == 0.0 {
@@ -105,13 +111,23 @@ impl ChunkOpts {
     /// 固定窗口分块（最通用）
     pub fn new(size: usize, overlap: usize) -> Self {
         assert!(size > 0, "块大小必须为正");
-        assert!(overlap < size, "重叠 {overlap} 必须小于块大小 {size}，否则窗口不前进");
-        ChunkOpts { size, overlap, align: false }
+        assert!(
+            overlap < size,
+            "重叠 {overlap} 必须小于块大小 {size}，否则窗口不前进"
+        );
+        ChunkOpts {
+            size,
+            overlap,
+            align: false,
+        }
     }
 
     /// 句子边界对齐分块（适合有标点的正文，块读起来更完整）
     pub fn aligned(size: usize, overlap: usize) -> Self {
-        ChunkOpts { align: true, ..Self::new(size, overlap) }
+        ChunkOpts {
+            align: true,
+            ..Self::new(size, overlap)
+        }
     }
 }
 
@@ -138,7 +154,10 @@ impl Chunk {
 
 /// 句子/段落结束符
 fn is_break(c: char) -> bool {
-    matches!(c, '。' | '！' | '？' | '；' | '…' | '.' | '!' | '?' | ';' | '\n')
+    matches!(
+        c,
+        '。' | '！' | '？' | '；' | '…' | '.' | '!' | '?' | ';' | '\n'
+    )
 }
 
 /// 在窗口边界 `end` 附近找最近的断点（返回"断点之后"的下标）。
@@ -254,7 +273,11 @@ impl TfIdf {
                 ((1.0 + n_docs as f32) / (1.0 + d)).ln() + 1.0
             })
             .collect();
-        let index = vocab.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
+        let index = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i))
+            .collect();
         TfIdf { index, vocab, idf }
     }
 
@@ -415,7 +438,11 @@ impl Retriever {
     /// 直接用现成的块建索引（逐块算向量，只算一次，查询时不再碰语料）
     pub fn build(embedder: Box<dyn Embedder>, chunks: Vec<Chunk>) -> Self {
         let vectors = chunks.iter().map(|c| embedder.embed(&c.text)).collect();
-        Retriever { embedder, chunks, vectors }
+        Retriever {
+            embedder,
+            chunks,
+            vectors,
+        }
     }
 
     /// 从一段文本建索引
@@ -435,7 +462,7 @@ impl Retriever {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()).map_or(false, |e| e == "txt"))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("txt"))
             .collect();
         files.sort();
         let mut chunks = Vec::new();
@@ -525,7 +552,7 @@ impl Retriever {
                     .map(|&j| cosine_similarity(&self.vectors[ci], &self.vectors[j]))
                     .fold(0.0f32, f32::max);
                 let mmr = lambda * rel - (1.0 - lambda) * redundancy;
-                if best.map_or(true, |(_, b)| mmr > b) {
+                if best.is_none_or(|(_, b)| mmr > b) {
                     best = Some((pos, mmr));
                 }
             }
@@ -653,10 +680,18 @@ pub fn build_rag_prompt(question: &str, hits: &[ScoredChunk], opts: &PromptOpts)
     let text = format!(
         "{}\n\n参考资料:\n{}\n问题: {}\n\n回答:",
         opts.instruction,
-        if body.is_empty() { "(无)\n" } else { body.as_str() },
+        if body.is_empty() {
+            "(无)\n"
+        } else {
+            body.as_str()
+        },
         question
     );
-    RagPrompt { text, used_chars, used_chunks }
+    RagPrompt {
+        text,
+        used_chars,
+        used_chunks,
+    }
 }
 
 #[cfg(test)]
@@ -716,7 +751,12 @@ mod tests {
         assert!(chunks.len() > 1, "这么长的文本应切成多块");
 
         for c in &chunks {
-            assert!(c.len() <= opts.size, "每块不超过 {} 字符，实际 {}", opts.size, c.len());
+            assert!(
+                c.len() <= opts.size,
+                "每块不超过 {} 字符，实际 {}",
+                opts.size,
+                c.len()
+            );
         }
 
         // 空文本与"比块还短的文本"都要能正确处理
@@ -749,8 +789,14 @@ mod tests {
         let b = vec![4.0, 5.0, 6.0];
         assert!((cosine_similarity(&a, &a) - 1.0).abs() < 1e-6, "自比为 1");
         assert!(cosine_similarity(&a, &b) > 0.9, "同向向量应接近 1");
-        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6, "正交为 0");
-        assert!(cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) < -0.99, "反向为 -1");
+        assert!(
+            cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6,
+            "正交为 0"
+        );
+        assert!(
+            cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) < -0.99,
+            "反向为 -1"
+        );
         let z = vec![0.0; a.len()];
         assert_eq!(cosine_similarity(&z, &a), 0.0, "零向量不得产生 NaN");
         assert!(cosine_similarity(&z, &z).is_finite());
@@ -774,7 +820,10 @@ mod tests {
             tf.idf_of("的")
         );
         assert_eq!(tf.idf_of("不存在的词"), 0.0, "未登录词 IDF 为 0");
-        assert!(tf.vocab().contains(&"退款".to_string()), "词表应含语料里的字词");
+        assert!(
+            tf.vocab().contains(&"退款".to_string()),
+            "词表应含语料里的字词"
+        );
         assert_eq!(tf.vocab().len(), tf.dim(), "词表大小即向量维度");
 
         let emb = Box::new(tf);
@@ -791,7 +840,10 @@ mod tests {
 
         // 查询里的字全都没在语料出现过 ⇒ 向量为零 ⇒ 分数全 0，而不是 NaN
         let miss = r.search("量子纠缠", 2);
-        assert!(miss.iter().all(|h| h.score == 0.0), "未登录查询应为 0 分：{miss:?}");
+        assert!(
+            miss.iter().all(|h| h.score == 0.0),
+            "未登录查询应为 0 分：{miss:?}"
+        );
     }
 
     /// 特征哈希：不需要词表即可检索，维度固定，自比相似度为 1
@@ -874,7 +926,10 @@ mod tests {
         let hits = r.search("甲甲甲", 3);
 
         // 预算充足：全部资料都在提示里
-        let roomy = PromptOpts { max_context_chars: 200, ..PromptOpts::default() };
+        let roomy = PromptOpts {
+            max_context_chars: 200,
+            ..PromptOpts::default()
+        };
         let full = build_rag_prompt("这段在讲什么？", &hits, &roomy);
         assert!(full.text.contains("这段在讲什么？"), "提示必须包含问题");
         for h in &hits {
@@ -885,12 +940,18 @@ mod tests {
             );
         }
         assert!(full.text.contains("参考资料"), "应有资料区块标题");
-        assert!(full.text.contains("只依据") || full.text.contains("无法从提供的资料"), "应带上约束语句");
+        assert!(
+            full.text.contains("只依据") || full.text.contains("无法从提供的资料"),
+            "应带上约束语句"
+        );
         assert!(full.used_chars <= roomy.max_context_chars);
         assert_eq!(full.used_chunks, hits.len());
 
         // 预算很小：按分数保留并截断，实际用量不超预算
-        let tight = PromptOpts { max_context_chars: 7, ..PromptOpts::default() };
+        let tight = PromptOpts {
+            max_context_chars: 7,
+            ..PromptOpts::default()
+        };
         let cut = build_rag_prompt("这段在讲什么？", &hits, &tight);
         assert!(
             cut.used_chars <= tight.max_context_chars,
@@ -899,8 +960,14 @@ mod tests {
             tight.max_context_chars
         );
         assert_eq!(cut.used_chunks, 1, "预算只够第一条时不该硬塞更多");
-        assert!(cut.text.contains(&truncate_chars(hits[0].chunk.text.trim(), 7)));
-        assert!(cut.text.contains("这段在讲什么？"), "裁剪资料不能把问题也裁掉");
+        assert!(
+            cut.text
+                .contains(&truncate_chars(hits[0].chunk.text.trim(), 7))
+        );
+        assert!(
+            cut.text.contains("这段在讲什么？"),
+            "裁剪资料不能把问题也裁掉"
+        );
 
         // 空检索结果也要给出结构完整的提示（否则下游会拿到半个模板）
         let none = build_rag_prompt("这段在讲什么？", &[], &roomy);
@@ -921,7 +988,10 @@ mod tests {
             .expect("读取 data/corpus 失败");
         assert!(r.len() > 10, "语料目录应切出足够多的块，实际 {}", r.len());
         assert!(!r.is_empty());
-        assert!(r.chunks().iter().all(|c| !c.source.is_empty()), "每块都应有来源");
+        assert!(
+            r.chunks().iter().all(|c| !c.source.is_empty()),
+            "每块都应有来源"
+        );
         assert!(r.chunks().iter().all(|c| !c.is_empty()), "块不应为空");
 
         // 同一目录两次建索引：块序列必须完全一致（依赖文件排序）
@@ -959,7 +1029,10 @@ mod tests {
         let v = emb.embed("甲乙丙");
         assert_eq!(v.len(), 16);
         assert!((l2_norm(&v) - 1.0).abs() < 1e-5, "稠密向量应 L2 归一化");
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6, "同一文本自比应为 1");
+        assert!(
+            (cosine_similarity(&v, &v) - 1.0).abs() < 1e-6,
+            "同一文本自比应为 1"
+        );
         // 推理路径没有 dropout，同一文本两次嵌入必须逐位相同
         assert_eq!(v, emb.embed("甲乙丙"), "同一文本的嵌入应可复现");
 

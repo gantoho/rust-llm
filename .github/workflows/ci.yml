@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Windows 上 MSVC 链接更稳，且项目 .cargo/config.toml 就是按 MSVC 配的
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C debuginfo=0
+
+jobs:
+  test:
+    name: build & test (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 默认配置：421+ 单元测试 + 集成测试
+      # （`--release` 是刻意的：本项目的测试包含大量数值对拍与性能探针，debug 下慢到不可用）
+      - name: test (default)
+        run: cargo test --release --all-targets
+
+      # 快速数学路径：FMA + 打包 dW 内核走的是另一条浮点路径，必须单独跑一次
+      - name: test (LLM_CPU_FMA=1)
+        run: cargo test --release --all-targets
+        env:
+          LLM_CPU_FMA: "1"
+
+      # GPU 后端只保证能编译（CI 机器没有 GPU，真机验证在本地做）
+      - name: check (gpu feature)
+        run: cargo check --all-targets --features gpu
+
+  # 下面两项暂为**非阻塞**：仓库当前还有 12 条编译告警、且尚未跑过 rustfmt。
+  # 清干净后把 `continue-on-error` 去掉即可变成硬门禁。
+  lint:
+    name: fmt & clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings

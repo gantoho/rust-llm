@@ -132,11 +132,11 @@ pub fn fit_power_law(xs: &[f64], ys: &[f64]) -> PowerLaw {
     let mut best: Option<(f64, f64, f64)> = None; // (sse, a, alpha)
     for i in 0..=GRID {
         let b = b_max * i as f64 / GRID as f64;
-        if let Some((a, alpha, sse)) = fit_linear_at_b(xs, ys, b) {
-            if best.is_none_or(|(bs, _, _)| sse < bs) {
-                best = Some((sse, a, alpha));
-                b_best = b;
-            }
+        if let Some((a, alpha, sse)) = fit_linear_at_b(xs, ys, b)
+            && best.is_none_or(|(bs, _, _)| sse < bs)
+        {
+            best = Some((sse, a, alpha));
+            b_best = b;
         }
     }
     let (_, a_fallback, alpha_fallback) =
@@ -235,11 +235,11 @@ pub fn params_per_layer(cfg: &TransformerConfig) -> usize {
         (d * d + b_qkv * d)                        // c_q
             + (d * r + b_qkv * r)                  // c_kv（低秩压缩）
             + 2 * (r * kv_dim + b_qkv * kv_dim)    // c_k, c_v（从 latent 升维）
-            + (d * d + b_o * d)                    // c_proj
+            + (d * d + b_o * d) // c_proj
     } else {
         (d * d + b_qkv * d)                        // c_q
             + 2 * (d * kv_dim + b_qkv * kv_dim)    // c_k, c_v
-            + (d * d + b_o * d)                    // c_proj
+            + (d * d + b_o * d) // c_proj
     };
     // MLP：GELU 两个投影（默认隐层 4d）、SwiGLU 三个投影（默认隐层 ≈ 2.67d）；
     // 隐层宽度统一取 `cfg.ffn_hidden()`，与 `TransformerBlock::new` 建层用的是同一个口径
@@ -374,7 +374,10 @@ pub fn parametric_optimal(c: f64) -> Allocation {
 /// 也就是 [`ratio20_optimal`] 的反解：`D = 20N`、`C = 6ND = 120N²`。
 /// 用来回答"我要训一个 13B 的模型，该配多少数据"。
 pub fn optimal_for_params(params: f64) -> Allocation {
-    assert!(params > 0.0 && params.is_finite(), "参数量必须是正有限值，实际 {params}");
+    assert!(
+        params > 0.0 && params.is_finite(),
+        "参数量必须是正有限值，实际 {params}"
+    );
     let d = TOKENS_PER_PARAM_OPTIMAL * params;
     Allocation {
         compute: flops_train(params, d),
@@ -392,7 +395,10 @@ pub fn optimal_for_params(params: f64) -> Allocation {
 /// 注意这里固定的是**训练算力**。实际部署要看**总成本**（训练 + 推理）：推理量大时，
 /// 过训练的小模型总账更划算——这就是"为什么故意偏离 Chinchilla"的答案。
 pub fn overtrain(c: f64, k: f64) -> Allocation {
-    assert!(k > 0.0 && k.is_finite(), "数据量倍数必须是正有限值，实际 {k}");
+    assert!(
+        k > 0.0 && k.is_finite(),
+        "数据量倍数必须是正有限值，实际 {k}"
+    );
     let base = ratio20_optimal(c);
     let d = base.tokens * k;
     // C = 6ND 固定，数据量涨了就只能缩小模型
@@ -550,11 +556,11 @@ impl ScanPoint {
 /// 扫描时模型宽度是变量，`n_embd % n_head` 这个约束不能靠调用方手工维护
 /// （手写一串能整除的组合，改个尺寸就 panic）。
 fn pick_n_head(d: usize, want: usize) -> usize {
-    if want >= 1 && d % want == 0 {
+    if want >= 1 && d.is_multiple_of(want) {
         return want;
     }
     let mut h = want.min(d).max(1);
-    while h > 1 && d % h != 0 {
+    while h > 1 && !d.is_multiple_of(h) {
         h -= 1;
     }
     h
@@ -595,7 +601,7 @@ pub fn scan_model_config(
     cfg.n_head = n_head;
     cfg.block_size = block_size;
     // GQA 的 KV 头数不能超过 Q 头数
-    if cfg.n_kv_head > n_head || n_head % cfg.n_kv_head.max(1) != 0 {
+    if cfg.n_kv_head > n_head || !n_head.is_multiple_of(cfg.n_kv_head.max(1)) {
         cfg.n_kv_head = 0; // 退回标准 MHA
     }
     cfg
@@ -643,7 +649,9 @@ pub fn params_scan(
             sc.batch_size * sc.block_size,
             sc.tokens_per_point(sc.steps) / 1e6,
         );
-        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng, None);
+        let loss = train_transformer(
+            &model, tokenizer, &loader, &tcfg, None, None, &mut rng, None,
+        );
         points.push(ScanPoint {
             label: format!("{n_layer}x{n_embd}"),
             n_layer,
@@ -689,7 +697,9 @@ pub fn tokens_scan(
             sc.tokens_per_point(steps) / 1e6,
             params_non_embedding(cfg),
         );
-        let loss = train_transformer(&model, tokenizer, &loader, &tcfg, None, None, &mut rng, None);
+        let loss = train_transformer(
+            &model, tokenizer, &loader, &tcfg, None, None, &mut rng, None,
+        );
         points.push(ScanPoint {
             label: format!("x{k}"),
             n_layer: cfg.n_layer,
@@ -706,15 +716,18 @@ pub fn tokens_scan(
 
 /// 用扫描点拟合 `loss vs 非嵌入参数量` 的幂律
 pub fn fit_over_params(points: &[ScanPoint]) -> PowerLaw {
-    let xs: Vec<f64> = points.iter().map(|p| p.params_non_embedding as f64).collect();
-    let ys: Vec<f64> = points.iter().map(|p| p.loss as f64).collect();
+    let xs: Vec<f64> = points
+        .iter()
+        .map(|p| p.params_non_embedding as f64)
+        .collect();
+    let ys: Vec<f64> = points.iter().map(|p| p.loss).collect();
     fit_power_law(&xs, &ys)
 }
 
 /// 用扫描点拟合 `loss vs 训练 token 数` 的幂律
 pub fn fit_over_tokens(points: &[ScanPoint]) -> PowerLaw {
     let xs: Vec<f64> = points.iter().map(|p| p.tokens).collect();
-    let ys: Vec<f64> = points.iter().map(|p| p.loss as f64).collect();
+    let ys: Vec<f64> = points.iter().map(|p| p.loss).collect();
     fit_power_law(&xs, &ys)
 }
 
@@ -745,7 +758,11 @@ mod tests {
             "不可约损失应恢复到 1.2 附近，实际 {:.4}",
             fit.b
         );
-        assert!(fit.r2 > 0.9999, "完美幂律数据的 r² 应接近 1，实际 {:.6}", fit.r2);
+        assert!(
+            fit.r2 > 0.9999,
+            "完美幂律数据的 r² 应接近 1，实际 {:.6}",
+            fit.r2
+        );
         // 外推：在没给过的规模上也要准
         let pred = fit.predict(5e8);
         assert!(
@@ -767,7 +784,11 @@ mod tests {
             "α 应恢复到 0.28 附近，实际 {:.4}",
             fit.alpha
         );
-        assert!(fit.b >= 0.0 && fit.b < 0.01, "b 应贴住 0，实际 {:.6}", fit.b);
+        assert!(
+            fit.b >= 0.0 && fit.b < 0.01,
+            "b 应贴住 0，实际 {:.6}",
+            fit.b
+        );
         assert!(fit.r2 > 0.999, "r² 应接近 1，实际 {:.6}", fit.r2);
     }
 
@@ -931,7 +952,10 @@ mod tests {
     #[test]
     fn test_wall_clock_matches_doc_example() {
         let c = flops_train(7.0e9, 1.0e12);
-        assert!((c - 4.2e22).abs() / 4.2e22 < 1e-9, "6ND = {c:.3e}，应为 4.2e22");
+        assert!(
+            (c - 4.2e22).abs() / 4.2e22 < 1e-9,
+            "6ND = {c:.3e}，应为 4.2e22"
+        );
         let hw = Hardware::default();
         let wc = hw.estimate(c);
         assert!(
@@ -1021,7 +1045,14 @@ mod tests {
             ..TransformerConfig::default()
         };
         let sizes = [(1usize, 32usize), (2, 64), (4, 128)];
-        let points = params_scan(&base, &sizes, &[corpus.clone()], None, &tokenizer, &sc);
+        let points = params_scan(
+            &base,
+            &sizes,
+            std::slice::from_ref(&corpus),
+            None,
+            &tokenizer,
+            &sc,
+        );
 
         assert_eq!(points.len(), 3);
         // 固定 token 预算：每个点见到的 token 数必须完全相同
@@ -1050,7 +1081,11 @@ mod tests {
         }
         // 幂律拟合：指数为正、不可约损失不超过最小实测 loss
         let fit = fit_over_params(&points);
-        assert!(fit.alpha > 0.0, "拟合出的 α 必须为正，实际 {:.4}", fit.alpha);
+        assert!(
+            fit.alpha > 0.0,
+            "拟合出的 α 必须为正，实际 {:.4}",
+            fit.alpha
+        );
         let min_loss = points.iter().map(|p| p.loss).fold(f64::INFINITY, f64::min);
         assert!(
             fit.b <= min_loss + 1e-6,
@@ -1081,7 +1116,14 @@ mod tests {
             vocab_size: tokenizer.vocab_size(),
             ..TransformerConfig::default()
         };
-        let points = tokens_scan(&cfg, &[1, 2, 4], &[corpus.clone()], None, &tokenizer, &sc);
+        let points = tokens_scan(
+            &cfg,
+            &[1, 2, 4],
+            std::slice::from_ref(&corpus),
+            None,
+            &tokenizer,
+            &sc,
+        );
         assert_eq!(points.len(), 3);
         for w in points.windows(2) {
             assert!(
@@ -1090,12 +1132,21 @@ mod tests {
                 w[1].tokens,
                 w[0].tokens
             );
-            assert!(w[1].loss < w[0].loss, "数据更多时 loss 应更低：{:.4} vs {:.4}", w[1].loss, w[0].loss);
+            assert!(
+                w[1].loss < w[0].loss,
+                "数据更多时 loss 应更低：{:.4} vs {:.4}",
+                w[1].loss,
+                w[0].loss
+            );
         }
         // 同一模型的 6ND：token 翻倍 ⇒ 算力翻倍
         assert!((points[1].compute() / points[0].compute() - 2.0).abs() < 1e-9);
         let fit = fit_over_tokens(&points);
-        assert!(fit.alpha > 0.0, "数据量的幂律指数必须为正，实际 {:.4}", fit.alpha);
+        assert!(
+            fit.alpha > 0.0,
+            "数据量的幂律指数必须为正，实际 {:.4}",
+            fit.alpha
+        );
     }
 
     /// 参数量公式必须与**实际建出来的模型**逐个参数对上。

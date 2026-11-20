@@ -147,9 +147,7 @@ pub fn top_k_gate(
         // 再对这 k 个排 O(k log k)——整行 O(E log E) 全排序是浪费（E=256、k=2 时差两个数量级）。
         // 比较器与全排序完全一致（值降序、并列下标升序），路由行为逐位不变
         //（对拍测试：`test_top_k_gate_matches_full_sort`）。
-        order.select_nth_unstable_by(k - 1, |&a, &b| {
-            row[b].total_cmp(&row[a]).then(a.cmp(&b))
-        });
+        order.select_nth_unstable_by(k - 1, |&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
         order[..k].sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
         for &e in &order[..k] {
             penalty[i * n_expert + e] = 0.0;
@@ -221,7 +219,12 @@ pub fn merge_stats(stats: &[RouteStats]) -> RouteStats {
     out.aux = stats.iter().map(|s| s.aux).sum::<f32>() / stats.len() as f32;
     let e = stats[0].counts.len();
     out.counts = (0..e)
-        .map(|i| stats.iter().map(|s| s.counts.get(i).copied().unwrap_or(0)).sum())
+        .map(|i| {
+            stats
+                .iter()
+                .map(|s| s.counts.get(i).copied().unwrap_or(0))
+                .sum()
+        })
         .collect();
     out
 }
@@ -309,7 +312,11 @@ pub fn sparse_stats(
         top_k: k,
         n_shared,
         expert_params: expert_param_count(d, use_swiglu),
-        router_params: if n_expert > 1 { router_param_count(d, e) } else { 0 },
+        router_params: if n_expert > 1 {
+            router_param_count(d, e)
+        } else {
+            0
+        },
     }
 }
 
@@ -731,10 +738,7 @@ mod tests {
 
     fn rand_x(n: usize, d: usize, seed: u64) -> Tensor {
         let mut rng = Rng::new(seed);
-        Tensor::from_vec(
-            (0..n * d).map(|_| rng.randn()).collect(),
-            vec![n, d],
-        )
+        Tensor::from_vec((0..n * d).map(|_| rng.randn()).collect(), vec![n, d])
     }
 
     /// 路由：Top-K 恰好取到 logits 最大的 K 个，且并列时按下标升序（确定性）
@@ -757,13 +761,20 @@ mod tests {
         assert_eq!(plan.sel[3], vec![1], "只有 token 1 选中了专家 3");
         assert_eq!(plan.dropped, 0);
         assert_eq!(plan.routed, vec![2, 2, 1, 1]);
-        assert!((plan.f.iter().sum::<f32>() - 1.0).abs() < 1e-6, "f 必须归一");
+        assert!(
+            (plan.f.iter().sum::<f32>() - 1.0).abs() < 1e-6,
+            "f 必须归一"
+        );
         // 掩码：选中的位置 0（penalty）/ 1（mask），其余 −∞ / 0，两者必须互补
         for i in 0..n {
             for j in 0..e {
                 let selected = plan.sel[j].contains(&i);
                 assert_eq!(plan.penalty[i * e + j] == 0.0, selected, "掩码与选择不一致");
-                assert_eq!(plan.mask[i * e + j] == 1.0, selected, "选中掩码与选择不一致");
+                assert_eq!(
+                    plan.mask[i * e + j] == 1.0,
+                    selected,
+                    "选中掩码与选择不一致"
+                );
             }
         }
     }
@@ -943,7 +954,9 @@ mod tests {
             let mut order: Vec<usize> = (0..e).collect();
             order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
             let picked = &order[..k];
-            let m = picked.iter().fold(f32::NEG_INFINITY, |acc, &j| acc.max(row[j]));
+            let m = picked
+                .iter()
+                .fold(f32::NEG_INFINITY, |acc, &j| acc.max(row[j]));
             let denom: f32 = picked.iter().map(|&j| (row[j] - m).exp()).sum();
             let xi = x.gather_rows(&[i]);
             for &j in picked {
@@ -1004,7 +1017,10 @@ mod tests {
                 assert_eq!(out[i * d + t], 0.0, "被丢弃的 token 该层输出应为 0");
             }
         }
-        assert!(out[..2 * d].iter().any(|v| *v != 0.0), "前 2 个 token 应正常算出");
+        assert!(
+            out[..2 * d].iter().any(|v| *v != 0.0),
+            "前 2 个 token 应正常算出"
+        );
 
         // 不限容量：6 个 token 全部走专家 0
         layer.capacity_factor = 0.0;
@@ -1018,7 +1034,10 @@ mod tests {
         let st = layer.stats();
         assert_eq!(st.counts, vec![n, 0]);
         assert_eq!(st.dropped, 0);
-        assert!((st.imbalance() - 2.0).abs() < 1e-9, "E=2 全压一个专家时不均衡度 = 2");
+        assert!(
+            (st.imbalance() - 2.0).abs() < 1e-9,
+            "E=2 全压一个专家时不均衡度 = 2"
+        );
     }
 
     /// 均衡辅助损失 `L_aux = E · Σ f_i·p_i` 的取值规律。
@@ -1059,7 +1078,10 @@ mod tests {
 
         // 背离的极端：支撑集不交 ⇒ 0。这就是"L_aux 恒 ≥ 1"这种说法错在哪
         let disjoint = aux_of(vec![0.5, 0.5, 0.0, 0.0], vec![0.0, 0.0, 0.5, 0.5]);
-        assert!(disjoint.abs() < 1e-6, "支撑集不交时下界是 0，实测 {disjoint}");
+        assert!(
+            disjoint.abs() < 1e-6,
+            "支撑集不交时下界是 0，实测 {disjoint}"
+        );
 
         // ⚠️ 最关键的一条：**p 均匀时 L_aux = 1，与 f 长什么样无关**
         // （Σ f_i·p_i = (1/E)·Σ f_i = 1/E ⇒ L_aux = E·(1/E) = 1）。
@@ -1105,10 +1127,7 @@ mod tests {
         // 把门控压平（含随机权重带来的逐 token 差异）后应回到接近 1
         layer.router.bias.set_data(vec![0.0; e]);
         let (_, aux) = layer.forward_with_aux(&x);
-        assert!(
-            aux.unwrap().item() < 1.3,
-            "门控接近均匀时均衡损失应接近 1"
-        );
+        assert!(aux.unwrap().item() < 1.3, "门控接近均匀时均衡损失应接近 1");
 
         // α = 0 ⇒ 不返回辅助损失（也不在计算图里留无用节点）
         layer.aux_coef = 0.0;
@@ -1211,12 +1230,13 @@ mod tests {
                 ss.total_params()
             );
             // 激活量口径：Top-K 个专家 + 路由器
-            assert_eq!(
-                ss.active_params(),
-                k * ss.expert_params + ss.router_params
-            );
+            assert_eq!(ss.active_params(), k * ss.expert_params + ss.router_params);
             // 稀疏性：4 个专家取 2 个 ⇒ 激活参数约占一半，省下约一半 FLOPs
-            assert!((ss.param_ratio() - 2.0).abs() < 0.05, "比例 {}", ss.param_ratio());
+            assert!(
+                (ss.param_ratio() - 2.0).abs() < 0.05,
+                "比例 {}",
+                ss.param_ratio()
+            );
             assert!(
                 (ss.flops_saving() - 0.5).abs() < 0.05,
                 "省下的比例 {}",
@@ -1332,7 +1352,11 @@ mod tests {
         let x = rand_x(n, d, 9);
 
         let _ = layer.forward(&x);
-        assert_eq!(layer.stats().counts, vec![n, 0, 0, 0], "并列时全部落到专家 0");
+        assert_eq!(
+            layer.stats().counts,
+            vec![n, 0, 0, 0],
+            "并列时全部落到专家 0"
+        );
         assert_eq!(layer.balance_bias(), vec![0.0; e], "初始偏置应为 0");
 
         assert!(layer.update_balance_bias(), "开启后应返回 true");
@@ -1363,9 +1387,8 @@ mod tests {
         let (d, e, k, n) = (4usize, 3usize, 2usize, 5usize);
         let on = build_biased(d, e, k, 11, 0.1);
         let off = build(d, e, k, 11);
-        let sizes = |l: &MoELayer| -> Vec<usize> {
-            l.parameters().iter().map(|p| p.numel()).collect()
-        };
+        let sizes =
+            |l: &MoELayer| -> Vec<usize> { l.parameters().iter().map(|p| p.numel()).collect() };
         assert_eq!(sizes(&on), sizes(&off), "偏置不该出现在参数表里");
         assert_eq!(on.balance_bias().len(), e);
 
@@ -1386,7 +1409,7 @@ mod tests {
             l.forward(&x).mul(&coef).sum().backward();
             l.parameters()
                 .iter()
-                .flat_map(|p| p.grad().iter().cloned().collect::<Vec<f32>>())
+                .flat_map(|p| p.grad().to_vec())
                 .collect()
         };
         assert_eq!(grads(&on), grads(&off), "偏置为 0 时梯度应逐位相同");

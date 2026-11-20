@@ -54,8 +54,10 @@ pub const ROPE_BASE: f32 = 10000.0;
 /// 此时频率表与 GPU 内核里写死的式子逐位一致（见 [`RopeSpec::is_plain`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RopeScaling {
     /// 不缩放（默认）
+    #[default]
     None,
     /// 位置插值（PI）：`θ_i = (pos / factor) / base^(2i/d)`
     Linear { factor: f32 },
@@ -74,12 +76,6 @@ pub enum RopeScaling {
     },
 }
 
-impl Default for RopeScaling {
-    fn default() -> Self {
-        RopeScaling::None
-    }
-}
-
 impl RopeScaling {
     /// 一句话描述（命令行回显与运行日志用）
     pub fn describe(self) -> String {
@@ -87,8 +83,15 @@ impl RopeScaling {
             RopeScaling::None => "无（训练窗口内）".to_string(),
             RopeScaling::Linear { factor } => format!("Linear 位置插值 ×{factor}"),
             RopeScaling::Ntk { factor } => format!("NTK-aware ×{factor}"),
-            RopeScaling::Yarn { factor, beta_fast, beta_slow, mscale } => {
-                format!("YaRN ×{factor}（beta_fast={beta_fast} beta_slow={beta_slow} mscale={mscale}）")
+            RopeScaling::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                mscale,
+            } => {
+                format!(
+                    "YaRN ×{factor}（beta_fast={beta_fast} beta_slow={beta_slow} mscale={mscale}）"
+                )
             }
         }
     }
@@ -156,7 +159,12 @@ impl Default for RopeSpec {
 impl RopeSpec {
     /// 历史三参数构造：配对方式取默认的 [`RopeStyle::Interleaved`]（逐位不变）。
     pub fn new(base: f32, scaling: RopeScaling, train_ctx: usize) -> Self {
-        RopeSpec { base, scaling, train_ctx, style: RopeStyle::Interleaved }
+        RopeSpec {
+            base,
+            scaling,
+            train_ctx,
+            style: RopeStyle::Interleaved,
+        }
     }
 
     /// 指定配对方式（builder 风格，避免改掉所有历史调用点）
@@ -172,7 +180,9 @@ impl RopeSpec {
     /// 不编 `gpu` feature 时它就是一段没人调用的守卫。
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub fn is_plain(&self) -> bool {
-        self.scaling == RopeScaling::None && self.base == ROPE_BASE && self.style == RopeStyle::Interleaved
+        self.scaling == RopeScaling::None
+            && self.base == ROPE_BASE
+            && self.style == RopeStyle::Interleaved
     }
 }
 
@@ -187,14 +197,14 @@ thread_local! {
     /// `head_dim` 不同，单槽会被对方顶掉、每层都未命中（纯性能问题）。4 槽足够装下
     /// 主干 + 视觉塔 + MLA 的 hd_rope 这类常见组合。
     static FREQ_SLOT: RefCell<Vec<(usize, RopeSpec, Arc<(Vec<f32>, f32)>)>> =
-        RefCell::new(Vec::new());
+        const { RefCell::new(Vec::new()) };
 
     /// 完整 cos/sin 表缓存（线程本地 4 槽）：key = (head_dim, spec, positions)。
     ///
     /// 一次前向里同一组 positions 会被所有层复用，只有第一层真正建表，
     /// 其余各层拿到共享的 Arc 表（零拷贝），省掉 rows×head_dim/2 次三角计算与两次分配。
     static TAB_SLOT: RefCell<Vec<(usize, RopeSpec, Vec<usize>, (Arc<Vec<f32>>, Arc<Vec<f32>>))>> =
-        RefCell::new(Vec::new());
+        const { RefCell::new(Vec::new()) };
 }
 
 /// 线程本地缓存槽数（见 [`FREQ_SLOT`] / [`TAB_SLOT`]）
@@ -294,7 +304,10 @@ fn inv_freqs(d: usize, spec: &RopeSpec) -> Vec<f32> {
     match spec.scaling {
         RopeScaling::None => raw,
         RopeScaling::Linear { factor } => {
-            assert!(factor > 0.0, "RoPE Linear 的 factor 必须 > 0，当前 {factor}");
+            assert!(
+                factor > 0.0,
+                "RoPE Linear 的 factor 必须 > 0，当前 {factor}"
+            );
             raw.iter().map(|f| f / factor).collect()
         }
         RopeScaling::Ntk { factor } => {
@@ -302,11 +315,22 @@ fn inv_freqs(d: usize, spec: &RopeSpec) -> Vec<f32> {
             // base' = base · factor^(d/(d-2))，代入 θ_i 即得第 i 个频率缩小 factor^(2i/(d-2)) 倍：
             // i = 0 完全不动，i = d/2-1 缩小整整 factor 倍，中间按指数过渡。
             // d = 2 时指数发散（维度太窄，NTK 本就无意义），退化成不缩放。
-            let exp = if d > 2 { d as f32 / (d as f32 - 2.0) } else { 0.0 };
+            let exp = if d > 2 {
+                d as f32 / (d as f32 - 2.0)
+            } else {
+                0.0
+            };
             let b = base * factor.powf(exp);
-            (0..half).map(|i| 1.0 / b.powf((2 * i) as f32 / d as f32)).collect()
+            (0..half)
+                .map(|i| 1.0 / b.powf((2 * i) as f32 / d as f32))
+                .collect()
         }
-        RopeScaling::Yarn { factor, beta_fast, beta_slow, .. } => {
+        RopeScaling::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            ..
+        } => {
             assert!(factor > 0.0, "RoPE YaRN 的 factor 必须 > 0，当前 {factor}");
             let (lo, hi) =
                 yarn_correction_range(d, base, spec.train_ctx.max(1), beta_fast, beta_slow);
@@ -416,7 +440,7 @@ fn rotate_with_tab(
 ) -> Tensor {
     let (rows, d) = (x.shape[0], x.shape[1]);
     assert!(
-        head_dim > 0 && head_dim % 2 == 0,
+        head_dim > 0 && head_dim.is_multiple_of(2),
         "head_dim 必须是正偶数（RoPE 按对旋转），当前 {head_dim}"
     );
     assert_eq!(
@@ -456,18 +480,19 @@ fn rotate_with_tab(
         // cos/sin 表用 Arc 共享给反向闭包（闭包要求 'static），不 to_vec 克隆整张表
         let ct = Arc::clone(c_tab);
         let st = Arc::clone(s_tab);
-        record(&result, vec![x.clone()], Arc::new(move || {
-            // 梯度 borrow 一次转只读切片，不做 to_vec 拷贝；
-            // 切片是 Sync，可安全带进下面的并行闭包（guard 本身不是）
-            let g_b = rg.borrow();
-            let g_ref: &[f32] = &g_b;
-            let ct_ref: &[f32] = &ct;
-            let st_ref: &[f32] = &st;
-            let mut sgm = sg.borrow_mut();
-            // 并行：每行独立计算梯度，行间无依赖（与前向一致）
-            sgm.par_chunks_mut(d)
-                .enumerate()
-                .for_each(|(r, sgm_row)| {
+        record(
+            &result,
+            vec![x.clone()],
+            Arc::new(move || {
+                // 梯度 borrow 一次转只读切片，不做 to_vec 拷贝；
+                // 切片是 Sync，可安全带进下面的并行闭包（guard 本身不是）
+                let g_b = rg.borrow();
+                let g_ref: &[f32] = &g_b;
+                let ct_ref: &[f32] = &ct;
+                let st_ref: &[f32] = &st;
+                let mut sgm = sg.borrow_mut();
+                // 并行：每行独立计算梯度，行间无依赖（与前向一致）
+                sgm.par_chunks_mut(d).enumerate().for_each(|(r, sgm_row)| {
                     let g_base = r * d;
                     let ct_base = r * half;
                     for e in 0..pairs {
@@ -479,7 +504,8 @@ fn rotate_with_tab(
                         sgm_row[hi] += -ga * s + gb * c;
                     }
                 });
-        }));
+            }),
+        );
     }
     result
 }
@@ -509,7 +535,11 @@ impl Tensor {
     pub fn rotary(&self, positions: &[usize], head_dim: usize, spec: &RopeSpec) -> Tensor {
         assert_eq!(self.rank(), 2, "rotary 输入应为 [rows, D]");
         assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
-        assert_eq!(self.shape[1] % head_dim, 0, "最后一维必须是 head_dim 的整数倍");
+        assert_eq!(
+            self.shape[1] % head_dim,
+            0,
+            "最后一维必须是 head_dim 的整数倍"
+        );
         let (c_tab, s_tab) = build_cos_sin_tab(positions, head_dim, spec);
         rotate_with_tab(self, &c_tab, &s_tab, head_dim, spec.style)
     }
@@ -628,7 +658,10 @@ mod tests {
         let scaled = x.rotary(&[10], 8, &p);
         let unscaled = x.rotary(&[5], 8, &plain());
         for (a, b) in scaled.data().iter().zip(unscaled.data().iter()) {
-            assert!((a - b).abs() < 1e-6, "Linear×2 的 pos=10 应等于未缩放的 pos=5");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Linear×2 的 pos=10 应等于未缩放的 pos=5"
+            );
         }
     }
 
@@ -640,7 +673,10 @@ mod tests {
         let d = 32;
         let factor = 8.0f32;
         let raw = inv_freqs(d, &plain());
-        let ntk = inv_freqs(d, &RopeSpec::new(ROPE_BASE, RopeScaling::Ntk { factor }, 512));
+        let ntk = inv_freqs(
+            d,
+            &RopeSpec::new(ROPE_BASE, RopeScaling::Ntk { factor }, 512),
+        );
         // 解析解：inv_freq_i 被缩小 factor^(2i/(d-2)) 倍
         for i in 0..d / 2 {
             let expect = raw[i] * factor.powf(-2.0 * i as f32 / (d as f32 - 2.0));
@@ -670,7 +706,12 @@ mod tests {
             d,
             &RopeSpec::new(
                 ROPE_BASE,
-                RopeScaling::Yarn { factor, beta_fast, beta_slow, mscale: 1.0 },
+                RopeScaling::Yarn {
+                    factor,
+                    beta_fast,
+                    beta_slow,
+                    mscale: 1.0,
+                },
                 train_ctx,
             ),
         );
@@ -680,7 +721,10 @@ mod tests {
         for i in 0..d / 2 {
             let f = i as f32;
             if f < lo {
-                assert!((yarn[i] - raw[i]).abs() < 1e-9, "i={i} 在 lo={lo} 之前应完全不缩放");
+                assert!(
+                    (yarn[i] - raw[i]).abs() < 1e-9,
+                    "i={i} 在 lo={lo} 之前应完全不缩放"
+                );
             } else if f >= hi {
                 assert!(
                     (yarn[i] - raw[i] / factor).abs() < raw[i] * 1e-4,
@@ -712,14 +756,21 @@ mod tests {
         // 落到表上：YaRN 的 cos/sin 整体被放大 mscale 倍
         let spec = RopeSpec::new(
             ROPE_BASE,
-            RopeScaling::Yarn { factor: 4.0, beta_fast: 32.0, beta_slow: 1.0, mscale: 1.0 },
+            RopeScaling::Yarn {
+                factor: 4.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                mscale: 1.0,
+            },
             512,
         );
-        let (c_yarn, s_yarn) = build_cos_sin_tab(&[3], 8, &spec);
-        let (c_plain, s_plain) = build_cos_sin_tab(&[3], 8, &plain());
+        let (c_yarn, _) = build_cos_sin_tab(&[3], 8, &spec);
+        let (c_plain, _) = build_cos_sin_tab(&[3], 8, &plain());
         let ratio = c_yarn[0] / c_plain[0];
-        assert!((ratio - m).abs() < 1e-5, "表里的 cos 应整体放大 {m} 倍，实际 {ratio}");
-        let _ = s_yarn[0] + s_plain[0];
+        assert!(
+            (ratio - m).abs() < 1e-5,
+            "表里的 cos 应整体放大 {m} 倍，实际 {ratio}"
+        );
     }
 
     /// RoPE 的核心性质：**注意力只取决于位置差**。任何一种频率缩放都只是换了一张
@@ -733,7 +784,12 @@ mod tests {
             RopeSpec::new(ROPE_BASE, RopeScaling::Ntk { factor: 4.0 }, 64),
             RopeSpec::new(
                 ROPE_BASE,
-                RopeScaling::Yarn { factor: 4.0, beta_fast: 32.0, beta_slow: 1.0, mscale: 1.0 },
+                RopeScaling::Yarn {
+                    factor: 4.0,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                    mscale: 1.0,
+                },
                 64,
             ),
         ];
@@ -785,7 +841,11 @@ mod tests {
         ] {
             let r = x.rotary(&[0], 4, &spec);
             for (a, b) in r.data().iter().zip(x.data().iter()) {
-                assert!((a - b).abs() < 1e-6, "pos=0 应为恒等变换（{}）", spec.scaling.describe());
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "pos=0 应为恒等变换（{}）",
+                    spec.scaling.describe()
+                );
             }
         }
     }
@@ -829,7 +889,11 @@ mod tests {
         let hd = 8usize;
         let pos = 7usize;
         let (c_tab, s_tab) = build_cos_sin_tab(&[pos], hd, &plain());
-        assert_eq!(c_tab.len(), hd / 2, "表宽应恰好是一个头（head_dim/2），不含其它头");
+        assert_eq!(
+            c_tab.len(),
+            hd / 2,
+            "表宽应恰好是一个头（head_dim/2），不含其它头"
+        );
         for p in 0..hd / 2 {
             let theta = pos as f32 / 10000f32.powf((2 * p) as f32 / hd as f32);
             assert!((c_tab[p] - theta.cos()).abs() < 1e-6, "cos[{p}]");
@@ -862,7 +926,11 @@ mod tests {
         let (rq, rk) = q.rotary_pair(&k, &pos, hd, &plain());
         // K 的旋转与「单独旋转 K」逐位一致：角度只由头内下标决定
         let k_alone = k.rotary(&pos, hd, &plain());
-        assert_eq!(rk.data(), k_alone.data(), "GQA 下 K 的旋转应与单独旋转 K 逐位一致");
+        assert_eq!(
+            rk.data(),
+            k_alone.data(),
+            "GQA 下 K 的旋转应与单独旋转 K 逐位一致"
+        );
         // 同一份数据在 Q 的前 n_kv 个头里与 K 逐位一致（角度只由头内下标决定）
         for r in 0..rows {
             for j in 0..n_kv * hd {
@@ -892,7 +960,9 @@ mod tests {
             let (rq, rk) = q.rotary_pair(&k, &[m, m + gap], hd, &plain());
             let (qd, kd) = (rq.data(), rk.data());
             // q 的行 0（位置 m）与 k 的行 1（位置 m+gap）在同一维度上点积
-            (0..hd).map(|j| qd[g * hd + j] * kd[n_kv * hd + h * hd + j]).sum()
+            (0..hd)
+                .map(|j| qd[g * hd + j] * kd[n_kv * hd + h * hd + j])
+                .sum()
         };
         for g in 0..n_head {
             for h in 0..n_kv {
@@ -945,7 +1015,11 @@ mod tests {
         let mut rng = crate::rng::Rng::new(37);
         let x: Vec<f32> = (0..hd).map(|_| rng.randn()).collect();
         let a = Tensor::param(x.clone(), vec![1, hd]).rotary(&[9], hd, &plain());
-        let b = Tensor::param(x.clone(), vec![1, hd]).rotary(&[9], hd, &plain().with_style(RopeStyle::Half));
+        let b = Tensor::param(x.clone(), vec![1, hd]).rotary(
+            &[9],
+            hd,
+            &plain().with_style(RopeStyle::Half),
+        );
         assert_ne!(a.data(), b.data(), "两种配对方式应给出不同结果");
         let n0: f32 = x.iter().map(|v| v * v).sum();
         for t in [&a, &b] {
@@ -997,7 +1071,10 @@ mod tests {
                 );
             }
         }
-        assert!(!spec.is_plain(), "rotate_half 不是 GPU 内核写死的口径，必须让它让路");
+        assert!(
+            !spec.is_plain(),
+            "rotate_half 不是 GPU 内核写死的口径，必须让它让路"
+        );
         assert!(plain().is_plain(), "默认口径（相邻配对）仍应与内核一致");
     }
 }

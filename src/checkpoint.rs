@@ -120,7 +120,13 @@ pub struct Checkpoint {
 /// 加载端重放量化得到的模型与内存里那个不是同一个）。真写错了会在下面直接断言拦下。
 ///
 /// 没有优化器状态可写（量化产物导出等）时改用 [`save_weights`]。
-pub fn save(path: &str, model: &Transformer, opt: &dyn OptimizerState, step: usize, best_val_loss: f32) {
+pub fn save(
+    path: &str,
+    model: &Transformer,
+    opt: &dyn OptimizerState,
+    step: usize,
+    best_val_loss: f32,
+) {
     let named = model.named_parameters();
     let (opt_t, opt_m, opt_v) = opt.state();
     let header = make_header(model, &named, step, best_val_loss, opt_t, false);
@@ -209,9 +215,8 @@ fn create_with_head(path: &str, model: &Transformer, header: &CkptHeader) -> (Fi
     let json = serde_json::to_vec(header).expect("序列化 checkpoint 头失败");
     let tmp = format!("{path}.tmp");
     let mut f = File::create(&tmp).unwrap_or_else(|e| panic!("无法创建 checkpoint {tmp}: {e}"));
-    let write = |r: std::io::Result<()>| {
-        r.unwrap_or_else(|e| panic!("写入 checkpoint {tmp} 失败: {e}"))
-    };
+    let write =
+        |r: std::io::Result<()>| r.unwrap_or_else(|e| panic!("写入 checkpoint {tmp} 失败: {e}"));
     write(f.write_all(MAGIC));
     write(f.write_all(&(json.len() as u32).to_le_bytes()));
     write(f.write_all(&json));
@@ -221,7 +226,8 @@ fn create_with_head(path: &str, model: &Transformer, header: &CkptHeader) -> (Fi
 /// 落盘收尾：刷盘 + 关闭临时文件，再**原子改名**到目标路径（见 [`create_with_head`]）。
 fn commit_atomic(f: File, tmp: &str, path: &str) {
     let mut f = f;
-    f.flush().unwrap_or_else(|e| panic!("刷写 checkpoint {tmp} 失败: {e}"));
+    f.flush()
+        .unwrap_or_else(|e| panic!("刷写 checkpoint {tmp} 失败: {e}"));
     drop(f);
     std::fs::rename(tmp, path).unwrap_or_else(|e| panic!("把 {tmp} 改名为 {path} 失败: {e}"));
 }
@@ -372,12 +378,7 @@ fn read_block(f: &mut File, path: &str, numel: usize) -> Vec<f32> {
         f.read_exact(&mut buf)
             .unwrap_or_else(|e| panic!("读取 checkpoint {path} 参数数据失败: {e}"));
         for (i, v) in data.iter_mut().enumerate() {
-            *v = f32::from_le_bytes([
-                buf[i * 4],
-                buf[i * 4 + 1],
-                buf[i * 4 + 2],
-                buf[i * 4 + 3],
-            ]);
+            *v = f32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]]);
         }
     }
     data
@@ -402,8 +403,8 @@ fn read_head(f: &mut File, path: &str) -> (CkptHeader, usize) {
     let mut json = vec![0u8; json_len];
     f.read_exact(&mut json)
         .unwrap_or_else(|e| panic!("读取 {path} JSON 头失败（文件过短或损坏）: {e}"));
-    let header: CkptHeader = serde_json::from_slice(&json)
-        .unwrap_or_else(|e| panic!("解析 checkpoint 头失败: {e}"));
+    let header: CkptHeader =
+        serde_json::from_slice(&json).unwrap_or_else(|e| panic!("解析 checkpoint 头失败: {e}"));
     // 拒绝比当前实现更新的格式：新版可能改了字段语义，静默按旧语义误读比报错更危险
     assert!(
         header.schema_version <= SCHEMA_VERSION,
@@ -486,11 +487,7 @@ fn restore_params(model: &Transformer, metas: &[ParamMeta], f: &mut File, path: 
                 meta.name
             )
         });
-        assert!(
-            !covered[si],
-            "checkpoint 参数名重复：{}",
-            meta.name
-        );
+        assert!(!covered[si], "checkpoint 参数名重复：{}", meta.name);
         covered[si] = true;
         slot_of_meta.push(si);
         let t = &named[si].1;
@@ -573,8 +570,7 @@ mod tests {
         let t_new = t.elapsed();
         let mut rng2 = Rng::new(1);
         let t = std::time::Instant::now();
-        let model_skip =
-            crate::rng::without_init(|| Transformer::new(ck.model.clone(), &mut rng2));
+        let model_skip = crate::rng::without_init(|| Transformer::new(ck.model.clone(), &mut rng2));
         let t_new_skip = t.elapsed();
         // 跳过初始化必须不改变随机数流（推理入口据此保证同 seed 生成结果不变）
         assert_eq!(rng.state(), rng2.state(), "without_init 改变了随机数流");
@@ -618,7 +614,11 @@ mod tests {
     fn assert_bits_eq(a: &[f32], b: &[f32], what: &str) {
         assert_eq!(a.len(), b.len(), "{what} 长度不一致");
         for (i, (x, y)) in a.iter().zip(b).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "{what}[{i}] 不是逐位还原：{x} vs {y}");
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{what}[{i}] 不是逐位还原：{x} vs {y}"
+            );
         }
     }
 
@@ -644,7 +644,11 @@ mod tests {
         assert_eq!(ckpt.best_val_loss, 1.2345);
         assert_eq!(ckpt.model.vocab_size, 64);
 
-        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+        for ((name, a), (_, b)) in model
+            .named_parameters()
+            .iter()
+            .zip(model2.named_parameters())
+        {
             assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
         }
         let (t2, m2, v2) = opt2.state();
@@ -695,7 +699,11 @@ mod tests {
 
         assert_eq!(ckpt.step, 13);
         assert_eq!(ckpt.best_val_loss, 0.9);
-        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+        for ((name, a), (_, b)) in model
+            .named_parameters()
+            .iter()
+            .zip(model2.named_parameters())
+        {
             assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
         }
         let (t2, m2, v2) = opt2.state();
@@ -721,7 +729,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(ckpt.step, 7);
-        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+        for ((name, a), (_, b)) in model
+            .named_parameters()
+            .iter()
+            .zip(model2.named_parameters())
+        {
             assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
         }
     }
@@ -820,7 +832,8 @@ mod tests {
     /// LoRA 之前存的旧档没有 `lora` 字段，必须照常读入为 None（serde default）
     #[test]
     fn test_header_without_lora_field_is_accepted() {
-        let json = r#"{"step":3,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":3,"params":[]}"#;
+        let json =
+            r#"{"step":3,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":3,"params":[]}"#;
         let h: CkptHeader = serde_json::from_str(json).expect("旧档应能读入");
         assert!(h.lora.is_none());
         assert_eq!(h.step, 3);
@@ -830,7 +843,8 @@ mod tests {
     /// 这是"加字段不能把已有存档读废"的同一条约束，两个字段各测一次。
     #[test]
     fn test_header_without_quant_field_is_accepted() {
-        let json = r#"{"step":4,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":4,"params":[]}"#;
+        let json =
+            r#"{"step":4,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":4,"params":[]}"#;
         let h: CkptHeader = serde_json::from_str(json).expect("旧档应能读入");
         assert!(h.quant.is_none());
         assert_eq!(h.step, 4);
@@ -840,7 +854,8 @@ mod tests {
     /// 加字段不能把已有存档读废，这是与 lora / quant 同一条约束的第三个实例。
     #[test]
     fn test_header_without_weights_only_field_is_accepted() {
-        let json = r#"{"step":5,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":5,"params":[]}"#;
+        let json =
+            r#"{"step":5,"best_val_loss":1.0,"model":{"vocab_size":64},"opt_t":5,"params":[]}"#;
         let h: CkptHeader = serde_json::from_str(json).expect("旧档应能读入");
         assert!(!h.weights_only, "缺字段应默认成三段式训练档");
     }
@@ -887,7 +902,11 @@ mod tests {
         assert!(ckpt.weights_only);
         assert_eq!(ckpt.step, 21);
         assert_eq!(ckpt.best_val_loss, 0.9);
-        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+        for ((name, a), (_, b)) in model
+            .named_parameters()
+            .iter()
+            .zip(model2.named_parameters())
+        {
             assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
         }
 
@@ -947,7 +966,11 @@ mod tests {
         let mut model2 = Transformer::new(TransformerConfig::tiny(64), &mut rng2);
         let ckpt = load_params(&path, &model2);
         assert_eq!(ckpt.quant.map(|m| m.bits), Some(QBits::Int8));
-        for ((name, a), (_, b)) in model.named_parameters().iter().zip(model2.named_parameters()) {
+        for ((name, a), (_, b)) in model
+            .named_parameters()
+            .iter()
+            .zip(model2.named_parameters())
+        {
             assert_bits_eq(&a.data_ref(), &b.data_ref(), &format!("参数 {name}"));
         }
 
@@ -1012,7 +1035,10 @@ mod tests {
             .filter(|(n, _)| n.starts_with("vision."))
             .map(|(n, t)| (n, t.data_ref().to_vec()))
             .collect();
-        assert!(!vision_before.is_empty(), "带视觉塔的模型应有 vision.* 参数");
+        assert!(
+            !vision_before.is_empty(),
+            "带视觉塔的模型应有 vision.* 参数"
+        );
 
         let mut opt2 = AdamW::new(1e-3, model2.parameters(), 0.1);
         load_with_opt(&path, &model2, &mut opt2);
@@ -1034,7 +1060,11 @@ mod tests {
                 .iter()
                 .find(|(m, _)| m == n)
                 .unwrap_or_else(|| panic!("模型缺少视觉参数 {n}"));
-            assert_bits_eq(before, &now.data_ref(), &format!("视觉参数 {n} 应保持初始化"));
+            assert_bits_eq(
+                before,
+                &now.data_ref(),
+                &format!("视觉参数 {n} 应保持初始化"),
+            );
         }
 
         // 优化器动量与新参数表对齐：存档里的历史保留、多出来的 vision.* 补零

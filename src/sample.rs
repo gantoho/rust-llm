@@ -98,12 +98,7 @@ impl Default for SampleOpts {
 ///
 /// - `recent`：参与重复惩罚的 token（调用方按窗口截好，通常是"最近 N 个已生成的 token"）。
 ///   传空切片即跳过惩罚。
-pub fn sample_token(
-    logits: &[f32],
-    opts: &SampleOpts,
-    recent: &[usize],
-    rng: &mut Rng,
-) -> usize {
+pub fn sample_token(logits: &[f32], opts: &SampleOpts, recent: &[usize], rng: &mut Rng) -> usize {
     let (ids, probs) = probs_from_logits(logits, opts, recent);
     let mut u = rng.next_f32();
     for (i, p) in probs.iter().enumerate() {
@@ -380,6 +375,58 @@ impl<'m, 'r> Generator<'m, 'r> {
     /// 没配视觉塔的 checkpoint 调用会在前向时断言失败。
     ///
     /// [`Transformer::forward_mm`]: crate::model::Transformer::forward_mm
+    /// 交给 Generator 一个**已经预填好前缀**的 KV cache（C9：prefix 复用的入口）。
+    ///
+    /// 典型用法：把 system + 模板这段固定前缀的 K/V 缓存起来，每个请求 fork 一份交给它，
+    /// 首次 `step()` 就只补"新增的那段"，省掉整段前缀的 prefill。
+    /// 传进来的 cache 必须与 `ids` 的**前 N 个 token 完全对应**（`fork` 自同一份前缀）。
+    #[allow(dead_code)] // serve 侧接线在下一轮
+    pub fn with_cache(mut self, cache: Vec<KVCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+    /// 当前 KV 缓存的快照（每条序列 `fork` 一份）。
+    ///
+    /// C9 的另一半：请求结束后把快照裁回 prompt 长度（`KVCache::rollback`）并缓存起来，
+    /// 下次相同前缀的请求就能 `with_cache` 直接续写，跳过整段 prefill。
+    #[allow(dead_code)] // serve 侧接线在下一轮
+    /// 把 KV 缓存**移出** Generator（`None` = 本就是全量模式）。
+    ///
+    /// 批处理调度器需要把多条序列的 cache 交给一次 `decode_batch`，而 `Generator` 借用着
+    /// `&Transformer` / `&mut Rng`、没法长期存在 slot 里 —— 所以设计成"**线程持有 Generator、
+    /// 只把 cache 搬出去**"：`take_cache` → 交给驱动线程批处理 → `put_cache` 放回。
+    #[allow(dead_code)] // 调度器接线在下一轮
+    /// 批处理用：**稳态解码**时下一步要喂的 token 与绝对位置。
+    ///
+    /// 返回 `None` 表示这一步不该进批（首次 prefill、或 prefix 复用后的首步要补中段），
+    /// 由调用方退回逐条 `step()`。
+    #[allow(dead_code)] // serve 侧接线在下一轮
+    pub fn batch_feed(&self) -> Option<(usize, usize)> {
+        if self.reason.is_some() {
+            return None;
+        }
+        let c = self.cache.as_ref()?;
+        let n = c[0].seq_len();
+        // 只有"缓存长度 = ids 长度 - 1"才是纯单 token 解码
+        if n == 0 || self.ids.len() != n + 1 {
+            return None;
+        }
+        Some((*self.ids.last()?, n))
+    }
+    pub fn take_cache(&mut self) -> Option<Vec<KVCache>> {
+        self.cache.take()
+    }
+
+    /// 把批处理完的 cache 放回（与 [`Self::take_cache`] 配对）。
+    #[allow(dead_code)] // 调度器接线在下一轮
+    pub fn put_cache(&mut self, cache: Vec<KVCache>) {
+        self.cache = Some(cache);
+    }
+    pub fn cache_snapshot(&self) -> Option<Vec<KVCache>> {
+        self.cache
+            .as_ref()
+            .map(|c| c.iter().map(|x| x.fork()).collect())
+    }
     pub fn with_pixels(mut self, pixels: Vec<f32>) -> Self {
         self.pixels = Some(pixels);
         self
@@ -391,16 +438,26 @@ impl<'m, 'r> Generator<'m, 'r> {
     /// 返回 `false` = 已收尾（原因见内部 `reason`，最终结果用 [`Generator::into_output`] 取）。
     /// 已收尾后再调用恒返回 `false`。
     pub fn step(&mut self) -> bool {
+        match self.logits_row() {
+            Some(row) => self.step_row(&row),
+            None => false,
+        }
+    }
+
+    /// 算出"下一步该采样哪一行 logits"（原 `step()` 的前半，逐字保留）。
+    ///
+    /// 返回 `None` = 已收尾（`reason` 已设，或已达 `max_new`）。
+    /// 批处理场景下由引擎调用一次 `decode_batch` 拿到 N 行，再逐条 `step_row`。
+    fn logits_row(&mut self) -> Option<Vec<f32>> {
         if self.reason.is_some() {
-            return false;
+            return None;
         }
         // 上限用尽：与原循环跑满 `0..max_new` 后的出口一致（生成段不 trim，原样交出）
         if self.remaining == 0 {
             self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..]);
             self.reason = Some(StopReason::MaxNew);
-            return false;
+            return None;
         }
-        self.remaining -= 1;
         let block_size = self.model.cfg.block_size;
 
         // 只保留最近的 block_size 个 token（两种模式都必须遵守的上下文上限）
@@ -429,14 +486,38 @@ impl<'m, 'r> Generator<'m, 'r> {
             if let Some(c) = cache {
                 // 首次：缓存为空，把整个 prompt 喂进去（顺便填充缓存）
                 // 之后：每步只前向最新 1 个 token，历史 K/V 从缓存取
-                if c[0].seq_len() == 0 {
-                    model.forward_mm(ctx, 1, ctx.len(), if inject { px } else { None }, Some(c), false)
+                // C9：缓存里已有前 N 个 token（prefix 复用）⇒ 只把**新增的那段**喂进去。
+                // 空缓存走全量 prefill；恰好只差一个 token 时等价于下面的逐 token 路径。
+                let cached = c[0].seq_len();
+                if cached == 0 {
+                    model.forward_mm(
+                        ctx,
+                        1,
+                        ctx.len(),
+                        if inject { px } else { None },
+                        Some(c),
+                        false,
+                    )
+                } else if self.ids.len() == self.n_prompt && cached > 0 && self.ids.len() > cached + 1 {
+                    // 只有**首步**（还没生成任何 token）才可能是注入的前缀缓存。
+                    // 滑窗缓存下 `seq_len()` 会封顶在窗口大小、而 `ids` 继续增长，
+                    // 若拿"缓存比 ids 短"当复用判据，就会每步重复喂 token，最终 t 超窗口。
+                    // 前缀复用：把 (cached, len) 这一段补进缓存（RoPE 位置由缓存长度推出）
+                    let rest = &self.ids[cached..];
+                    model.forward(rest, 1, rest.len(), Some(c), false)
                 } else {
                     model.forward(&self.ids[self.ids.len() - 1..], 1, 1, Some(c), false)
                 }
             } else {
                 // 全量模式：每次把整个上下文重新算一遍（慢，但没有 cache 内存）
-                model.forward_mm(ctx, 1, ctx.len(), if inject { px } else { None }, None, false)
+                model.forward_mm(
+                    ctx,
+                    1,
+                    ctx.len(),
+                    if inject { px } else { None },
+                    None,
+                    false,
+                )
             }
         });
 
@@ -470,7 +551,25 @@ impl<'m, 'r> Generator<'m, 'r> {
         // 重复惩罚的回看窗口：只看最近 N 个 token（含 prompt），更早的不再计入。
         // 窗口过大时高频 token 会被持续压低，可能影响语句的连贯性。
         // 图段内跳过惩罚：VQ 码本里重复是常态，按出现次数累乘的惩罚会把常见码打崩。
-        let recent = if self.opts.repetition_window == 0 || self.img_seg.is_some() {
+        Some(row.to_vec())
+    }
+
+    /// 用**外部算好的一行 logits** 推进一次采样与状态机（原 `step()` 的后半，逐字保留）。
+    ///
+    /// EOS / 停止标记 / UTF-8 掩码 / 图像状态机全在内部，与 `step()` 完全同一套逻辑。
+    /// 返回 `false` = 已收尾。
+    pub fn step_row(&mut self, row: &[f32]) -> bool {
+        // 上限与计数放在这里：批处理会**直接**调 `step_row`（跳过 `logits_row`），
+        // 所以"每采样一个 token 就消耗一格 remaining"必须由采样这一侧负责。
+        if self.reason.is_some() {
+            return false;
+        }
+        if self.remaining == 0 {
+            self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..]);
+            self.reason = Some(StopReason::MaxNew);
+            return false;
+        }
+        self.remaining -= 1;        let recent = if self.opts.repetition_window == 0 || self.img_seg.is_some() {
             &[][..]
         } else {
             let start = self.ids.len().saturating_sub(self.opts.repetition_window);
@@ -484,7 +583,9 @@ impl<'m, 'r> Generator<'m, 'r> {
         // 采到 EOS 就收：这是模型自己学出来的结束符号（训练时每段序列末尾都带它），
         // 比"等某个字符组合出现"可靠得多。EOS 本身不进结果（`decode` 跳过特殊 token）。
         if self.eos == Some(next) {
-            self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..self.ids.len() - 1]);
+            self.generated = self
+                .tokenizer
+                .decode(&self.ids[self.n_prompt..self.ids.len() - 1]);
             self.reason = Some(StopReason::Eos);
             return false;
         }
@@ -582,9 +683,15 @@ impl<'m, 'r> Generator<'m, 'r> {
         let segs = &self.ids[self.n_prompt..];
         let mut i = 0;
         while i < segs.len() {
-            if segs[i] == im.start && segs.len() > i + im.count + 1 && segs[i + im.count + 1] == im.end {
+            if segs[i] == im.start
+                && segs.len() > i + im.count + 1
+                && segs[i + im.count + 1] == im.end
+            {
                 let seg = &segs[i + 1..=i + im.count];
-                if let Some(codes) = seg.iter().map(|&id| im.cb_index(id)).collect::<Option<Vec<_>>>()
+                if let Some(codes) = seg
+                    .iter()
+                    .map(|&id| im.cb_index(id))
+                    .collect::<Option<Vec<_>>>()
                 {
                     out.push(codes);
                     i += im.count + 2; // start + P 个码本 + end
@@ -734,14 +841,18 @@ pub fn beam_search(
     // prefill 只喂到**倒数第二个** token 为止：剩下那一个交给主循环统一处理
     // （循环里"把最后一个 token 喂进缓存换出下一个 token 的分布"是同一套动作，
     // 少一个特例就少一处出错的地方）。prompt 只有一个 token 时不用 prefill。
-    if let Some(cache) = base_cache.as_mut() {
-        if prompt_ids.len() >= 2 {
-            let start = prompt_ids.len().saturating_sub(model.cfg.block_size);
-            let prefill = &prompt_ids[start..prompt_ids.len() - 1];
-            crate::tensor::no_grad(|| model.forward(prefill, 1, prefill.len(), Some(cache), false));
-        }
+    if let Some(cache) = base_cache.as_mut()
+        && prompt_ids.len() >= 2
+    {
+        let start = prompt_ids.len().saturating_sub(model.cfg.block_size);
+        let prefill = &prompt_ids[start..prompt_ids.len() - 1];
+        crate::tensor::no_grad(|| model.forward(prefill, 1, prefill.len(), Some(cache), false));
     }
-    let only_cache = || base_cache.as_ref().map(|c| c.iter().map(|x| x.fork()).collect());
+    let only_cache = || {
+        base_cache
+            .as_ref()
+            .map(|c| c.iter().map(|x| x.fork()).collect())
+    };
 
     let mut beams: Vec<Beam> = vec![Beam {
         ids: prompt_ids,
@@ -752,7 +863,6 @@ pub fn beam_search(
     let eos = tokenizer.eos_id();
     // 字节级 BPE 的 UTF-8 约束（同 generate：排除"半个汉字"的 token）
     let vocab_bytes = tokenizer.vocab_bytes();
-    let mut masked: Vec<f32> = Vec::new();
 
     for _step in 0..max_new {
         // ---- 先把"未收尾路径"的下一个 token 分布**一次批量算出来** ----
@@ -861,7 +971,10 @@ pub fn beam_search(
                 let mut ids = beam.ids.clone();
                 ids.push(tok);
                 // 克隆父路径的缓存：兄弟路径的前缀完全相同，缓存自然也一样
-                let cache = beam.cache.as_ref().map(|c| c.iter().map(|x| x.fork()).collect());
+                let cache = beam
+                    .cache
+                    .as_ref()
+                    .map(|c| c.iter().map(|x| x.fork()).collect());
                 candidates.push(Beam {
                     ids,
                     score: new_score,
@@ -872,7 +985,11 @@ pub fn beam_search(
         }
 
         // 按分数排序，保留 top-beam_size
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates.truncate(beam_size);
         beams = candidates;
 
@@ -1061,11 +1178,30 @@ mod tests {
         let (model, tokenizer) = tiny_setup();
         // tiny 的 block_size = 32：prompt 3 + 生成 20 = 23 ≤ 32，全程在缓存窗口内
         let mut rng_full = Rng::new(1234);
-        let full = generate(&model, &tokenizer, "the", 20, &opts(), KvOpts::off(), &mut rng_full);
+        let full = generate(
+            &model,
+            &tokenizer,
+            "the",
+            20,
+            &opts(),
+            KvOpts::off(),
+            &mut rng_full,
+        );
         let mut rng_cache = Rng::new(1234);
-        let cached = generate(&model, &tokenizer, "the", 20, &opts(), KvOpts::on(0, None), &mut rng_cache);
+        let cached = generate(
+            &model,
+            &tokenizer,
+            "the",
+            20,
+            &opts(),
+            KvOpts::on(0, None),
+            &mut rng_cache,
+        );
 
-        assert_eq!(full, cached, "窗口内的 KV cache 生成应与全量前向逐 token 一致");
+        assert_eq!(
+            full, cached,
+            "窗口内的 KV cache 生成应与全量前向逐 token 一致"
+        );
     }
 
     /// 超出缓存窗口后，KV cache 模式靠滑动窗口继续生成，不再提前结束：
@@ -1127,10 +1263,26 @@ mod tests {
             o.stop = stop;
 
             let mut rng_plain = Rng::new(77);
-            let plain = generate_with_reason(model, tokenizer, prompt, max_new, &o, KvOpts::off(), &mut rng_plain);
+            let plain = generate_with_reason(
+                model,
+                tokenizer,
+                prompt,
+                max_new,
+                &o,
+                KvOpts::off(),
+                &mut rng_plain,
+            );
 
             let mut rng_s = Rng::new(77);
-            let mut g = Generator::new(model, tokenizer, prompt, max_new, &o, KvOpts::off(), &mut rng_s);
+            let mut g = Generator::new(
+                model,
+                tokenizer,
+                prompt,
+                max_new,
+                &o,
+                KvOpts::off(),
+                &mut rng_s,
+            );
             let mut stream = String::new();
             while g.step() {
                 if let Some(t) = g.next_text() {
@@ -1142,7 +1294,10 @@ mod tests {
 
             let tag = format!("prompt={prompt:?} max_new={max_new} stop={stop:?}");
             assert_eq!(stream, out.generated, "流式拼接必须等于最终生成段（{tag}）");
-            assert_eq!(out.generated, plain.generated, "同种子下流式与非流式生成段一致（{tag}）");
+            assert_eq!(
+                out.generated, plain.generated,
+                "同种子下流式与非流式生成段一致（{tag}）"
+            );
             assert_eq!(out.reason, plain.reason, "收尾原因一致（{tag}）");
             assert_eq!(out.text, plain.text, "全文一致（{tag}）");
         }
@@ -1156,12 +1311,32 @@ mod tests {
     /// 流式安全发出的扣留规则：尾部空白与停止标记的真前缀都不能先发出去。
     #[test]
     fn test_safe_len_holds_back_stop_prefix_and_trailing_space() {
-        assert_eq!(safe_len("abc", &[]), 3, "无停止标记时全发（收尾结果不 trim）");
-        assert_eq!(safe_len("abc ", &["用户："]), 3, "尾部空白要扣：命中标记时最终结果要 trim_end");
-        assert_eq!(safe_len("abc用", &["用户："]), 3, "标记的真前缀要扣：标记可能横跨两次采样");
+        assert_eq!(
+            safe_len("abc", &[]),
+            3,
+            "无停止标记时全发（收尾结果不 trim）"
+        );
+        assert_eq!(
+            safe_len("abc ", &["用户："]),
+            3,
+            "尾部空白要扣：命中标记时最终结果要 trim_end"
+        );
+        assert_eq!(
+            safe_len("abc用", &["用户："]),
+            3,
+            "标记的真前缀要扣：标记可能横跨两次采样"
+        );
         assert_eq!(safe_len("abc用户", &["用户："]), 3, "多字节前缀整段扣住");
-        assert_eq!(safe_len("abc 用户", &["用户："]), 3, "前缀之前的空白也会被最终的 trim_end 掉");
-        assert_eq!(safe_len("abc用 ", &["用户："]), 6, "空格已隔开前缀，标记拼不上，只扣尾部空白");
+        assert_eq!(
+            safe_len("abc 用户", &["用户："]),
+            3,
+            "前缀之前的空白也会被最终的 trim_end 掉"
+        );
+        assert_eq!(
+            safe_len("abc用 ", &["用户："]),
+            6,
+            "空格已隔开前缀，标记拼不上，只扣尾部空白"
+        );
         assert_eq!(safe_len("abc", &["xyz"]), 3, "没有前缀命中就不扣");
     }
 
@@ -1177,8 +1352,16 @@ mod tests {
         let mut rng = Rng::new(99);
         // 生成 1 个 token：生成段只有一个字符，拼不出两字符的停止标记，断言是确定的
         let out = generate_with_reason(&model, &tokenizer, prompt, 1, &o, KvOpts::off(), &mut rng);
-        assert_ne!(out.reason, StopReason::StopMark("qz"), "停止标记只在生成段里查找");
-        assert_eq!(out.text, format!("{prompt}{}", out.generated), "全文 = prompt + 生成段");
+        assert_ne!(
+            out.reason,
+            StopReason::StopMark("qz"),
+            "停止标记只在生成段里查找"
+        );
+        assert_eq!(
+            out.text,
+            format!("{prompt}{}", out.generated),
+            "全文 = prompt + 生成段"
+        );
 
         // 停止标记落在生成段第 0 位（空标记的 find 恒为 0）：生成段为空、全文退回 prompt
         o.stop = &[""];
@@ -1186,7 +1369,10 @@ mod tests {
         let out = generate_with_reason(&model, &tokenizer, prompt, 8, &o, KvOpts::off(), &mut rng);
         assert_eq!(out.reason, StopReason::StopMark(""));
         assert_eq!(out.generated, "", "生成段为空");
-        assert_eq!(out.text, prompt, "生成段为空时全文就是 prompt（旧写法在这里会切出空串）");
+        assert_eq!(
+            out.text, prompt,
+            "生成段为空时全文就是 prompt（旧写法在这里会切出空串）"
+        );
     }
 
     /// 重复惩罚要把"最近出现过"的 token 压下去。
@@ -1260,7 +1446,11 @@ mod tests {
         let vocab = tok.vocab_bytes().unwrap();
         let zhong = "中".as_bytes(); // E4 B8 AD
 
-        assert_eq!(pending_tail(vocab, &[0x41]), Vec::<u8>::new(), "ASCII 后无未完成字节");
+        assert_eq!(
+            pending_tail(vocab, &[0x41]),
+            Vec::<u8>::new(),
+            "ASCII 后无未完成字节"
+        );
         assert_eq!(pending_tail(vocab, &[0xE4]), zhong[..1].to_vec());
         assert_eq!(pending_tail(vocab, &[0xE4, 0xB8]), zhong[..2].to_vec());
         assert_eq!(
@@ -1269,7 +1459,10 @@ mod tests {
             "完整字符不应残留 pending"
         );
         // 序列从"中"的续字节开始（真实场景里前面还有 E4），也要能定位到 E4
-        assert_eq!(pending_tail(vocab, &[0x41, 0xB8, 0xAD, 0xE4]), zhong[..1].to_vec());
+        assert_eq!(
+            pending_tail(vocab, &[0x41, 0xB8, 0xAD, 0xE4]),
+            zhong[..1].to_vec()
+        );
     }
 
     /// 图片段受约束采样的两条腿：状态机推进（start→码本×P→end）与采样域掩码。
@@ -1301,7 +1494,10 @@ mod tests {
         let mut l = vec![1.0f32; 32];
         mask_image(&mut l, im, None);
         for id in 11..=23 {
-            assert!(l[id].is_sign_negative() && l[id].is_infinite(), "图外应屏蔽 {id}");
+            assert!(
+                l[id].is_sign_negative() && l[id].is_infinite(),
+                "图外应屏蔽 {id}"
+            );
         }
         assert_eq!(l[im.start], 1.0, "start 必须可采样（生成图片的唯一入口）");
         assert_eq!(l[0], 1.0, "普通文本 token 不受影响");
@@ -1311,7 +1507,11 @@ mod tests {
         mask_image(&mut l, im, Some(2));
         for id in 0..32 {
             let alive = !l[id].is_infinite();
-            assert_eq!(alive, (16..24).contains(&id), "图内(2) 应只留码本区，id={id}");
+            assert_eq!(
+                alive,
+                (16..24).contains(&id),
+                "图内(2) 应只留码本区，id={id}"
+            );
         }
 
         // 图内已满 P 个：只留 end 收尾
@@ -1381,5 +1581,97 @@ mod tests {
             !long_run.generated.is_empty(),
             "滑窗后应照常出字：{long_run:?}"
         );
+    }
+
+    /// C9：把前缀 K/V 预填后交给 `with_cache`，输出必须与"整段 prefill"**逐字相同**。
+    #[test]
+    fn test_prefix_cache_reuse_matches_full_prefill() {
+        let (model, tokenizer) = tiny_setup();
+        let prompt = "the quick brown fox";
+        let o = opts();
+        let kv = KvOpts::on(0, None);
+        let run = |g: &mut Generator| {
+            let mut s = String::new();
+            while g.step() {
+                if let Some(t) = g.next_text() {
+                    s.push_str(&t);
+                }
+            }
+            s.push_str(&g.flush());
+            s
+        };
+        // 参考：整段 prefill
+        let mut r1 = Rng::new(7);
+        let mut g1 = Generator::new(&model, &tokenizer, prompt, 6, &o, kv, &mut r1);
+        let want = run(&mut g1);
+        // 复用：先自己把前一半 token 灌进 cache，其余交给 Generator 补
+        let mut ids: Vec<usize> = tokenizer.bos_id().into_iter().collect();
+        ids.extend(tokenizer.encode(prompt));
+        let k = ids.len() / 2;
+        assert!(k > 0 && ids.len() > k + 1, "测试前缀太短");
+        let mut cache = model.new_kv_cache();
+        crate::tensor::no_grad(|| {
+            model.forward(&ids[..k], 1, k, Some(&mut cache), false);
+        });
+        let mut r2 = Rng::new(7);
+        let mut g2 =
+            Generator::new(&model, &tokenizer, prompt, 6, &o, kv, &mut r2).with_cache(cache);
+        assert_eq!(run(&mut g2), want, "prefix 复用与整段 prefill 的输出必须逐字相同");
+    }
+
+    /// C6 ③ 的**批处理协议**：两条序列各自 `step()` 走完 prefill，之后每轮
+    /// "`take_cache` → `decode_batch` → `put_cache` → `step_row`"，输出必须与各自独立 `step()` 完全一致。
+    /// 驱动线程要做的正是这套动作，所以这个测试就是调度器的逻辑对拍网。
+    #[test]
+    fn test_batched_steps_match_sequential() {
+        let (model, tokenizer) = tiny_setup();
+        let o = opts();
+        let kv = KvOpts::on(0, None);
+        let prompts = ["the quick", "brown fox jumps"];
+        let max_new = 5;
+        // 参考：两条各自完整 step()
+        let mut want = Vec::new();
+        for p in prompts {
+            let mut r = Rng::new(11);
+            let mut g = Generator::new(&model, &tokenizer, p, max_new, &o, kv, &mut r);
+            while g.step() {}
+            want.push(g.into_output().generated);
+        }
+        // 批量协议
+        let mut r1 = Rng::new(11);
+        let mut r2 = Rng::new(11);
+        // 两条序列各自持有一个 Rng：`Generator` 借的是 `&mut Rng`，
+        // 用 `Vec<Rng>` 索引会因借用重叠而编译不过，必须写成两个独立局部变量。
+        let mut gens = vec![
+            Generator::new(&model, &tokenizer, prompts[0], max_new, &o, kv, &mut r1),
+            Generator::new(&model, &tokenizer, prompts[1], max_new, &o, kv, &mut r2),
+        ];
+        // 第一步（prefill + 首次采样）仍逐条做，与生产一致（prefill 不进批）
+        let mut alive: Vec<usize> = (0..gens.len()).collect();
+        alive.retain(|&i| gens[i].step());
+        // 之后每轮：把各条 cache 搬出去，一次 decode_batch，再逐条 step_row
+        while !alive.is_empty() {
+            let mut ids = Vec::new();
+            let mut bases = Vec::new();
+            let mut caches = Vec::new();
+            for &i in &alive {
+                ids.push(*gens[i].ids.last().expect("至少一个 token"));
+                let c = gens[i].take_cache().expect("cache 模式");
+                bases.push(c[0].seq_len());
+                caches.push(c);
+            }
+            let rows = crate::tensor::no_grad(|| model.decode_batch(&ids, &mut caches, &bases));
+            let v = model.cfg.vocab_size;
+            let g = rows.data();
+            for (k, &i) in alive.iter().enumerate() {
+                let row = g[k * v..(k + 1) * v].to_vec();
+                gens[i].put_cache(std::mem::take(&mut caches[k]));
+                gens[i].step_row(&row);
+            }
+            alive.retain(|&i| gens[i].reason.is_none());
+        }
+        for (i, g) in gens.into_iter().enumerate() {
+            assert_eq!(g.into_output().generated, want[i], "第 {i} 条序列的批处理输出与逐条不一致");
+        }
     }
 }

@@ -233,21 +233,23 @@ impl OptimizerState for AdamW {
 fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     const MC: usize = 32; // 每个 rayon 任务处理 32 个输出行（行间无依赖）
     let mut c = vec![0.0f32; m * n];
-    c.par_chunks_mut(MC * n).enumerate().for_each(|(blk, cblk)| {
-        let first = blk * MC;
-        let rows = cblk.len() / n;
-        for r in 0..rows {
-            let i = first + r;
-            let arow = &a[i * k..(i + 1) * k];
-            let crow = &mut cblk[r * n..(r + 1) * n];
-            for (p, &av) in arow.iter().enumerate() {
-                let brow = &b[p * n..(p + 1) * n];
-                for (cv, &bv) in crow.iter_mut().zip(brow) {
-                    *cv += av * bv;
+    c.par_chunks_mut(MC * n)
+        .enumerate()
+        .for_each(|(blk, cblk)| {
+            let first = blk * MC;
+            let rows = cblk.len() / n;
+            for r in 0..rows {
+                let i = first + r;
+                let arow = &a[i * k..(i + 1) * k];
+                let crow = &mut cblk[r * n..(r + 1) * n];
+                for (p, &av) in arow.iter().enumerate() {
+                    let brow = &b[p * n..(p + 1) * n];
+                    for (cv, &bv) in crow.iter_mut().zip(brow) {
+                        *cv += av * bv;
+                    }
                 }
             }
-        }
-    });
+        });
     c
 }
 
@@ -277,13 +279,11 @@ fn gram(x: &[f32], r: usize, c: usize) -> Vec<f32> {
 fn transpose(a: &[f32], r: usize, c: usize) -> Vec<f32> {
     let mut t = vec![0.0f32; r * c];
     // 按源行分块并行：目标写跨越 c 个元素一步，但每个 (i,j) 只被一个任务写
-    t.par_chunks_mut(r)
-        .enumerate()
-        .for_each(|(j, trow)| {
-            for (i, slot) in trow.iter_mut().enumerate() {
-                *slot = a[i * c + j];
-            }
-        });
+    t.par_chunks_mut(r).enumerate().for_each(|(j, trow)| {
+        for (i, slot) in trow.iter_mut().enumerate() {
+            *slot = a[i * c + j];
+        }
+    });
     t
 }
 
@@ -303,7 +303,11 @@ fn zeropower_newton_schulz(g: &[f32], rows: usize, cols: usize, steps: usize) ->
     const B: f32 = -4.7750;
     const C: f32 = 2.0315;
     let transposed = rows > cols;
-    let (r, c) = if transposed { (cols, rows) } else { (rows, cols) };
+    let (r, c) = if transposed {
+        (cols, rows)
+    } else {
+        (rows, cols)
+    };
     let mut x = if transposed {
         transpose(g, rows, cols)
     } else {
@@ -324,17 +328,9 @@ fn zeropower_newton_schulz(g: &[f32], rows: usize, cols: usize, steps: usize) ->
             .map(|(&av, &a2v)| B * av + C * a2v)
             .collect();
         let bx = matmul(&b, &x, r, r, c); // (bA + cA²) X
-        x = x
-            .iter()
-            .zip(&bx)
-            .map(|(&xv, &bxv)| A * xv + bxv)
-            .collect();
+        x = x.iter().zip(&bx).map(|(&xv, &bxv)| A * xv + bxv).collect();
     }
-    if transposed {
-        transpose(&x, r, c)
-    } else {
-        x
-    }
+    if transposed { transpose(&x, r, c) } else { x }
 }
 
 /// Muon 优化器（**M**oment**u**m **o**rthogonalized by **N**ewton–Schulz）
@@ -579,7 +575,10 @@ mod tests {
         opt.step();
         let d = p.data_ref();
         assert!(d.iter().all(|v| v.is_finite()), "零梯度步产生了非有限参数");
-        assert!(d.iter().all(|&v| v == 0.0), "零梯度 + 零权重衰减不应改动参数");
+        assert!(
+            d.iter().all(|&v| v == 0.0),
+            "零梯度 + 零权重衰减不应改动参数"
+        );
     }
 
     /// 二维参数的更新量应为 `-lr·scale·NS(B)`。取梯度为单位阵时动量是 `(1-μ)·I`（奇异值全同），
@@ -621,14 +620,18 @@ mod tests {
         };
         let wide = norm_of(2, 8);
         let tall = norm_of(8, 2);
-        assert!((tall / wide - 2.0).abs() < 1e-2, "缩放比 = {}，期望 2", tall / wide);
+        assert!(
+            (tall / wide - 2.0).abs() < 1e-2,
+            "缩放比 = {}，期望 2",
+            tall / wide
+        );
     }
 
     /// 一维参数必须与 AdamW 走出**逐位相同**的结果（同样的 betas / eps / t / lr / wd）。
     #[test]
     fn test_muon_falls_back_to_adamw_on_1d_params() {
         let init = vec![0.7f32, -1.3, 2.1, 0.05];
-        let grad = vec![0.2f32, -0.4, 0.9, 0.15];
+        let grad = [0.2f32, -0.4, 0.9, 0.15];
         let (lr, wd) = (0.05f32, 0.1f32);
 
         let a = tensor(init.clone(), vec![4]);
@@ -644,7 +647,11 @@ mod tests {
         let av = a.data_ref().to_vec();
         let bv = b.data_ref().to_vec();
         for (i, (x, y)) in av.iter().zip(&bv).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "一维参数[{i}]与 AdamW 不是逐位一致：{x} vs {y}");
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "一维参数[{i}]与 AdamW 不是逐位一致：{x} vs {y}"
+            );
         }
     }
 

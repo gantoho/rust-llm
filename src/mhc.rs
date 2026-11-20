@@ -220,9 +220,7 @@ pub fn expand_streams(x: &Tensor, n: usize) -> Tensor {
     let d_tot = x.numel();
     let flat = x.reshape(vec![1, d_tot]);
     let ones = Tensor::from_vec(vec![1.0; n], vec![n, 1]);
-    let gains: Vec<f32> = (0..n)
-        .map(|s| 1.0 + s as f32 * STREAM_GAIN_STEP)
-        .collect();
+    let gains: Vec<f32> = (0..n).map(|s| 1.0 + s as f32 * STREAM_GAIN_STEP).collect();
     let g = Tensor::from_vec(gains, vec![n, 1]);
     ones.matmul(&flat).mul(&g)
 }
@@ -382,7 +380,9 @@ mod tests {
     #[test]
     fn test_sinkhorn_spectral_norm_is_one() {
         let n = 4;
-        let raw: Vec<f32> = (0..n * n).map(|k| 0.2 + ((k * 13) % 11) as f32 * 0.5).collect();
+        let raw: Vec<f32> = (0..n * n)
+            .map(|k| 0.2 + ((k * 13) % 11) as f32 * 0.5)
+            .collect();
         let out = sinkhorn(&raw, n, 50);
         let sigma = spectral_norm(&out, n, 200);
         assert!(
@@ -495,12 +495,17 @@ mod tests {
     #[test]
     fn test_mixing_params_receive_gradient() {
         let hc = HyperConnection::new(3, 10);
-        let x = Tensor::from_vec((0..12).map(|i| (i as f32) * 0.1 - 0.5).collect(), vec![1, 4, 3]);
+        let x = Tensor::from_vec(
+            (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect(),
+            vec![1, 4, 3],
+        );
         let streams = expand_streams(&x, 3);
         let h = hc.read(&streams, 1, 4, 3);
         let y = h.mul_scalar(2.0);
         let out = hc.write(&streams, &y); // [3, 12]
-        let w: Vec<f32> = (0..36).map(|i| ((i * 7) % 11) as f32 / 11.0 - 0.5).collect();
+        let w: Vec<f32> = (0..36)
+            .map(|i| ((i * 7) % 11) as f32 / 11.0 - 0.5)
+            .collect();
         let coef = Tensor::from_vec(w, vec![3, 12]);
         out.mul(&coef).sum().backward();
 
@@ -518,7 +523,10 @@ mod tests {
     #[test]
     fn test_doubly_stochastic_preserves_total_energy() {
         let hc = HyperConnection::new(3, 30);
-        let x = Tensor::from_vec((0..12).map(|i| (i as f32) * 0.1 - 0.5).collect(), vec![1, 4, 3]);
+        let x = Tensor::from_vec(
+            (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect(),
+            vec![1, 4, 3],
+        );
         let streams = expand_streams(&x, 3);
         let before: f32 = streams.data_ref().iter().sum();
         let after: f32 = hc.depth().matmul(&streams).data_ref().iter().sum();

@@ -69,12 +69,12 @@ impl CharTokenizer {
     pub fn decode(&self, ids: &[usize]) -> String {
         ids.iter()
             .map(|&i| {
-                self.chars
-                    .get(i)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        panic!("decode 遇到越界 token id {i}（词表大小 {}）", self.chars.len())
-                    })
+                self.chars.get(i).copied().unwrap_or_else(|| {
+                    panic!(
+                        "decode 遇到越界 token id {i}（词表大小 {}）",
+                        self.chars.len()
+                    )
+                })
             })
             .collect()
     }
@@ -188,7 +188,11 @@ impl BPETokenizer {
         }
 
         let target_merges = target_vocab - 256;
-        let log_interval = if target_merges >= 20 { target_merges / 20 } else { 1 };
+        let log_interval = if target_merges >= 20 {
+            target_merges / 20
+        } else {
+            1
+        };
         // 双缓冲交替复用：每轮合并结果写进 buf 再 swap，避免逐轮重新分配大 Vec
         let mut buf: Vec<u32> = Vec::with_capacity(ids.len());
 
@@ -197,7 +201,7 @@ impl BPETokenizer {
             let best = loop {
                 match heap.pop() {
                     Some((f, Reverse(p))) if f > 0 && pair_freq.get(&p).copied() == Some(f) => {
-                        break p
+                        break p;
                     }
                     Some(_) => continue, // 频次已过期（该 pair 后来被合并改动过）
                     None => break 'train, // 语料已无可合并 pair（如单字节语料）
@@ -237,14 +241,28 @@ impl BPETokenizer {
             std::mem::swap(&mut ids, &mut buf);
 
             let merge_count = merges.len();
-            if merge_count % log_interval == 0 || merge_count <= 5 {
-                println!("  BPE 进度: {}/{} 次合并, 词表 {}, 序列长度 {}",
-                    merge_count, target_merges, vocab.len(), ids.len());
+            if merge_count.is_multiple_of(log_interval) || merge_count <= 5 {
+                println!(
+                    "  BPE 进度: {}/{} 次合并, 词表 {}, 序列长度 {}",
+                    merge_count,
+                    target_merges,
+                    vocab.len(),
+                    ids.len()
+                );
             }
         }
-        println!("  BPE 训练完成: {} 次合并, 词表 {}", merges.len(), vocab.len());
+        println!(
+            "  BPE 训练完成: {} 次合并, 词表 {}",
+            merges.len(),
+            vocab.len()
+        );
 
-        BPETokenizer { merges, vocab, byte_id: (0u32..256).collect(), pretok: false }
+        BPETokenizer {
+            merges,
+            vocab,
+            byte_id: (0u32..256).collect(),
+            pretok: false,
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -347,10 +365,12 @@ impl BPETokenizer {
     pub fn decode(&self, ids: &[usize]) -> String {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
-            let tok = self
-                .vocab
-                .get(id)
-                .unwrap_or_else(|| panic!("decode 遇到越界 token id {id}（词表大小 {}）", self.vocab.len()));
+            let tok = self.vocab.get(id).unwrap_or_else(|| {
+                panic!(
+                    "decode 遇到越界 token id {id}（词表大小 {}）",
+                    self.vocab.len()
+                )
+            });
             bytes.extend_from_slice(tok);
         }
         match String::from_utf8(bytes) {
@@ -366,7 +386,10 @@ impl BPETokenizer {
                     }
                     // 非法字节：不该出现，保留警告便于定位
                     None => {
-                        eprintln!("[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节", e.utf8_error());
+                        eprintln!(
+                            "[decode] 警告：拼接出非法 UTF-8（{}），已跳过无效字节",
+                            e.utf8_error()
+                        );
                         skip_invalid_utf8(bytes)
                     }
                 }
@@ -381,7 +404,7 @@ impl BPETokenizer {
             "pretok": self.pretok,
             "byte_ids": self.byte_id,
             "merges": self.merges.iter().map(|(a, b, r)| vec![*a, *b, *r]).collect::<Vec<_>>(),
-            "vocab": self.vocab.iter().map(|v| v.clone()).collect::<Vec<_>>(),
+            "vocab": self.vocab.to_vec(),
         })
     }
 
@@ -427,7 +450,12 @@ impl BPETokenizer {
             None => (0u32..256).collect(),
         };
         assert_eq!(byte_id.len(), 256, "byte_ids 必须恰好 256 项");
-        BPETokenizer { merges, vocab, byte_id, pretok }
+        BPETokenizer {
+            merges,
+            vocab,
+            byte_id,
+            pretok,
+        }
     }
 }
 
@@ -453,7 +481,8 @@ pub fn gpt2_pretokenize(text: &str) -> Vec<Vec<u8>> {
     // 结果一致；真要严格对齐需要 `regex` 的 Unicode 属性支持（见模块测试的说明）。
     let is_letter = |c: u8| c.is_ascii_alphabetic() || c >= 0x80;
     let is_num = |c: u8| c.is_ascii_digit();
-    let is_space = |c: u8| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c;
+    let is_space =
+        |c: u8| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c;
     while i < b.len() {
         let start = i;
         // 分支 1：英文缩写后缀（'s / 't / 're / 've / 'm / 'll / 'd）
@@ -501,7 +530,12 @@ pub fn gpt2_pretokenize(text: &str) -> Vec<Vec<u8>> {
         }
         // 分支 4：可选的单个前导空格 + 一串标点/符号（非空白、非字母、非数字）
         let mut j = i;
-        if b[j] == b' ' && j + 1 < b.len() && !is_space(b[j + 1]) && !is_letter(b[j + 1]) && !is_num(b[j + 1]) {
+        if b[j] == b' '
+            && j + 1 < b.len()
+            && !is_space(b[j + 1])
+            && !is_letter(b[j + 1])
+            && !is_num(b[j + 1])
+        {
             j += 1;
         }
         if j < b.len() && !is_space(b[j]) && !is_letter(b[j]) && !is_num(b[j]) {
@@ -588,26 +622,26 @@ impl Tokenizer {
                  SentencePiece / WordPiece / Unigram 需要另做转换"
             ));
         }
-        if let Some(nrm) = j.get("normalizer") {
-            if !nrm.is_null() {
-                // 只放行 **NFC**：Qwen2.5 系列带 `{"type":"NFC"}`（Qwen2 是 null，所以以前能过）。
-                // NFC = Unicode 规范合成（`e` + U+0301 → `é`），对**已经处于 NFC 的文本是
-                // 恒等变换**——中文、常规英文、正常输入的文本都已是 NFC，分词结果与 HF
-                // 完全一致；只有"组合字符序列"这类输入才会不同，所以这里放行并打印提示。
-                // 其余归一化形式（NFD / NFKC / NFKD / Sequence）会真正改变字节序列，仍然拒绝。
-                let t = nrm.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                if t != "NFC" {
-                    return Err(format!(
-                        "tokenizer.json 带 normalizer（{nrm}）：本仓库只放行 `NFC`\
+        if let Some(nrm) = j.get("normalizer")
+            && !nrm.is_null()
+        {
+            // 只放行 **NFC**：Qwen2.5 系列带 `{"type":"NFC"}`（Qwen2 是 null，所以以前能过）。
+            // NFC = Unicode 规范合成（`e` + U+0301 → `é`），对**已经处于 NFC 的文本是
+            // 恒等变换**——中文、常规英文、正常输入的文本都已是 NFC，分词结果与 HF
+            // 完全一致；只有"组合字符序列"这类输入才会不同，所以这里放行并打印提示。
+            // 其余归一化形式（NFD / NFKC / NFKD / Sequence）会真正改变字节序列，仍然拒绝。
+            let t = nrm.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            if t != "NFC" {
+                return Err(format!(
+                    "tokenizer.json 带 normalizer（{nrm}）：本仓库只放行 `NFC`\
                          （对已是 NFC 的文本是恒等变换），`{t}` 会改变字节序列、与 HF 分词结果不一致"
-                    ));
-                }
-                println!(
-                    "  提示：该分词器声明了 NFC 归一化。本仓库不实现 Unicode 归一化，\
+                ));
+            }
+            println!(
+                "  提示：该分词器声明了 NFC 归一化。本仓库不实现 Unicode 归一化，\
                      对已是 NFC 的文本（中文/常规英文）分词结果与 HF 一致；\
                      含组合字符序列的输入会有差异（如 `e`+U+0301 不会被合成 `é`）。"
-                );
-            }
+            );
         }
         let pt = serde_json::to_string(&j["pre_tokenizer"]).unwrap_or_default();
         if !pt.contains("ByteLevel") {
@@ -620,9 +654,9 @@ impl Tokenizer {
         let dec = |s: &str| -> Result<Vec<u8>, String> {
             s.chars()
                 .map(|c| {
-                    enc.get(&c).copied().ok_or_else(|| {
-                        format!("token `{s}` 含无法映射的字符 U+{:04X}", c as u32)
-                    })
+                    enc.get(&c)
+                        .copied()
+                        .ok_or_else(|| format!("token `{s}` 含无法映射的字符 U+{:04X}", c as u32))
                 })
                 .collect()
         };
@@ -635,7 +669,8 @@ impl Tokenizer {
         for (tok, id) in vocab_obj {
             let id = id
                 .as_u64()
-                .ok_or_else(|| format!("model.vocab 的 `{tok}` 不是整数 id"))? as u32;
+                .ok_or_else(|| format!("model.vocab 的 `{tok}` 不是整数 id"))?
+                as u32;
             str2id.insert(tok.clone(), id);
         }
         let mut specials_raw: Vec<(String, u32)> = Vec::new();
@@ -653,13 +688,20 @@ impl Tokenizer {
             }
         }
         // id → 字节
-        let n = str2id.values().copied().max().map(|m| m as usize + 1).unwrap_or(0);
+        let n = str2id
+            .values()
+            .copied()
+            .max()
+            .map(|m| m as usize + 1)
+            .unwrap_or(0);
         let mut slots: Vec<Option<Vec<u8>>> = vec![None; n];
         for (tok, id) in &str2id {
             let bytes = dec(tok)?;
             match &slots[*id as usize] {
                 Some(prev) if *prev != bytes => {
-                    return Err(format!("词表 id {id} 同时对应两组字节：{prev:?} vs {bytes:?}"))
+                    return Err(format!(
+                        "词表 id {id} 同时对应两组字节：{prev:?} vs {bytes:?}"
+                    ));
                 }
                 _ => slots[*id as usize] = Some(bytes),
             }
@@ -744,10 +786,17 @@ impl Tokenizer {
         // 额外字面量：所有 special 里除了已认领的 BOS/EOS/PAD 之外的
         let extra_literals: Vec<(String, usize)> = specials_raw
             .into_iter()
-            .filter(|(_, id)| (*id as usize) != bos && (*id as usize) != eos && (*id as usize) != pad)
+            .filter(|(_, id)| {
+                (*id as usize) != bos && (*id as usize) != eos && (*id as usize) != pad
+            })
             .map(|(t, id)| (t, id as usize))
             .collect();
-        let inner = Inner::Bpe(BPETokenizer { merges, vocab, byte_id, pretok: true });
+        let inner = Inner::Bpe(BPETokenizer {
+            merges,
+            vocab,
+            byte_id,
+            pretok: true,
+        });
         Ok(Tokenizer {
             inner,
             specials: Some(SpecialTokens { bos, eos, pad }),
@@ -813,7 +862,11 @@ impl ImageTokens {
 
     /// 真实 VQ 码本下标 -> 词表 id
     pub fn cb_id(&self, code: usize) -> usize {
-        assert!(code < self.cb_count, "VQ 码 {code} 超出码本大小 {}", self.cb_count);
+        assert!(
+            code < self.cb_count,
+            "VQ 码 {code} 超出码本大小 {}",
+            self.cb_count
+        );
         self.cb_first + code
     }
 
@@ -974,7 +1027,12 @@ impl Tokenizer {
     /// 新建分词器都要挂上特殊 token：id 从内容词表的末尾接着排
     fn wrap(inner: Inner) -> Self {
         let specials = Some(SpecialTokens::new(inner.vocab_size()));
-        Tokenizer { inner, specials, image: None, extra_literals: Vec::new() }
+        Tokenizer {
+            inner,
+            specials,
+            image: None,
+            extra_literals: Vec::new(),
+        }
     }
 
     /// 挂上图片 token 区间（id 紧跟在 PAD 之后），供图片理解/生成使用。
@@ -1065,7 +1123,8 @@ impl Tokenizer {
     }
 
     fn is_special(&self, id: usize) -> bool {
-        self.specials.map_or(false, |s| s.contains(id)) || self.image.map_or(false, |im| im.contains(id))
+        self.specials.is_some_and(|s| s.contains(id))
+            || self.image.is_some_and(|im| im.contains(id))
     }
 
     /// 文本 -> id 序列。
@@ -1093,7 +1152,7 @@ impl Tokenizer {
             }
             let mut hit: Option<(usize, Hit, usize)> = None; // (位置, 命中, 字面量字节数)
             let note = |p: usize, h: Hit, len: usize, hit: &mut Option<(usize, Hit, usize)>| {
-                if hit.map_or(true, |(best, _, _)| p < best) {
+                if hit.is_none_or(|(best, _, _)| p < best) {
                     *hit = Some((p, h, len));
                 }
             };
@@ -1109,10 +1168,10 @@ impl Tokenizer {
                     note(p, Hit::Id(*id), lit.len(), &mut hit);
                 }
             }
-            if self.image.is_some() {
-                if let Some(p) = rest.find(IMAGE_LITERAL) {
-                    note(p, Hit::Image, IMAGE_LITERAL.len(), &mut hit);
-                }
+            if self.image.is_some()
+                && let Some(p) = rest.find(IMAGE_LITERAL)
+            {
+                note(p, Hit::Image, IMAGE_LITERAL.len(), &mut hit);
             }
             match hit {
                 Some((p, what, len)) => {
@@ -1270,8 +1329,8 @@ impl Tokenizer {
 
     /// 从文件加载分词器（自动识别 char/bpe 类型，只读一次文件）
     pub fn load(path: &str) -> Self {
-        let mut f = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
+        let mut f =
+            std::fs::File::open(path).unwrap_or_else(|e| panic!("无法打开分词器文件 {path}: {e}"));
         let mut text = String::new();
         f.read_to_string(&mut text)
             .unwrap_or_else(|e| panic!("读取分词器文件 {path} 失败: {e}"));
@@ -1294,7 +1353,8 @@ impl Tokenizer {
             let s = &json["specials"];
             let read = |k: &str| {
                 s[k].as_u64()
-                    .unwrap_or_else(|| panic!("分词器 specials.{k} 缺失或不是整数")) as usize
+                    .unwrap_or_else(|| panic!("分词器 specials.{k} 缺失或不是整数"))
+                    as usize
             };
             let sp = SpecialTokens {
                 bos: read("bos"),
@@ -1336,7 +1396,8 @@ impl Tokenizer {
             let s = &json["image"];
             let read = |k: &str| {
                 s[k].as_u64()
-                    .unwrap_or_else(|| panic!("分词器 image.{k} 缺失或不是整数")) as usize
+                    .unwrap_or_else(|| panic!("分词器 image.{k} 缺失或不是整数"))
+                    as usize
             };
             let im = ImageTokens {
                 start: read("start"),
@@ -1347,7 +1408,9 @@ impl Tokenizer {
                 cb_count: read("cb_count"),
             };
             // 区间必须紧接 PAD 且内部连续，否则词表大小与模型嵌入表对不上
-            let pad = specials.expect("分词器带 image 字段时必须也有 specials").pad;
+            let pad = specials
+                .expect("分词器带 image 字段时必须也有 specials")
+                .pad;
             assert_eq!(
                 im.start,
                 pad + 1,
@@ -1356,7 +1419,11 @@ impl Tokenizer {
                 pad + 1
             );
             assert_eq!(im.ph_first, im.start + 1, "image.ph_first 必须紧跟 start");
-            assert_eq!(im.end, im.ph_first + im.count, "image.end 必须紧跟占位符区间");
+            assert_eq!(
+                im.end,
+                im.ph_first + im.count,
+                "image.end 必须紧跟占位符区间"
+            );
             assert_eq!(im.cb_first, im.end + 1, "image.cb_first 必须紧跟 end");
             Some(im)
         } else {
@@ -1376,7 +1443,12 @@ impl Tokenizer {
                     .collect()
             })
             .unwrap_or_default();
-        Tokenizer { inner, specials, image, extra_literals }
+        Tokenizer {
+            inner,
+            specials,
+            image,
+            extra_literals,
+        }
     }
 }
 
@@ -1589,8 +1661,7 @@ mod tests {
             return;
         };
         let naive_merge = |bytes: &[u8]| -> Vec<usize> {
-            let mut ids: Vec<u32> =
-                bytes.iter().map(|&b| bpe.byte_id[b as usize]).collect();
+            let mut ids: Vec<u32> = bytes.iter().map(|&b| bpe.byte_id[b as usize]).collect();
             for &(a, b, new_id) in bpe.merges.iter() {
                 let mut out: Vec<u32> = Vec::with_capacity(ids.len());
                 let mut i = 0;
@@ -1747,7 +1818,10 @@ mod tests {
         let mut tok = Tokenizer::bpe("你好世界你好世界", 300);
         let content = tok.content_vocab_size();
         let im = tok
-            .attach_image_tokens(4 /* P=4 个占位符 */, 8 /* K=8 个码本 token */)
+            .attach_image_tokens(
+                4, /* P=4 个占位符 */
+                8, /* K=8 个码本 token */
+            )
             .expect("带 specials 的新分词器应能挂图片 token");
 
         // id 排布：[内容][bos,eos,pad][start][ph×4][end][vq×8]
@@ -1757,7 +1831,17 @@ mod tests {
         assert_eq!(im.end, im.ph_first + 4);
         assert_eq!(im.cb_first, im.end + 1);
         assert_eq!(tok.vocab_size(), im.cb_first + 8);
-        assert_eq!(im.expand(), vec![im.start, im.ph_first, im.ph_first + 1, im.ph_first + 2, im.ph_first + 3, im.end]);
+        assert_eq!(
+            im.expand(),
+            vec![
+                im.start,
+                im.ph_first,
+                im.ph_first + 1,
+                im.ph_first + 2,
+                im.ph_first + 3,
+                im.end
+            ]
+        );
 
         // 编码时字面量展开；decode 丢弃、verbose 折叠回字面量
         let plain = tok.encode("图:");

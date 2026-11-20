@@ -104,7 +104,11 @@ pub fn encode_e2m1(x: f32) -> u8 {
     let mant23 = bits & 0x7F_FFFF;
     let raw_exp = ((bits >> 23) & 0xFF) as i32;
     // ax 有限且 > 0：f32 的指数域要么正规（1..=254），要么次正规（0）
-    let e = if raw_exp == 0 { i32::MIN } else { raw_exp - 127 };
+    let e = if raw_exp == 0 {
+        i32::MIN
+    } else {
+        raw_exp - 127
+    };
     let one = 1u32 << mb;
 
     if e >= emin {
@@ -217,7 +221,7 @@ impl Fp4Tensor {
     /// 取第 `i` 个元素的 4 位码（低位在前）
     fn code_at(&self, i: usize) -> u8 {
         let byte = self.codes[i / 2];
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             byte & 0x0F
         } else {
             byte >> 4
@@ -339,8 +343,20 @@ mod tests {
             assert_eq!(encode_e2m1(v), c, "E2M1 编码 {v} 应为 {c:#X}");
             assert_eq!(decode_e2m1(c), v, "E2M1 解码 {c:#X} 应为 {v}");
             // 负半轴对称
-            assert_eq!(encode_e2m1(-v), c | 0x8, "E2M1 编码 {} 应为 {:#X}", -v, c | 0x8);
-            assert_eq!(decode_e2m1(c | 0x8), -v, "E2M1 解码 {:#X} 应为 {}", c | 0x8, -v);
+            assert_eq!(
+                encode_e2m1(-v),
+                c | 0x8,
+                "E2M1 编码 {} 应为 {:#X}",
+                -v,
+                c | 0x8
+            );
+            assert_eq!(
+                decode_e2m1(c | 0x8),
+                -v,
+                "E2M1 解码 {:#X} 应为 {}",
+                c | 0x8,
+                -v
+            );
         }
     }
 
@@ -365,9 +381,17 @@ mod tests {
     fn test_e2m1_unit_roundoff() {
         assert_eq!(UNIT_ROUNDOFF, 0.25);
         // 0.25 落在 0 与 0.5 的正中点：ties-to-even 取偶数档（0）
-        assert_eq!(encode_e2m1(0.25), 0x0, "0.25 是 0 与 0.5 的中点，应取偶数档 0");
+        assert_eq!(
+            encode_e2m1(0.25),
+            0x0,
+            "0.25 是 0 与 0.5 的中点，应取偶数档 0"
+        );
         // 0.75 落在 0.5 与 1.0 的中点：ties-to-even 取尾数为偶的 1.0（码 0x2）
-        assert_eq!(encode_e2m1(0.75), 0x2, "0.75 是 0.5 与 1.0 的中点，应取尾数为偶的 1.0");
+        assert_eq!(
+            encode_e2m1(0.75),
+            0x2,
+            "0.75 是 0.5 与 1.0 的中点，应取尾数为偶的 1.0"
+        );
         // 5.0 落在 4.0 与 6.0 的中点：ties-to-even 取偶数档（4.0 ← 码 6）
         assert_eq!(encode_e2m1(5.0), 0x6, "5.0 是 4 与 6 的中点，应取偶数档 4");
         // 稍偏一点就跨过中点
@@ -375,7 +399,10 @@ mod tests {
         assert_eq!(decode_e2m1(encode_e2m1(4.9)), 4.0);
         // 最差相对误差发生在 [4,6) 段：最近邻间距 2，相对 2/4 = 50%
         let worst = (6.0 - 4.0) / 4.0;
-        assert!((worst - 2.0 * UNIT_ROUNDOFF).abs() < 1e-6, "最差相对误差 50%");
+        assert!(
+            (worst - 2.0 * UNIT_ROUNDOFF).abs() < 1e-6,
+            "最差相对误差 50%"
+        );
     }
 
     /// nibble 打包必须无损且**字节数如实**：`n` 个元素占 `ceil(n/2)` 字节。
@@ -386,13 +413,20 @@ mod tests {
         let q = Fp4Tensor::from_slice(&data, vec![8], 4);
         assert_eq!(q.elements(), 8);
         assert_eq!(q.blocks(), 2);
-        assert_eq!(q.bytes(), 4 + 2 * 4, "8 元素 FP4 应占 ceil(8/2)=4 字节码 + 2 个 scale");
+        assert_eq!(
+            q.bytes(),
+            4 + 2 * 4,
+            "8 元素 FP4 应占 ceil(8/2)=4 字节码 + 2 个 scale"
+        );
         // 每个块自己的 scale = amax/6；块内数值本身就在格点上，仅被 scale 缩放
         for (i, &x) in data.iter().enumerate() {
             let back = q.dequantize_flat()[i];
             let blk_max = if i < 4 { 1.5 } else { 6.0 };
             let expect = x / blk_max * blk_max;
-            assert!((back - expect).abs() < 1e-6, "{x} 往返后应为 {expect}，实际 {back}");
+            assert!(
+                (back - expect).abs() < 1e-6,
+                "{x} 往返后应为 {expect}，实际 {back}"
+            );
         }
         // 奇数长度：最后一个字节只用了低半字节，字节数仍是 ceil(n/2)
         let odd = Fp4Tensor::from_slice(&[1.0, 1.0, 1.0], vec![3], 32);
@@ -407,7 +441,10 @@ mod tests {
         let n = 128;
         let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
         let q4 = Fp4Tensor::from_slice(&data, vec![n], TRAIN_BLOCK);
-        assert!((q4.bits_per_element() - 5.0).abs() < 1e-9, "FP4/32 应为 5 bit/元素");
+        assert!(
+            (q4.bits_per_element() - 5.0).abs() < 1e-9,
+            "FP4/32 应为 5 bit/元素"
+        );
         let t = Tensor::from_vec(data, vec![n]);
         let q8 = fp8::Fp8Tensor::quantize(&t, fp8::TRAIN_FORMAT, fp8::TRAIN_BLOCK);
         let bits8 = 8.0 * q8.elements() as f64 + 32.0 * q8.blocks() as f64;
@@ -464,7 +501,10 @@ mod tests {
     fn test_all_zero_block_no_nan() {
         let data = vec![0f32; 64];
         let q = Fp4Tensor::from_slice(&data, vec![64], TRAIN_BLOCK);
-        assert!(q.dequantize_flat().iter().all(|v| *v == 0.0), "全零块解码应全为 0");
+        assert!(
+            q.dequantize_flat().iter().all(|v| *v == 0.0),
+            "全零块解码应全为 0"
+        );
         assert!(q.scales.iter().all(|s| *s == 0.0), "全零块的 scale 应为 0");
     }
 

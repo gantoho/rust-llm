@@ -205,7 +205,12 @@ pub fn encode(x: f32, fmt: Fp8Format) -> u8 {
     }
     if ax > fmt.max() {
         // E5M2 报 Inf；E4M3 无 Inf，按 OCP 规范饱和到最大有限值
-        return sign | if fmt.has_inf() { fmt.inf_code() } else { fmt.max_finite_code() };
+        return sign
+            | if fmt.has_inf() {
+                fmt.inf_code()
+            } else {
+                fmt.max_finite_code()
+            };
     }
 
     let mb = fmt.mantissa_bits();
@@ -214,7 +219,11 @@ pub fn encode(x: f32, fmt: Fp8Format) -> u8 {
     let raw_exp = ((bits >> 23) & 0xFF) as i32;
     let mant23 = bits & 0x7F_FFFF;
     // ax 有限且 > 0：f32 的指数域要么是正规（1..=254），要么是次正规（0）
-    let e = if raw_exp == 0 { i32::MIN } else { raw_exp - 127 };
+    let e = if raw_exp == 0 {
+        i32::MIN
+    } else {
+        raw_exp - 127
+    };
     let emin = 1 - bias;
     let one = 1u32 << mb;
 
@@ -228,7 +237,12 @@ pub fn encode(x: f32, fmt: Fp8Format) -> u8 {
             m = 0;
             ee += 1;
             if ee > fmt.max_exp() {
-                return sign | if fmt.has_inf() { fmt.inf_code() } else { fmt.max_finite_code() };
+                return sign
+                    | if fmt.has_inf() {
+                        fmt.inf_code()
+                    } else {
+                        fmt.max_finite_code()
+                    };
             }
         }
         sign | (((ee + bias) as u8) << mb) | (m as u8)
@@ -252,7 +266,11 @@ pub fn decode(code: u8, fmt: Fp8Format) -> f32 {
 
     if ef == ef_mask {
         if fmt.has_inf() {
-            return if m == 0 { sign * f32::INFINITY } else { f32::NAN };
+            return if m == 0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            };
         }
         if m == (1u32 << mb) - 1 {
             return f32::NAN; // E4M3 的唯一 NaN 码
@@ -481,7 +499,11 @@ mod tests {
             (-1.0, 0xB8),
             (-448.0, 0xFE),
         ] {
-            assert_eq!(encode(x, Fp8Format::E4M3), code, "E4M3 编码 {x} 应为 {code:#04X}");
+            assert_eq!(
+                encode(x, Fp8Format::E4M3),
+                code,
+                "E4M3 编码 {x} 应为 {code:#04X}"
+            );
             assert_eq!(
                 decode(code, Fp8Format::E4M3),
                 x,
@@ -496,7 +518,11 @@ mod tests {
             (57344.0, 0x7B),
             (-1.0, 0xBC),
         ] {
-            assert_eq!(encode(x, Fp8Format::E5M2), code, "E5M2 编码 {x} 应为 {code:#04X}");
+            assert_eq!(
+                encode(x, Fp8Format::E5M2),
+                code,
+                "E5M2 编码 {x} 应为 {code:#04X}"
+            );
             assert_eq!(
                 decode(code, Fp8Format::E5M2),
                 x,
@@ -504,10 +530,7 @@ mod tests {
             );
         }
         // 两种格式的"1.0"码不同：E4M3 是 0x38，E5M2 是 0x3C —— 指数位宽不同
-        assert_ne!(
-            encode(1.0, Fp8Format::E4M3),
-            encode(1.0, Fp8Format::E5M2)
-        );
+        assert_ne!(encode(1.0, Fp8Format::E4M3), encode(1.0, Fp8Format::E5M2));
     }
 
     /// 非规格化数与两个零：FP8 的次正规码用于表示比 `min_positive_normal` 更小的数
@@ -641,7 +664,10 @@ mod tests {
         assert!(Fp8Format::E5M2.max() > Fp8Format::E4M3.max() * 100.0);
         assert!(Fp8Format::E5M2.min_positive_normal() < Fp8Format::E4M3.min_positive_normal());
         // 两者的相对精度差一倍：E4M3 是 2^-4，E5M2 是 2^-3
-        assert_eq!(Fp8Format::E5M2.unit_roundoff(), 2.0 * Fp8Format::E4M3.unit_roundoff());
+        assert_eq!(
+            Fp8Format::E5M2.unit_roundoff(),
+            2.0 * Fp8Format::E4M3.unit_roundoff()
+        );
     }
 
     /// 模拟 matmul：误差落在 FP8 应有的量级（个位数百分比），不是"差不多等于 0"
@@ -664,7 +690,11 @@ mod tests {
             let (mut sig, mut noise, mut max_abs) = (0f64, 0f64, 0f32);
             for i in 0..de_ref.len() {
                 let e = (de_ref[i] - ds_ref[i]).abs();
-                assert!(e.is_finite(), "{} 模拟结果出现非有限值 —— 多半是编码溢出成了 Inf", f.name());
+                assert!(
+                    e.is_finite(),
+                    "{} 模拟结果出现非有限值 —— 多半是编码溢出成了 Inf",
+                    f.name()
+                );
                 sig += (de_ref[i] as f64).powi(2);
                 noise += (e as f64) * (e as f64);
                 max_abs = max_abs.max(e);
@@ -814,7 +844,10 @@ mod tests {
                 &mut crate::rng::Rng::new(seed),
             )
         };
-        let corpus: Vec<usize> = crate::data::CORPUS.chars().map(|c| c as usize % 64).collect();
+        let corpus: Vec<usize> = crate::data::CORPUS
+            .chars()
+            .map(|c| c as usize % 64)
+            .collect();
 
         // 先正常训几步，让权重进入"有结构"的状态（全随机权重下 loss 对扰动不敏感）
         let model = tiny(5);

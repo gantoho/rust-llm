@@ -1,7 +1,9 @@
 //! experiments：实验类命令实现（scaling / moe / distributed / align / rag / speculative / distill / fp8 / fp4 / csa / mla / demo）。
 
 use crate::autograd::clear_tape;
-use crate::cli::{AlignArgs, CsaArgs, DistArgs, DistillArgs, Fp4Args, Fp8Args, MlaArgs, RagArgs, SpecArgs};
+use crate::cli::{
+    AlignArgs, CsaArgs, DistArgs, DistillArgs, Fp4Args, Fp8Args, MlaArgs, RagArgs, SpecArgs,
+};
 use crate::config::Config;
 use crate::data::{BatchSource, CORPUS, DataLoader, load_documents};
 use crate::layers::{Linear, tanh};
@@ -44,7 +46,7 @@ fn parse_sizes(spec: &str) -> Vec<(usize, usize)> {
         .filter(|s| !s.is_empty())
         .map(|s| {
             let (l, d) = s
-                .split_once(|c: char| c == 'x' || c == 'X' || c == '*')
+                .split_once(['x', 'X', '*'])
                 .unwrap_or_else(|| panic!("规模 `{s}` 格式不对，应为 `层数x宽度`（如 4x128）"));
             let l: usize = l
                 .trim()
@@ -129,7 +131,7 @@ fn print_scan_row(p: &scaling::ScanPoint, x: f64, law: &scaling::PowerLaw) {
 /// 数字可能与论文差很远（tiny 模型 + 小语料，根本不在论文的规模区间），
 /// 但**方法**是同一套：口径统一（非嵌入参数、6ND）、同一 token 预算、固定随机种子。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_scaling(
+pub fn cmd_scaling(
     config_path: &str,
     sizes_spec: &str,
     steps: usize,
@@ -166,8 +168,11 @@ pub(crate) fn cmd_scaling(
     // 语料与分词器：整场扫描共用同一份，否则不同规模的 loss 之间没有可比性
     let train_docs = load_documents(&cfg.train.train_file);
     let val_text = cfg.train.val_file.as_deref().map(read_text);
-    let tokenizer =
-        Tokenizer::from_name(&cfg.train.tokenizer, &train_docs.join("\n"), cfg.train.bpe_vocab);
+    let tokenizer = Tokenizer::from_name(
+        &cfg.train.tokenizer,
+        &train_docs.join("\n"),
+        cfg.train.bpe_vocab,
+    );
 
     // 模型基底：沿用配置里的结构开关（RMSNorm / SwiGLU / GQA / dropout），只改层数与宽度
     let mut base = cfg.model.clone();
@@ -185,7 +190,10 @@ pub(crate) fn cmd_scaling(
                 "批大小 / 上下文 / 学习率",
                 format!("{batch_size} / {block_size} / {lr}"),
             ),
-            ("分词器", format!("{}（词表 {}）", tokenizer.kind(), tokenizer.vocab_size())),
+            (
+                "分词器",
+                format!("{}（词表 {}）", tokenizer.kind(), tokenizer.vocab_size()),
+            ),
             (
                 "模型基底",
                 format!(
@@ -275,7 +283,11 @@ pub(crate) fn cmd_scaling(
             a.params,
             a.tokens,
             a.loss,
-            if (k - 1.0).abs() < 1e-9 { "  ← 20:1 配比点（D/N = 20）" } else { "" }
+            if (k - 1.0).abs() < 1e-9 {
+                "  ← 20:1 配比点（D/N = 20）"
+            } else {
+                ""
+            }
         );
     }
     // 同一条 IsoFLOP 曲线上，参数化损失的最小值不在 k = 1：
@@ -294,7 +306,10 @@ pub(crate) fn cmd_scaling(
         max_lr: lr,
         seed,
     };
-    logln!("=== 二、实测：loss vs 参数量 N（固定 {} token 预算） ===", sc.tokens_per_point(steps));
+    logln!(
+        "=== 二、实测：loss vs 参数量 N（固定 {} token 预算） ===",
+        sc.tokens_per_point(steps)
+    );
     let pts = scaling::params_scan(
         &base,
         &sizes,
@@ -389,7 +404,9 @@ pub(crate) fn cmd_scaling(
 
     // ---------- 4. CSV ----------
     if let Some(path) = out {
-        let mut s = String::from("axis,label,n_layer,n_embd,params,params_non_embedding,steps,tokens,compute_flops,loss\n");
+        let mut s = String::from(
+            "axis,label,n_layer,n_embd,params,params_non_embedding,steps,tokens,compute_flops,loss\n",
+        );
         for (axis, list) in [("params", &pts), ("tokens", &tpts)] {
             for p in list.iter() {
                 s.push_str(&format!(
@@ -452,7 +469,8 @@ fn moe_model(
     seed: u64,
 ) -> Transformer {
     moe_model_full(
-        vocab, n_embd, n_layer, block_size, n_expert, top_k, aux_coef, z_loss, 0, false, 0.001, seed,
+        vocab, n_embd, n_layer, block_size, n_expert, top_k, aux_coef, z_loss, 0, false, 0.001,
+        seed,
     )
 }
 
@@ -476,7 +494,7 @@ fn moe_model_full(
     seed: u64,
 ) -> Transformer {
     assert!(
-        n_embd % 4 == 0,
+        n_embd.is_multiple_of(4),
         "n_embd 必须能被 n_head=4 整除（实际 {n_embd}）"
     );
     let cfg = TransformerConfig {
@@ -510,7 +528,12 @@ fn moe_model_full(
 /// 单批的负载有随机性（哪些 token 恰好落在哪个专家上），要看"训练后路由是否真的被均衡了"
 /// 必须跨多批累计。这里用**训练区**采样：`moe` 子命令的加载器不切验证集
 /// （[`data::CORPUS`] 只有几百个 token），而且路由分布本就该看训练分布。
-fn moe_probe(model: &Transformer, loader: &dyn BatchSource, batches: usize, rng: &mut Rng) -> moe::RouteStats {
+fn moe_probe(
+    model: &Transformer,
+    loader: &dyn BatchSource,
+    batches: usize,
+    rng: &mut Rng,
+) -> moe::RouteStats {
     let mut counts: Vec<usize> = Vec::new();
     let (mut dropped, mut n_tokens) = (0usize, 0usize);
     let mut aux = 0.0f32;
@@ -574,8 +597,8 @@ fn skew_router(model: &Transformer, n_expert: usize) {
 ///
 /// 但"有区分度"与"起点塌缩"必须同时成立：把初始化权重原样留着的话，`logits` 的极差（实测
 /// > 3.0）会盖过 +3.0 的偏置——K = 1 时 8 个专家里 7 个都抢到了 token，起点根本没塌缩。
-/// 所以这里把权重**整体缩小 `WEIGHT_SCALE` 倍**：方向不变（token 区分度还在），幅度压到
-/// 0.5 以内（+3.0 的偏置稳稳胜出 ⇒ 前 `top_k` 个专家吃下全部 token）。
+/// > 所以这里把权重**整体缩小 `WEIGHT_SCALE` 倍**：方向不变（token 区分度还在），幅度压到
+/// > 0.5 以内（+3.0 的偏置稳稳胜出 ⇒ 前 `top_k` 个专家吃下全部 token）。
 ///
 /// 前 `top_k` 个专家的偏置一起抬：K ≥ 2 时只抬专家 0，第二个名额会由（缩小后的）`logits`
 /// 决定、随 token 变化，起点就不再是"全压在前 K 个专家上"了。
@@ -707,7 +730,7 @@ fn print_route_report(tag: &str, st: &moe::RouteStats, top_k: usize) {
 ///    不加的那份会赢者通吃，大部分专家拿不到任何梯度——这就是辅助损失存在的理由。
 /// 3. **容量因子与 Token Dropping**：拿上面那个偏斜的模型，扫不同的容量因子看丢弃比例。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_moe(
+pub fn cmd_moe(
     experts_spec: &str,
     top_k: usize,
     steps: usize,
@@ -765,10 +788,7 @@ pub(crate) fn cmd_moe(
                 },
             ),
             ("容量因子扫描", factors_spec.to_string()),
-            (
-                "分词器",
-                format!("{}（词表 {vocab}）", tokenizer.kind()),
-            ),
+            ("分词器", format!("{}（词表 {vocab}）", tokenizer.kind())),
         ],
     );
 
@@ -796,7 +816,17 @@ pub(crate) fn cmd_moe(
         }
         let k = top_k.min(e);
         let model = moe_model_full(
-            vocab, n_embd, n_layer, block_size, e, k, aux_coef, z_loss, shared_experts, false, 0.001,
+            vocab,
+            n_embd,
+            n_layer,
+            block_size,
+            e,
+            k,
+            aux_coef,
+            z_loss,
+            shared_experts,
+            false,
+            0.001,
             seed,
         );
         let measured: usize = model.parameters().iter().map(|p| p.numel()).sum();
@@ -884,7 +914,8 @@ pub(crate) fn cmd_moe(
 
         // ③ sign 偏置臂：α = 0（不加辅助损失），只推进均衡偏置。
         // 起点同为"全压在前 K 个专家上"，但保留权重区分度（见 `skew_router_weak_weights` 的说明）。
-        let bias_model = moe_model_full(vocab, 32, 1, 32, e, iso_k, 0.0, 0.0, 0, true, bias_lr, seed);
+        let bias_model =
+            moe_model_full(vocab, 32, 1, 32, e, iso_k, 0.0, 0.0, 0, true, bias_lr, seed);
         skew_router_weak_weights(&bias_model, e, iso_k);
         let (b_ref, a_bias) = bias_only_balance(&bias_model, &iso_loader, bias_steps, seed);
         assert!(
@@ -898,7 +929,11 @@ pub(crate) fn cmd_moe(
 
         logln!("  —— K = {iso_k} ——");
         print_route_report("① 不均衡：塌缩起点（哪里都不动）", &b, iso_k);
-        print_route_report(&format!("② α·L_aux：只优化 L_aux {balance_steps} 步"), &a_aux, iso_k);
+        print_route_report(
+            &format!("② α·L_aux：只优化 L_aux {balance_steps} 步"),
+            &a_aux,
+            iso_k,
+        );
         print_route_report(
             &format!("③ sign 偏置：只推进偏置 {bias_steps} 步（γ = {bias_lr}，一次梯度都不算）"),
             &a_bias,
@@ -943,7 +978,10 @@ pub(crate) fn cmd_moe(
             a_bias.aux
         ));
     }
-    logln!("  汇总（同一塌缩起点、同一诊断口径）：\n        {}", iso_summary.join("\n        "));
+    logln!(
+        "  汇总（同一塌缩起点、同一诊断口径）：\n        {}",
+        iso_summary.join("\n        ")
+    );
     logln!(
         "  读法：\n  \
          · L_aux = E·Σ f_i p_i 对 p 是**软**的、对 f 是**硬**的（f 由 argmax 给出，不可导、是常数）。\n  \
@@ -982,21 +1020,29 @@ pub(crate) fn cmd_moe(
         (format!("α = {aux_coef}（加辅助损失）"), aux_coef, false),
     ];
     if bias_balance {
-        arms.push((
-            format!("α = 0 + sign 偏置均衡（γ = {bias_lr}）"),
-            0.0,
-            true,
-        ));
+        arms.push((format!("α = 0 + sign 偏置均衡（γ = {bias_lr}）"), 0.0, true));
     }
     for (tag, alpha, use_bias) in &arms {
         let (alpha, use_bias) = (*alpha, *use_bias);
         let model = moe_model_full(
-            vocab, n_embd, n_layer, block_size, e, k, alpha, z_loss, shared_experts, use_bias,
-            bias_lr, seed,
+            vocab,
+            n_embd,
+            n_layer,
+            block_size,
+            e,
+            k,
+            alpha,
+            z_loss,
+            shared_experts,
+            use_bias,
+            bias_lr,
+            seed,
         );
         let mut rng = Rng::new(seed);
         logln!("  —— {tag} ——");
-        let loss = train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None);
+        let loss = train::train_transformer(
+            &model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None,
+        );
         let mut probe_rng = Rng::new(seed + 1);
         let st = moe_probe(&model, &loader, 16, &mut probe_rng);
         logln!("  训练收尾 loss = {loss:.4}");
@@ -1006,7 +1052,10 @@ pub(crate) fn cmd_moe(
         } else {
             format!("α={alpha}")
         };
-        end_to_end.push(format!("{short}: loss {loss:.4} / 不均衡度 {:.2}", st.imbalance()));
+        end_to_end.push(format!(
+            "{short}: loss {loss:.4} / 不均衡度 {:.2}",
+            st.imbalance()
+        ));
         if alpha == 0.0 && !use_bias {
             skewed = Some(model);
         }
@@ -1036,7 +1085,11 @@ pub(crate) fn cmd_moe(
     logln!("=== 四、容量因子与 Token Dropping（用上面 α = 0 那份模型，负载最不均） ===");
     let mut model = skewed.expect("α = 0 那组必然建过模型");
     let n_tokens = batch_size * block_size;
-    logln!("  每批 {n_tokens} 个 token，K={k} ⇒ 路由分配共 {} 条，平均每个专家 {}", n_tokens * k, n_tokens * k / e);
+    logln!(
+        "  每批 {n_tokens} 个 token，K={k} ⇒ 路由分配共 {} 条，平均每个专家 {}",
+        n_tokens * k,
+        n_tokens * k / e
+    );
     for &cf in &factors {
         model.set_moe_capacity_factor(cf);
         let cap = moe::expert_capacity(n_tokens, e, k, cf);
@@ -1079,7 +1132,7 @@ pub(crate) fn cmd_moe(
 /// 为什么值得这么绕：分布式的坑几乎全在**切分边界**上——错开一格、少算一段、
 /// 拼回时块序没转回来，这些错都不会崩、不会 NaN，只是让模型悄悄收敛到别的地方。
 /// 单进程模拟能让这些边界被逐位对拍钉死，真机调试则要拿 N 张卡去猜。
-pub(crate) fn cmd_distributed(args: &DistArgs) {
+pub fn cmd_distributed(args: &DistArgs) {
     runlog::announce("distributed");
 
     let (dp, tp, pp) = (args.dp, args.tp, args.pp);
@@ -1133,7 +1186,11 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
         let logits = model.forward(ids, b, t, None, false);
         loss::cross_entropy_loss_masked(&logits, targets, None)
     };
-    let total_params: usize = make_model(seed).parameters().iter().map(|p| p.numel()).sum();
+    let total_params: usize = make_model(seed)
+        .parameters()
+        .iter()
+        .map(|p| p.numel())
+        .sum();
     let shard = per_rank_b * t; // 每个 rank 一个 batch 的 token 数
 
     runlog::fields(
@@ -1166,7 +1223,11 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
          各 rank 的本地数据与自己的编号有关，这样「某个 rank 少搬了一块」会在结果里露出来。"
     );
     let locals: Vec<Vec<f32>> = (0..dp)
-        .map(|r| (0..total_params).map(|i| ((i * 37 + r * 11) % 101) as f32 * 0.01).collect())
+        .map(|r| {
+            (0..total_params)
+                .map(|i| ((i * 37 + r * 11) % 101) as f32 * 0.01)
+                .collect()
+        })
         .collect();
     let mut world = distributed::World::new(dp);
     let ring = world.all_reduce_sum(&locals);
@@ -1234,7 +1295,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
     let ref_losses: Vec<f32> = {
         let replicas: Vec<Transformer> = (0..dp).map(|_| make_model(seed)).collect();
         let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
-        let mut opts: Vec<AdamW> = per_rank.iter().map(|p| AdamW::new(lr, p.clone(), wd)).collect();
+        let mut opts: Vec<AdamW> = per_rank
+            .iter()
+            .map(|p| AdamW::new(lr, p.clone(), wd))
+            .collect();
         let mut sync = distributed::DataParallel::new(dp);
         let mut losses = Vec::new();
         for _ in 0..steps {
@@ -1276,8 +1340,9 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
         let replicas: Vec<Transformer> = (0..dp).map(|_| make_model(seed)).collect();
         let per_rank: Vec<Vec<Tensor>> = replicas.iter().map(|m| m.parameters()).collect();
         let mut zero = distributed::ZeroOptimizer::new(stage, dp, total_params, lr, wd);
-        let mut flat: Vec<Vec<f32>> =
-            (0..dp).map(|_| distributed::flatten_params(&per_rank[0])).collect();
+        let mut flat: Vec<Vec<f32>> = (0..dp)
+            .map(|_| distributed::flatten_params(&per_rank[0]))
+            .collect();
         let mut losses = Vec::new();
         for _ in 0..steps {
             let mut grads = Vec::with_capacity(dp);
@@ -1416,7 +1481,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
         ("dW1（按列拼回）", max_abs_diff(&dw1_full, &w1_ref.grad())),
         ("db1", max_abs_diff(&db1_full, &b1_ref.grad())),
         ("dW2（按行拼回）", max_abs_diff(&dw2_full, &w2_ref.grad())),
-        ("db2", max_abs_diff(&tpm.fc2().bias().grad(), &b2_ref.grad())),
+        (
+            "db2",
+            max_abs_diff(&tpm.fc2().bias().grad(), &b2_ref.grad()),
+        ),
     ];
     logln!(
         "  N = {} 的切分 vs 单卡（最大逐元素差）：{}",
@@ -1458,7 +1526,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
     for l in &ref_layers {
         y = l.forward(&y);
     }
-    y.mul(&y).sum().mul_scalar(1.0 / total_rows as f32).backward();
+    y.mul(&y)
+        .sum()
+        .mul_scalar(1.0 / total_rows as f32)
+        .backward();
 
     // 每个 micro-batch 的损失之和 = 全 batch 的损失，缩放因子按同一个分母给
     let loss_of = |y: &Tensor| y.mul(y).sum().mul_scalar(1.0 / total_rows as f32);
@@ -1470,15 +1541,16 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
     };
 
     let gpipe = distributed::Pipeline::new(chain(seed + 3), distributed::Schedule::gpipe(mb, p));
-    let rep_g = gpipe.run(&(0..mb).map(|i| inputs(i)).collect::<Vec<Tensor>>(), loss_of);
+    let rep_g = gpipe.run(&(0..mb).map(&inputs).collect::<Vec<Tensor>>(), loss_of);
     let onef1b = distributed::Pipeline::new(
         chain(seed + 3),
         distributed::Schedule::one_forward_one_backward(mb, p),
     );
-    let rep_o = onef1b.run(&(0..mb).map(|i| inputs(i)).collect::<Vec<Tensor>>(), loss_of);
+    let rep_o = onef1b.run(&(0..mb).map(inputs).collect::<Vec<Tensor>>(), loss_of);
 
-    let outs =
-        |rep: &distributed::RunReport| -> Vec<f32> { rep.outputs.iter().flat_map(|t| t.data()).collect() };
+    let outs = |rep: &distributed::RunReport| -> Vec<f32> {
+        rep.outputs.iter().flat_map(|t| t.data()).collect()
+    };
     let (g_out, o_out) = (outs(&rep_g), outs(&rep_o));
     assert!(
         max_abs_diff(&g_out, &y.data()) < 1e-5,
@@ -1559,7 +1631,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
             col_cover[c] += 1;
         }
     }
-    assert!(col_cover.iter().all(|&c| c == 1), "输出列在 tp 轴上不重不漏被破坏");
+    assert!(
+        col_cover.iter().all(|&c| c == 1),
+        "输出列在 tp 轴上不重不漏被破坏"
+    );
 
     let mut layer_cover = vec![0usize; layers_demo];
     for pp_i in 0..pp {
@@ -1577,7 +1652,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
             layer_cover[k] += 1;
         }
     }
-    assert!(layer_cover.iter().all(|&c| c == 1), "层在 pp 轴上不重不漏被破坏");
+    assert!(
+        layer_cover.iter().all(|&c| c == 1),
+        "层在 pp 轴上不重不漏被破坏"
+    );
 
     // dp 轴上是**复制**：同一个 (tp, pp) 上的 dp 个 rank 持有完全一样的参数分片，
     // 只有样本区间不同——这正是"参数不按 dp 切"的意思
@@ -1606,7 +1684,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
                 );
                 assert_eq!(other.columns, plan.columns, "dp 副本的参数分片必须完全相同");
                 assert_eq!(other.layers, plan.layers);
-                assert_ne!(other.batch, plan.batch, "dp 轴切的是数据：各副本的样本区间不能相同");
+                assert_ne!(
+                    other.batch, plan.batch,
+                    "dp 轴切的是数据：各副本的样本区间不能相同"
+                );
             }
         }
     }
@@ -1628,7 +1709,10 @@ pub(crate) fn cmd_distributed(args: &DistArgs) {
             batch_cover[k] += 1;
         }
     }
-    assert!(batch_cover.iter().all(|&c| c == 1), "样本在 dp 轴上不重不漏被破坏");
+    assert!(
+        batch_cover.iter().all(|&c| c == 1),
+        "样本在 dp 轴上不重不漏被破坏"
+    );
     logln!(
         "  自检通过：参数在 (tp, pp) 网格上不重不漏，dp 轴上是**复制**（同一分片、不同数据）；\n  \
          数据在 dp 轴上不重不漏，在 (tp, pp) 内部是复制的。"
@@ -1686,20 +1770,32 @@ fn loss_curve(losses: &[f32], points: usize) -> String {
 /// PPO 看 KL(k3) 的两个"本该如此"与它把策略拴在原地的效果。
 ///
 /// 四件套共用同一套小 Transformer 结构，只在初始化种子上分开：结构一样，差异才能全归给算法。
-pub(crate) fn cmd_align(a: &AlignArgs) {
+pub fn cmd_align(a: &AlignArgs) {
     runlog::announce("align");
 
     assert!(
-        a.n_embd % 4 == 0,
+        a.n_embd.is_multiple_of(4),
         "n_embd 必须能被 n_head=4 整除（实际 {}）",
         a.n_embd
     );
-    assert!(a.rm_steps >= 1, "奖励模型至少要训 1 步（实际 {}）", a.rm_steps);
+    assert!(
+        a.rm_steps >= 1,
+        "奖励模型至少要训 1 步（实际 {}）",
+        a.rm_steps
+    );
     assert!(a.steps >= 1, "DPO 至少要训 1 步（实际 {}）", a.steps);
     assert!(a.beta > 0.0, "DPO 的 β 必须为正（实际 {}）", a.beta);
-    assert!(a.clip_eps > 0.0, "裁剪范围 ε 必须为正（实际 {}）", a.clip_eps);
+    assert!(
+        a.clip_eps > 0.0,
+        "裁剪范围 ε 必须为正（实际 {}）",
+        a.clip_eps
+    );
     assert!(a.kl_coef > 0.0, "KL 系数必须为正（实际 {}）", a.kl_coef);
-    assert!(a.group_size >= 2, "组内相对优势至少要 2 条回答（实际 {}）", a.group_size);
+    assert!(
+        a.group_size >= 2,
+        "组内相对优势至少要 2 条回答（实际 {}）",
+        a.group_size
+    );
 
     let tokenizer = Tokenizer::char(CORPUS);
     let vocab = tokenizer.vocab_size();
@@ -1717,12 +1813,19 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         };
         Transformer::new(cfg, &mut Rng::new(s))
     };
-    let n_params: usize = backbone(a.seed).parameters().iter().map(|p| p.numel()).sum();
+    let n_params: usize = backbone(a.seed)
+        .parameters()
+        .iter()
+        .map(|p| p.numel())
+        .sum();
 
     runlog::fields(
         "本次运行参数",
         &[
-            ("奖励模型步数 / 学习率", format!("{} / {}", a.rm_steps, a.rm_lr)),
+            (
+                "奖励模型步数 / 学习率",
+                format!("{} / {}", a.rm_steps, a.rm_lr),
+            ),
             ("DPO 步数 / 学习率", format!("{} / {}", a.steps, a.lr)),
             ("DPO β", a.beta.to_string()),
             ("裁剪范围 ε", a.clip_eps.to_string()),
@@ -1731,7 +1834,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
             ("批大小 / 上下文", format!("{} / {}", a.batch_size, t)),
             (
                 "模型",
-                format!("n_layer={} n_embd={} n_head=4（GELU FFN）", a.n_layer, a.n_embd),
+                format!(
+                    "n_layer={} n_embd={} n_head=4（GELU FFN）",
+                    a.n_layer, a.n_embd
+                ),
             ),
             ("参数量", n_params.to_string()),
             ("分词器", format!("{}（词表 {vocab}）", tokenizer.kind())),
@@ -1741,7 +1847,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     // ---------- 一、序列对数概率：对齐只算「模型要说的话」 ----------
     logln!("=== 一、序列对数概率与掩码：算 loss 的位置必须与推理时说的话一致 ===");
     let take = 24.min(corpus_ids.len() - 1);
-    assert!(take >= 12, "内置语料太短，凑不出「提问 + 回答」（实际只有 {take} 个 token）");
+    assert!(
+        take >= 12,
+        "内置语料太短，凑不出「提问 + 回答」（实际只有 {take} 个 token）"
+    );
     let mut with_bos: Vec<usize> = tokenizer.bos_id().into_iter().collect();
     with_bos.extend_from_slice(&corpus_ids[..take]);
     let prompt_len = 1 + 8; // BOS + 前 8 个 token 当作"提问"
@@ -1752,10 +1861,21 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     let ans_lp = align::sequence_logprob_value(&probe, &ans);
 
     // 掩码口径自检：整条序列除首位外全参与；只算回答时恰好少掉 prompt 那一段
-    assert_eq!(full.supervised(), full.len() - 1, "整条序列应除首位外全部参与");
-    assert_eq!(ans.supervised(), ans.len() - prompt_len, "只有回答部分该参与");
+    assert_eq!(
+        full.supervised(),
+        full.len() - 1,
+        "整条序列应除首位外全部参与"
+    );
+    assert_eq!(
+        ans.supervised(),
+        ans.len() - prompt_len,
+        "只有回答部分该参与"
+    );
     // 少算若干项 log π ≤ 0 的和，对数概率只会更"接近 0"（即更大）
-    assert!(full_lp <= ans_lp, "整条序列的对数概率不可能比只算回答的更大");
+    assert!(
+        full_lp <= ans_lp,
+        "整条序列的对数概率不可能比只算回答的更大"
+    );
 
     logln!(
         "  序列长度 {}（BOS + 语料前 {} 个 token），前 {} 个位置当作「提问」（含 BOS）。",
@@ -1763,8 +1883,16 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         take,
         prompt_len
     );
-    logln!("  整条都算：监督位 {} ｜ log π = {:.4}", full.supervised(), full_lp);
-    logln!("  只算回答：监督位 {} ｜ log π = {:.4}", ans.supervised(), ans_lp);
+    logln!(
+        "  整条都算：监督位 {} ｜ log π = {:.4}",
+        full.supervised(),
+        full_lp
+    );
+    logln!(
+        "  只算回答：监督位 {} ｜ log π = {:.4}",
+        ans.supervised(),
+        ans_lp
+    );
     logln!(
         "  两者相差 {:.4}，正是提问那 {} 项的和。",
         ans_lp - full_lp,
@@ -1804,7 +1932,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
             / set.len() as f32
     };
     let eval_scores = |m: &align::RewardModel| -> Vec<(f32, f32)> {
-        eval_pairs.iter().map(|(c, r)| (m.score_value(c), m.score_value(r))).collect()
+        eval_pairs
+            .iter()
+            .map(|(c, r)| (m.score_value(c), m.score_value(r)))
+            .collect()
     };
 
     // Δ = 0 时 BT 损失取到最大值 ln 2：两条回答不分伯仲，正是最该被推开的时刻
@@ -1841,10 +1972,15 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         "排序准确率应明显高于随机 0.5：训练前 {acc_before:.3} → 训练后 {acc_after:.3}"
     );
 
-    logln!("  每条回答的长度：训练用 {:?} 个 token，评测用 {:?}（评测长度没在训练里出现过）。",
+    logln!(
+        "  每条回答的长度：训练用 {:?} 个 token，评测用 {:?}（评测长度没在训练里出现过）。",
         train_pairs.iter().map(|(c, _)| c.len()).collect::<Vec<_>>(),
-        eval_pairs.iter().map(|(c, _)| c.len()).collect::<Vec<_>>());
-    logln!("  Δ = 0 时损失 = ln 2 = {:.4}（最大值，训练把它推大）", tie_loss);
+        eval_pairs.iter().map(|(c, _)| c.len()).collect::<Vec<_>>()
+    );
+    logln!(
+        "  Δ = 0 时损失 = ln 2 = {:.4}（最大值，训练把它推大）",
+        tie_loss
+    );
     logln!(
         "  {} 步成对训练（lr = {}）：平均偏好边界 {:.4} → {:.4}",
         a.rm_steps,
@@ -1889,7 +2025,8 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         .map(|c| (c[0], c[1]))
         .collect();
 
-    let snapshot = |m: &Transformer| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
+    let snapshot =
+        |m: &Transformer| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
     let ref_snapshot = snapshot(&reference);
     let policy_margin = |m: &Transformer| -> f32 {
         dpo_pairs
@@ -1901,7 +2038,9 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
             .sum::<f32>()
     };
     let dpo_batch = |m: &Transformer| -> f32 {
-        tensor::no_grad(|| align::dpo_batch_loss(m, &dpo_pairs, &ref_logprobs, a.beta, false).item())
+        tensor::no_grad(|| {
+            align::dpo_batch_loss(m, &dpo_pairs, &ref_logprobs, a.beta, false).item()
+        })
     };
 
     // 策略与参考模型同一个模型时，隐式奖励之差为 0 ⇒ DPO 损失 = ln 2
@@ -1931,7 +2070,11 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     let margin_after = policy_margin(&policy);
     let loss_after = dpo_batch(&policy);
 
-    assert_eq!(snapshot(&reference), ref_snapshot, "参考模型必须全程冻结（一个参数都不能动）");
+    assert_eq!(
+        snapshot(&reference),
+        ref_snapshot,
+        "参考模型必须全程冻结（一个参数都不能动）"
+    );
     assert!(
         margin_after > margin_before,
         "训练后 chosen/rejected 的对数概率边界应严格变大：{margin_before:.6} → {margin_after:.6}"
@@ -1941,7 +2084,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         "训练后 DPO 损失应下降：{loss_before:.6} → {loss_after:.6}"
     );
 
-    logln!("  {} 对偏好样本（同一 prompt 下好 / 坏回答，长度相同只差最后一个 token）", dpo_pairs.len());
+    logln!(
+        "  {} 对偏好样本（同一 prompt 下好 / 坏回答，长度相同只差最后一个 token）",
+        dpo_pairs.len()
+    );
     logln!(
         "  策略 = 参考模型时损失 = ln 2 = {:.4}（隐式奖励之差为 0，与奖励模型的 Δ = 0 同一个位置）",
         tied_loss
@@ -1954,7 +2100,12 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         margin_before,
         margin_after
     );
-    logln!("  DPO 损失：{:.4} → {:.4}｜{}", loss_before, loss_after, loss_curve(&losses, 6));
+    logln!(
+        "  DPO 损失：{:.4} → {:.4}｜{}",
+        loss_before,
+        loss_after,
+        loss_curve(&losses, 6)
+    );
     logln!(
         "  读法：DPO 把「奖励」取成 β·(log π_θ − log π_ref)，于是 RLHF 的「奖励最大化 + KL 约束」\n  \
          有闭式最优解——不需要单独训一个奖励模型。β 是「允许偏离参考模型多远」的温度：\n  \
@@ -1968,7 +2119,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     let adv_mean = demo_adv.iter().sum::<f32>() / demo_adv.len() as f32;
     // 总体标准差（除以 n，不是 n−1）
     let adv_var = demo_adv.iter().map(|x| x * x).sum::<f32>() / demo_adv.len() as f32;
-    assert!(adv_mean.abs() < 1e-6, "组内优势的均值必须为 0，实际 {adv_mean}");
+    assert!(
+        adv_mean.abs() < 1e-6,
+        "组内优势的均值必须为 0，实际 {adv_mean}"
+    );
     assert!(
         (adv_var.sqrt() - 1.0).abs() < 1e-6,
         "组内优势的总体标准差必须为 1，实际 {}",
@@ -1990,7 +2144,9 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         adv_mean,
         adv_var.sqrt()
     );
-    logln!("  组内分数全相同（std = 0）时短路返回全 0：否则 NaN 会污染整份参数（不报错，只训出哑巴模型）");
+    logln!(
+        "  组内分数全相同（std = 0）时短路返回全 0：否则 NaN 会污染整份参数（不报错，只训出哑巴模型）"
+    );
 
     // 用训练好的奖励模型给一组真实回答打分 → 组内相对优势 → GRPO 损失
     let group: Vec<align::MaskedSequence> = (0..a.group_size)
@@ -2007,7 +2163,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         .map(|s| align::sequence_logprob(&policy, s, false))
         .collect();
     let grpo_value = align::grpo_loss(&logp_policy, &logp_old, &group_adv, a.clip_eps).item();
-    assert!(grpo_value.is_finite(), "GRPO 损失不该是 NaN / inf：{grpo_value}");
+    assert!(
+        grpo_value.is_finite(),
+        "GRPO 损失不该是 NaN / inf：{grpo_value}"
+    );
     logln!(
         "  奖励模型给 {} 条回答打分（含好 / 坏两种末尾 token）：",
         a.group_size
@@ -2015,7 +2174,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     for (i, (r, av)) in group_rewards.iter().zip(&group_adv).enumerate() {
         logln!("    第 {} 条 ｜ 奖励 {:>8.4} ｜ 优势 {:>8.4}", i, r, av);
     }
-    logln!("  GRPO 损失（当前策略 = 采样时的策略，重要性比 ρ ≡ 1）= {:.6}", grpo_value);
+    logln!(
+        "  GRPO 损失（当前策略 = 采样时的策略，重要性比 ρ ≡ 1）= {:.6}",
+        grpo_value
+    );
     logln!(
         "    —— 恰好为 0：ρ ≡ 1 时代理目标就是组内优势本身，而组内优势的均值恒为 0。\n  \
          所以首次更新前 GRPO 的总梯度只来自「谁比组内平均好」，不来自「绝对分有多高」。"
@@ -2033,7 +2195,10 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     let g_clip = lp_new[0].grad()[0];
     let g_open = lp_new[1].grad()[0];
     // 被裁剪的样本：clip 在区间外是常数，梯度为 0；未裁剪的：dL/dlog π = −A·ρ/n = −1·1/2
-    assert!(g_clip.abs() < 1e-6, "被裁剪样本的梯度必须为 0，实际 {g_clip}");
+    assert!(
+        g_clip.abs() < 1e-6,
+        "被裁剪样本的梯度必须为 0，实际 {g_clip}"
+    );
     assert!(
         (g_open + 0.5).abs() < 1e-5,
         "未裁剪样本的 dL/dlog π 应为 −A·ρ/n = −0.5，实际 {g_open}"
@@ -2047,10 +2212,7 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         "    被裁剪那条的 dL/dlog π = {:.2e}（clip 在区间外是常数，梯度恰为 0）",
         g_clip
     );
-    logln!(
-        "    未裁剪那条的 dL/dlog π = {:.4}（= −A·ρ/n）",
-        g_open
-    );
+    logln!("    未裁剪那条的 dL/dlog π = {:.4}（= −A·ρ/n）", g_open);
     logln!(
         "  读法：GRPO 省掉价值网络的关键就是组内平均分——同一 prompt 采一组回答，均值天然是基线，\n  \
          顺手把「这道题本身难不难」这个与策略无关的偏移减掉了。裁剪则是「一步别走太远」：\n  \
@@ -2072,7 +2234,12 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
         } else {
             format!("{:.4}", (2.0 * kl).sqrt() / d.abs())
         };
-        logln!("    delta = {:>5} ｜ KL = {:.6} ｜ √(2KL)/|delta| = {}", d, kl, ratio);
+        logln!(
+            "    delta = {:>5} ｜ KL = {:.6} ｜ √(2KL)/|delta| = {}",
+            d,
+            kl,
+            ratio
+        );
     }
     assert_eq!(align::kl_k3(0.0), 0.0, "π_θ = π_ref 时 KL 必须恰为 0");
     logln!(
@@ -2089,20 +2256,29 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
     let ppo_adv = vec![1.0f32, -1.0f32];
     let ppo_ref = vec![-1.0f32, -4.0f32];
     let mk = |v: Vec<f32>| -> Vec<Tensor> {
-        v.into_iter().map(|x| Tensor::param(vec![x], vec![1])).collect()
+        v.into_iter()
+            .map(|x| Tensor::param(vec![x], vec![1]))
+            .collect()
     };
     let lp_for_grpo = mk(vec![-1.0, -2.0]);
     let lp_ppo0 = mk(vec![-1.0, -2.0]);
     let lp_ppo1 = mk(vec![-1.0, -2.0]);
     let grpo_ref = align::grpo_loss(&lp_for_grpo, &ppo_old, &ppo_adv, a.clip_eps).item();
     let ppo0 = align::ppo_loss(&lp_ppo0, &ppo_old, &ppo_adv, &ppo_ref, a.clip_eps, 0.0).item();
-    let ppo1 = align::ppo_loss(&lp_ppo1, &ppo_old, &ppo_adv, &ppo_ref, a.clip_eps, a.kl_coef).item();
+    let ppo1 = align::ppo_loss(
+        &lp_ppo1, &ppo_old, &ppo_adv, &ppo_ref, a.clip_eps, a.kl_coef,
+    )
+    .item();
     assert!(
         (grpo_ref - ppo0).abs() < 1e-6,
         "kl_coef = 0 时 PPO 必须与 GRPO 完全一致：{grpo_ref} vs {ppo0}"
     );
     assert!(ppo1 > ppo0, "KL 惩罚必须把损失抬高：{ppo0} → {ppo1}");
-    logln!("  kl_coef = 0 时 PPO 与 GRPO 逐位一致：{:.6} vs {:.6}", grpo_ref, ppo0);
+    logln!(
+        "  kl_coef = 0 时 PPO 与 GRPO 逐位一致：{:.6} vs {:.6}",
+        grpo_ref,
+        ppo0
+    );
     logln!(
         "  同一个代理目标加 KL 罚（kl_coef = {}）：{:.6} → {:.6}",
         a.kl_coef,
@@ -2139,7 +2315,7 @@ pub(crate) fn cmd_align(a: &AlignArgs) {
 /// 检索质量的上限由**切块**决定（切错了后面再精巧也补不回来），所以第一节先把分块的
 /// 三条不变量逐条钉住；第二、三节用字符级向量（TF-IDF / 特征哈希）跑检索与 MMR 重排，
 /// 第四节看提示裁剪是否守住预算，第五节接上模型稠密向量做对照（含"为什么它必须先训练"）。
-pub(crate) fn cmd_rag(a: &RagArgs) {
+pub fn cmd_rag(a: &RagArgs) {
     runlog::announce("rag");
 
     assert!(
@@ -2150,13 +2326,21 @@ pub(crate) fn cmd_rag(a: &RagArgs) {
     );
     assert!(a.top_k >= 1, "至少要返回 1 条（实际 {}）", a.top_k);
     assert!(a.hash_dim >= 1, "哈希维度必须为正（实际 {}）", a.hash_dim);
-    assert!(a.context_chars >= 1, "字符预算必须为正（实际 {}）", a.context_chars);
+    assert!(
+        a.context_chars >= 1,
+        "字符预算必须为正（实际 {}）",
+        a.context_chars
+    );
     assert!(
         (0.0..=1.0).contains(&a.mmr_lambda),
         "λ 必须落在 [0, 1]（实际 {}）",
         a.mmr_lambda
     );
-    assert!(a.n_embd % 4 == 0, "n_embd 必须能被 n_head=4 整除（实际 {}）", a.n_embd);
+    assert!(
+        a.n_embd.is_multiple_of(4),
+        "n_embd 必须能被 n_head=4 整除（实际 {}）",
+        a.n_embd
+    );
 
     let opts = rag::ChunkOpts::new(a.chunk_size, a.overlap);
     let aligned = rag::ChunkOpts::aligned(a.chunk_size, a.overlap);
@@ -2165,7 +2349,10 @@ pub(crate) fn cmd_rag(a: &RagArgs) {
     runlog::fields(
         "本次运行参数",
         &[
-            ("切块（上限 / 重叠）", format!("{} / {} 字符", a.chunk_size, a.overlap)),
+            (
+                "切块（上限 / 重叠）",
+                format!("{} / {} 字符", a.chunk_size, a.overlap),
+            ),
             ("返回条数 k", a.top_k.to_string()),
             (
                 "MMR（λ / 池大小）",
@@ -2206,19 +2393,25 @@ pub(crate) fn cmd_rag(a: &RagArgs) {
             );
             rebuilt.extend(c.text.chars().take(c.len() - a.overlap));
         } else {
-            rebuilt.extend(c.text.chars());
+            rebuilt.push_str(&c.text);
         }
     }
-    assert_eq!(rebuilt, CORPUS, "去掉与后块重叠的部分后拼接，必须恰好还原原文");
+    assert_eq!(
+        rebuilt, CORPUS,
+        "去掉与后块重叠的部分后拼接，必须恰好还原原文"
+    );
 
     // 对齐版：块尾尽量落在句子/段落结束符上（找不到断点时才保持原边界）
     let is_break = |c: char| {
-        matches!(c, '。' | '！' | '？' | '；' | '…' | '.' | '!' | '?' | ';' | '\n')
+        matches!(
+            c,
+            '。' | '！' | '？' | '；' | '…' | '.' | '!' | '?' | ';' | '\n'
+        )
     };
     let on_break = |cs: &[rag::Chunk]| -> usize {
         cs.iter()
             .take(cs.len().saturating_sub(1))
-            .filter(|c| c.text.chars().last().map_or(false, is_break))
+            .filter(|c| c.text.chars().last().is_some_and(is_break))
             .count()
     };
     for c in &snapped {
@@ -2343,12 +2536,22 @@ pub(crate) fn cmd_rag(a: &RagArgs) {
 
     let hits = retriever.search(&a.query, a.top_k);
     let mmr = retriever.search_mmr(&a.query, a.top_k, a.mmr_lambda, a.mmr_pool);
-    assert_eq!(hits.len(), a.top_k.min(retriever.len()), "top-k 应返回 min(k, 块数) 条");
+    assert_eq!(
+        hits.len(),
+        a.top_k.min(retriever.len()),
+        "top-k 应返回 min(k, 块数) 条"
+    );
     assert_eq!(mmr.len(), hits.len(), "MMR 与普通 top-k 返回条数应相同");
     for w in hits.windows(2) {
-        assert!(w[0].score >= w[1].score - 1e-6, "top-k 必须按相关度降序（提示裁剪依赖这一点）");
+        assert!(
+            w[0].score >= w[1].score - 1e-6,
+            "top-k 必须按相关度降序（提示裁剪依赖这一点）"
+        );
     }
-    assert!(hits[0].score > 0.0, "查询与语料有共同词项，最高相关度应大于 0");
+    assert!(
+        hits[0].score > 0.0,
+        "查询与语料有共同词项，最高相关度应大于 0"
+    );
 
     let plain_red = max_pairwise_similarity(&retriever, &hits);
     let mmr_red = max_pairwise_similarity(&retriever, &mmr);
@@ -2436,7 +2639,10 @@ pub(crate) fn cmd_rag(a: &RagArgs) {
         tight_prompt.used_chunks, 1,
         "预算极小时仍应保住第一条（按字符截断收下，否则检索白做）"
     );
-    assert!(tight_prompt.used_chars <= tight_budget, "截断后仍不能超预算");
+    assert!(
+        tight_prompt.used_chars <= tight_budget,
+        "截断后仍不能超预算"
+    );
 
     logln!(
         "  预算充足（10 万字符）→ 收下 {} / {} 条、用掉 {} 字符",
@@ -2488,7 +2694,10 @@ pub(crate) fn cmd_rag(a: &RagArgs) {
     let lex_time = t0.elapsed();
     let t1 = std::time::Instant::now();
     let dense = rag::Retriever::build(
-        Box::new(rag::ModelEmbedder::new(std::sync::Arc::new(model), tokenizer)),
+        Box::new(rag::ModelEmbedder::new(
+            std::sync::Arc::new(model),
+            tokenizer,
+        )),
         chunks.clone(),
     );
     let dense_time = t1.elapsed();
@@ -2623,22 +2832,34 @@ impl speculative::Drafter for FixedDrafter {
 
 /// 推测解码（第 34 课）与多 Token 预测（第 35 课）的可运行实验：
 /// 无损性核对 → 接受率与加速比 → 缓存账目 → 首 token 分布等价 → MTP 头当草稿。
-pub(crate) fn cmd_speculative(s: &SpecArgs) {
+pub fn cmd_speculative(s: &SpecArgs) {
     runlog::announce("speculative");
 
     assert!(
-        s.n_embd % 4 == 0,
+        s.n_embd.is_multiple_of(4),
         "n_embd 必须能被 n_head=4 整除（实际 {}）",
         s.n_embd
     );
     assert!(s.gamma >= 1, "草稿长度 γ 至少为 1（实际 {}）", s.gamma);
-    assert!(s.mtp_heads >= 1, "MTP 至少要有 1 个头（实际 {}）", s.mtp_heads);
-    assert!(s.mtp_steps >= 1, "MTP 至少要训 1 步（实际 {}）", s.mtp_steps);
+    assert!(
+        s.mtp_heads >= 1,
+        "MTP 至少要有 1 个头（实际 {}）",
+        s.mtp_heads
+    );
+    assert!(
+        s.mtp_steps >= 1,
+        "MTP 至少要训 1 步（实际 {}）",
+        s.mtp_steps
+    );
     assert!(s.max_new >= 1, "max_new 至少为 1（实际 {}）", s.max_new);
-    assert!(s.trials >= 200, "分布检验至少 200 次试验（实际 {}）", s.trials);
+    assert!(
+        s.trials >= 200,
+        "分布检验至少 200 次试验（实际 {}）",
+        s.trials
+    );
     // 一轮前向要一次喂进 γ+1 个 token（序列最后一个 + γ 个草稿），必须塞得进窗口
     assert!(
-        s.gamma + 1 <= s.block_size,
+        s.gamma < s.block_size,
         "一轮前向要喂 γ+1 = {} 个 token，block_size 至少要 {}（实际 {}）",
         s.gamma + 1,
         s.gamma + 1,
@@ -2699,13 +2920,22 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
         &[
             ("草稿长度 γ", s.gamma.to_string()),
             ("每次生成 token 上限", s.max_new.to_string()),
-            ("MTP 头数 / 训练步数", format!("{} / {}", s.mtp_heads, s.mtp_steps)),
+            (
+                "MTP 头数 / 训练步数",
+                format!("{} / {}", s.mtp_heads, s.mtp_steps),
+            ),
             ("分布检验试验次数", s.trials.to_string()),
             ("采样温度", s.temperature.to_string()),
-            ("批大小 / 上下文", format!("{} / {}", s.batch_size, s.block_size)),
+            (
+                "批大小 / 上下文",
+                format!("{} / {}", s.batch_size, s.block_size),
+            ),
             (
                 "模型",
-                format!("n_layer={} n_embd={} n_head=4（GELU FFN）", s.n_layer, s.n_embd),
+                format!(
+                    "n_layer={} n_embd={} n_head=4（GELU FFN）",
+                    s.n_layer, s.n_embd
+                ),
             ),
             ("参数量", n_params.to_string()),
             ("分词器", format!("{}（词表 {vocab}）", tokenizer.kind())),
@@ -2777,9 +3007,20 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
         spec_stats.emitted
     );
 
-    logln!("  提示词「{}」，目标模型生成 {} 个 token。", s.prompt, s.max_new);
-    logln!("  逐 token 贪心解码：{}", rag::truncate_chars(&plain_text, 44));
-    logln!("  推测解码（γ = {}）：    {}", s.gamma, rag::truncate_chars(&spec_text, 44));
+    logln!(
+        "  提示词「{}」，目标模型生成 {} 个 token。",
+        s.prompt,
+        s.max_new
+    );
+    logln!(
+        "  逐 token 贪心解码：{}",
+        rag::truncate_chars(&plain_text, 44)
+    );
+    logln!(
+        "  推测解码（γ = {}）：    {}",
+        s.gamma,
+        rag::truncate_chars(&spec_text, 44)
+    );
     report("本次统计", &spec_stats);
     logln!(
         "  读法：上面两行文本**逐位相同**。本次 {} 个候选里只有 {} 个被采纳（接受率 {:.4}），输出\n  \
@@ -2925,13 +3166,8 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
     assert!(!prompt_ids.is_empty(), "提示词至少要能编码出 1 个 token");
     let mut ids = prompt_ids.clone();
     let mut drafter = speculative::ModelDrafter::new(&draft, kv);
-    let mut dec = speculative::SpecDecoder::new(
-        &target,
-        kv,
-        s.gamma,
-        sampled,
-        vocab_bytes.as_deref(),
-    );
+    let mut dec =
+        speculative::SpecDecoder::new(&target, kv, s.gamma, sampled, vocab_bytes.as_deref());
     let mut rng = Rng::new(s.seed + 5);
     let mut lens: Vec<usize> = Vec::new();
     for round in 0..6 {
@@ -2956,8 +3192,16 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
         dec.stats().rounds,
         "每轮只该有一次目标前向"
     );
-    logln!("  提示词编码 {} 个 token，连跑 6 轮（γ = {}）。", prompt_ids.len(), dec.gamma());
-    logln!("  每轮产出的 token 数：{:?}（γ + 1 = {} 是上限；被拒的轮次会短一些，靠 rollback 对齐缓存）", lens, dec.gamma() + 1);
+    logln!(
+        "  提示词编码 {} 个 token，连跑 6 轮（γ = {}）。",
+        prompt_ids.len(),
+        dec.gamma()
+    );
+    logln!(
+        "  每轮产出的 token 数：{:?}（γ + 1 = {} 是上限；被拒的轮次会短一些，靠 rollback 对齐缓存）",
+        lens,
+        dec.gamma() + 1
+    );
     logln!(
         "  序列长度：{} → {} ｜ 缓存已喂入位置：{}",
         prompt_ids.len(),
@@ -2993,13 +3237,8 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
         probs: vec![0.5, 0.3, 0.2],
     };
     for _ in 0..s.trials {
-        let mut one = speculative::SpecDecoder::new(
-            &target,
-            kv,
-            s.gamma,
-            sharp,
-            vocab_bytes.as_deref(),
-        );
+        let mut one =
+            speculative::SpecDecoder::new(&target, kv, s.gamma, sharp, vocab_bytes.as_deref());
         let emitted = one.step(&seq, &mut fixed, &mut rng);
         counts[emitted[0]] += 1;
         accepted += one.stats().accepted;
@@ -3016,11 +3255,7 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
         "接受路径与残差修正路径都该被覆盖（采纳 {accepted} ｜ 修正 {corrected}）"
     );
 
-    let mut top: Vec<(usize, f32)> = p_ids
-        .iter()
-        .copied()
-        .zip(p_probs.iter().copied())
-        .collect();
+    let mut top: Vec<(usize, f32)> = p_ids.iter().copied().zip(p_probs.iter().copied()).collect();
     top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     top.truncate(3);
     logln!(
@@ -3129,9 +3364,16 @@ pub(crate) fn cmd_speculative(s: &SpecArgs) {
         first,
         last
     );
-    logln!("  用 MTP 头当草稿生成 {} 个 token：{}", s.max_new, rag::truncate_chars(&mtp_text, 44));
+    logln!(
+        "  用 MTP 头当草稿生成 {} 个 token：{}",
+        s.max_new,
+        rag::truncate_chars(&mtp_text, 44)
+    );
     report("MTP 草稿", &mtp_stats);
-    assert_eq!(mtp_stats.target_forwards, mtp_stats.rounds, "每轮只该有一次目标前向");
+    assert_eq!(
+        mtp_stats.target_forwards, mtp_stats.rounds,
+        "每轮只该有一次目标前向"
+    );
     logln!(
         "  对照：MTP 草稿接受率 {:.4}、每次前向 {:.2} 个 token ｜ 第二节的自回归草稿 {:.4}、{:.2} 个 token",
         mtp_stats.acceptance_rate(),
@@ -3183,17 +3425,21 @@ fn corpus_windows(
 /// 二、**KD 梯度自检**：解析梯度 vs 有限差分。`T²` 缩放写漏、`(p_s − p_t)` 符号写反
 ///     这类错误不会让 loss 报表变难看，只会让训练悄悄变差，数值核对是唯一可靠的防线
 /// 三、**对照实验**：同一个学生、同一批数据、同一步数，唯一差别是有没有 KD 项
-pub(crate) fn cmd_distill(d: &DistillArgs) {
+pub fn cmd_distill(d: &DistillArgs) {
     runlog::announce("distill");
 
     // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
-    assert!(d.teacher_steps >= 1, "教师至少要训 1 步（实际 {}）", d.teacher_steps);
+    assert!(
+        d.teacher_steps >= 1,
+        "教师至少要训 1 步（实际 {}）",
+        d.teacher_steps
+    );
     assert!(d.steps >= 1, "学生至少要训 1 步（实际 {}）", d.steps);
     assert!(d.lr > 0.0, "学习率必须为正（实际 {}）", d.lr);
     assert!(d.batch_size >= 1, "批大小至少为 1（实际 {}）", d.batch_size);
     assert!(d.block >= 4, "上下文长度至少为 4（实际 {}）", d.block);
     assert!(
-        d.teacher_n_embd % 4 == 0 && d.student_n_embd % 4 == 0,
+        d.teacher_n_embd.is_multiple_of(4) && d.student_n_embd.is_multiple_of(4),
         "n_embd 必须能被 n_head=4 整除（教师 {} / 学生 {}）",
         d.teacher_n_embd,
         d.student_n_embd
@@ -3255,12 +3501,12 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
                     format!("{}（共 {} 类）", d.top_k, vocab)
                 },
             ),
-            ("教师步数 / 学生步数", format!("{} / {}", d.teacher_steps, d.steps)),
-            ("学习率", d.lr.to_string()),
             (
-                "批大小 / 上下文",
-                format!("{} / {}", d.batch_size, d.block),
+                "教师步数 / 学生步数",
+                format!("{} / {}", d.teacher_steps, d.steps),
             ),
+            ("学习率", d.lr.to_string()),
+            ("批大小 / 上下文", format!("{} / {}", d.batch_size, d.block)),
             (
                 "教师模型",
                 format!(
@@ -3280,7 +3526,13 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
             ),
             (
                 "语料 / 词表",
-                format!("{} 字符（训练 {} / 验证 {} token），词表 {}", CORPUS.len(), train_ids.len(), val_ids.len(), vocab),
+                format!(
+                    "{} 字符（训练 {} / 验证 {} token），词表 {}",
+                    CORPUS.len(),
+                    train_ids.len(),
+                    val_ids.len(),
+                    vocab
+                ),
             ),
         ],
     );
@@ -3354,12 +3606,22 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
         idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
         idx.truncate(5);
         idx.iter()
-            .map(|&j| format!("`{}` {:.3}", tokenizer.decode(&[j]).escape_default(), row[j]))
+            .map(|&j| {
+                format!(
+                    "`{}` {:.3}",
+                    tokenizer.decode(&[j]).escape_default(),
+                    row[j]
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ｜ ")
     };
     logln!("  T = 1.0 的 top-5：{}", show_top5(1.0));
-    logln!("  T = {:.1} 的 top-5：{}", d.temperature, show_top5(d.temperature));
+    logln!(
+        "  T = {:.1} 的 top-5：{}",
+        d.temperature,
+        show_top5(d.temperature)
+    );
     if d.top_k > 0 {
         logln!(
             "  读法：温度把 logits 除以 T 再 softmax —— T 越大，原本被压到 1e-3 量级的\n  \
@@ -3429,8 +3691,14 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
     // ---------- 三、对照实验：软标签 vs 硬标签 ----------
     logln!("=== 三、对照实验：同一学生、同一批数据、同一步数，只差一个 α ===");
     // 训练与评测都用固定种子的数据窗口：两组学生看到的样本逐位相同
-    let (x_train, y_train) = corpus_windows(&train_ids, d.block, d.batch_size * 4, &mut Rng::new(d.seed + 77));
-    let teacher_train = tensor::no_grad(|| teacher.forward(&x_train, d.batch_size * 4, d.block, None, false));
+    let (x_train, y_train) = corpus_windows(
+        &train_ids,
+        d.block,
+        d.batch_size * 4,
+        &mut Rng::new(d.seed + 77),
+    );
+    let teacher_train =
+        tensor::no_grad(|| teacher.forward(&x_train, d.batch_size * 4, d.block, None, false));
     let (ev_x, ev_y) = corpus_windows(&val_ids, d.block, d.batch_size, &mut Rng::new(d.seed + 91));
     let ev_teacher = tensor::no_grad(|| teacher.forward(&ev_x, d.batch_size, d.block, None, false));
     let ev_soft = distill::SoftTargets::from_logits(
@@ -3466,7 +3734,11 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
 
     let (ce_hard, kl_hard, ag_hard) = run(0.0);
     let (ce_kd, kl_kd, ag_kd) = run(d.alpha);
-    logln!("  评测集：{} 个窗口 × {} 个位置（训练时未见过）", d.batch_size, d.block);
+    logln!(
+        "  评测集：{} 个窗口 × {} 个位置（训练时未见过）",
+        d.batch_size,
+        d.block
+    );
     logln!(
         "  只对硬标签（α=0）：验证 CE {:.4}｜困惑度 {:.3}｜对教师的 KL {:.4}｜top-1 一致 {:.1}%",
         ce_hard,
@@ -3514,7 +3786,7 @@ pub(crate) fn cmd_distill(d: &DistillArgs) {
 ///
 /// 全程只是**数值模拟**：本仓库的算子跑在 CPU 的 f32 上，编解码只会更慢，
 /// 真实的 FP8 加速需要 GPU 的 FP8 tensor core（见 [`crate::fp8`] 的模块说明）。
-pub(crate) fn cmd_fp8(d: &Fp8Args) {
+pub fn cmd_fp8(d: &Fp8Args) {
     runlog::announce("fp8");
 
     // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
@@ -3522,10 +3794,14 @@ pub(crate) fn cmd_fp8(d: &Fp8Args) {
     assert!(d.steps >= 1, "训练步数至少为 1（实际 {}）", d.steps);
     assert!(d.lr > 0.0, "学习率必须为正（实际 {}）", d.lr);
     assert!(d.batch_size >= 1, "批大小至少为 1（实际 {}）", d.batch_size);
-    assert!(d.block_size >= 4, "上下文长度至少为 4（实际 {}）", d.block_size);
+    assert!(
+        d.block_size >= 4,
+        "上下文长度至少为 4（实际 {}）",
+        d.block_size
+    );
     assert!(d.n_layer >= 1, "层数至少为 1（实际 {}）", d.n_layer);
     assert!(
-        d.n_embd >= 4 && d.n_embd % 4 == 0,
+        d.n_embd >= 4 && d.n_embd.is_multiple_of(4),
         "n_embd 必须能被 n_head=4 整除且 >= 4（实际 {}）",
         d.n_embd
     );
@@ -3713,7 +3989,12 @@ pub(crate) fn cmd_fp8(d: &Fp8Args) {
             max_abs = max_abs.max(err);
         }
         let rel_fro = (noise / sig.max(f64::MIN_POSITIVE)).sqrt();
-        logln!("  {:<8}{:>13.2}%{:>14.3e}", f.name(), rel_fro * 100.0, max_abs);
+        logln!(
+            "  {:<8}{:>13.2}%{:>14.3e}",
+            f.name(),
+            rel_fro * 100.0,
+            max_abs
+        );
     }
     logln!(
         "  读法：E4M3 的误差明显更小（3 位尾数 vs 2 位），代价是动态范围小两个数量级。\n  \
@@ -3772,7 +4053,12 @@ pub(crate) fn cmd_fp8(d: &Fp8Args) {
     );
 
     // 验证集（训练未见过）
-    let (vx, vy) = corpus_windows(&val_ids, d.block_size, d.batch_size, &mut Rng::new(d.seed + 7));
+    let (vx, vy) = corpus_windows(
+        &val_ids,
+        d.block_size,
+        d.batch_size,
+        &mut Rng::new(d.seed + 7),
+    );
     let eval_ce = || -> f32 {
         tensor::no_grad(|| {
             let logits = model.forward(&vx, d.batch_size, d.block_size, None, false);
@@ -3789,9 +4075,7 @@ pub(crate) fn cmd_fp8(d: &Fp8Args) {
             p.decode_mut().copy_from_slice(sr);
         }
     };
-    let quantize = |f: fp8::Fp8Format| {
-        fp8::roundtrip_params_in_place(&params, f, fp8::TRAIN_BLOCK)
-    };
+    let quantize = |f: fp8::Fp8Format| fp8::roundtrip_params_in_place(&params, f, fp8::TRAIN_BLOCK);
 
     logln!(
         "  评测集：{} 个窗口 × {} 个位置（训练时未见过）。同一个模型，唯一变化是权重落到 FP8：",
@@ -3870,7 +4154,7 @@ pub(crate) fn cmd_fp8(d: &Fp8Args) {
 /// 一、**4 位浮点长什么样**：E2M1 的全部 16 个码列出来（正号侧只有 8 个数，没有 Inf/NaN）
 /// 二、**分块缩放与位宽账本**：块大小 → 精度/字节的权衡，并与 FP8 并排对照
 /// 三、**位宽 vs 验证 loss**：同一个训练好的小模型，权重分别落 FP8 / FP4 后的验证 CE
-pub(crate) fn cmd_fp4(d: &Fp4Args) {
+pub fn cmd_fp4(d: &Fp4Args) {
     runlog::announce("fp4");
 
     // ---------- 参数校验（写在最前面：跑几分钟才发现参数不合法最浪费时间） ----------
@@ -3878,10 +4162,14 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
     assert!(d.steps >= 1, "训练步数至少为 1（实际 {}）", d.steps);
     assert!(d.lr > 0.0, "学习率必须为正（实际 {}）", d.lr);
     assert!(d.batch_size >= 1, "批大小至少为 1（实际 {}）", d.batch_size);
-    assert!(d.block_size >= 4, "上下文长度至少为 4（实际 {}）", d.block_size);
+    assert!(
+        d.block_size >= 4,
+        "上下文长度至少为 4（实际 {}）",
+        d.block_size
+    );
     assert!(d.n_layer >= 1, "层数至少为 1（实际 {}）", d.n_layer);
     assert!(
-        d.n_embd >= 4 && d.n_embd % 4 == 0,
+        d.n_embd >= 4 && d.n_embd.is_multiple_of(4),
         "n_embd 必须能被 n_head=4 整除且 >= 4（实际 {}）",
         d.n_embd
     );
@@ -3900,8 +4188,14 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
             ),
             ("演示矩阵", format!("{}×{}", d.rows, d.cols)),
             ("训练步数 / 学习率", format!("{} / {}", d.steps, d.lr)),
-            ("批大小 / 上下文", format!("{} / {}", d.batch_size, d.block_size)),
-            ("小模型", format!("n_embd={} n_layer={}", d.n_embd, d.n_layer)),
+            (
+                "批大小 / 上下文",
+                format!("{} / {}", d.batch_size, d.block_size),
+            ),
+            (
+                "小模型",
+                format!("n_embd={} n_layer={}", d.n_embd, d.n_layer),
+            ),
         ],
     );
 
@@ -3924,7 +4218,11 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
     logln!("  **既没有 Inf 码也没有 NaN 码**：16 个码全是有限值，溢出与 NaN 只能饱和到 ±6.0。");
     logln!("  {:<8}{:>10}{:>16}", "码", "解码值", "间距÷上一档");
     for (i, &v) in fp4::REPRESENTABLE.iter().enumerate() {
-        let prev = if i == 0 { 0.0 } else { fp4::REPRESENTABLE[i - 1] };
+        let prev = if i == 0 {
+            0.0
+        } else {
+            fp4::REPRESENTABLE[i - 1]
+        };
         // 相对间距按「相邻间距 ÷ 上一档」算：上一档是 0 时无定义，标成 —
         let rel = if prev > 0.0 {
             format!("{:.1}%", (v - prev) / prev * 100.0)
@@ -4017,7 +4315,11 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
         );
     }
     // 同一张权重换成 FP8（E4M3）对照
-    let blk = if d.block == 0 { numel } else { d.block.min(numel) };
+    let blk = if d.block == 0 {
+        numel
+    } else {
+        d.block.min(numel)
+    };
     let q8 = fp8::Fp8Tensor::quantize(&wt, fp8::TRAIN_FORMAT, blk);
     let e8 = q8.errors(&wt);
     logln!(
@@ -4088,7 +4390,12 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
     );
 
     // 验证集（训练未见过）
-    let (vx, vy) = corpus_windows(&val_ids, d.block_size, d.batch_size, &mut Rng::new(d.seed + 7));
+    let (vx, vy) = corpus_windows(
+        &val_ids,
+        d.block_size,
+        d.batch_size,
+        &mut Rng::new(d.seed + 7),
+    );
     let eval_ce = || -> f32 {
         tensor::no_grad(|| {
             let logits = model.forward(&vx, d.batch_size, d.block_size, None, false);
@@ -4108,7 +4415,8 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
 
     // FP8（E4M3 + 每 32 元素一个 scale）
     restore(&backup);
-    let (_, ne8, by8) = fp8::roundtrip_params_in_place(&params, fp8::TRAIN_FORMAT, fp8::TRAIN_BLOCK);
+    let (_, ne8, by8) =
+        fp8::roundtrip_params_in_place(&params, fp8::TRAIN_FORMAT, fp8::TRAIN_BLOCK);
     let ce8 = eval_ce();
     restore(&backup);
     let bits8 = 8.0 * by8 as f64 / ne8.max(1) as f64;
@@ -4198,7 +4506,7 @@ pub(crate) fn cmd_fp4(d: &Fp4Args) {
 /// 一、**覆盖不变式**：三分支可见位置的并集必须恰好是 `[0, i]`（不丢历史、不漏未来）
 /// 二、**KV 字节账本**：压缩缓存（最近 m 个原始位置 + 压缩块）相对全量缓存的压缩率
 /// 三、**top-k 稀疏算力账本**：每个 query 实际参与打分的槽位数，对照全量 `T`
-pub(crate) fn cmd_csa(d: &CsaArgs) {
+pub fn cmd_csa(d: &CsaArgs) {
     runlog::announce("csa");
 
     assert!(d.t >= 8, "上下文长度至少 8（实际 {}）", d.t);
@@ -4216,11 +4524,19 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
             ("KV 头数 × head_dim", format!("{} × {}", d.n_kv_head, d.d)),
             (
                 "HCA 倍率",
-                if d.hca < 2 { "关闭".to_string() } else { d.hca.to_string() },
+                if d.hca < 2 {
+                    "关闭".to_string()
+                } else {
+                    d.hca.to_string()
+                },
             ),
             (
                 "top-k",
-                if d.top_k == 0 { "稠密（全部已完成块）".to_string() } else { d.top_k.to_string() },
+                if d.top_k == 0 {
+                    "稠密（全部已完成块）".to_string()
+                } else {
+                    d.top_k.to_string()
+                },
             ),
         ],
     );
@@ -4232,7 +4548,13 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
     logln!("=== 一、三分支覆盖不变式：可见位置的并集必须恰好是 [0, i] ===");
     logln!("  关键判据：一个压缩块只有在**块末位置 ≤ i** 时才可见。若用「块起点 ≤ i」当判据，");
     logln!("  就会把块内尚未生成的 token 平均进来 —— 那是训练时的信息泄漏，loss 会虚假地变好。");
-    logln!("  {:<6}{:<8}{:>14}{:>24}", "m", "HCA", "检查 query 数", "结论");
+    logln!(
+        "  {:<6}{:<8}{:>14}{:>24}",
+        "m",
+        "HCA",
+        "检查 query 数",
+        "结论"
+    );
     for m in [2usize, 4, 8, 16] {
         for h in [0usize, d.hca.max(2)] {
             let mut bad: Option<usize> = None;
@@ -4252,7 +4574,10 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
                     Some(i) => format!("失败 @i={i} ✗"),
                 }
             );
-            assert!(bad.is_none(), "m={m} HCA={h} 覆盖不变式被破坏（@i={bad:?}）");
+            assert!(
+                bad.is_none(),
+                "m={m} HCA={h} 覆盖不变式被破坏（@i={bad:?}）"
+            );
         }
     }
     logln!("  读法：局部窗口补上「最近 m 个位置」，细压缩补上「[0, B_i·m) 的全部已完成块」，");
@@ -4268,7 +4593,13 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
         d.d,
         full as f64 / 1048576.0
     );
-    logln!("  {:<8}{:>18}{:>18}{:>12}", "块宽 m", "全量字节", "压缩后字节", "压缩比");
+    logln!(
+        "  {:<8}{:>18}{:>18}{:>12}",
+        "块宽 m",
+        "全量字节",
+        "压缩后字节",
+        "压缩比"
+    );
     let mut best = (0usize, 0.0f64);
     for m in [2usize, 4, 8, 16, 32, 64] {
         if m > d.t {
@@ -4281,9 +4612,7 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
         }
         logln!("  {:<8}{:>18}{:>18}{:>11.2}x", m, full, c, ratio);
     }
-    logln!(
-        "  压缩缓存 = 最近 m 个原始位置 + floor(T/m) 个压缩块 ⇒ 长度约 m + T/m，",
-    );
+    logln!("  压缩缓存 = 最近 m 个原始位置 + floor(T/m) 个压缩块 ⇒ 长度约 m + T/m，",);
     logln!(
         "  在 m ≈ √T 处取最小（本题最优 m ≈ √{} ≈ {}，实测最优 m = {}，压缩 {:.2}x）。",
         d.t,
@@ -4321,7 +4650,11 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
         logln!(
             "  {:<6}{:<8}{:>8}{:>10}{:>10}{:>12}{:>11.3}{:>11.3}x",
             m,
-            if d.top_k == 0 { "稠密".to_string() } else { d.top_k.to_string() },
+            if d.top_k == 0 {
+                "稠密".to_string()
+            } else {
+                d.top_k.to_string()
+            },
             m,
             k,
             nb2,
@@ -4362,11 +4695,15 @@ pub(crate) fn cmd_csa(d: &CsaArgs) {
 /// 一、**增量缓存字节账本**：`(r + n_head·hd_rope)` 相对全量 `2·n_head·head_dim` 的压缩比
 /// 二、**权重吸收的解码算力账本**：吸收把"物化 K/V 再点积"换成"直接在 latent 空间点积"
 /// 三、**解耦约束自检**：把"配置写错会 panic"的那几条约束列清楚，并给出开关用法
-pub(crate) fn cmd_mla(d: &MlaArgs) {
+pub fn cmd_mla(d: &MlaArgs) {
     runlog::announce("mla");
 
     assert!(d.n_head >= 1 && d.hd_nope >= 1, "头数与 hd_nope 至少为 1");
-    assert!(d.hd_rope >= 2 && d.hd_rope % 2 == 0, "解耦 RoPE 维必须是不小于 2 的偶数（实际 {}）", d.hd_rope);
+    assert!(
+        d.hd_rope >= 2 && d.hd_rope.is_multiple_of(2),
+        "解耦 RoPE 维必须是不小于 2 的偶数（实际 {}）",
+        d.hd_rope
+    );
     assert!(d.r >= 1, "latent 维度 r 至少为 1");
     assert!(d.t >= 1 && d.n_layer >= 1, "上下文 T 与层数至少为 1");
 
@@ -4410,7 +4747,13 @@ pub(crate) fn cmd_mla(d: &MlaArgs) {
         mla_pt as f64 * d.t as f64 * d.n_layer as f64 / 1073741824.0,
         full_pt as f64 * d.t as f64 * d.n_layer as f64 / 1073741824.0
     );
-    logln!("  {:<10}{:>16}{:>16}{:>12}", "latent r", "MLA 字节", "全量字节", "压缩比");
+    logln!(
+        "  {:<10}{:>16}{:>16}{:>12}",
+        "latent r",
+        "MLA 字节",
+        "全量字节",
+        "压缩比"
+    );
     for r in [64usize, 128, 256, 512, 1024, 2048] {
         let m = crate::attention::mla_cache_bytes_per_token(r, d.n_head, d.hd_rope);
         logln!(
@@ -4428,21 +4771,42 @@ pub(crate) fn cmd_mla(d: &MlaArgs) {
     logln!("=== 二、权重吸收的解码算力账本（每层、全历史 T 的乘加次数）===");
     logln!("  朴素路径：先把每个 latent 物化成 K 与 V，再打分/加权；");
     logln!("  吸收路径：把 W_UK 折进 query，直接在 r 维 latent 上打分/加权，**从不物化 K/V**。");
-    logln!("  {:<10}{:>20}{:>20}{:>12}", "T", "朴素 MACs", "吸收 MACs", "算力比");
+    logln!(
+        "  {:<10}{:>20}{:>20}{:>12}",
+        "T",
+        "朴素 MACs",
+        "吸收 MACs",
+        "算力比"
+    );
     for t in [128usize, 512, 2048, 8192] {
         let a = crate::attention::naive_mla_macs(t, d.n_head, d.hd_nope, d.r);
         let b = crate::attention::absorbed_mla_macs(t, d.n_head, d.hd_nope, d.r);
-        logln!("  {:<10}{:>20}{:>20}{:>11.2}x", t, a, b, a as f64 / b.max(1) as f64);
+        logln!(
+            "  {:<10}{:>20}{:>20}{:>11.2}x",
+            t,
+            a,
+            b,
+            a as f64 / b.max(1) as f64
+        );
     }
     logln!("  读法：朴素路径的 T 项系数是 2·n_head·r·hd_nope，吸收路径是 2·n_head·r，");
-    logln!("  比值趋近 **hd_nope**（本题 {}）——T 越长省得越多。", d.hd_nope);
-    logln!("  代价：吸收只在**无梯度推理**里可用（本仓库 `mla_absorb` 仅在 `!grad_enabled()` 时生效），");
+    logln!(
+        "  比值趋近 **hd_nope**（本题 {}）——T 越长省得越多。",
+        d.hd_nope
+    );
+    logln!(
+        "  代价：吸收只在**无梯度推理**里可用（本仓库 `mla_absorb` 仅在 `!grad_enabled()` 时生效），"
+    );
     logln!("  且与 QK-Norm 不兼容——RMSNorm 的逐头缩放无法被线性吸收。");
 
     // ---------- 三、解耦约束自检 ----------
     logln!("=== 三、解耦 RoPE 的约束自检 ===");
-    logln!("  · head_dim 拆成 hd_nope + hd_rope，只有**后** hd_rope 维旋转（hd_rope 必须为偶数）；");
-    logln!("  · q_rope / k_rope 由输入**直接投影**（c_qr / c_kr），与压缩 latent 解耦——这是吸收成立的前提；");
+    logln!(
+        "  · head_dim 拆成 hd_nope + hd_rope，只有**后** hd_rope 维旋转（hd_rope 必须为偶数）；"
+    );
+    logln!(
+        "  · q_rope / k_rope 由输入**直接投影**（c_qr / c_kr），与压缩 latent 解耦——这是吸收成立的前提；"
+    );
     logln!("  · 解耦要求 n_kv_head ∈ {{0 (=n_head), n_head}}，不允许真正的 GQA 头分组；");
     logln!("  · mla_absorb 与 qk_norm 互斥；mla_rope_dim == 0 时 mla_absorb 必须为 false。");
 
@@ -4473,7 +4837,7 @@ pub(crate) fn cmd_mla(d: &MlaArgs) {
 
 // ==================== 端到端演示（demo 子命令） ====================
 
-pub(crate) fn run_demo() {
+pub fn run_demo() {
     demo_xor();
     demo_bpe();
     demo_transformer();
@@ -4584,7 +4948,9 @@ fn demo_transformer() {
         log_file: None, // 演示不落盘
         ..config::TrainConfig::default()
     };
-    train::train_transformer(&model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None);
+    train::train_transformer(
+        &model, &tokenizer, &loader, &tcfg, None, None, &mut rng, None,
+    );
 
     // 生成 1（无 cache）：全量前向用滑动窗口，可以生成超过 block_size 的长文本
     // 三次生成共用同一套采样参数（含重复惩罚），否则差异分不清是 cache 还是采样造成的
@@ -4596,7 +4962,15 @@ fn demo_transformer() {
     };
     println!("\n  —— 生成 1（prompt=Once upon a, 无 KV cache，全量前向）——");
     let mut rng_full = Rng::new(2024);
-    let out_full = generate(&model, &tokenizer, "Once upon a", 80, &opts, KvOpts::off(), &mut rng_full);
+    let out_full = generate(
+        &model,
+        &tokenizer,
+        "Once upon a",
+        80,
+        &opts,
+        KvOpts::off(),
+        &mut rng_full,
+    );
     println!("  {out_full}");
 
     // 生成 2（带 KV cache，第 25 课）：**必须用同一个 prompt 和同一个种子**，否则两次输出
@@ -4604,7 +4978,15 @@ fn demo_transformer() {
     // 缓存带滑动窗口（第 25 课第 8 节），生成长度同样不受缓存容量限制，不会提前停。
     println!("\n  —— 生成 2（同 prompt、同种子，带 KV cache）——");
     let mut rng_kv = Rng::new(2024);
-    let out_kv = generate(&model, &tokenizer, "Once upon a", 80, &opts, KvOpts::on(0, None), &mut rng_kv);
+    let out_kv = generate(
+        &model,
+        &tokenizer,
+        "Once upon a",
+        80,
+        &opts,
+        KvOpts::on(0, None),
+        &mut rng_kv,
+    );
     println!("  {out_kv}");
     println!(
         "\n  KV cache 带滑动窗口，生成长度不再受缓存容量限制：两种模式都生成满 80 个 token —— {}",
@@ -4624,15 +5006,35 @@ fn demo_transformer() {
     let prompt_len = tokenizer.encode("Once upon a").len();
     let in_window = model.cfg.block_size.saturating_sub(prompt_len);
     let mut rng_a = Rng::new(2024);
-    let a = generate(&model, &tokenizer, "Once upon a", in_window, &opts, KvOpts::off(), &mut rng_a);
+    let a = generate(
+        &model,
+        &tokenizer,
+        "Once upon a",
+        in_window,
+        &opts,
+        KvOpts::off(),
+        &mut rng_a,
+    );
     let mut rng_b = Rng::new(2024);
-    let b = generate(&model, &tokenizer, "Once upon a", in_window, &opts, KvOpts::on(0, None), &mut rng_b);
+    let b = generate(
+        &model,
+        &tokenizer,
+        "Once upon a",
+        in_window,
+        &opts,
+        KvOpts::on(0, None),
+        &mut rng_b,
+    );
     println!(
         "\n  窗口内等价自检（prompt {prompt_len} + 新 {in_window} = {} ≤ block_size {}）：\
          缓存模式与全量模式逐 token {}",
         prompt_len + in_window,
         model.cfg.block_size,
-        if a == b { "完全一致 ✓" } else { "不一致 ✗" }
+        if a == b {
+            "完全一致 ✓"
+        } else {
+            "不一致 ✗"
+        }
     );
     if a != b {
         println!("    全量：{a}\n    缓存：{b}");
@@ -4642,7 +5044,15 @@ fn demo_transformer() {
     // 用全量前向，这样输出的毛病都归模型自己，不被缓存路径的任何细节搅混。
     println!("\n  —— 生成 3（prompt=The fox，换开头看泛化）——");
     let mut rng_fox = Rng::new(2024);
-    let out_fox = generate(&model, &tokenizer, "The fox", 80, &opts, KvOpts::off(), &mut rng_fox);
+    let out_fox = generate(
+        &model,
+        &tokenizer,
+        "The fox",
+        80,
+        &opts,
+        KvOpts::off(),
+        &mut rng_fox,
+    );
     println!("  {out_fox}");
 }
 
@@ -4702,8 +5112,13 @@ fn demo_gpu() {
     let r = gpu::relu(&x).unwrap();
     let z = gpu::add(&x, &y).unwrap();
     let ok = s.iter().zip(&x).all(|(a, b)| (a - b * 2.0).abs() < 1e-4)
-        && r.iter().zip(&x).all(|(a, b)| (*a - b.max(0.0)).abs() < 1e-5)
-        && z.iter().zip(&x).zip(&y).all(|((a, b), c)| (a - (b + c)).abs() < 1e-4);
+        && r.iter()
+            .zip(&x)
+            .all(|(a, b)| (*a - b.max(0.0)).abs() < 1e-5)
+        && z.iter()
+            .zip(&x)
+            .zip(&y)
+            .all(|((a, b), c)| (a - (b + c)).abs() < 1e-4);
     println!(
         "  逐元素算子（scale/relu/add）验证：{}",
         if ok { "通过" } else { "失败" }

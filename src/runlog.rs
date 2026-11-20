@@ -81,12 +81,11 @@ fn start_point() -> (Instant, DateTime) {
 
 /// 在内存中暂存、最后一次性取出，避免持锁做 I/O 之外的琐事
 fn with_log(f: impl FnOnce(&mut RunLog)) {
-    if let Some(cell) = RUN_LOG.get() {
-        if let Ok(mut guard) = cell.lock() {
-            if let Some(log) = guard.as_mut() {
-                f(log);
-            }
-        }
+    if let Some(cell) = RUN_LOG.get()
+        && let Ok(mut guard) = cell.lock()
+        && let Some(log) = guard.as_mut()
+    {
+        f(log);
     }
 }
 
@@ -109,9 +108,13 @@ pub fn start(op: &str) -> String {
         return path;
     }
     crate::config::ensure_parent_dir(&path);
-    let file = std::fs::File::create(&path)
-        .unwrap_or_else(|e| panic!("无法创建运行日志 {path}: {e}"));
-    let log = RunLog { path: path.clone(), file, started };
+    let file =
+        std::fs::File::create(&path).unwrap_or_else(|e| panic!("无法创建运行日志 {path}: {e}"));
+    let log = RunLog {
+        path: path.clone(),
+        file,
+        started,
+    };
     let cell = RUN_LOG.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = cell.lock() {
         *guard = Some(log);
@@ -150,7 +153,11 @@ pub fn section(title: &str) {
 ///
 /// 对齐按**显示宽度**算（中日韩字符在等宽字体里占两列），否则中文键名会参差不齐。
 pub fn fields(title: &str, items: &[(&str, String)]) {
-    let width = items.iter().map(|(k, _)| display_width(k)).max().unwrap_or(0);
+    let width = items
+        .iter()
+        .map(|(k, _)| display_width(k))
+        .max()
+        .unwrap_or(0);
     with_log(|log| {
         let _ = writeln!(log.file, "\n--- {title} ---");
         for (k, v) in items {
@@ -176,8 +183,7 @@ fn display_width(s: &str) -> usize {
 
 /// 写一节 JSON（完整配置等结构化信息，便于直接 diff 两次实验）
 pub fn json<T: serde::Serialize>(title: &str, value: &T) {
-    let text = serde_json::to_string_pretty(value)
-        .unwrap_or_else(|e| format!("<序列化失败: {e}>"));
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("<序列化失败: {e}>"));
     section(title);
     append(&text);
 }
@@ -195,14 +201,18 @@ pub fn finish() {
     with_log(|log| {
         let _ = writeln!(log.file, "\n--- 运行结束 ---");
         let _ = writeln!(log.file, "结束时间   : {}", fmt_time(local_now()));
-        let _ = writeln!(log.file, "总耗时     : {:.3}s", log.started.elapsed().as_secs_f64());
+        let _ = writeln!(
+            log.file,
+            "总耗时     : {:.3}s",
+            log.started.elapsed().as_secs_f64()
+        );
         let _ = writeln!(log.file, "日志文件   : {}", log.path);
         let _ = log.file.flush();
     });
-    if let Some(cell) = RUN_LOG.get() {
-        if let Ok(mut guard) = cell.lock() {
-            *guard = None;
-        }
+    if let Some(cell) = RUN_LOG.get()
+        && let Ok(mut guard) = cell.lock()
+    {
+        *guard = None;
     }
 }
 
@@ -217,7 +227,10 @@ fn write_header(op: &str, begin: DateTime) {
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "<未知>".to_string());
     with_log(|log| {
-        let _ = writeln!(log.file, "==================== 运行日志 ====================");
+        let _ = writeln!(
+            log.file,
+            "==================== 运行日志 ===================="
+        );
         let _ = writeln!(log.file, "操作       : {op}");
         let _ = writeln!(log.file, "开始时间   : {}（命令开始执行）", fmt_time(begin));
         let _ = writeln!(log.file, "完整命令   : {full}");
@@ -227,7 +240,11 @@ fn write_header(op: &str, begin: DateTime) {
             log.file,
             "程序版本   : {}（{}，{} {}）",
             env!("CARGO_PKG_VERSION"),
-            if cfg!(debug_assertions) { "debug" } else { "release" },
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
             std::env::consts::OS,
             std::env::consts::ARCH,
         );
@@ -238,24 +255,39 @@ fn write_header(op: &str, begin: DateTime) {
             rayon::current_num_threads()
         );
         let _ = writeln!(log.file, "GPU        : {}", gpu_desc());
-        let _ = writeln!(log.file, "==================================================");
+        let _ = writeln!(
+            log.file,
+            "=================================================="
+        );
     });
 }
 
 /// 完整命令行：可执行文件 + 全部参数（含空格的参数加引号）
 fn command_line() -> (String, String) {
     let mut args = std::env::args();
-    let exe = args.next().unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string());
+    let exe = args
+        .next()
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string());
     let rest: Vec<String> = args.collect();
     let quoted = |xs: &[String]| {
         xs.iter()
-            .map(|a| if a.is_empty() || a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
+            .map(|a| {
+                if a.is_empty() || a.contains(' ') {
+                    format!("\"{a}\"")
+                } else {
+                    a.clone()
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let full = format!("{} {}", quote(&exe), quoted(&rest)).trim_end().to_string();
+    let full = format!("{} {}", quote(&exe), quoted(&rest))
+        .trim_end()
+        .to_string();
     // 用户平时敲的就是 cargo 命令，单独记一条，便于直接复制复现
-    let cargo = format!("cargo run --release -- {}", quoted(&rest)).trim_end().to_string();
+    let cargo = format!("cargo run --release -- {}", quoted(&rest))
+        .trim_end()
+        .to_string();
     (full, cargo)
 }
 

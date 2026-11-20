@@ -21,19 +21,34 @@ pub const SFT_STOP: &[&str] = &[SFT_END, SFT_USER];
 ///
 /// 必须真的调 `encode` 来数 token —— 按"字节数 / 字符数"估算的偏差很大：
 /// 中英文、BPE 合并数都不同，同样长度的文本 token 数能差一倍以上。
+///
+/// 实现要点（两个 encode 口径的统一做法）：**每行只 encode 一次**，用"逐行 token 数之和"
+/// 作为拼接后 token 数的**上界**（BPE 只会在边界处并合，不会变多）反向定位候选，
+/// 再用一次真实 `encode` 校验并按需继续放宽；上界失效时退回线性扫描。
+/// 旧实现是"每个候选都 encode 整段"（O(行数²)），20 行历史约 22 次全量 encode。
 pub fn trim_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
     if history.is_empty() || tokenizer.encode(history).len() <= budget {
         return history.to_string();
     }
-    // 行粒度足够细：每轮对话都会写入多行
     let lines: Vec<&str> = history.split('\n').collect();
-    for start in 1..lines.len() {
-        let candidate = lines[start..].join("\n");
-        if tokenizer.encode(&candidate).len() <= budget {
-            return candidate;
+    let counts: Vec<usize> = lines.iter().map(|l| tokenizer.encode(l).len()).collect();
+    // 从尾部按上界累加，得到"一定装得下"的最长后缀
+    let mut sum = 0usize;
+    let mut start = lines.len();
+    for (i, c) in counts.iter().enumerate().rev() {
+        if sum + c > budget {
+            break;
         }
+        sum += c;
+        start = i;
     }
-    String::new()
+    grow_suffix(
+        &lines,
+        start,
+        budget,
+        |lines, s| lines[s..].join("\n"),
+        tokenizer,
+    )
 }
 
 /// SFT 模板下的历史裁剪：以 `SFT_USER` 为切点按**轮**丢，而不是按行。
@@ -44,14 +59,65 @@ pub fn trim_sft_history(tokenizer: &Tokenizer, history: &str, budget: usize) -> 
     if history.is_empty() || tokenizer.encode(history).len() <= budget {
         return history.to_string();
     }
-    for (pos, _) in history.match_indices(SFT_USER) {
-        let candidate = &history[pos..];
-        if tokenizer.encode(candidate).len() <= budget {
-            return candidate.to_string();
+    let starts: Vec<usize> = history.match_indices(SFT_USER).map(|(p, _)| p).collect();
+    if starts.is_empty() {
+        return String::new();
+    }
+    // 每轮切出来单独 encode 一次（同 [`trim_history`] 的上界思路）
+    let mut rounds: Vec<&str> = Vec::with_capacity(starts.len());
+    for (i, &p) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(history.len());
+        rounds.push(&history[p..end]);
+    }
+    let counts: Vec<usize> = rounds.iter().map(|r| tokenizer.encode(r).len()).collect();
+    let mut sum = 0usize;
+    let mut start = rounds.len();
+    for (i, c) in counts.iter().enumerate().rev() {
+        if sum + c > budget {
+            break;
+        }
+        sum += c;
+        start = i;
+    }
+    grow_suffix(
+        &rounds,
+        start,
+        budget,
+        |rounds, s| rounds[s..].concat(),
+        tokenizer,
+    )
+}
+
+/// 从 `start` 开始（上界保证装得下）尽可能向前放宽，返回**最长且不超预算**的后缀。
+///
+/// `build` 把 `items[start..]` 拼回候选文本；`tokenizer.encode` 是唯一权威口径。
+/// 上界估计若失效（真实长度反而更小/更大），退回逐级线性扫描，保证与旧实现同结果。
+fn grow_suffix<T, F>(
+    items: &[T],
+    start: usize,
+    budget: usize,
+    build: F,
+    tokenizer: &Tokenizer,
+) -> String
+where
+    F: Fn(&[T], usize) -> String,
+{
+    let fits = |s: usize| tokenizer.encode(&build(items, s)).len() <= budget;
+    // 上界估计若连"整体"都装不下，先确认 start 处确实可行；不可行就线性推进
+    let mut s = start;
+    while !fits(s) {
+        s += 1;
+        if s > items.len() {
+            return String::new();
         }
     }
-    String::new()
+    // 尽可能向前放宽一行/一轮（真实长度可能因跨边界并合而更省）
+    while s > 0 && fits(s - 1) {
+        s -= 1;
+    }
+    build(items, s)
 }
+
 
 /// 一轮 prompt 的组装结果。
 pub struct Assembled {
@@ -94,7 +160,11 @@ pub fn assemble(
 
     let system = system.trim();
     // +1 是 system 后面的 '\n'
-    let n_system_prefix = if system.is_empty() { 0 } else { tokenizer.encode(system).len() + 1 };
+    let n_system_prefix = if system.is_empty() {
+        0
+    } else {
+        tokenizer.encode(system).len() + 1
+    };
     // 历史预算 = 输入预算 - system（含其后 '\n'）- 本轮追加内容 - 历史与它之间的 '\n'
     let history_budget = prompt_budget.saturating_sub(n_system_prefix + n_tail + 1);
 
@@ -104,7 +174,10 @@ pub fn assemble(
         trim_history(tokenizer, history, history_budget)
     };
     let trimmed = if kept.len() < history.len() {
-        Some((tokenizer.encode(history).len(), tokenizer.encode(&kept).len()))
+        Some((
+            tokenizer.encode(history).len(),
+            tokenizer.encode(&kept).len(),
+        ))
     } else {
         None
     };
@@ -120,7 +193,12 @@ pub fn assemble(
     }
     prompt.push_str(&tail);
 
-    Assembled { prompt, history: kept, trimmed, history_budget }
+    Assembled {
+        prompt,
+        history: kept,
+        trimmed,
+        history_budget,
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +244,9 @@ mod tests {
     #[test]
     fn test_trim_sft_history_cuts_at_turn_boundary() {
         let tok = tiny_tokenizer();
-        let history = format!("{SFT_USER}\n问题一\n{SFT_ASSISTANT}\n回答一\n{SFT_USER}\n问题二\n{SFT_ASSISTANT}\n回答二");
+        let history = format!(
+            "{SFT_USER}\n问题一\n{SFT_ASSISTANT}\n回答一\n{SFT_USER}\n问题二\n{SFT_ASSISTANT}\n回答二"
+        );
         let full = tok.encode(&history).len();
         // 预算砍半：应从「用户：」处切，保留最近一轮，且切点必是轮边界
         let kept = trim_sft_history(&tok, &history, full / 2);
@@ -174,5 +254,68 @@ mod tests {
         assert!(tok.encode(&kept).len() <= full / 2);
         assert!(!kept.contains("问题一"));
         assert!(kept.contains("问题二"));
+    }
+}
+
+#[cfg(test)]
+mod trim_equivalence {
+    use super::*;
+
+    /// 旧实现（每个候选都 encode 整段）—— 作为语义基准，新实现必须与它逐字符一致。
+    fn naive_trim(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
+        if history.is_empty() || tokenizer.encode(history).len() <= budget {
+            return history.to_string();
+        }
+        let lines: Vec<&str> = history.split('\n').collect();
+        for start in 1..lines.len() {
+            let candidate = lines[start..].join("\n");
+            if tokenizer.encode(&candidate).len() <= budget {
+                return candidate;
+            }
+        }
+        String::new()
+    }
+
+    fn naive_trim_sft(tokenizer: &Tokenizer, history: &str, budget: usize) -> String {
+        if history.is_empty() || tokenizer.encode(history).len() <= budget {
+            return history.to_string();
+        }
+        for (pos, _) in history.match_indices(SFT_USER) {
+            let candidate = &history[pos..];
+            if tokenizer.encode(candidate).len() <= budget {
+                return candidate.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// 新的"逐行/逐轮计数 + 校验"必须与线性扫描**逐字符相同**（含空历史、无换行、
+    /// 预算为 0、预算极小只能留最后一行等边界）。
+    #[test]
+    fn test_trim_matches_naive_scan() {
+        let hists = [
+            "第一行\n第二行\n第三行\n第四行",
+            "a\nbb\nccc\ndddd\neeeee",
+            "",
+            "单行没有换行",
+            "用户：问题一\n回答一\n用户：问题二\n回答二\n用户：问题三",
+        ];
+        // 字表必须覆盖测试文本里出现的每个字符（char 分词器遇到未登录字符会 panic）
+        let corpus = hists.concat();
+        let tok = Tokenizer::char(&corpus);
+        for h in hists {
+            for budget in 0..60usize {
+                assert_eq!(
+                    trim_history(&tok, h, budget),
+                    naive_trim(&tok, h, budget),
+                    "trim_history 不一致：hist={h:?} budget={budget}"
+                );
+                assert_eq!(
+                    trim_sft_history(&tok, h, budget),
+                    naive_trim_sft(&tok, h, budget),
+                    "trim_sft_history 不一致：hist={h:?} budget={budget}"
+                );
+            }
+        }
     }
 }

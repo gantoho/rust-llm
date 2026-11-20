@@ -6,16 +6,16 @@
 //!
 //! 本文件另存放跨文件共享的辅助函数。
 
-pub(crate) mod core;
-pub(crate) mod deploy;
-pub(crate) mod experiments;
+pub mod core;
+pub mod deploy;
+pub mod experiments;
 
 use crate::cli::RopeArgs;
 use crate::data::load_text;
 use crate::model::Transformer;
 use crate::quant::QBits;
-use crate::rope::RopeScaling;
 use crate::rng::Rng;
+use crate::rope::RopeScaling;
 use crate::sample::{KvOpts, StopReason};
 use crate::tokenizer::Tokenizer;
 
@@ -23,7 +23,7 @@ use crate::checkpoint;
 use crate::config;
 
 /// 命令行上的 KV cache 量化位宽名字 -> 枚举（`none` = 不量化）
-pub(crate) fn kv_bits_from_name(name: &str) -> Option<QBits> {
+pub fn kv_bits_from_name(name: &str) -> Option<QBits> {
     match name {
         "none" => None,
         "int8" => Some(QBits::Int8),
@@ -35,8 +35,12 @@ pub(crate) fn kv_bits_from_name(name: &str) -> Option<QBits> {
 /// 命令行上的 RoPE 外推方式名字 -> 枚举（未给出时返回 `None` = 沿用 checkpoint）
 pub(crate) fn rope_scaling_from_cli(args: &RopeArgs) -> Option<RopeScaling> {
     match args.rope_scaling.as_deref()? {
-        "linear" => Some(RopeScaling::Linear { factor: args.rope_factor }),
-        "ntk" => Some(RopeScaling::Ntk { factor: args.rope_factor }),
+        "linear" => Some(RopeScaling::Linear {
+            factor: args.rope_factor,
+        }),
+        "ntk" => Some(RopeScaling::Ntk {
+            factor: args.rope_factor,
+        }),
         // beta_fast / beta_slow / mscale 用论文与社区实践的默认值（32 / 1 / 1.0）：
         // 它们决定"哪些维度算高频"的分段边界，除非有明确理由，调到它们只会让结果更难复现。
         "yarn" => Some(RopeScaling::Yarn {
@@ -63,7 +67,12 @@ pub(crate) fn apply_rope_override(model: &mut Transformer, args: &RopeArgs) -> O
     let train_ctx = model.cfg.rope_train_ctx();
     let new_ctx = max_ctx.unwrap_or(train_ctx);
     let new_base = base.unwrap_or(model.cfg.rope_base);
-    let old_ctx = model.set_rope(new_base, scaling.unwrap_or(model.cfg.rope_scaling), train_ctx, new_ctx);
+    let old_ctx = model.set_rope(
+        new_base,
+        scaling.unwrap_or(model.cfg.rope_scaling),
+        train_ctx,
+        new_ctx,
+    );
     Some(format!(
         "上下文窗口 {old_ctx} → {new_ctx}，base = {new_base}，外推 = {}",
         model.cfg.rope_scaling.describe()
@@ -88,7 +97,7 @@ pub(crate) fn truncate_chars(s: &str, n: usize) -> &str {
 
 /// Windows 控制台默认 GBK，把输出代码页切到 UTF-8，避免中文乱码
 #[cfg(windows)]
-pub(crate) fn init_console_utf8() {
+pub fn init_console_utf8() {
     unsafe {
         windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
         windows_sys::Win32::System::Console::SetConsoleCP(65001);
@@ -131,7 +140,12 @@ pub(crate) fn load_model_and_tokenizer(
                 ckpt.model.vocab_size
             );
         }
-        logln!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        logln!(
+            "分词器：从 {} 加载（{}，词表 {}）",
+            path,
+            loaded.kind(),
+            loaded.vocab_size()
+        );
         loaded
     } else {
         load_tokenizer_for_inference(tcfg, ckpt.model.vocab_size)
@@ -142,8 +156,7 @@ pub(crate) fn load_model_and_tokenizer(
     // 而读档本身只要 0.7 s。随机数流照常推进 ⇒ 之后用同一 rng 采样的行为逐位不变
     // （见 [`crate::rng::without_init`]）。这里不会发生词表扩展：模型配置取自
     // checkpoint 头部，词表大小必然一致。
-    let mut model =
-        crate::rng::without_init(|| Transformer::new(ckpt.model.clone(), &mut rng));
+    let mut model = crate::rng::without_init(|| Transformer::new(ckpt.model.clone(), &mut rng));
     // LoRA 存档：先按头部记录重放注入（冻结主干 + 每层 Q/K/V 挂适配器），再恢复参数。
     // 顺序不能反——参数是**按名字**逐个对齐的，模型里少一套 `*.lora_a` / `*.lora_b`
     // 就会在 restore_params 处断言失败（见 [`checkpoint::CkptHeader`] 的 lora 字段）。
@@ -151,6 +164,21 @@ pub(crate) fn load_model_and_tokenizer(
         model.apply_lora(lora, &mut rng);
     }
     checkpoint::load_params(ckpt_path, &model);
+    // C10：量化档读进来是"反量化后的 f32 + 头部量化元数据"，按设计要在加载端**重放量化**
+    // 才真正省内存。默认关（量化档在重放前的语义是 f32，改变它会让既有产物行为突变）；
+    // 显式 `LLM_QUANT_REPLAY=1` 时按头部参数重放，配合 `quant::QMatrix::gemv`
+    // 的单行融合内核，int8 推理同时拿到"内存 1/4 + 速度更快"。
+    if std::env::var_os("LLM_QUANT_REPLAY").is_some() {
+        if let Some(meta) = ckpt.quant.as_ref() {
+            checkpoint::requantize_after_load(&mut model, meta);
+            logln!(
+                "[quant] 已按存档头部重放量化（{:?}，{:.2} MB → {:.2} MB）",
+                meta.bits,
+                meta.orig_bytes as f64 / 1e6,
+                meta.quant_bytes as f64 / 1e6
+            );
+        }
+    }
     // 存档头里的量化记录只是"这份权重当初被量化过"的注记：数据块里始终是 f32，
     // 加载出来的模型也是普通 f32 模型（见 [`checkpoint::save`]）。打印出来是为了让
     // "这次推理为什么没省显存"一目了然——想真省，得按这条记录重建量化。
@@ -213,22 +241,36 @@ pub(crate) fn resolve_model_spec<'a>(
     Option<String>,
 ) {
     let ckpt_path = resolve_ckpt(ckpt, &tcfg.out_dir);
-    let (mut model, tokenizer, ckpt) = load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
+    let (mut model, tokenizer, ckpt) =
+        load_model_and_tokenizer(&ckpt_path, tcfg, seed, tokenizer_path);
     maybe_merge_lora(&mut model, merge_lora);
     let rope_note = rope_opt.and_then(|r| apply_rope_override(&mut model, r));
     (model, tokenizer, ckpt, ckpt_path, rope_note)
 }
 
 /// 推理时加载分词器：优先从文件加载，避免依赖语料
-pub(crate) fn load_tokenizer_for_inference(tcfg: &config::TrainConfig, expect_vocab: usize) -> Tokenizer {
+pub(crate) fn load_tokenizer_for_inference(
+    tcfg: &config::TrainConfig,
+    expect_vocab: usize,
+) -> Tokenizer {
     // 1. 用户显式配置了 tokenizer_file
     if let Some(ref path) = tcfg.tokenizer_file {
         let loaded = Tokenizer::load(path);
         if expect_vocab != 0 {
-            assert_eq!(loaded.vocab_size(), expect_vocab,
-                "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), expect_vocab);
+            assert_eq!(
+                loaded.vocab_size(),
+                expect_vocab,
+                "分词器词表（{}）与 checkpoint（{}）不一致",
+                loaded.vocab_size(),
+                expect_vocab
+            );
         }
-        logln!("分词器：从 {} 加载（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+        logln!(
+            "分词器：从 {} 加载（{}，词表 {}）",
+            path,
+            loaded.kind(),
+            loaded.vocab_size()
+        );
         return loaded;
     }
     // 2. 自动查找训练时保存的 tokenizer.json
@@ -236,10 +278,20 @@ pub(crate) fn load_tokenizer_for_inference(tcfg: &config::TrainConfig, expect_vo
     if std::path::Path::new(&auto_path).exists() {
         let loaded = Tokenizer::load(&auto_path);
         if expect_vocab != 0 {
-            assert_eq!(loaded.vocab_size(), expect_vocab,
-                "分词器词表（{}）与 checkpoint（{}）不一致", loaded.vocab_size(), expect_vocab);
+            assert_eq!(
+                loaded.vocab_size(),
+                expect_vocab,
+                "分词器词表（{}）与 checkpoint（{}）不一致",
+                loaded.vocab_size(),
+                expect_vocab
+            );
         }
-        logln!("分词器：从 {} 加载（{}，词表 {}）", auto_path, loaded.kind(), loaded.vocab_size());
+        logln!(
+            "分词器：从 {} 加载（{}，词表 {}）",
+            auto_path,
+            loaded.kind(),
+            loaded.vocab_size()
+        );
         return loaded;
     }
     // 3. 都没有，从语料训练（兜底）
@@ -248,16 +300,25 @@ pub(crate) fn load_tokenizer_for_inference(tcfg: &config::TrainConfig, expect_vo
 }
 
 #[cfg(not(windows))]
-pub(crate) fn init_console_utf8() {}
+pub fn init_console_utf8() {}
 
 /// 按配置重建分词器（char / bpe）。
 /// 优先从文件加载（如果 tokenizer_file 配置了），否则从语料训练。
 /// `expect_vocab = 0` 表示不校验（训练时词表由分词器决定）。
-pub(crate) fn build_tokenizer(tcfg: &config::TrainConfig, train_text: &str, expect_vocab: usize) -> Tokenizer {
+pub(crate) fn build_tokenizer(
+    tcfg: &config::TrainConfig,
+    train_text: &str,
+    expect_vocab: usize,
+) -> Tokenizer {
     let tok = if let Some(ref path) = tcfg.tokenizer_file {
         if std::path::Path::new(path).exists() {
             let loaded = Tokenizer::load(path);
-            logln!("已从 {} 加载分词器（{}，词表 {}）", path, loaded.kind(), loaded.vocab_size());
+            logln!(
+                "已从 {} 加载分词器（{}，词表 {}）",
+                path,
+                loaded.kind(),
+                loaded.vocab_size()
+            );
             loaded
         } else {
             logln!("分词器文件 {} 不存在，从语料训练新分词器", path);
@@ -306,7 +367,7 @@ pub(crate) fn describe_stop(reason: StopReason) -> String {
 /// "开口就是停止标记「用户：」，没答就转下一轮"套在一段有内容的回答上是错的。
 /// 只记空输出的那几轮时，非空回答究竟是采到 EOS 还是命中停止标记停下的就查不到——
 /// 而这两种收尾写进历史的方式并不相同（见 `cmd_chat` 的历史更新）。
-pub(crate) fn stop_label(reason: StopReason) -> String {
+pub fn stop_label(reason: StopReason) -> String {
     match reason {
         StopReason::Eos => "采到 EOS".to_string(),
         StopReason::StopMark(mark) => format!("命中停止标记「{mark}」"),

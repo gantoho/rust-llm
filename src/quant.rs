@@ -111,11 +111,7 @@ pub struct QMatrix {
 
 /// 打包后的字节数：int8 时一码一字节，int4 时两码一字节（奇数个码向上取整）
 fn packed_len(n: usize, bits: QBits) -> usize {
-    if bits.packed() {
-        n.div_ceil(2)
-    } else {
-        n
-    }
+    if bits.packed() { n.div_ceil(2) } else { n }
 }
 
 /// 把整数码打包成字节流（int8 直接按位存，int4 两个码一个字节：低半字节在前）
@@ -207,7 +203,13 @@ pub fn group_scales(x: &[f32], rows: usize, cols: usize, axis: QAxis) -> Vec<f32
 /// 这里用第三条路：**0 表示"未定"**，等这一列第一次出现非零数据时再用它定标。
 /// 这个改动是安全的：历史码值在这种列上必然全是 0（`0 / s * qmax = 0`），
 /// 反量化恒为 0，换一个 scale 不会改变任何一个已写入的数值。
-pub fn resolve_scales(x: &[f32], rows: usize, cols: usize, axis: QAxis, scales: &[f32]) -> Vec<f32> {
+pub fn resolve_scales(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    axis: QAxis,
+    scales: &[f32],
+) -> Vec<f32> {
     if axis == QAxis::Row || !scales.iter().any(|s| *s <= 0.0) {
         return scales.to_vec();
     }
@@ -357,10 +359,90 @@ impl QMatrix {
         self.bytes.len() + self.scales.len() * 4
     }
 
+    /// decode 单行：`y[c] = Σ_r x[r] · w[r][c]`，**直接从量化码算，不落地 f32 权重**。
+    ///
+    /// 与"先 [`Self::dequantize`] 再逐列 axpy"**逐位一致**：每个元素仍按
+    /// `w = (code as f32 / qmax) * scale` 还原 —— 除法换成 256（int4 时 16）项查表，
+    /// 取值完全相同；累加保持 r 升序。输出列按块并行（单行是带宽受限，列是唯一并行维度）。
+    ///
+    /// 这是 C10 的第一步：`Linear::forward` 的量化分支目前每次前向都整表反量化
+    /// （0.5B 的 `w_down` 一层就是 17 MB/token），换成本内核后权重访存降到 1/4。
+    pub fn gemv(&self, x: &[f32]) -> Vec<f32> {
+        use rayon::prelude::*;
+        assert_eq!(x.len(), self.rows, "gemv 输入长度应等于 rows");
+        let cols = self.cols;
+        let mut out = vec![0.0f32; cols];
+        if cols == 0 || self.rows == 0 {
+            return out;
+        }
+        let qmax = self.bits.qmax() as f32;
+        // 码 → code/qmax 查表：避开逐元素除法，且与 `code as f32 / qmax` 同值
+        let n_tab = match self.bits {
+            QBits::Int8 => 256usize,
+            QBits::Int4 => 16usize,
+        };
+        let tab: Vec<f32> = (0..n_tab)
+            .map(|i| {
+                let code = if n_tab == 256 {
+                    i as u8 as i8 as f32
+                } else {
+                    (((i as u8) << 4) as i8 >> 4) as f32 // int4 半字节符号扩展
+                };
+                code / qmax
+            })
+            .collect();
+        let bytes = &self.bytes;
+        let packed = matches!(self.bits, QBits::Int4);
+        // 第 m 个码在打包字节里的下标（int4：两码一字节，低半字节在前）
+        let code_at = |m: usize| -> usize {
+            if packed {
+                let b = bytes[m / 2];
+                let nib = if m % 2 == 0 { b & 0x0F } else { (b >> 4) & 0x0F };
+                nib as usize
+            } else {
+                bytes[m] as usize
+            }
+        };
+        let nt = rayon::current_num_threads().max(1);
+        let chunk = cols.div_ceil(nt * 4).max(64).min(cols);
+        out.par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, ochunk)| {
+                let c0 = ci * chunk;
+                match self.axis {
+                    QAxis::Row => {
+                        for (r, &xv) in x.iter().enumerate() {
+                            let s = self.scales[r];
+                            let base = r * cols + c0;
+                            for (j, o) in ochunk.iter_mut().enumerate() {
+                                *o += xv * (tab[code_at(base + j)] * s);
+                            }
+                        }
+                    }
+                    QAxis::Col => {
+                        for (r, &xv) in x.iter().enumerate() {
+                            let base = r * cols + c0;
+                            for (j, o) in ochunk.iter_mut().enumerate() {
+                                *o += xv * (tab[code_at(base + j)] * self.scales[c0 + j]);
+                            }
+                        }
+                    }
+                }
+            });
+        out
+    }
+
     /// 还原成完整的 f32 矩阵
     pub fn dequantize(&self) -> Vec<f32> {
         let codes = unpack_codes(&self.bytes, self.bits, self.rows * self.cols);
-        dequantize_with_scales(&codes, self.rows, self.cols, self.bits, self.axis, &self.scales)
+        dequantize_with_scales(
+            &codes,
+            self.rows,
+            self.cols,
+            self.bits,
+            self.axis,
+            &self.scales,
+        )
     }
 
     /// 还原第 `i` 行（只解这一行的码，避免为了取一行解整张矩阵）
@@ -388,11 +470,13 @@ impl QMatrix {
     ///   超出初始范围的新值被裁剪到 `qmax`——代价有界，收益是 O(1) 的元数据开销。
     pub fn push_rows(&mut self, x: &[f32], new_rows: usize) {
         assert_eq!(x.len(), new_rows * self.cols, "追加数据长度与形状不符");
-        let mut codes = unpack_codes(&self.bytes, self.bits, self.rows * self.cols);
-        match self.axis {
+        if new_rows == 0 {
+            return;
+        }
+        let new_codes = match self.axis {
             QAxis::Row => {
                 let new_scales = group_scales(x, new_rows, self.cols, QAxis::Row);
-                let new_codes = quantize_with_scales(
+                let c = quantize_with_scales(
                     x,
                     new_rows,
                     self.cols,
@@ -401,20 +485,29 @@ impl QMatrix {
                     &new_scales,
                 );
                 self.scales.extend_from_slice(&new_scales);
-                codes.extend_from_slice(&new_codes);
+                c
             }
             QAxis::Col => {
                 // 冻结的列 scale 里可能还留着"未定"的 0（冻结那一刻该列全为零）：
                 // 这一批它终于有非零数据了，顺势定标，并把定下来的值写回，
                 // 之后的行就都按它走。历史码值在这种列上全是 0，换 scale 不影响它们。
                 self.scales = resolve_scales(x, new_rows, self.cols, QAxis::Col, &self.scales);
-                let new_codes =
-                    quantize_with_scales(x, new_rows, self.cols, self.bits, QAxis::Col, &self.scales);
-                codes.extend_from_slice(&new_codes);
+                quantize_with_scales(x, new_rows, self.cols, self.bits, QAxis::Col, &self.scales)
             }
+        };
+        // 关键：**把新码直接追加到已打包的字节流**，不再整表 unpack + repack。
+        // 原来每次追加都要碰一遍已有 T 行，滑窗推理下每 token 一次 ⇒ 整段 O(T²)。
+        // int4 下若历史码数是奇数，最后一个字节的**高**半字节还是空的，先塞新码的第一个。
+        let old_codes = self.rows * self.cols;
+        let mut from = 0usize;
+        if matches!(self.bits, QBits::Int4) && old_codes % 2 == 1 {
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= ((new_codes[0] as u8) & 0x0F) << 4;
+            from = 1;
         }
+        self.bytes
+            .extend_from_slice(&pack_codes(&new_codes[from..], self.bits));
         self.rows += new_rows;
-        self.bytes = pack_codes(&codes, self.bits);
     }
 
     /// 丢掉最前面的 `n` 行（KV cache 滑动窗口 / Attention Sink 用）
@@ -423,13 +516,37 @@ impl QMatrix {
         if n == 0 {
             return;
         }
-        let codes = unpack_codes(&self.bytes, self.bits, self.rows * self.cols);
-        let kept = codes[n * self.cols..].to_vec();
+        // 同样避免整表 repack：按**字节**跳过即可。
+        // 码流是行主序平铺的，所以丢 `n*cols` 个码等价于丢对应字节；
+        // int4 下偏移可能落在半个字节上，此时把高半字节挪到低半字节、后续字节整体左移 4 bit。
+        let off = n * self.cols;
+        let (start, half) = match self.bits {
+            QBits::Int8 => (off, false),
+            QBits::Int4 => (off / 2, off % 2 == 1),
+        };
+        if half {
+            // 偏移落在半字节上：剩余码要从"高位起"重新对齐。逐码搬一次（只在这一条
+            // 少数路径上发生，且仍是一趟 O(剩余码数) 的搬移，不是整表 unpack→repack）。
+            let n_rem = self.rows * self.cols - off;
+            let mut out = vec![0u8; n_rem.div_ceil(2)];
+            for j in 0..n_rem {
+                let m = off + j;
+                let b = self.bytes[m / 2];
+                let nib = if m % 2 == 0 { b & 0x0F } else { (b >> 4) & 0x0F };
+                if j % 2 == 0 {
+                    out[j / 2] = nib;
+                } else {
+                    out[j / 2] |= nib << 4;
+                }
+            }
+            self.bytes = out;
+        } else {
+            self.bytes.drain(..start);
+        }
         if self.axis == QAxis::Row {
             self.scales.drain(..n);
         }
         self.rows -= n;
-        self.bytes = pack_codes(&kept, self.bits);
     }
 
     /// 丢掉最末尾的 `n` 行（推测解码回滚用，见 [`crate::attention::KVCache::rollback`]）
@@ -529,8 +646,12 @@ impl QuantMethod {
     pub fn describe(self) -> &'static str {
         match self {
             QuantMethod::Rtn => "逐列独立四舍五入，列与列之间不共享任何信息（无需校准数据）",
-            QuantMethod::Hess => "用 XᵀX 的逆把每个输入通道的量化误差按相关性分摊给后面未量化的通道，逐通道最小化加权误差",
-            QuantMethod::Awq => "按激活幅度缩放输入通道（组内几何均值归一），让重要通道落到更细的量化格点上",
+            QuantMethod::Hess => {
+                "用 XᵀX 的逆把每个输入通道的量化误差按相关性分摊给后面未量化的通道，逐通道最小化加权误差"
+            }
+            QuantMethod::Awq => {
+                "按激活幅度缩放输入通道（组内几何均值归一），让重要通道落到更细的量化格点上"
+            }
         }
     }
 
@@ -1092,7 +1213,11 @@ pub fn hess_quantize(
             cholesky(&damped, rows).map(|l| cholesky_inverse_upper(&l, rows))
         }
     };
-    let block = if opts.block == 0 { rows } else { opts.block.min(rows) };
+    let block = if opts.block == 0 {
+        rows
+    } else {
+        opts.block.min(rows)
+    };
     hess_apply(w, rows, cols, bits, axis, &perm, hinv.as_deref(), block)
 }
 
@@ -1118,7 +1243,11 @@ fn hess_apply(
     assert_eq!(w.len(), rows * cols, "Hessian 量化输入长度与形状不符");
     assert_eq!(perm.len(), rows, "置换的长度必须等于输入通道数");
     if let Some(inv) = hinv {
-        assert_eq!(inv.len(), rows * rows, "H⁻¹ 必须落在输入维度上，形状 [rows, rows]");
+        assert_eq!(
+            inv.len(),
+            rows * rows,
+            "H⁻¹ 必须落在输入维度上，形状 [rows, rows]"
+        );
     }
     // block == 0 会让下面的分块循环原地打转（i2 == i1，i1 永不前进）
     let block = block.max(1);
@@ -1154,11 +1283,19 @@ fn hess_apply(
                     .collect();
                 (c, 0.0)
             };
-            let scale_of = |c: usize| if axis == QAxis::Row { row_scale } else { scales[c] };
+            let scale_of = |c: usize| {
+                if axis == QAxis::Row {
+                    row_scale
+                } else {
+                    scales[c]
+                }
+            };
             // 本行已经定案：工作副本写回"量化后的值"。这样循环结束时 work 的每一行都恰好
             // 等于它被量化时的取值，最后交给 quantize_with_scales 组装的码值与上面逐个
             // 算出的码值逐位一致（表示与 RTN 完全同构，只是取值不同）。
-            let deq: Vec<f32> = (0..cols).map(|c| codes[c] as f32 / qmax * scale_of(c)).collect();
+            let deq: Vec<f32> = (0..cols)
+                .map(|c| codes[c] as f32 / qmax * scale_of(c))
+                .collect();
             for c in 0..cols {
                 work[i * cols + c] = deq[c];
             }
@@ -1297,7 +1434,11 @@ pub fn awq_scales(act_abs_mean: &[f32], alpha: f32, group_size: usize) -> Vec<f3
 /// 就落在了量化误差上。
 pub fn awq_fold_weight(w: &[f32], rows: usize, cols: usize, s: &[f32]) -> Vec<f32> {
     assert_eq!(w.len(), rows * cols, "AWQ 权重长度与形状不符");
-    assert_eq!(s.len(), rows, "AWQ 缩放向量长度必须等于输入通道数（权重的行数）");
+    assert_eq!(
+        s.len(),
+        rows,
+        "AWQ 缩放向量长度必须等于输入通道数（权重的行数）"
+    );
     let mut out = w.to_vec();
     for r in 0..rows {
         for c in 0..cols {
@@ -1350,7 +1491,11 @@ pub fn awq_quantize(
 /// 系统性缩放，α 越小（`s` 越接近 1）看起来就越"准"，搜索就会系统性偏向 α=0。
 pub fn awq_unfold_weight(w: &[f32], rows: usize, cols: usize, s: &[f32]) -> Vec<f32> {
     assert_eq!(w.len(), rows * cols, "AWQ 权重长度与形状不符");
-    assert_eq!(s.len(), rows, "AWQ 缩放向量长度必须等于输入通道数（权重的行数）");
+    assert_eq!(
+        s.len(),
+        rows,
+        "AWQ 缩放向量长度必须等于输入通道数（权重的行数）"
+    );
     let mut out = w.to_vec();
     for r in 0..rows {
         for c in 0..cols {
@@ -1371,7 +1516,9 @@ pub const AWQ_ALPHA_GRID_STEP: f32 = 0.05;
 /// 生成 AWQ 的 α 搜索网格（含两端点）
 pub fn awq_alpha_grid() -> Vec<f32> {
     let steps = (1.0 / AWQ_ALPHA_GRID_STEP).round() as usize;
-    (0..=steps).map(|i| i as f32 * AWQ_ALPHA_GRID_STEP).collect()
+    (0..=steps)
+        .map(|i| i as f32 * AWQ_ALPHA_GRID_STEP)
+        .collect()
 }
 
 /// AWQ 的 α 搜索：在网格上按**代理误差**挑最优缩放指数，返回 `(量化结果, 缩放向量, α)`。
@@ -1496,7 +1643,8 @@ pub fn awq_best_alpha(
     }
     // 第 4 项（输出误差）只用于选优，不往外传：调用方若要报告误差，会在自己的口径上重算一次
     // 与 `awq_quantize_search` 同样的理由：网格为空时回落到 `awq_alpha_grid`，故恒非空
-    let (alpha, q, s, _) = best.expect("α 网格不能为空（网格为空时会回落到 awq_alpha_grid，恒非空）");
+    let (alpha, q, s, _) =
+        best.expect("α 网格不能为空（网格为空时会回落到 awq_alpha_grid，恒非空）");
     (alpha, q, s)
 }
 
@@ -1666,9 +1814,11 @@ impl QuantSummary {
 
     /// 相对误差最大的那一层（`None` = 一层都没量化）
     pub fn worst_layer(&self) -> Option<&QuantReport> {
-        self.layers
-            .iter()
-            .max_by(|a, b| a.rel_err.partial_cmp(&b.rel_err).unwrap_or(std::cmp::Ordering::Equal))
+        self.layers.iter().max_by(|a, b| {
+            a.rel_err
+                .partial_cmp(&b.rel_err)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// 中文摘要：算法、位宽、总字节与压缩率、层数、最差层、被跳过的层数
@@ -1729,7 +1879,9 @@ mod tests {
     use crate::rng::Rng;
 
     fn ramp(n: usize) -> Vec<f32> {
-        (0..n).map(|i| (i as f32 * 0.37).sin() * (1.0 + i as f32 * 0.01)).collect()
+        (0..n)
+            .map(|i| (i as f32 * 0.37).sin() * (1.0 + i as f32 * 0.01))
+            .collect()
     }
 
     /// 打包 / 解包必须无损（int4 的符号扩展、两码一字节都要对）
@@ -1738,7 +1890,9 @@ mod tests {
         for bits in [QBits::Int8, QBits::Int4] {
             let qmax = bits.qmax() as i8;
             // 奇数个码也要能处理：int4 时最后一个字节的高半字节是填充
-            let codes: Vec<i8> = (0..17).map(|i| (i % 2 == 0).then(|| -qmax).unwrap_or(qmax)).collect();
+            let codes: Vec<i8> = (0..17)
+                .map(|i| if i % 2 == 0 { -qmax } else { qmax })
+                .collect();
             let bytes = pack_codes(&codes, bits);
             assert_eq!(bytes.len(), packed_len(codes.len(), bits));
             assert_eq!(unpack_codes(&bytes, bits, codes.len()), codes);
@@ -1798,14 +1952,8 @@ mod tests {
         // 手工构造"全局一个 scale"：把所有 scale 都设成全局最大值
         let global = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let global_scales = vec![global; rows];
-        let per_all = QMatrix::quantize_with_scales(
-            &x,
-            rows,
-            cols,
-            QBits::Int4,
-            QAxis::Row,
-            &global_scales,
-        );
+        let per_all =
+            QMatrix::quantize_with_scales(&x, rows, cols, QBits::Int4, QAxis::Row, &global_scales);
 
         // 只看小量级的那 7 行。第 0 行的误差在两种方案里都由它自己的 scale 决定，
         // 混在一起会把差异淹没；真正体现"分组"价值的是小行有没有被大行的 scale 压死。
@@ -1877,7 +2025,10 @@ mod tests {
             let mut dropped = q.clone();
             dropped.drop_front_rows(2);
             assert_eq!(dropped.rows(), 4);
-            assert_eq!(dropped.scales().len(), if axis == QAxis::Row { 4 } else { cols });
+            assert_eq!(
+                dropped.scales().len(),
+                if axis == QAxis::Row { 4 } else { cols }
+            );
             assert_eq!(
                 dropped.dequantize(),
                 full[2 * cols..].to_vec(),
@@ -1895,7 +2046,11 @@ mod tests {
         // 第 0 行全零，所以前两列只能停在"未定"；后两列由第 1 行定标
         let first = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, -3.0];
         let mut q = QMatrix::quantize(&first, 2, cols, QBits::Int8, QAxis::Col);
-        assert_eq!((q.scales()[0], q.scales()[1]), (0.0, 0.0), "全零列应停在未定状态");
+        assert_eq!(
+            (q.scales()[0], q.scales()[1]),
+            (0.0, 0.0),
+            "全零列应停在未定状态"
+        );
         assert_eq!((q.scales()[2], q.scales()[3]), (2.0, 3.0));
         assert_eq!(q.dequantize(), first, "未定的列反量化回 0，与原值仍然一致");
 
@@ -1925,7 +2080,11 @@ mod tests {
         let x = ramp(rows * cols);
         let q8 = QMatrix::quantize(&x, rows, cols, QBits::Int8, QAxis::Row);
         let q4 = QMatrix::quantize(&x, rows, cols, QBits::Int4, QAxis::Row);
-        assert_eq!(q4.bytes().len() * 2, q8.bytes().len(), "int4 的码应只有 int8 的一半字节");
+        assert_eq!(
+            q4.bytes().len() * 2,
+            q8.bytes().len(),
+            "int4 的码应只有 int8 的一半字节"
+        );
         // 相对原始 f32 数据：int8 是 1/4，int4 是 1/8（这里只算整数码部分）
         assert_eq!(q8.bytes().len() * 4, rows * cols * 4);
         assert_eq!(q4.bytes().len() * 8, rows * cols * 4);
@@ -2066,13 +2225,19 @@ mod tests {
         let mut bad = a.clone();
         bad[0] = -1.0;
         bad[0 * n + 1] = 0.0;
-        bad[1 * n + 0] = 0.0;
+        bad[n] = 0.0;
         // 直接给一个对角为负的矩阵：A = -I
         let neg_i: Vec<f32> = (0..n * n)
             .map(|i| if i / n == i % n { -1.0 } else { 0.0 })
             .collect();
-        assert!(cholesky(&neg_i, n).is_none(), "负定矩阵不该分解出一个实的下三角因子");
-        assert!(cholesky(&vec![0.0f32; n * n], n).is_none(), "零矩阵是奇异的");
+        assert!(
+            cholesky(&neg_i, n).is_none(),
+            "负定矩阵不该分解出一个实的下三角因子"
+        );
+        assert!(
+            cholesky(&vec![0.0f32; n * n], n).is_none(),
+            "零矩阵是奇异的"
+        );
     }
 
     /// Hessian 量化的全部意义所在：同样的位宽、同一份权重、同一个 `H` 下，
@@ -2091,7 +2256,15 @@ mod tests {
         let hess = HessianKind::Full(h.clone());
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
-            let hess = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &HessOpts::default());
+            let hess = hess_quantize(
+                &w,
+                rows,
+                cols,
+                bits,
+                QAxis::Col,
+                &hess,
+                &HessOpts::default(),
+            );
             let err = |q: &QMatrix| {
                 let d = q.dequantize();
                 let e: Vec<f32> = w.iter().zip(&d).map(|(a, b)| a - b).collect();
@@ -2129,7 +2302,11 @@ mod tests {
             // 全零 Hessian：trace = 0，加阻尼也救不回正定性
             let zero_h = HessianKind::Full(vec![0.0f32; rows * rows]);
             let q1 = hess_quantize(&w, rows, cols, bits, QAxis::Col, &zero_h, &opts);
-            assert_eq!(q1.dequantize(), rtn.dequantize(), "H 全零时必须逐位退回 RTN");
+            assert_eq!(
+                q1.dequantize(),
+                rtn.dequantize(),
+                "H 全零时必须逐位退回 RTN"
+            );
 
             // 对角含 NaN：Cholesky 的 `d > 0` 判断天然挡住 NaN
             let mut nan_h = vec![0.0f32; rows * rows];
@@ -2145,7 +2322,10 @@ mod tests {
                 &HessianKind::Full(nan_h),
                 &opts,
             );
-            assert!(q2.dequantize().iter().all(|v| v.is_finite()), "NaN 不得扩散到结果里");
+            assert!(
+                q2.dequantize().iter().all(|v| v.is_finite()),
+                "NaN 不得扩散到结果里"
+            );
             assert_eq!(q2.dequantize(), rtn.dequantize(), "H 含 NaN 时必须退回 RTN");
 
             // 负定的"Hessian"（对角全负）同样退回
@@ -2161,7 +2341,11 @@ mod tests {
                 &HessianKind::Full(neg_h),
                 &opts,
             );
-            assert_eq!(q3.dequantize(), rtn.dequantize(), "非正定 Hessian 必须退回 RTN");
+            assert_eq!(
+                q3.dequantize(),
+                rtn.dequantize(),
+                "非正定 Hessian 必须退回 RTN"
+            );
 
             // 对角模式：`H⁻¹` 也是对角阵 ⇒ 跨通道补偿系数恒为 0 ⇒ 与 RTN 逐位相同
             let diag: Vec<f32> = (0..rows).map(|i| 1.0 + i as f32 * 0.1).collect();
@@ -2202,7 +2386,10 @@ mod tests {
         for i in 0..n {
             damped[i * n + i] += damp;
         }
-        assert!(cholesky(&damped, n).is_some(), "阻尼后 H 应为正定，Cholesky 必须成功");
+        assert!(
+            cholesky(&damped, n).is_some(),
+            "阻尼后 H 应为正定，Cholesky 必须成功"
+        );
 
         let (rows, cols) = (n, 16);
         let w = ramp(rows * cols);
@@ -2217,13 +2404,27 @@ mod tests {
                 bits,
                 QAxis::Col,
                 &hess,
-                &HessOpts { damp: 0.0, ..Default::default() },
+                &HessOpts {
+                    damp: 0.0,
+                    ..Default::default()
+                },
             );
-            assert_eq!(no_damp.dequantize(), rtn.dequantize(), "Cholesky 失败时必须退回 RTN");
+            assert_eq!(
+                no_damp.dequantize(),
+                rtn.dequantize(),
+                "Cholesky 失败时必须退回 RTN"
+            );
 
             // damp > 0：分解成功 ⇒ 补偿路径真的跑起来，结果依然有限且结构合法
-            let with_damp =
-                hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &HessOpts::default());
+            let with_damp = hess_quantize(
+                &w,
+                rows,
+                cols,
+                bits,
+                QAxis::Col,
+                &hess,
+                &HessOpts::default(),
+            );
             assert!(with_damp.dequantize().iter().all(|v| v.is_finite()));
             assert_eq!(with_damp.axis(), QAxis::Col);
             assert_eq!((with_damp.rows(), with_damp.cols()), (rows, cols));
@@ -2265,9 +2466,15 @@ mod tests {
             let rel_rtn = err(&rtn);
             let mut results = Vec::new();
             for act_order in [false, true] {
-                let opts = HessOpts { act_order, ..Default::default() };
+                let opts = HessOpts {
+                    act_order,
+                    ..Default::default()
+                };
                 let q = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &opts);
-                assert!(q.dequantize().iter().all(|v| v.is_finite()), "act_order={act_order} 产出了非有限值");
+                assert!(
+                    q.dequantize().iter().all(|v| v.is_finite()),
+                    "act_order={act_order} 产出了非有限值"
+                );
                 assert_eq!(q.axis(), QAxis::Col);
                 assert_eq!((q.rows(), q.cols()), (rows, cols));
                 assert_eq!(q.scales().len(), cols);
@@ -2315,9 +2522,15 @@ mod tests {
             let rel_rtn = err(&rtn);
             let mut base: Option<f32> = None;
             for block in [0usize, 1, 4, 16] {
-                let opts = HessOpts { block, ..Default::default() };
+                let opts = HessOpts {
+                    block,
+                    ..Default::default()
+                };
                 let q = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &opts);
-                assert!(q.dequantize().iter().all(|v| v.is_finite()), "block={block} 产出了非有限值");
+                assert!(
+                    q.dequantize().iter().all(|v| v.is_finite()),
+                    "block={block} 产出了非有限值"
+                );
                 assert_eq!(q.byte_len(), rtn.byte_len(), "分块不改变表示口径");
                 let r = err(&q);
                 println!("[{}] block={block:>3} 加权相对误差 {r:.6}", bits.name());
@@ -2352,12 +2565,19 @@ mod tests {
         let w = ramp(rows * cols);
         let act: Vec<f32> = (0..rows).map(|j| 0.3 + j as f32 * 1.1).collect();
         let s = awq_scales(&act, 0.0, rows);
-        assert!(s.iter().all(|v| *v == 1.0), "α=0 时缩放必须恰好是 1.0，而不是 1+ε");
+        assert!(
+            s.iter().all(|v| *v == 1.0),
+            "α=0 时缩放必须恰好是 1.0，而不是 1+ε"
+        );
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
             let (q, s2) = awq_quantize(&w, rows, cols, bits, QAxis::Col, &act, 0.0);
             assert_eq!(s2, s);
-            assert_eq!(q.dequantize(), rtn.dequantize(), "α=0 时 AWQ 必须逐位等于 RTN");
+            assert_eq!(
+                q.dequantize(),
+                rtn.dequantize(),
+                "α=0 时 AWQ 必须逐位等于 RTN"
+            );
         }
     }
 
@@ -2401,13 +2621,18 @@ mod tests {
         let mut rng = Rng::new(303);
         let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
         // 通道重要性差异很大：α 才有可搜的空间
-        let act: Vec<f32> = (0..rows).map(|j| 0.05 + 4.0f32.powi(j as i32 % 7 - 3)).collect();
+        let act: Vec<f32> = (0..rows)
+            .map(|j| 0.05 + 4.0f32.powi(j as i32 % 7 - 3))
+            .collect();
 
         let grid = awq_alpha_grid();
         assert_eq!(grid.first(), Some(&0.0));
         assert_eq!(grid.last(), Some(&1.0));
         assert_eq!(grid.len(), 21);
-        assert!(grid.windows(2).all(|w| (w[1] - w[0] - AWQ_ALPHA_GRID_STEP).abs() < 1e-6));
+        assert!(
+            grid.windows(2)
+                .all(|w| (w[1] - w[0] - AWQ_ALPHA_GRID_STEP).abs() < 1e-6)
+        );
 
         for bits in [QBits::Int8, QBits::Int4] {
             let equiv_err = |alpha: f32| {
@@ -2418,9 +2643,13 @@ mod tests {
             assert!(grid.contains(&alpha), "搜索给出的 α={alpha} 不在网格里");
             assert_eq!(s.len(), rows, "AWQ 缩放向量长度必须等于输入通道数");
             assert_eq!(q.scales().len(), cols);
-            let best = quant_error(&w, &awq_unfold_weight(&q.dequantize(), rows, cols, &s)).relative;
+            let best =
+                quant_error(&w, &awq_unfold_weight(&q.dequantize(), rows, cols, &s)).relative;
             let rtn = equiv_err(0.0);
-            println!("[{}] 选出 α={alpha:.2}，等效 rel {best:.5}；α=0 时 rel {rtn:.5}", bits.name());
+            println!(
+                "[{}] 选出 α={alpha:.2}，等效 rel {best:.5}；α=0 时 rel {rtn:.5}",
+                bits.name()
+            );
             assert!(
                 best <= rtn + 1e-9,
                 "[{}] 搜索必须不差于 α=0：{best} vs {rtn}",
@@ -2450,7 +2679,15 @@ mod tests {
         let h = random_spd(rows, 31); // 用良态正定矩阵当 Hessian（H 在输入维度上），确保走的是补偿分支
         let hess = HessianKind::Full(h);
         for bits in [QBits::Int8, QBits::Int4] {
-            let q = hess_quantize(&w, rows, cols, bits, QAxis::Col, &hess, &HessOpts::default());
+            let q = hess_quantize(
+                &w,
+                rows,
+                cols,
+                bits,
+                QAxis::Col,
+                &hess,
+                &HessOpts::default(),
+            );
             assert_eq!(q.axis(), QAxis::Col);
             assert_eq!((q.rows(), q.cols()), (rows, cols));
             assert_eq!(q.scales().len(), cols, "逐列分组：每个输出通道一个 scale");
@@ -2466,7 +2703,8 @@ mod tests {
             assert_eq!(back.len(), rows * cols);
             assert!(back.iter().all(|v| v.is_finite()));
             // 反量化值本身就在格点上：拿它按同一套 scale 再量化一次应逐位稳定
-            let again = QMatrix::quantize_with_scales(&back, rows, cols, bits, QAxis::Col, q.scales());
+            let again =
+                QMatrix::quantize_with_scales(&back, rows, cols, bits, QAxis::Col, q.scales());
             for (a, b) in again.dequantize().iter().zip(&back) {
                 assert!((a - b).abs() <= 1e-6, "格点值再量化发生了漂移：{a} vs {b}");
             }
@@ -2475,7 +2713,10 @@ mod tests {
                 let m = (0..rows)
                     .map(|r| back[r * cols + c].abs())
                     .fold(0.0f32, f32::max);
-                assert!(m <= q.scales()[c] * (1.0 + 1e-5), "第 {c} 列超出了自己的 scale");
+                assert!(
+                    m <= q.scales()[c] * (1.0 + 1e-5),
+                    "第 {c} 列超出了自己的 scale"
+                );
             }
         }
     }
@@ -2490,7 +2731,10 @@ mod tests {
         for g in 0..2 {
             let seg: Vec<f32> = s[g * 4..(g + 1) * 4].to_vec();
             let mean_log = seg.iter().map(|v| v.ln()).sum::<f32>() / 4.0;
-            assert!(mean_log.abs() < 1e-4, "第 {g} 组的几何均值应为 1，log 均值 = {mean_log}");
+            assert!(
+                mean_log.abs() < 1e-4,
+                "第 {g} 组的几何均值应为 1，log 均值 = {mean_log}"
+            );
             for i in 0..4 {
                 for j in (i + 1)..4 {
                     let (a, b) = (act[g * 4 + i], act[g * 4 + j]);
@@ -2510,9 +2754,13 @@ mod tests {
         let ratio = s1[3] / s1[0];
         assert!((ratio - 8.0).abs() < 1e-3, "α=1 时比值应为 8，实得 {ratio}");
         // α = 0 退化成"不缩放"
-        assert!(awq_scales(&act, 0.0, 4).iter().all(|v| (v - 1.0).abs() < 1e-6));
+        assert!(
+            awq_scales(&act, 0.0, 4)
+                .iter()
+                .all(|v| (v - 1.0).abs() < 1e-6)
+        );
         // 全零激活（该层从未被激活）不得产生 NaN / Inf
-        let z = awq_scales(&vec![0.0f32; 4], 0.5, 4);
+        let z = awq_scales(&[0.0f32; 4], 0.5, 4);
         assert!(z.iter().all(|v| v.is_finite() && *v > 0.0));
     }
 
@@ -2657,11 +2905,20 @@ mod tests {
         let neg_i: Vec<f32> = (0..n * n)
             .map(|i| if i / n == i % n { -1.0 } else { 0.0 })
             .collect();
-        assert!(cholesky_inverse(&neg_i, n, 0.0).is_none(), "负定矩阵不该给出逆");
-        assert!(cholesky_inverse(&vec![0.0f32; n * n], n, 0.0).is_none(), "零矩阵是奇异的");
+        assert!(
+            cholesky_inverse(&neg_i, n, 0.0).is_none(),
+            "负定矩阵不该给出逆"
+        );
+        assert!(
+            cholesky_inverse(&vec![0.0f32; n * n], n, 0.0).is_none(),
+            "零矩阵是奇异的"
+        );
         let mut nan_h = a.clone();
         nan_h[0] = f32::NAN;
-        assert!(cholesky_inverse(&nan_h, n, 1.0).is_none(), "NaN 必须判失败而不是扩散出去");
+        assert!(
+            cholesky_inverse(&nan_h, n, 1.0).is_none(),
+            "NaN 必须判失败而不是扩散出去"
+        );
         // 反过来：阻尼够大时同一张负定矩阵又能求了——这正是"非正定就加大 damp 重试"的意义
         let rescued = cholesky_inverse(&neg_i, n, 2.0).expect("充分阻尼后必可逆");
         assert!(rescued.iter().all(|v| v.is_finite()));
@@ -2753,15 +3010,22 @@ mod tests {
             );
         }
         let trace = (0..rows).map(|i| h_mean[i * rows + i]).sum::<f32>();
-        let hinv =
-            cholesky_inverse(&h_mean, rows, HESS_DAMP * trace / rows as f32).expect("阻尼后必为正定");
+        let hinv = cholesky_inverse(&h_mean, rows, HESS_DAMP * trace / rows as f32)
+            .expect("阻尼后必为正定");
         let sq = |wq: &[f32]| output_error_sq(&x, &w, wq, tokens, rows, cols);
         for bits in [QBits::Int8, QBits::Int4] {
             let rtn = QMatrix::quantize(&w, rows, cols, bits, QAxis::Col);
             let hess = hess_quantize_with_hinv(&w, rows, cols, bits, QAxis::Col, &hinv);
             let (a, b) = (sq(&hess.dequantize()), sq(&rtn.dequantize()));
-            println!("[{}] 校准数据输出平方误差 Hessian 量化 {a:.6} < RTN {b:.6}", bits.name());
-            assert!(a < b, "[{}] Hessian 量化必须把输出误差压得更低：{a} vs {b}", bits.name());
+            println!(
+                "[{}] 校准数据输出平方误差 Hessian 量化 {a:.6} < RTN {b:.6}",
+                bits.name()
+            );
+            assert!(
+                a < b,
+                "[{}] Hessian 量化必须把输出误差压得更低：{a} vs {b}",
+                bits.name()
+            );
         }
     }
 
@@ -2791,12 +3055,26 @@ mod tests {
         cal.observe(&x, tokens);
         let act = cal.act_abs_mean();
         // 显著性通道必须真的排在前面，否则这组数据压根没造出重尾
-        assert!(act[0] > 10.0 * act[1], "重尾激活的构造无效：{} vs {}", act[0], act[1]);
+        assert!(
+            act[0] > 10.0 * act[1],
+            "重尾激活的构造无效：{} vs {}",
+            act[0],
+            act[1]
+        );
 
         let sq = |wq: &[f32]| output_error_sq(&x, &w, wq, tokens, rows, cols);
         for bits in [QBits::Int4, QBits::Int8] {
-            let (alpha, q, s) =
-                awq_best_alpha(&w, rows, cols, bits, QAxis::Col, &act, &x, tokens, &awq_alpha_grid());
+            let (alpha, q, s) = awq_best_alpha(
+                &w,
+                rows,
+                cols,
+                bits,
+                QAxis::Col,
+                &act,
+                &x,
+                tokens,
+                &awq_alpha_grid(),
+            );
             assert!(awq_alpha_grid().contains(&alpha), "α={alpha} 不在网格里");
             assert_eq!(s.len(), rows, "缩放向量长度必须等于输入通道数");
             assert_eq!(q.scales().len(), cols, "逐列分组：每个输出通道一个 scale");
@@ -2813,10 +3091,24 @@ mod tests {
                 "[{}] AWQ 必须优于不缩放的 RTN：{a} vs {b}",
                 bits.name()
             );
-            assert!(alpha > 0.0, "[{}] 重尾激活下不该选中 α=0（那等于不缩放）", bits.name());
+            assert!(
+                alpha > 0.0,
+                "[{}] 重尾激活下不该选中 α=0（那等于不缩放）",
+                bits.name()
+            );
         }
         // 空网格回落到默认网格（而不是 panic）
-        let (a2, _, _) = awq_best_alpha(&w, rows, cols, QBits::Int4, QAxis::Col, &act, &x, tokens, &[]);
+        let (a2, _, _) = awq_best_alpha(
+            &w,
+            rows,
+            cols,
+            QBits::Int4,
+            QAxis::Col,
+            &act,
+            &x,
+            tokens,
+            &[],
+        );
         assert!(awq_alpha_grid().contains(&a2));
     }
 
@@ -2829,7 +3121,9 @@ mod tests {
         let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
         let x: Vec<f32> = (0..n * rows).map(|_| rng.randn() * 1.5).collect();
         // 通道幅度差两个数量级：缩放才有东西可分配
-        let act: Vec<f32> = (0..rows).map(|j| if j % 4 == 0 { 50.0 } else { 0.4 }).collect();
+        let act: Vec<f32> = (0..rows)
+            .map(|j| if j % 4 == 0 { 50.0 } else { 0.4 })
+            .collect();
         // 组大小取 rows：整条输入一个组，几何均值归一在全局生效
         let s = awq_scales(&act, 0.5, rows);
         assert_eq!(s.len(), rows);
@@ -2844,7 +3138,10 @@ mod tests {
         // `s` 必须能精确还原等价权重（折叠后再除回来 == 原权重）
         let back = awq_unfold_weight(&folded, rows, cols, &s);
         for (i, (a, b)) in w.iter().zip(&back).enumerate() {
-            assert!((a - b).abs() < 1e-5 * a.abs().max(1.0), "第 {i} 项折回来不对：{a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-5 * a.abs().max(1.0),
+                "第 {i} 项折回来不对：{a} vs {b}"
+            );
         }
 
         // 2) 量化之后：`s` 仍然必须能把码值折回原坐标，等价权重才与原权重可比
@@ -2894,7 +3191,11 @@ mod tests {
             }
         }
         // mean|x|：(|1| + |0.5| + |-4|) / 3 这一类
-        let want_mean = [(1.0 + 0.5 + 4.0) / 3.0, (2.0 + 0.25 + 1.5) / 3.0, (3.0 + 1.0 + 0.5) / 3.0];
+        let want_mean = [
+            (1.0 + 0.5 + 4.0) / 3.0,
+            (2.0 + 0.25 + 1.5) / 3.0,
+            (3.0 + 1.0 + 0.5) / 3.0,
+        ];
         for (j, want) in want_mean.iter().enumerate() {
             assert!(
                 (a.act_abs_mean()[j] - want).abs() < 1e-5,
@@ -2943,6 +3244,129 @@ mod tests {
                 let wrong = vec![1.0f32; cols * cols];
                 let q2 = hess_quantize_with_hinv(&w, rows, cols, bits, axis, &wrong);
                 assert_eq!(q2.bytes(), rtn.bytes(), "维度不符时同样退回 RTN");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemv_bit_exact_tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    /// 融合反量化的 GEMV 必须与"反量化 + 逐列 axpy"**逐元素相等**（不是近似）。
+    /// 尺寸取奇数（37×53）：覆盖 int4 半字节边界、行宽为奇数、行尾半字节错位。
+    #[test]
+    fn test_qmatrix_gemv_matches_dequantize_then_axpy() {
+        let mut rng = Rng::new(5);
+        for &bits in &[QBits::Int8, QBits::Int4] {
+            for &axis in &[QAxis::Row, QAxis::Col] {
+                let (rows, cols) = (37usize, 53usize);
+                let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
+                let q = QMatrix::quantize(&w, rows, cols, bits, axis);
+                let deq = q.dequantize();
+                let x: Vec<f32> = (0..rows).map(|_| rng.randn()).collect();
+                // 参考实现：反量化后按 r 升序做逐列 axpy（与 matmul 的 i-k-j 序一致）
+                let mut want = vec![0.0f32; cols];
+                for (r, &xv) in x.iter().enumerate() {
+                    for (c, wv) in deq[r * cols..(r + 1) * cols].iter().enumerate() {
+                        want[c] += xv * wv;
+                    }
+                }
+                let got = q.gemv(&x);
+                assert_eq!(got, want, "bits={bits:?} axis={axis:?}：与反量化路径不一致");
+            }
+        }
+    }
+
+    /// 融合内核 vs 现有"整表反量化 + axpy"（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release quant::gemv_bit_exact_tests::probe_gemv_speed -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn probe_gemv_speed() {
+        use std::time::Instant;
+        // 0.5B 的 w_down 尺寸：反量化一次就是 4864×896×4 B = 17 MB
+        let (rows, cols) = (896usize, 4864usize);
+        let mut rng = Rng::new(1);
+        let w: Vec<f32> = (0..rows * cols).map(|_| rng.randn()).collect();
+        let x: Vec<f32> = (0..rows).map(|_| rng.randn()).collect();
+        for &bits in &[QBits::Int8, QBits::Int4] {
+            for &axis in &[QAxis::Row, QAxis::Col] {
+                let q = QMatrix::quantize(&w, rows, cols, bits, axis);
+                let t = Instant::now();
+                let deq = q.dequantize();
+                let mut y0 = vec![0.0f32; cols];
+                for (r, &xv) in x.iter().enumerate() {
+                    for (c, wv) in deq[r * cols..(r + 1) * cols].iter().enumerate() {
+                        y0[c] += xv * wv;
+                    }
+                }
+                let ta = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let y1 = q.gemv(&x);
+                let tb = t.elapsed().as_secs_f64();
+                let max = y0
+                    .iter()
+                    .zip(&y1)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!(
+                    "[{bits:?}/{axis:?}] 反量化+axpy {:.1} ms | 融合 gemv {:.1} ms | **{:.2}×** | 最大偏差 {:.1e}",
+                    ta * 1e3,
+                    tb * 1e3,
+                    ta / tb,
+                    max
+                );
+            }
+        }
+    }}
+
+#[cfg(test)]
+mod kv_append_tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    /// 量化 KV 的**追加/淘汰**不再整表重打包，但必须与"解出全部码再打包"完全自洽，
+    /// 且淘汰后保留下来的行逐元素不变。行宽取奇数 7：int4 下偏移会落在半字节上。
+    #[test]
+    fn test_quant_kv_append_and_evict_match_repack() {
+        for &bits in &[QBits::Int8, QBits::Int4] {
+            for &axis in &[QAxis::Row, QAxis::Col] {
+                let cols = 7usize;
+                let mut q = QMatrix::zeros(0, cols, bits, axis);
+                let mut rng = Rng::new(11);
+                for chunk in [2usize, 1, 3] {
+                    let x: Vec<f32> = (0..chunk * cols).map(|_| rng.randn()).collect();
+                    q.push_rows(&x, chunk);
+                }
+                assert_eq!(q.rows, 6);
+                // 不变式：字节流 == 按行解出全部码再打包（抓 int4 半字节错位）
+                let codes = unpack_codes(&q.bytes, q.bits, q.rows * q.cols);
+                assert_eq!(
+                    pack_codes(&codes, q.bits),
+                    q.bytes,
+                    "bits={bits:?} axis={axis:?}：追加后字节流不自洽"
+                );
+                // 逐行快照 → 丢前 1 行（奇数行宽 ⇒ 偏移落在半字节上）
+                let before: Vec<Vec<f32>> = (0..q.rows).map(|i| q.row(i)).collect();
+                q.drop_front_rows(1);
+                assert_eq!(q.rows, 5);
+                for i in 0..q.rows {
+                    assert_eq!(
+                        q.row(i),
+                        before[i + 1],
+                        "bits={bits:?} axis={axis:?}：丢行后第 {i} 行变了"
+                    );
+                }
+                let codes = unpack_codes(&q.bytes, q.bits, q.rows * q.cols);
+                assert_eq!(
+                    pack_codes(&codes, q.bits),
+                    q.bytes,
+                    "bits={bits:?} axis={axis:?}：丢行后字节流不自洽"
+                );
             }
         }
     }

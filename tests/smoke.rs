@@ -14,7 +14,11 @@ fn bin() -> Command {
 #[test]
 fn help_lists_subcommands() {
     let out = bin().arg("--help").output().expect("启动二进制失败");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     for cmd in ["train", "eval", "generate", "serve", "preset"] {
         assert!(stdout.contains(cmd), "help 输出缺少子命令 {cmd}:\n{stdout}");
@@ -30,11 +34,20 @@ fn preset_writes_config_file() {
         .arg(&path)
         .output()
         .expect("启动二进制失败");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("输出文件不可读 {path:?}: {e}"));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("输出文件不可读 {path:?}: {e}"));
     // 配置字段确实落盘（不是空文件/截断）
-    assert!(text.contains("n_embd"), "配置内容异常:\n{}", &text[..text.len().min(400)]);
+    assert!(
+        text.contains("n_embd"),
+        "配置内容异常:\n{}",
+        &text[..text.len().min(400)]
+    );
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("输出不是合法 JSON");
     assert!(parsed.get("model").is_some() && parsed.get("train").is_some());
 

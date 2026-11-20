@@ -194,8 +194,14 @@ pub fn sequence_logprob_value(model: &Transformer, seq: &MaskedSequence) -> f32 
 ///
 /// 参考模型全程冻结，它的 logprob 在训练过程中一个数都不会变——每步重算一遍
 /// 纯属浪费（DPO 的算力有一半花在这上面）。提前算好存成 f32，训练循环里只跑策略。
-pub fn precompute_reference_logprobs(reference: &Transformer, samples: &[MaskedSequence]) -> Vec<f32> {
-    samples.iter().map(|s| sequence_logprob_value(reference, s)).collect()
+pub fn precompute_reference_logprobs(
+    reference: &Transformer,
+    samples: &[MaskedSequence],
+) -> Vec<f32> {
+    samples
+        .iter()
+        .map(|s| sequence_logprob_value(reference, s))
+        .collect()
 }
 
 // ==================== DPO ====================
@@ -268,7 +274,9 @@ pub fn dpo_batch_loss(
             Some(acc) => acc.add(&loss),
         });
     }
-    total.expect("非空批次").mul_scalar(1.0 / pairs.len() as f32)
+    total
+        .expect("非空批次")
+        .mul_scalar(1.0 / pairs.len() as f32)
 }
 
 // ==================== GRPO 与 PPO ====================
@@ -336,8 +344,16 @@ fn clipped_objective(
     clip_eps: f32,
 ) -> (f32, Vec<f32>) {
     assert!(!logp_policy.is_empty(), "空轨迹没有代理目标可言");
-    assert_eq!(logp_policy.len(), logp_old.len(), "轨迹条数必须与 logp_old 一致");
-    assert_eq!(logp_policy.len(), advantages.len(), "轨迹条数必须与优势一致");
+    assert_eq!(
+        logp_policy.len(),
+        logp_old.len(),
+        "轨迹条数必须与 logp_old 一致"
+    );
+    assert_eq!(
+        logp_policy.len(),
+        advantages.len(),
+        "轨迹条数必须与优势一致"
+    );
     assert!(clip_eps > 0.0, "裁剪范围必须为正，实际 {clip_eps}");
 
     let n = logp_policy.len() as f32;
@@ -488,7 +504,11 @@ mod tests {
         let lo = Tensor::param(vec![-500.0], vec![1]);
         let loss = bradley_terry_loss(&hi, &lo);
         assert!(loss.item().is_finite(), "损失不该溢出：{}", loss.item());
-        assert!(loss.item() < 1e-6, "差距极大时损失应趋于 0：{}", loss.item());
+        assert!(
+            loss.item() < 1e-6,
+            "差距极大时损失应趋于 0：{}",
+            loss.item()
+        );
 
         let hi2 = Tensor::param(vec![-500.0], vec![1]);
         let lo2 = Tensor::param(vec![500.0], vec![1]);
@@ -690,8 +710,7 @@ mod tests {
             pairs
                 .iter()
                 .map(|p| {
-                    sequence_logprob_value(m, &p.chosen)
-                        - sequence_logprob_value(m, &p.rejected)
+                    sequence_logprob_value(m, &p.chosen) - sequence_logprob_value(m, &p.rejected)
                 })
                 .sum()
         };
@@ -735,8 +754,9 @@ mod tests {
             &flatten_pairs(&pairs),
         ));
 
-        let snapshot =
-            |m: &Transformer| -> Vec<f32> { m.parameters().iter().flat_map(|p| p.data()).collect() };
+        let snapshot = |m: &Transformer| -> Vec<f32> {
+            m.parameters().iter().flat_map(|p| p.data()).collect()
+        };
         let ref_before = snapshot(&reference);
         let policy_before = snapshot(&policy);
 
@@ -769,7 +789,10 @@ mod tests {
         assert!(mean.abs() < 1e-5, "组内优势均值应为 0，实际 {mean}");
         assert!((var - 1.0).abs() < 1e-5, "组内优势方差应为 1，实际 {var}");
         // 分数越高优势越大，且严格单调
-        assert!(adv[0] < adv[1] && adv[1] < adv[2] && adv[2] < adv[3], "应保持组内次序：{adv:?}");
+        assert!(
+            adv[0] < adv[1] && adv[1] < adv[2] && adv[2] < adv[3],
+            "应保持组内次序：{adv:?}"
+        );
         assert!(adv[0] < 0.0 && adv[3] > 0.0, "低于/高于组内平均的应为负/正");
     }
 
@@ -783,7 +806,10 @@ mod tests {
                 adv.iter().all(|a| *a == 0.0),
                 "分数相同则组内分不出好坏，优势应为 0：{adv:?}"
             );
-            assert!(adv.iter().all(|a| a.is_finite()), "不得出现 NaN/Inf：{adv:?}");
+            assert!(
+                adv.iter().all(|a| a.is_finite()),
+                "不得出现 NaN/Inf：{adv:?}"
+            );
         }
         // 单个样本的"组"同样退化为 0
         assert_eq!(group_advantages(&[1.0]), vec![0.0]);
@@ -831,7 +857,7 @@ mod tests {
 
         // ρ ≠ 1 时梯度带上 ρ 因子：log π 比采样时高了 0.1（仍在 1±ε 内，不触发裁剪）
         let shifted = Tensor::param(vec![old[0] + 0.1], vec![]);
-        let loss2 = grpo_loss(&[shifted.clone()], &[old[0]], &[1.0], 0.2);
+        let loss2 = grpo_loss(std::slice::from_ref(&shifted), &[old[0]], &[1.0], 0.2);
         loss2.backward();
         assert!(
             (shifted.grad()[0] + 0.1f32.exp()).abs() < 1e-4,
@@ -851,7 +877,8 @@ mod tests {
         let good = masked_answer(&tok, "ab", "cab");
         let bad = masked_answer(&tok, "ab", "caa");
         let advantages = group_advantages(&[1.0, -1.0]);
-        let margin = |m: &Transformer| sequence_logprob_value(m, &good) - sequence_logprob_value(m, &bad);
+        let margin =
+            |m: &Transformer| sequence_logprob_value(m, &good) - sequence_logprob_value(m, &bad);
 
         let before = margin(&policy);
         let mut opt = AdamW::new(1e-3, policy.parameters(), 0.0);
@@ -884,7 +911,14 @@ mod tests {
 
         // 优势 > 0 且 ρ = 2 > 1.2：目标被 clip 到 (1+ε)·A，落在区间外是常数 ⇒ 梯度 0
         let ratio_hi = Tensor::param(vec![2.0f32.ln()], vec![]);
-        let loss = ppo_loss(&[ratio_hi.clone()], &[0.0], &[1.0], &[0.0], eps, 0.0);
+        let loss = ppo_loss(
+            std::slice::from_ref(&ratio_hi),
+            &[0.0],
+            &[1.0],
+            &[0.0],
+            eps,
+            0.0,
+        );
         loss.backward();
         assert!(
             (loss.item() + 1.2).abs() < 1e-5,
@@ -895,7 +929,14 @@ mod tests {
 
         // 优势 < 0 且 ρ = 0.5 < 1−ε：min 取到 clip 分支 ⇒ 梯度同样为 0
         let ratio_lo = Tensor::param(vec![0.5f32.ln()], vec![]);
-        let loss_lo = ppo_loss(&[ratio_lo.clone()], &[0.0], &[-1.0], &[0.0], eps, 0.0);
+        let loss_lo = ppo_loss(
+            std::slice::from_ref(&ratio_lo),
+            &[0.0],
+            &[-1.0],
+            &[0.0],
+            eps,
+            0.0,
+        );
         loss_lo.backward();
         assert!(
             (loss_lo.item() - 0.8).abs() < 1e-5,
@@ -910,7 +951,7 @@ mod tests {
     fn test_ppo_unclipped_branch_gradient_is_analytic() {
         // ρ = 1（log π 与 log π_old 相同）：d loss/d log π = −A·1/1 = −1
         let lp = Tensor::param(vec![0.0f32], vec![]);
-        let loss = ppo_loss(&[lp.clone()], &[0.0], &[1.0], &[0.0], 0.2, 0.0);
+        let loss = ppo_loss(std::slice::from_ref(&lp), &[0.0], &[1.0], &[0.0], 0.2, 0.0);
         loss.backward();
         assert!(
             (lp.grad()[0] + 1.0).abs() < 1e-5,
@@ -920,7 +961,7 @@ mod tests {
 
         // ρ = 1.1（仍在 1±0.2 内）：梯度应为 −A·ρ = −1.1
         let lp2 = Tensor::param(vec![1.1f32.ln()], vec![]);
-        let loss2 = ppo_loss(&[lp2.clone()], &[0.0], &[1.0], &[0.0], 0.2, 0.0);
+        let loss2 = ppo_loss(std::slice::from_ref(&lp2), &[0.0], &[1.0], &[0.0], 0.2, 0.0);
         loss2.backward();
         assert!(
             (lp2.grad()[0] + 1.1).abs() < 1e-5,
@@ -951,7 +992,10 @@ mod tests {
         // 若存在一阶项 c·δ，这里会收敛到常数 c 而不是 0——参考模型所在处必须没有
         // 一阶的"推走"力，否则 KL 约束会把策略从参考点推开。
         let odd = (kl_k3(h) - kl_k3(-h)) / (2.0 * h);
-        assert!(odd.abs() < 1e-3, "一阶项必须为 0（奇部/2δ → 0），实际 {odd}");
+        assert!(
+            odd.abs() < 1e-3,
+            "一阶项必须为 0（奇部/2δ → 0），实际 {odd}"
+        );
 
         for x in [-3.0f32, -0.5, 0.5, 3.0] {
             assert!(kl_k3(x) >= 0.0, "KL 不可能为负，kl_k3({x}) = {}", kl_k3(x));
@@ -964,7 +1008,14 @@ mod tests {
         // 策略当前 log π = −1.0，参考 log π_ref = −0.5 ⇒ delta = 0.5，策略偏低
         // KL 项梯度 = 1 − e^{0.5} < 0 ⇒ 梯度下降会抬高 log π（朝参考模型靠）
         let lp = Tensor::param(vec![-1.0f32], vec![]);
-        let loss = ppo_loss(&[lp.clone()], &[-1.0], &[0.0], &[-0.5], 0.2, 1.0);
+        let loss = ppo_loss(
+            std::slice::from_ref(&lp),
+            &[-1.0],
+            &[0.0],
+            &[-0.5],
+            0.2,
+            1.0,
+        );
         loss.backward();
         let want = 1.0 - 0.5f32.exp();
         assert!(

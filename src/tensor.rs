@@ -685,10 +685,12 @@ fn bf16_vec_enabled() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn bf16x8_to_f32x8(p: *const u16) -> std::arch::x86_64::__m256 {
-    use std::arch::x86_64::*;
-    let raw = _mm_loadu_si128(p as *const __m128i);
-    let wide = _mm256_cvtepu16_epi32(raw);
-    _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16))
+    unsafe {
+        use std::arch::x86_64::*;
+        let raw = _mm_loadu_si128(p as *const __m128i);
+        let wide = _mm256_cvtepu16_epi32(raw);
+        _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16))
+    }
 }
 
 /// 8 个 f32 的水平求和。
@@ -708,38 +710,42 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn bf16_dot_f32(a: &[f32], b: &[u16]) -> f32 {
-    use std::arch::x86_64::*;
-    let k = a.len().min(b.len());
-    let chunks = k / 8;
-    let mut acc = _mm256_setzero_ps();
-    for c in 0..chunks {
-        let av = _mm256_loadu_ps(a.as_ptr().add(c * 8));
-        let bv = bf16x8_to_f32x8(b.as_ptr().add(c * 8));
-        acc = _mm256_fmadd_ps(av, bv, acc);
+    unsafe {
+        use std::arch::x86_64::*;
+        let k = a.len().min(b.len());
+        let chunks = k / 8;
+        let mut acc = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let av = _mm256_loadu_ps(a.as_ptr().add(c * 8));
+            let bv = bf16x8_to_f32x8(b.as_ptr().add(c * 8));
+            acc = _mm256_fmadd_ps(av, bv, acc);
+        }
+        let mut s = hsum256(acc);
+        for i in chunks * 8..k {
+            s += a[i] * bf16_to_f32(b[i]);
+        }
+        s
     }
-    let mut s = hsum256(acc);
-    for i in chunks * 8..k {
-        s += a[i] * bf16_to_f32(b[i]);
-    }
-    s
 }
 
 /// `acc[j] += a_v · bf16(b[j])`（axpy，AVX2 一次 8 个）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn bf16_axpy_f32(acc: &mut [f32], a_v: f32, b: &[u16]) {
-    use std::arch::x86_64::*;
-    let n = acc.len().min(b.len());
-    let chunks = n / 8;
-    let av = _mm256_set1_ps(a_v);
-    for c in 0..chunks {
-        let j = c * 8;
-        let bv = bf16x8_to_f32x8(b.as_ptr().add(j));
-        let p = acc.as_mut_ptr().add(j);
-        _mm256_storeu_ps(p, _mm256_fmadd_ps(av, bv, _mm256_loadu_ps(p)));
-    }
-    for j in chunks * 8..n {
-        acc[j] += a_v * bf16_to_f32(b[j]);
+    unsafe {
+        use std::arch::x86_64::*;
+        let n = acc.len().min(b.len());
+        let chunks = n / 8;
+        let av = _mm256_set1_ps(a_v);
+        for c in 0..chunks {
+            let j = c * 8;
+            let bv = bf16x8_to_f32x8(b.as_ptr().add(j));
+            let p = acc.as_mut_ptr().add(j);
+            _mm256_storeu_ps(p, _mm256_fmadd_ps(av, bv, _mm256_loadu_ps(p)));
+        }
+        for j in chunks * 8..n {
+            acc[j] += a_v * bf16_to_f32(b[j]);
+        }
     }
 }
 
@@ -796,43 +802,43 @@ unsafe fn micro_8x8_fma(
     use std::arch::x86_64::*;
     // edition 2024 的 unsafe_op_in_unsafe_fn：`unsafe fn` 体内也要显式开块
     unsafe {
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
-    let mut acc4 = _mm256_setzero_ps();
-    let mut acc5 = _mm256_setzero_ps();
-    let mut acc6 = _mm256_setzero_ps();
-    let mut acc7 = _mm256_setzero_ps();
-    for kk in 0..k {
-        let bv = _mm256_loadu_ps(b.add(kk * ldb));
-        let ap = a.add(kk * a_k);
-        acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap), bv, acc0);
-        acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(a_row)), bv, acc1);
-        acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(2 * a_row)), bv, acc2);
-        acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(3 * a_row)), bv, acc3);
-        acc4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(4 * a_row)), bv, acc4);
-        acc5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(5 * a_row)), bv, acc5);
-        acc6 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(6 * a_row)), bv, acc6);
-        acc7 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(7 * a_row)), bv, acc7);
-    }
-    let mut p;
-    p = c;
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc0));
-    p = c.add(ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc1));
-    p = c.add(2 * ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc2));
-    p = c.add(3 * ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc3));
-    p = c.add(4 * ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc4));
-    p = c.add(5 * ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc5));
-    p = c.add(6 * ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc6));
-    p = c.add(7 * ldc);
-    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc7));
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let mut acc4 = _mm256_setzero_ps();
+        let mut acc5 = _mm256_setzero_ps();
+        let mut acc6 = _mm256_setzero_ps();
+        let mut acc7 = _mm256_setzero_ps();
+        for kk in 0..k {
+            let bv = _mm256_loadu_ps(b.add(kk * ldb));
+            let ap = a.add(kk * a_k);
+            acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap), bv, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(a_row)), bv, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(2 * a_row)), bv, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(3 * a_row)), bv, acc3);
+            acc4 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(4 * a_row)), bv, acc4);
+            acc5 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(5 * a_row)), bv, acc5);
+            acc6 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(6 * a_row)), bv, acc6);
+            acc7 = _mm256_fmadd_ps(_mm256_broadcast_ss(&*ap.add(7 * a_row)), bv, acc7);
+        }
+        let mut p;
+        p = c;
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc0));
+        p = c.add(ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc1));
+        p = c.add(2 * ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc2));
+        p = c.add(3 * ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc3));
+        p = c.add(4 * ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc4));
+        p = c.add(5 * ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc5));
+        p = c.add(6 * ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc6));
+        p = c.add(7 * ldc);
+        _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc7));
     }
 }
 
@@ -883,13 +889,19 @@ fn matmul_data(
     // ⇒ 20 个核只用 1 个）。而且 b_t 的物理 [N,K] 布局对"单行"来说恰好是**行内连续**：
     // 每个输出列就是一次 a·W[j] 点积，两侧都连续，既不必物化转置，也能按输出列
     // 切给多核。累加序仍是 kk 升序 ⇒ 与通用路径逐位一致。
-    if batch == 1 && m == 1 && n >= 64 && n * k >= 1 << 20 {
-        if let MatData::F32(av) = a.data {
-            // 激活恒为 f32（bf16 只作权重存储）；左操作数是 bf16 时走下面的通用路径
-            let nt = rayon::current_num_threads().max(1);
-            let nc_t = n.div_ceil(nt * 4).max(64);
-            let mut out = vec![0.0f32; n];
-            out.par_chunks_mut(nc_t).enumerate().for_each(|(ci, ochunk)| {
+    if batch == 1
+        && m == 1
+        && n >= 64
+        && n * k >= 1 << 20
+        && let MatData::F32(av) = a.data
+    {
+        // 激活恒为 f32（bf16 只作权重存储）；左操作数是 bf16 时走下面的通用路径
+        let nt = rayon::current_num_threads().max(1);
+        let nc_t = n.div_ceil(nt * 4).max(64);
+        let mut out = vec![0.0f32; n];
+        out.par_chunks_mut(nc_t)
+            .enumerate()
+            .for_each(|(ci, ochunk)| {
                 let nb = ci * nc_t;
                 let nc = ochunk.len();
                 ochunk.fill(0.0);
@@ -934,8 +946,7 @@ fn matmul_data(
                     }
                 }
             });
-            return out;
-        }
+        return out;
     }
     let b_f32;
     let b_u16;
@@ -974,12 +985,17 @@ fn matmul_data(
     // 落在同一/相邻 cache line、而归约步长跨 2 KB，实测落成 L3 带宽受限
     // （`512×4096×384` 上 204 → 214 GF/s，仅 1.05×）；要吃到 FMA 的收益得先做
     // A 打包 + 更大的寄存器块，属于另一轮 GEMM 重写。batch>1 的 3D 形态同理留给通用路径。
-    if cpu_fma_enabled() && batch == 1 && !a_t {
-        if let (MatData::F32(av), MatData::F32(bv)) = (a2.data, b2.data) {
-            // A 的访问步长：非转置时 A 是 [M,K]（行步长 k、归约步长 1）；
-            // a_t（`dW = Aᵀ·g`）时物理是 [K,M]，取的是转置 —— 行步长 1、归约步长 m。
-            let (a_row, a_k) = if a_t { (1usize, m) } else { (k, 1usize) };
-            out.par_chunks_mut(MC * n).enumerate().for_each(|(blk, out_blk)| {
+    if cpu_fma_enabled()
+        && batch == 1
+        && !a_t
+        && let (MatData::F32(av), MatData::F32(bv)) = (a2.data, b2.data)
+    {
+        // A 的访问步长：非转置时 A 是 [M,K]（行步长 k、归约步长 1）；
+        // a_t（`dW = Aᵀ·g`）时物理是 [K,M]，取的是转置 —— 行步长 1、归约步长 m。
+        let (a_row, a_k) = if a_t { (1usize, m) } else { (k, 1usize) };
+        out.par_chunks_mut(MC * n)
+            .enumerate()
+            .for_each(|(blk, out_blk)| {
                 let first_row = blk * MC;
                 let rows = out_blk.len() / n;
                 let mut nb = 0;
@@ -1030,8 +1046,7 @@ fn matmul_data(
                     nb += NC;
                 }
             });
-            return out;
-        }
+        return out;
     }
 
     // ---- dW（`a_t`）的打包 + KC 归约分块路径 ----
@@ -1042,13 +1057,16 @@ fn matmul_data(
     //
     // 规模门槛：`k >= 256`（至少一个 KC 块，打包才摊得平）、`m*n >= 4096`（输出 tile
     // 太少时并行度与面板复用都拿不到）。`LLM_MM_NO_PACKED=1` 可强制回退（同进程 A/B）。
-    if cpu_fma_enabled() && batch == 1 && a_t && k >= 256 && m * n >= 4096 {
-        if let (MatData::F32(av), MatData::F32(bv)) = (a2.data, b2.data) {
-            if std::env::var_os("LLM_MM_NO_PACKED").is_none() {
-                gemm_ta_packed(av, bv, &mut out, m, k, n);
-                return out;
-            }
-        }
+    if cpu_fma_enabled()
+        && batch == 1
+        && a_t
+        && k >= 256
+        && m * n >= 4096
+        && let (MatData::F32(av), MatData::F32(bv)) = (a2.data, b2.data)
+        && std::env::var_os("LLM_MM_NO_PACKED").is_none()
+    {
+        gemm_ta_packed(av, bv, &mut out, m, k, n);
+        return out;
     }
 
     // 按**输出行**并行：把 (batch × m) 行拉平后交给 rayon，行与行之间无依赖。
@@ -1087,7 +1105,7 @@ fn matmul_data(
     let col_blocks = if col_split_off || row_blocks * 3 >= nt || n < 64 {
         1
     } else {
-        ((nt + row_blocks - 1) / row_blocks).min((n / 16).max(1))
+        nt.div_ceil(row_blocks).min((n / 16).max(1))
     };
 
     if col_blocks <= 1 {
@@ -1100,7 +1118,18 @@ fn matmul_data(
                 let mut nb = 0;
                 while nb < n {
                     let nc = NC.min(n - nb);
-                    axpy_tile(a2, b2, &a_bases[..rows], &b_bases[..rows], nb, k, n, if a_t { m } else { 1 }, nc, &mut acc[..rows * nc]);
+                    axpy_tile(
+                        a2,
+                        b2,
+                        &a_bases[..rows],
+                        &b_bases[..rows],
+                        nb,
+                        k,
+                        n,
+                        if a_t { m } else { 1 },
+                        nc,
+                        &mut acc[..rows * nc],
+                    );
                     for r in 0..rows {
                         let dst = r * n + nb;
                         out_blk[dst..dst + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
@@ -1115,8 +1144,9 @@ fn matmul_data(
     let bounds: Vec<(usize, usize)> = (0..col_blocks)
         .map(|t| (t * n / col_blocks, (t + 1) * n / col_blocks))
         .collect();
-    let mut pieces: Vec<Vec<&mut [f32]>> =
-        (0..col_blocks).map(|_| Vec::with_capacity(rows_total)).collect();
+    let mut pieces: Vec<Vec<&mut [f32]>> = (0..col_blocks)
+        .map(|_| Vec::with_capacity(rows_total))
+        .collect();
     for row in out.chunks_mut(n) {
         let mut rest = row;
         for (t, b) in bounds.iter().enumerate() {
@@ -1126,26 +1156,40 @@ fn matmul_data(
         }
         debug_assert!(rest.is_empty(), "列分块必须恰好切完一整行");
     }
-    pieces.into_par_iter().enumerate().for_each(|(t, mut cols)| {
-        let (c0, c1) = bounds[t];
-        let mut acc = vec![0.0f32; MC * NC];
-        let mut r0 = 0;
-        while r0 < rows_total {
-            let rows = (rows_total - r0).min(MC);
-            let (a_bases, b_bases) = row_bases(r0, rows, m, k, n, a_t);
-            let mut nb = c0;
-            while nb < c1 {
-                let nc = NC.min(c1 - nb);
-                axpy_tile(a2, b2, &a_bases[..rows], &b_bases[..rows], nb, k, n, if a_t { m } else { 1 }, nc, &mut acc[..rows * nc]);
-                for r in 0..rows {
-                    let off = nb - c0;
-                    cols[r0 + r][off..off + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
+    pieces
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(t, mut cols)| {
+            let (c0, c1) = bounds[t];
+            let mut acc = vec![0.0f32; MC * NC];
+            let mut r0 = 0;
+            while r0 < rows_total {
+                let rows = (rows_total - r0).min(MC);
+                let (a_bases, b_bases) = row_bases(r0, rows, m, k, n, a_t);
+                let mut nb = c0;
+                while nb < c1 {
+                    let nc = NC.min(c1 - nb);
+                    axpy_tile(
+                        a2,
+                        b2,
+                        &a_bases[..rows],
+                        &b_bases[..rows],
+                        nb,
+                        k,
+                        n,
+                        if a_t { m } else { 1 },
+                        nc,
+                        &mut acc[..rows * nc],
+                    );
+                    for r in 0..rows {
+                        let off = nb - c0;
+                        cols[r0 + r][off..off + nc].copy_from_slice(&acc[r * nc..r * nc + nc]);
+                    }
+                    nb += NC;
                 }
-                nb += NC;
+                r0 += MC;
             }
-            r0 += MC;
-        }
-    });
+        });
     out
 }
 
@@ -1336,15 +1380,17 @@ fn transpose_flat<T: Copy + Default + Send + Sync>(
     batch: usize,
 ) -> Vec<T> {
     let mut t = vec![T::default(); batch * rows * cols];
-    t.par_chunks_mut(rows * cols).enumerate().for_each(|(b, chunk)| {
-        let src = &v[b * rows * cols..(b + 1) * rows * cols];
-        for i in 0..rows {
-            let srow = &src[i * cols..(i + 1) * cols];
-            for (j, &s) in srow.iter().enumerate() {
-                chunk[j * rows + i] = s;
+    t.par_chunks_mut(rows * cols)
+        .enumerate()
+        .for_each(|(b, chunk)| {
+            let src = &v[b * rows * cols..(b + 1) * rows * cols];
+            for i in 0..rows {
+                let srow = &src[i * cols..(i + 1) * cols];
+                for (j, &s) in srow.iter().enumerate() {
+                    chunk[j * rows + i] = s;
+                }
             }
-        }
-    });
+        });
     t
 }
 
@@ -1385,6 +1431,29 @@ fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize
 /// O(T×T_total) 的分配；只有 GPU 常驻路径与 `LLM_GPU_PROBE` 录制（内核按真实
 /// buffer 消费掩码）才在这里真的物化一次。
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+/// 同 [`causal_mask_data`]，但按 `(t, t_total)` **缓存**（thread-local，照 `rope.rs` 的 cos/sin 表写法）。
+///
+/// 掩码只依赖形状，而 `attn_resident` / `mlp_resident` 是**逐层**调用的 —— 原来每层都重建
+/// 一张 `[t, t_total]`（t=512、24 层 ≈ 24 MB/步的临时分配与填充）。缓存后每步只建一次。
+pub fn causal_mask_arc(t: usize, t_total: usize) -> std::sync::Arc<Vec<f32>> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    thread_local! {
+        static CACHE: RefCell<HashMap<(usize, usize), Arc<Vec<f32>>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if let Some(v) = m.get(&(t, t_total)) {
+            return Arc::clone(v);
+        }
+        // 形状只有少数几种（训练窗口 + 评测窗口），不做淘汰也不会涨
+        let v = Arc::new(causal_mask_data(t, t_total));
+        m.insert((t, t_total), Arc::clone(&v));
+        v
+    })
+}
 pub fn causal_mask_data(t: usize, t_total: usize) -> Vec<f32> {
     let visible_before = t_total - t;
     let mut mask = vec![0.0f32; t * t_total];
@@ -1431,72 +1500,76 @@ fn flash_forward_cpu(
 ) -> Vec<f32> {
     let bs = block_size.max(1);
     let mut out = vec![0.0f32; bh * t * head_dim];
-    out.par_chunks_mut(head_dim).enumerate().for_each(|(r, ochunk)| {
-        let i = r % t;
-        // 掩码行按 **query 行**取（同一 query 的所有头共用一行掩码）
-        let mrow: Option<&[f32]> = mask.map(|m| &m[i * t_total..(i + 1) * t_total]);
-        let k_end = match mrow {
-            Some(_) => t_total, // 有掩码：可见性完全由掩码决定，不能再按因果截断
-            None => (i + visible_before + 1).min(t_total),
-        };
-        // K/V 是 [kv_bh, T_total, HD] 展平：本行 Q 头 hh = r/t 映射到共享 KV 头
-        // hh/n_rep（与旧 repeat_kv 的「第 b 个 KV 头复制成 n_rep 份、头序 b*n_rep+r」
-        // 互逆；n_rep=1 时退化为按行所属批组起算）
-        let kv_base = ((r / t) / n_rep) * t_total * head_dim;
-        let qrow = &q_scaled[r * head_dim..(r + 1) * head_dim];
-        let mut m = f32::NEG_INFINITY;        // 行内运行最大值
-        let mut l = 0.0f32;                   // 行内指数和（最终归一化分母）
-        let mut acc = vec![0.0f32; head_dim]; // 未归一化的输出累加
-        let mut sbuf = vec![0.0f32; bs];      // 块内打分暂存（每行的工作集 = O(block_size)）
-        let mut ks = 0;
-        while ks < k_end {
-            let ke = (ks + bs).min(k_end);
-            let n = ke - ks;
-            // 1) 块内打分 S = Q'·Kᵀ（缩放已在 Q' 里）；有掩码时把掩码行加进来
-            for jj in 0..n {
-                let krow = &k[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
-                let mut s = 0.0f32;
-                for d in 0..head_dim {
-                    s += qrow[d] * krow[d];
+    out.par_chunks_mut(head_dim)
+        .enumerate()
+        .for_each(|(r, ochunk)| {
+            let i = r % t;
+            // 掩码行按 **query 行**取（同一 query 的所有头共用一行掩码）
+            let mrow: Option<&[f32]> = mask.map(|m| &m[i * t_total..(i + 1) * t_total]);
+            let k_end = match mrow {
+                Some(_) => t_total, // 有掩码：可见性完全由掩码决定，不能再按因果截断
+                None => (i + visible_before + 1).min(t_total),
+            };
+            // K/V 是 [kv_bh, T_total, HD] 展平：本行 Q 头 hh = r/t 映射到共享 KV 头
+            // hh/n_rep（与旧 repeat_kv 的「第 b 个 KV 头复制成 n_rep 份、头序 b*n_rep+r」
+            // 互逆；n_rep=1 时退化为按行所属批组起算）
+            let kv_base = ((r / t) / n_rep) * t_total * head_dim;
+            let qrow = &q_scaled[r * head_dim..(r + 1) * head_dim];
+            let mut m = f32::NEG_INFINITY; // 行内运行最大值
+            let mut l = 0.0f32; // 行内指数和（最终归一化分母）
+            let mut acc = vec![0.0f32; head_dim]; // 未归一化的输出累加
+            let mut sbuf = vec![0.0f32; bs]; // 块内打分暂存（每行的工作集 = O(block_size)）
+            let mut ks = 0;
+            while ks < k_end {
+                let ke = (ks + bs).min(k_end);
+                let n = ke - ks;
+                // 1) 块内打分 S = Q'·Kᵀ（缩放已在 Q' 里）；有掩码时把掩码行加进来
+                for jj in 0..n {
+                    let krow =
+                        &k[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
+                    let mut s = 0.0f32;
+                    for d in 0..head_dim {
+                        s += qrow[d] * krow[d];
+                    }
+                    if let Some(mr) = mrow {
+                        s += mr[ks + jj];
+                    }
+                    sbuf[jj] = s;
                 }
-                if let Some(mr) = mrow {
-                    s += mr[ks + jj];
+                // 2) 在线 softmax：运行最大值更新后，旧累计整体乘 exp(m_old - m_new) 重标定
+                let blk_max = sbuf[..n].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let m_new = m.max(blk_max);
+                // 整块都被屏蔽（首块全屏蔽时 m 也仍是 -inf）：本块对 l/acc 贡献恒为 0。
+                // 必须在这里短路——否则 (m - m_new) 与 (sbuf - m_new) 会算成
+                // -inf - (-inf) = NaN，把整行输出污染成 NaN。
+                if m_new == f32::NEG_INFINITY {
+                    ks = ke;
+                    continue;
                 }
-                sbuf[jj] = s;
-            }
-            // 2) 在线 softmax：运行最大值更新后，旧累计整体乘 exp(m_old - m_new) 重标定
-            let blk_max = sbuf[..n].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let m_new = m.max(blk_max);
-            // 整块都被屏蔽（首块全屏蔽时 m 也仍是 -inf）：本块对 l/acc 贡献恒为 0。
-            // 必须在这里短路——否则 (m - m_new) 与 (sbuf - m_new) 会算成
-            // -inf - (-inf) = NaN，把整行输出污染成 NaN。
-            if m_new == f32::NEG_INFINITY {
+                let f = (m - m_new).exp(); // m = -inf（首块）时为 0，等价于从零开始累加
+                l *= f;
+                for a in acc.iter_mut() {
+                    *a *= f;
+                }
+                // 3) 累加新块的 exp·V
+                for jj in 0..n {
+                    let e = (sbuf[jj] - m_new).exp();
+                    l += e;
+                    let vrow =
+                        &v[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
+                    for d in 0..head_dim {
+                        acc[d] += e * vrow[d];
+                    }
+                }
+                m = m_new;
                 ks = ke;
-                continue;
             }
-            let f = (m - m_new).exp(); // m = -inf（首块）时为 0，等价于从零开始累加
-            l *= f;
-            for a in acc.iter_mut() {
-                *a *= f;
-            }
-            // 3) 累加新块的 exp·V
-            for jj in 0..n {
-                let e = (sbuf[jj] - m_new).exp();
-                l += e;
-                let vrow = &v[kv_base + (ks + jj) * head_dim..kv_base + (ks + jj + 1) * head_dim];
+            if l > 0.0 {
                 for d in 0..head_dim {
-                    acc[d] += e * vrow[d];
+                    ochunk[d] = acc[d] / l;
                 }
             }
-            m = m_new;
-            ks = ke;
-        }
-        if l > 0.0 {
-            for d in 0..head_dim {
-                ochunk[d] = acc[d] / l;
-            }
-        }
-    });
+        });
     out
 }
 
@@ -1579,21 +1652,34 @@ fn attn_softmax_cpu(
     mask: Option<&[f32]>,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * t_total];
-    out.par_chunks_mut(t_total).enumerate().for_each(|(r, row)| {
-        let i = r % t;
-        let base = r * t_total;
-        match mask {
-            None => {
-                let k_end = (i + visible_before + 1).min(t_total);
-                softmax_row_into(row, &x[base..base + t_total], k_end);
+    out.par_chunks_mut(t_total)
+        .enumerate()
+        .for_each(|(r, row)| {
+            let i = r % t;
+            let base = r * t_total;
+            match mask {
+                None => {
+                    let k_end = (i + visible_before + 1).min(t_total);
+                    softmax_row_into(row, &x[base..base + t_total], k_end);
+                }
+                Some(m) => {
+                    let mrow = &m[i * t_total..(i + 1) * t_total];
+                    // B2：原来每行 `Vec` 分配一次（`rows = bh·t`，t=1024 时一次反向就是
+                    // 11.5 万次 malloc）。改成**线程本地复用缓冲**：数值与运算顺序完全不变。
+                    thread_local! {
+                        static SROW: std::cell::RefCell<Vec<f32>> =
+                            const { std::cell::RefCell::new(Vec::new()) };
+                    }
+                    SROW.with(|c| {
+                        let mut srow = c.borrow_mut();
+                        srow.clear();
+                        srow.reserve(t_total);
+                        srow.extend((0..t_total).map(|j| x[base + j] + mrow[j]));
+                        softmax_row_into(row, &srow, t_total);
+                    });
+                }
             }
-            Some(m) => {
-                let mrow = &m[i * t_total..(i + 1) * t_total];
-                let srow: Vec<f32> = (0..t_total).map(|j| x[base + j] + mrow[j]).collect();
-                softmax_row_into(row, &srow, t_total);
-            }
-        }
-    });
+        });
     out
 }
 
@@ -1708,7 +1794,7 @@ fn matmul_backward(
     let sd = a.data.clone();
     let od = b.data.clone();
     record(
-        &result,
+        result,
         vec![a.clone(), b.clone()],
         Arc::new(move || {
             let g = rg.borrow();
@@ -1718,10 +1804,7 @@ fn matmul_backward(
             let sdb = sd.borrow();
             let odb = if same_data { None } else { Some(od.borrow()) };
             let sa = MatOperand::of(&sdb, &sd);
-            let sb = odb
-                .as_deref()
-                .map(|g| MatOperand::of(g, &od))
-                .unwrap_or(sa);
+            let sb = odb.as_deref().map(|g| MatOperand::of(g, &od)).unwrap_or(sa);
             // ∂a = g @ bᵀ、∂b = aᵀ @ g：GPU 内核支持按转置读物理矩阵，
             // 无需在 CPU 构造 52 万~210 万元素的转置矩阵（仅 CPU 回退时才物化）
             let da = matmul_data(MatOperand::F32(&g), sb, m, n, k, batch, false, !b_t);
@@ -1729,23 +1812,23 @@ fn matmul_backward(
             drop(g);
             drop(sdb);
             drop(odb);
-        // a、b 是同一张量（x@x）时梯度缓冲也是同一把锁——Mutex 不可重入，
-        // 必须走单锁分支把 da/db 依次叠加进同一块缓冲
-        //
-        // 累加按块并行：da/db 刚由多核内核算出，紧接着若用单核搬一遍，输出头那种
-        // 级别的 dW（896×151936 = 1.36 亿元素 ≈ 读 2 份 + 写 1 份 1.6 GB）会白扔
-        // 100 ms 以上（实测单线程 9.6 GB/s vs 20 线程 32.5 GB/s）。每个槽位只被
-        // 自己的块写，块内顺序仍是 i 升序 ⇒ 与串行累加**逐位一致**。
-        if Shared::ptr_eq(&sg, &og) {
-            let mut sgm = sg.borrow_mut();
-            add_assign_slice(&mut sgm, &da, 1.0);
-            add_assign_slice(&mut sgm, &db, 1.0);
-        } else {
-            let mut sgm = sg.borrow_mut();
-            let mut ogm = og.borrow_mut();
-            add_assign_slice(&mut sgm, &da, 1.0);
-            add_assign_slice(&mut ogm, &db, 1.0);
-        }
+            // a、b 是同一张量（x@x）时梯度缓冲也是同一把锁——Mutex 不可重入，
+            // 必须走单锁分支把 da/db 依次叠加进同一块缓冲
+            //
+            // 累加按块并行：da/db 刚由多核内核算出，紧接着若用单核搬一遍，输出头那种
+            // 级别的 dW（896×151936 = 1.36 亿元素 ≈ 读 2 份 + 写 1 份 1.6 GB）会白扔
+            // 100 ms 以上（实测单线程 9.6 GB/s vs 20 线程 32.5 GB/s）。每个槽位只被
+            // 自己的块写，块内顺序仍是 i 升序 ⇒ 与串行累加**逐位一致**。
+            if Shared::ptr_eq(&sg, &og) {
+                let mut sgm = sg.borrow_mut();
+                add_assign_slice(&mut sgm, &da, 1.0);
+                add_assign_slice(&mut sgm, &db, 1.0);
+            } else {
+                let mut sgm = sg.borrow_mut();
+                let mut ogm = og.borrow_mut();
+                add_assign_slice(&mut sgm, &da, 1.0);
+                add_assign_slice(&mut ogm, &db, 1.0);
+            }
         }),
     );
 }
@@ -1791,7 +1874,11 @@ impl Tensor {
             // 的 ensure_grad 按 numel 补齐（节点身份 = grad 缓存地址，补齐
             // 不改变已有登记）。
             // grad 恒为 f32，不随数据 dtype 变化（见字段注释）。
-            grad: Shared::new(if grad_enabled() { vec![0.0; len] } else { Vec::new() }),
+            grad: Shared::new(if grad_enabled() {
+                vec![0.0; len]
+            } else {
+                Vec::new()
+            }),
             requires_grad: Arc::new(AtomicBool::new(requires_grad)),
         }
     }
@@ -1801,12 +1888,7 @@ impl Tensor {
     /// 算子内全程 f32 计算，构造输出时若源是 bf16 则末尾一次性
     /// encode 落盘，保持整条计算流的存储 dtype 与源一致。
     /// `requires_grad` 仍由调用方显式传入（与 dtype 无关）。
-    pub(crate) fn new_like(
-        &self,
-        data: Vec<f32>,
-        shape: Vec<usize>,
-        requires_grad: bool,
-    ) -> Self {
+    pub(crate) fn new_like(&self, data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
         Self::new_with_dtype(data, shape, requires_grad, self.dtype())
     }
 
@@ -1867,13 +1949,20 @@ impl Tensor {
     pub(crate) fn shared(data: Shared<Buffer>, shape: Vec<usize>) -> Self {
         let numel: usize = shape.iter().product();
         let len = data.borrow().len();
-        assert_eq!(len, numel, "共享数据长度 {len} 与形状 {shape:?} 要求的元素数 {numel} 不一致");
+        assert_eq!(
+            len, numel,
+            "共享数据长度 {len} 与形状 {shape:?} 要求的元素数 {numel} 不一致"
+        );
         let strides = row_major_strides(&shape);
         Tensor {
             data, // 零拷贝：直接共享调用方的缓冲句柄
             shape,
             strides,
-            grad: Shared::new(if grad_enabled() { vec![0.0; len] } else { Vec::new() }),
+            grad: Shared::new(if grad_enabled() {
+                vec![0.0; len]
+            } else {
+                Vec::new()
+            }),
             requires_grad: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1953,8 +2042,7 @@ impl Tensor {
         let rank = self.rank();
         let mut out = vec![0.0f32; self.numel()];
         let mut idx = vec![0usize; rank];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let _ = i; // 逻辑下标由 idx 里程表维护
+        for slot in out.iter_mut() {
             let mut off = 0usize;
             for d in 0..rank {
                 off += idx[d] * self.strides[d];
@@ -2259,29 +2347,32 @@ impl Tensor {
                 let mut out_data = vec![0.0f32; total];
                 // 并行按 4096 分块：每个块只分解一次起点下标，
                 // 块内用「里程表进位」递增多维下标，避免逐元素做除法。
-                out_data.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
-                    let mut r = ci * 4096;
-                    let mut idx = [0usize; 8];
-                    for d in (0..rank).rev() {
-                        idx[d] = r % shape[d];
-                        r /= shape[d];
-                    }
-                    for slot in chunk.iter_mut() {
-                        let mut off = 0usize;
-                        for d in 0..rank {
-                            off += idx[d] * strides[d];
-                        }
-                        *slot = sd_ref[off];
-                        // 里程表 +1（逻辑行主序）
+                out_data
+                    .par_chunks_mut(4096)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let mut r = ci * 4096;
+                        let mut idx = [0usize; 8];
                         for d in (0..rank).rev() {
-                            idx[d] += 1;
-                            if idx[d] < shape[d] {
-                                break;
-                            }
-                            idx[d] = 0;
+                            idx[d] = r % shape[d];
+                            r /= shape[d];
                         }
-                    }
-                });
+                        for slot in chunk.iter_mut() {
+                            let mut off = 0usize;
+                            for d in 0..rank {
+                                off += idx[d] * strides[d];
+                            }
+                            *slot = sd_ref[off];
+                            // 里程表 +1（逻辑行主序）
+                            for d in (0..rank).rev() {
+                                idx[d] += 1;
+                                if idx[d] < shape[d] {
+                                    break;
+                                }
+                                idx[d] = 0;
+                            }
+                        }
+                    });
                 drop(sd);
                 out_data
             }
@@ -2290,19 +2381,23 @@ impl Tensor {
         if self.req() {
             let rg = result.grad.clone();
             let sg = self.grad.clone();
-            record(&result, vec![self.clone()], Arc::new(move || {
-                let g = rg.borrow();
-                let g_ref: &[f32] = &g;
-                let mut sgm = sg.borrow_mut();
-                // 物化只改内存布局、不改逻辑元素顺序，梯度 1:1 逐元素累加。
-                sgm.par_chunks_mut(4096)
-                    .zip(g_ref.par_chunks(4096))
-                    .for_each(|(s, gg)| {
-                        for (a, &b) in s.iter_mut().zip(gg) {
-                            *a += b;
-                        }
-                    });
-            }));
+            record(
+                &result,
+                vec![self.clone()],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let g_ref: &[f32] = &g;
+                    let mut sgm = sg.borrow_mut();
+                    // 物化只改内存布局、不改逻辑元素顺序，梯度 1:1 逐元素累加。
+                    sgm.par_chunks_mut(4096)
+                        .zip(g_ref.par_chunks(4096))
+                        .for_each(|(s, gg)| {
+                            for (a, &b) in s.iter_mut().zip(gg) {
+                                *a += b;
+                            }
+                        });
+                }),
+            );
         }
         result
     }
@@ -2329,27 +2424,35 @@ impl Tensor {
             shape: new_shape,
             strides,
             // 惰性规则同 [Tensor::new]：求导模式全长，no_grad 置空
-            grad: Shared::new(if grad_enabled() { vec![0.0; numel] } else { Vec::new() }),
+            grad: Shared::new(if grad_enabled() {
+                vec![0.0; numel]
+            } else {
+                Vec::new()
+            }),
             requires_grad: Arc::new(AtomicBool::new(requires_grad)),
         };
         if requires_grad {
             let rg = result.grad.clone();
             let sg = src.grad.clone();
-            record(&result, vec![src], Arc::new(move || {
-                let g = rg.borrow();
-                let g_ref: &[f32] = &g;
-                let mut sgm = sg.borrow_mut();
-                // reshape 只改形状、不改元素顺序，所以梯度是 1:1 的逐元素累加。
-                // 按 4096 分块并行：输出头的 logits 是 [B*T, vocab] = 3355 万元素，
-                // 串行版单步要 ~0.4s（占单步 ~9%），是矩阵乘之外最大的纯访存热点。
-                sgm.par_chunks_mut(4096)
-                    .zip(g_ref.par_chunks(4096))
-                    .for_each(|(s, gg)| {
-                        for (a, &b) in s.iter_mut().zip(gg) {
-                            *a += b;
-                        }
-                    });
-            }));
+            record(
+                &result,
+                vec![src],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let g_ref: &[f32] = &g;
+                    let mut sgm = sg.borrow_mut();
+                    // reshape 只改形状、不改元素顺序，所以梯度是 1:1 的逐元素累加。
+                    // 按 4096 分块并行：输出头的 logits 是 [B*T, vocab] = 3355 万元素，
+                    // 串行版单步要 ~0.4s（占单步 ~9%），是矩阵乘之外最大的纯访存热点。
+                    sgm.par_chunks_mut(4096)
+                        .zip(g_ref.par_chunks(4096))
+                        .for_each(|(s, gg)| {
+                            for (a, &b) in s.iter_mut().zip(gg) {
+                                *a += b;
+                            }
+                        });
+                }),
+            );
         }
         result
     }
@@ -2382,7 +2485,11 @@ impl Tensor {
             shape: new_shape.clone(),
             strides: new_strides,
             // 惰性规则同 [Tensor::new]：求导模式全长，no_grad 置空
-            grad: Shared::new(if grad_enabled() { vec![0.0; total] } else { Vec::new() }),
+            grad: Shared::new(if grad_enabled() {
+                vec![0.0; total]
+            } else {
+                Vec::new()
+            }),
             requires_grad: Arc::new(AtomicBool::new(requires_grad)),
         };
         if self.req() {
@@ -2398,18 +2505,22 @@ impl Tensor {
                 let (r, c) = (self.shape[0], self.shape[1]); // 源是 [r, c]，视图是 [c, r]
                 let rg = result.grad.clone();
                 let sg = self.grad.clone();
-                record(&result, vec![self.clone()], Arc::new(move || {
-                    let g = rg.borrow();
-                    let mut sgm = sg.borrow_mut();
-                    let g_ref: &[f32] = &g;
-                    // 按**源的行** j 并行：每个任务写 sg 的一整行（连续），
-                    // 读 g 的一列（跨步 r，与转置本身的访存形态相同）。
-                    sgm.par_chunks_mut(c).enumerate().for_each(|(j, row)| {
-                        for (i, s) in row.iter_mut().enumerate() {
-                            *s += g_ref[i * r + j];
-                        }
-                    });
-                }));
+                record(
+                    &result,
+                    vec![self.clone()],
+                    Arc::new(move || {
+                        let g = rg.borrow();
+                        let mut sgm = sg.borrow_mut();
+                        let g_ref: &[f32] = &g;
+                        // 按**源的行** j 并行：每个任务写 sg 的一整行（连续），
+                        // 读 g 的一列（跨步 r，与转置本身的访存形态相同）。
+                        sgm.par_chunks_mut(c).enumerate().for_each(|(j, row)| {
+                            for (i, s) in row.iter_mut().enumerate() {
+                                *s += g_ref[i * r + j];
+                            }
+                        });
+                    }),
+                );
                 return result;
             }
             // 反解 permute 的逆映射：inv[perm[i]] = i
@@ -2450,26 +2561,30 @@ impl Tensor {
             });
             let rg = result.grad.clone();
             let sg = self.grad.clone();
-            record(&result, vec![self.clone()], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                let g_ref: &[f32] = &g;
-                let mb: &[usize] = &map;
-                // map 是 out→src 的置换（双射）：先串行建逆映射 src→out（纯整数
-                // 赋值，远比浮点循环便宜），再按梯度槽位分块并行回填——双射保证
-                // 每个槽位只被一个输出索引命中，块间无写冲突。
-                let mut inv = vec![0usize; mb.len()];
-                for (of, &sf) in mb.iter().enumerate() {
-                    inv[sf] = of;
-                }
-                let inv_ref: &[usize] = &inv;
-                sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
-                    let base = ci * 4096;
-                    for (j, s) in ch.iter_mut().enumerate() {
-                        *s += g_ref[inv_ref[base + j]];
+            record(
+                &result,
+                vec![self.clone()],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    let g_ref: &[f32] = &g;
+                    let mb: &[usize] = &map;
+                    // map 是 out→src 的置换（双射）：先串行建逆映射 src→out（纯整数
+                    // 赋值，远比浮点循环便宜），再按梯度槽位分块并行回填——双射保证
+                    // 每个槽位只被一个输出索引命中，块间无写冲突。
+                    let mut inv = vec![0usize; mb.len()];
+                    for (of, &sf) in mb.iter().enumerate() {
+                        inv[sf] = of;
                     }
-                });
-            }));
+                    let inv_ref: &[usize] = &inv;
+                    sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
+                        let base = ci * 4096;
+                        for (j, s) in ch.iter_mut().enumerate() {
+                            *s += g_ref[inv_ref[base + j]];
+                        }
+                    });
+                }),
+            );
         }
         result
     }
@@ -2582,16 +2697,36 @@ impl Tensor {
         let a_view: SrcIdxView<'_> = (&a_src).into();
         let b_view: SrcIdxView<'_> = (&b_src).into();
         let mut out_data = vec![0.0f32; total];
-        out_data
-            .par_chunks_mut(4096)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let base = ci * 4096;
-                for (j, slot) in chunk.iter_mut().enumerate() {
-                    let t = base + j;
-                    *slot = fwd(sa_ref[a_view.idx(t)], sb_ref[b_view.idx(t)]);
-                }
-            });
+        // 快路：二维连续 lhs + 一维 rhs（长度 == 末维）⇒ 就是**按行广播**。
+        // 通用路径每个元素都要算一次 `t % n` 取 rhs 下标；这里换成"每行拿一次行基址、
+        // 行内顺序配对"。`Linear::forward` 的 bias 加法正落在这个形状上（每层每步一趟）。
+        let row_bcast = target_shape.len() == 2
+            && lhs.shape == target_shape
+            && rhs.rank() == 1
+            && rhs.shape()[0] == target_shape[1];
+        if row_bcast {
+            let n = target_shape[1];
+            out_data
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(r, orow)| {
+                    let arow = &sa_ref[r * n..(r + 1) * n];
+                    for ((o, &a), &b) in orow.iter_mut().zip(arow.iter()).zip(sb_ref.iter()) {
+                        *o = fwd(a, b);
+                    }
+                });
+        } else {
+            out_data
+                .par_chunks_mut(4096)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let base = ci * 4096;
+                    for (j, slot) in chunk.iter_mut().enumerate() {
+                        let t = base + j;
+                        *slot = fwd(sa_ref[a_view.idx(t)], sb_ref[b_view.idx(t)]);
+                    }
+                });
+        }
         drop(sa);
         drop(sb);
 
@@ -2608,143 +2743,147 @@ impl Tensor {
             let a_src_c = a_src;
             let b_src_c = b_src;
             let same_shape = lhs.shape == rhs.shape;
-            record(&result, vec![lhs, rhs], Arc::new(move || {
-                let g = rg.borrow();
-                // 同一张量参与两次（如 x*x）时 sd/od 是同一把 Mutex——判同一后只借一把锁，
-                // 两个只读视图都指向它（shared borrow 可安全别名）
-                let same_data = Shared::ptr_eq(&sd, &od);
-                let sd_b = sd.decode();
-                let od_b = if same_data { None } else { Some(od.decode()) };
-                let g_ref: &[f32] = &g;
-                let sd_ref: &[f32] = &sd_b;
-                let od_ref: &[f32] = od_b.as_deref().unwrap_or(&sd_b);
-                if same_shape {
-                    // 形状相同 ⇒ 两侧索引都是恒等（见 broadcast_plan），可以按块并行。
-                    // 残差相加、x*x 这类占反向的大头，串行时单步 ~0.5s。
-                    if Shared::ptr_eq(&sg, &og) {
-                        // 同一张量参与运算（如 x*x、x/x），两条路径梯度叠加
-                        let mut sgm = sg.borrow_mut();
-                        sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
-                            let base = ci * 4096;
-                            for (j, s) in ch.iter_mut().enumerate() {
-                                let t = base + j;
-                                let (da, db) = back(sd_ref[t], od_ref[t]);
-                                *s += g_ref[t] * (da + db);
-                            }
-                        });
-                    } else {
-                        let mut sgm = sg.borrow_mut();
-                        let mut ogm = og.borrow_mut();
-                        sgm.par_chunks_mut(4096)
-                            .zip(ogm.par_chunks_mut(4096))
-                            .enumerate()
-                            .for_each(|(ci, (ca, cb))| {
+            record(
+                &result,
+                vec![lhs, rhs],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    // 同一张量参与两次（如 x*x）时 sd/od 是同一把 Mutex——判同一后只借一把锁，
+                    // 两个只读视图都指向它（shared borrow 可安全别名）
+                    let same_data = Shared::ptr_eq(&sd, &od);
+                    let sd_b = sd.decode();
+                    let od_b = if same_data { None } else { Some(od.decode()) };
+                    let g_ref: &[f32] = &g;
+                    let sd_ref: &[f32] = &sd_b;
+                    let od_ref: &[f32] = od_b.as_deref().unwrap_or(&sd_b);
+                    if same_shape {
+                        // 形状相同 ⇒ 两侧索引都是恒等（见 broadcast_plan），可以按块并行。
+                        // 残差相加、x*x 这类占反向的大头，串行时单步 ~0.5s。
+                        if Shared::ptr_eq(&sg, &og) {
+                            // 同一张量参与运算（如 x*x、x/x），两条路径梯度叠加
+                            let mut sgm = sg.borrow_mut();
+                            sgm.par_chunks_mut(4096).enumerate().for_each(|(ci, ch)| {
                                 let base = ci * 4096;
-                                for (j, (sa, sb)) in ca.iter_mut().zip(cb.iter_mut()).enumerate() {
+                                for (j, s) in ch.iter_mut().enumerate() {
                                     let t = base + j;
                                     let (da, db) = back(sd_ref[t], od_ref[t]);
-                                    *sa += g_ref[t] * da;
-                                    *sb += g_ref[t] * db;
+                                    *s += g_ref[t] * (da + db);
                                 }
                             });
-                    }
-                } else {
-                    // 广播分支：Mod/Map 的目标是多对一（如 t % numel），不能按
-                    // 槽位分块直写。形状==目标的一侧槽位与 t 对齐，可直接分块并行；
-                    // 另一侧先在块内收集 (槽位, 值)，再按块序串行合并——合并顺序
-                    // 等于 t 递增顺序，与原串行累加逐位一致。
-                    let av = SrcIdxView::from(&a_src_c);
-                    let bv = SrcIdxView::from(&b_src_c);
-                    let a_aligned = matches!(a_src_c, SrcIdx::Ident);
-                    let b_aligned = matches!(b_src_c, SrcIdx::Ident);
-                    let mut sgm = sg.borrow_mut();
-                    let mut ogm = og.borrow_mut();
-                    match (a_aligned, b_aligned) {
-                        (true, false) => {
-                            // a 恒等直写；b 多对一，块内收集后合并进 ogm
-                            let partials: Vec<Vec<(usize, f32)>> = sgm
-                                .par_chunks_mut(4096)
+                        } else {
+                            let mut sgm = sg.borrow_mut();
+                            let mut ogm = og.borrow_mut();
+                            sgm.par_chunks_mut(4096)
+                                .zip(ogm.par_chunks_mut(4096))
                                 .enumerate()
-                                .map(|(ci, ch)| {
+                                .for_each(|(ci, (ca, cb))| {
                                     let base = ci * 4096;
-                                    let mut local = Vec::with_capacity(ch.len());
-                                    for (j, s) in ch.iter_mut().enumerate() {
+                                    for (j, (sa, sb)) in
+                                        ca.iter_mut().zip(cb.iter_mut()).enumerate()
+                                    {
                                         let t = base + j;
-                                        let ib = bv.idx(t);
-                                        let (da, db) = back(sd_ref[t], od_ref[ib]);
-                                        *s += g_ref[t] * da;
-                                        local.push((ib, g_ref[t] * db));
+                                        let (da, db) = back(sd_ref[t], od_ref[t]);
+                                        *sa += g_ref[t] * da;
+                                        *sb += g_ref[t] * db;
                                     }
-                                    local
-                                })
-                                .collect();
-                            for part in partials {
-                                for (i, v) in part {
-                                    ogm[i] += v;
-                                }
-                            }
+                                });
                         }
-                        (false, true) => {
-                            // b 恒等直写；a 多对一，块内收集后合并进 sgm
-                            let partials: Vec<Vec<(usize, f32)>> = ogm
-                                .par_chunks_mut(4096)
-                                .enumerate()
-                                .map(|(ci, ch)| {
-                                    let base = ci * 4096;
-                                    let mut local = Vec::with_capacity(ch.len());
-                                    for (j, s) in ch.iter_mut().enumerate() {
-                                        let t = base + j;
-                                        let ia = av.idx(t);
-                                        let (da, db) = back(sd_ref[ia], od_ref[t]);
-                                        *s += g_ref[t] * db;
-                                        local.push((ia, g_ref[t] * da));
+                    } else {
+                        // 广播分支：Mod/Map 的目标是多对一（如 t % numel），不能按
+                        // 槽位分块直写。形状==目标的一侧槽位与 t 对齐，可直接分块并行；
+                        // 另一侧先在块内收集 (槽位, 值)，再按块序串行合并——合并顺序
+                        // 等于 t 递增顺序，与原串行累加逐位一致。
+                        let av = SrcIdxView::from(&a_src_c);
+                        let bv = SrcIdxView::from(&b_src_c);
+                        let a_aligned = matches!(a_src_c, SrcIdx::Ident);
+                        let b_aligned = matches!(b_src_c, SrcIdx::Ident);
+                        let mut sgm = sg.borrow_mut();
+                        let mut ogm = og.borrow_mut();
+                        match (a_aligned, b_aligned) {
+                            (true, false) => {
+                                // a 恒等直写；b 多对一，块内收集后合并进 ogm
+                                let partials: Vec<Vec<(usize, f32)>> = sgm
+                                    .par_chunks_mut(4096)
+                                    .enumerate()
+                                    .map(|(ci, ch)| {
+                                        let base = ci * 4096;
+                                        let mut local = Vec::with_capacity(ch.len());
+                                        for (j, s) in ch.iter_mut().enumerate() {
+                                            let t = base + j;
+                                            let ib = bv.idx(t);
+                                            let (da, db) = back(sd_ref[t], od_ref[ib]);
+                                            *s += g_ref[t] * da;
+                                            local.push((ib, g_ref[t] * db));
+                                        }
+                                        local
+                                    })
+                                    .collect();
+                                for part in partials {
+                                    for (i, v) in part {
+                                        ogm[i] += v;
                                     }
-                                    local
-                                })
-                                .collect();
-                            for part in partials {
-                                for (i, v) in part {
-                                    sgm[i] += v;
                                 }
                             }
-                        }
-                        _ => {
-                            // 两侧都多对一：并行收集两侧 (槽位, 值) 后按块序合并
-                            let (pa, pb): (
-                                Vec<Vec<(usize, f32)>>,
-                                Vec<Vec<(usize, f32)>>,
-                            ) = g_ref
-                                .par_chunks(4096)
-                                .enumerate()
-                                .map(|(ci, gc)| {
-                                    let base = ci * 4096;
-                                    let mut la = Vec::with_capacity(gc.len());
-                                    let mut lb = Vec::with_capacity(gc.len());
-                                    for (k, &gv) in gc.iter().enumerate() {
-                                        let t = base + k;
-                                        let ia = av.idx(t);
-                                        let ib = bv.idx(t);
-                                        let (da, db) = back(sd_ref[ia], od_ref[ib]);
-                                        la.push((ia, gv * da));
-                                        lb.push((ib, gv * db));
+                            (false, true) => {
+                                // b 恒等直写；a 多对一，块内收集后合并进 sgm
+                                let partials: Vec<Vec<(usize, f32)>> = ogm
+                                    .par_chunks_mut(4096)
+                                    .enumerate()
+                                    .map(|(ci, ch)| {
+                                        let base = ci * 4096;
+                                        let mut local = Vec::with_capacity(ch.len());
+                                        for (j, s) in ch.iter_mut().enumerate() {
+                                            let t = base + j;
+                                            let ia = av.idx(t);
+                                            let (da, db) = back(sd_ref[ia], od_ref[t]);
+                                            *s += g_ref[t] * db;
+                                            local.push((ia, g_ref[t] * da));
+                                        }
+                                        local
+                                    })
+                                    .collect();
+                                for part in partials {
+                                    for (i, v) in part {
+                                        sgm[i] += v;
                                     }
-                                    (la, lb)
-                                })
-                                .collect();
-                            for part in pa {
-                                for (i, v) in part {
-                                    sgm[i] += v;
                                 }
                             }
-                            for part in pb {
-                                for (i, v) in part {
-                                    ogm[i] += v;
+                            _ => {
+                                // 两侧都多对一：并行收集两侧 (槽位, 值) 后按块序合并
+                                let (pa, pb): (Vec<Vec<(usize, f32)>>, Vec<Vec<(usize, f32)>>) =
+                                    g_ref
+                                        .par_chunks(4096)
+                                        .enumerate()
+                                        .map(|(ci, gc)| {
+                                            let base = ci * 4096;
+                                            let mut la = Vec::with_capacity(gc.len());
+                                            let mut lb = Vec::with_capacity(gc.len());
+                                            for (k, &gv) in gc.iter().enumerate() {
+                                                let t = base + k;
+                                                let ia = av.idx(t);
+                                                let ib = bv.idx(t);
+                                                let (da, db) = back(sd_ref[ia], od_ref[ib]);
+                                                la.push((ia, gv * da));
+                                                lb.push((ib, gv * db));
+                                            }
+                                            (la, lb)
+                                        })
+                                        .collect();
+                                for part in pa {
+                                    for (i, v) in part {
+                                        sgm[i] += v;
+                                    }
+                                }
+                                for part in pb {
+                                    for (i, v) in part {
+                                        ogm[i] += v;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }));
+                }),
+            );
         }
         result
     }
@@ -2760,19 +2899,27 @@ impl Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
         let data = x.decode().iter().map(|a| a + scalar).collect();
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                let g_ref: &[f32] = &g;
-                // 加标量的反向是恒等映射：整段梯度逐位搬运，按元素并行
-                sgm.par_iter_mut()
-                    .zip(g_ref.par_iter())
-                    .for_each(|(s, &gv)| *s += gv);
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    let g_ref: &[f32] = &g;
+                    // 加标量的反向是恒等映射：整段梯度逐位搬运，按元素并行
+                    sgm.par_iter_mut()
+                        .zip(g_ref.par_iter())
+                        .for_each(|(s, &gv)| *s += gv);
+                }),
+            );
         }
         result
     }
@@ -2780,23 +2927,27 @@ impl Tensor {
     pub fn mul_scalar(&self, scalar: f32) -> Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
-        let data: Vec<f32> = x
-            .decode()
-            .par_iter()
-            .map(|&a| a * scalar)
-            .collect();
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let data: Vec<f32> = x.decode().par_iter().map(|&a| a * scalar).collect();
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                let g_ref: &[f32] = &g;
-                sgm.par_iter_mut()
-                    .zip(g_ref.par_iter())
-                    .for_each(|(s, &gv)| *s += gv * scalar);
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    let g_ref: &[f32] = &g;
+                    sgm.par_iter_mut()
+                        .zip(g_ref.par_iter())
+                        .for_each(|(s, &gv)| *s += gv * scalar);
+                }),
+            );
         }
         result
     }
@@ -2813,17 +2964,25 @@ impl Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
         let data = x.decode().iter().map(|a| -a).collect();
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] -= g[i];
-                }
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    for i in 0..g.len() {
+                        sgm[i] -= g[i];
+                    }
+                }),
+            );
         }
         result
     }
@@ -2840,17 +2999,25 @@ impl Tensor {
             .map(|&a| if a > 0.0 { 1.0 } else { 0.0 })
             .collect();
         drop(sd);
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i] * mask[i];
-                }
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    for i in 0..g.len() {
+                        sgm[i] += g[i] * mask[i];
+                    }
+                }),
+            );
         }
         result
     }
@@ -2863,17 +3030,25 @@ impl Tensor {
         let sd = x.decode();
         let data: Vec<f32> = sd.iter().map(|&a| a.tanh()).collect();
         drop(sd);
-        let result = x.new_like(data.clone(), x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data.clone(),
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i] * (1.0 - data[i] * data[i]);
-                }
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    for i in 0..g.len() {
+                        sgm[i] += g[i] * (1.0 - data[i] * data[i]);
+                    }
+                }),
+            );
         }
         result
     }
@@ -2882,7 +3057,7 @@ impl Tensor {
     /// 这是现代 LLM使用的激活函数。
     /// 反向：dGELU/dx = 0.5(1+t) + 0.5x(1-t²)·da/dx，其中 a = √(2/π)(x+0.044715x³)，t = tanh(a)
     pub fn gelu(&self) -> Tensor {
-        const SQRT_2_PI: f32 = 0.797_884_560_8; // sqrt(2/π)
+        const SQRT_2_PI: f32 = 0.797_884_6; // sqrt(2/π)
         const COEF: f32 = 0.044_715;
         // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 sd）
         let x = self.contiguous();
@@ -2908,38 +3083,48 @@ impl Tensor {
         drop(sd);
         // data 直接 move 进张量（不要 `data.clone()`：那会为"反向闭包还要用"白拷一份全长数据，
         // 而反向根本不需要 gelu 的输出，只需要 t 与输入 x）
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let sd = x.data.clone();
             let tv = t_vals;
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let x_b = sd.decode();
-                let mut sgm = sg.borrow_mut();
-                // 只借切片、不做 to_vec 副本：`&[f32]` 本身是 Send+Sync，可以直接进
-                // rayon 闭包（与 layernorm 反向同一写法）。原先的 g_vec / x_vec 只是
-                // 为了绕开 `MutexGuard: !Send`，代价是每次反向多两份全长拷贝。
-                let g: &[f32] = &g;
-                let x_b: &[f32] = &x_b;
-                let len = g.len();
-                // 逐元素独立：直接并行写回梯度槽（原先先写 dx 再串行 +=，多一趟全长读写）
-                sgm.par_chunks_mut(4096)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let base = ci * 4096;
-                        for (j, slot) in chunk.iter_mut().enumerate() {
-                            let i = base + j;
-                            if i >= len { break; }
-                            let x = x_b[i];
-                            let t = tv[i];
-                            let da_dx = SQRT_2_PI * (1.0 + 3.0 * COEF * x * x);
-                            let dy_dx = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * da_dx;
-                            *slot += g[i] * dy_dx;
-                        }
-                    });
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let x_b = sd.decode();
+                    let mut sgm = sg.borrow_mut();
+                    // 只借切片、不做 to_vec 副本：`&[f32]` 本身是 Send+Sync，可以直接进
+                    // rayon 闭包（与 layernorm 反向同一写法）。原先的 g_vec / x_vec 只是
+                    // 为了绕开 `MutexGuard: !Send`，代价是每次反向多两份全长拷贝。
+                    let g: &[f32] = &g;
+                    let x_b: &[f32] = &x_b;
+                    let len = g.len();
+                    // 逐元素独立：直接并行写回梯度槽（原先先写 dx 再串行 +=，多一趟全长读写）
+                    sgm.par_chunks_mut(4096)
+                        .enumerate()
+                        .for_each(|(ci, chunk)| {
+                            let base = ci * 4096;
+                            for (j, slot) in chunk.iter_mut().enumerate() {
+                                let i = base + j;
+                                if i >= len {
+                                    break;
+                                }
+                                let x = x_b[i];
+                                let t = tv[i];
+                                let da_dx = SQRT_2_PI * (1.0 + 3.0 * COEF * x * x);
+                                let dy_dx = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * da_dx;
+                                *slot += g[i] * dy_dx;
+                            }
+                        });
+                }),
+            );
         }
         result
     }
@@ -2964,10 +3149,7 @@ impl Tensor {
     ///     = d_silu · sigmoid(x) · (1 + x · (1 - sigmoid(x)))
     /// ```
     pub fn swiglu(&self, gate: &Tensor) -> Tensor {
-        assert_eq!(
-            self.shape, gate.shape,
-            "SwiGLU 的两个输入形状必须一致"
-        );
+        assert_eq!(self.shape, gate.shape, "SwiGLU 的两个输入形状必须一致");
         // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 xd/gd）
         let x = self.contiguous();
         let g_in = gate.contiguous();
@@ -2992,7 +3174,9 @@ impl Tensor {
                 let base = ci * 4096;
                 for (j, (o, sig)) in oc.iter_mut().zip(sg.iter_mut()).enumerate() {
                     let idx = base + j;
-                    if idx >= len { break; }
+                    if idx >= len {
+                        break;
+                    }
                     let x = sd_ref[idx];
                     let sig_v = 1.0 / (1.0 + (-x).exp());
                     let silu_v = x * sig_v;
@@ -3012,59 +3196,68 @@ impl Tensor {
             let xd = x.data.clone();
             let gd = g_in.data.clone();
             let sig = sig_vals;
-            record(&result, vec![x, g_in], Arc::new(move || {
-                // 梯度缓冲判同一：swiglu(x, x) 时 self 与 gate 共用同一把锁，
-                // Mutex 不可重入——同缓冲必须单锁、两份贡献依次叠加进同一块内存
-                let same_grad = Shared::ptr_eq(&sx, &sg);
-                let g = rg.borrow();
-                let x_b_guard = xd.decode();
-                let g_b_guard = if Shared::ptr_eq(&xd, &gd) {
-                    None
-                } else {
-                    Some(gd.decode())
-                };
-                let g: &[f32] = &g;
-                let x_b: &[f32] = &x_b_guard;
-                let g_b: &[f32] = g_b_guard.as_deref().unwrap_or(&x_b_guard);
-                let len = g.len();
-                let sig: &[f32] = &sig;
-                let chunk = 4096;
-                if same_grad {
-                    // 同一缓冲：∂gate = g·silu(x)，∂x = g·gate·dsigmoid，
-                    // 两笔都累加进同一块内存，合成一次 +=
-                    // 逐元素独立 ⇒ 分块并行，块内顺序与串行写法逐个相同（逐位一致）
-                    let mut gx = sx.borrow_mut();
-                    gx.par_chunks_mut(chunk).enumerate().for_each(|(ci, gxc)| {
-                        let base = ci * chunk;
-                        for (j, slot) in gxc.iter_mut().enumerate() {
-                            let i = base + j;
-                            if i >= len { break; }
-                            let sig_v = sig[i];
-                            let silu_v = x_b[i] * sig_v; // 与 forward 的 silu 逐位相同
-                            let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
-                            *slot += g[i] * silu_v + g[i] * g_b[i] * dsig;
-                        }
-                    });
-                } else {
-                    let mut gx = sx.borrow_mut();
-                    let mut gg = sg.borrow_mut();
-                    gx.par_chunks_mut(chunk)
-                        .zip(gg.par_chunks_mut(chunk))
-                        .enumerate()
-                        .for_each(|(ci, (gxc, ggc))| {
+            record(
+                &result,
+                vec![x, g_in],
+                Arc::new(move || {
+                    // 梯度缓冲判同一：swiglu(x, x) 时 self 与 gate 共用同一把锁，
+                    // Mutex 不可重入——同缓冲必须单锁、两份贡献依次叠加进同一块内存
+                    let same_grad = Shared::ptr_eq(&sx, &sg);
+                    let g = rg.borrow();
+                    let x_b_guard = xd.decode();
+                    let g_b_guard = if Shared::ptr_eq(&xd, &gd) {
+                        None
+                    } else {
+                        Some(gd.decode())
+                    };
+                    let g: &[f32] = &g;
+                    let x_b: &[f32] = &x_b_guard;
+                    let g_b: &[f32] = g_b_guard.as_deref().unwrap_or(&x_b_guard);
+                    let len = g.len();
+                    let sig: &[f32] = &sig;
+                    let chunk = 4096;
+                    if same_grad {
+                        // 同一缓冲：∂gate = g·silu(x)，∂x = g·gate·dsigmoid，
+                        // 两笔都累加进同一块内存，合成一次 +=
+                        // 逐元素独立 ⇒ 分块并行，块内顺序与串行写法逐个相同（逐位一致）
+                        let mut gx = sx.borrow_mut();
+                        gx.par_chunks_mut(chunk).enumerate().for_each(|(ci, gxc)| {
                             let base = ci * chunk;
-                            for (j, (xs, gs)) in gxc.iter_mut().zip(ggc.iter_mut()).enumerate() {
+                            for (j, slot) in gxc.iter_mut().enumerate() {
                                 let i = base + j;
-                                if i >= len { break; }
+                                if i >= len {
+                                    break;
+                                }
                                 let sig_v = sig[i];
-                                let silu_v = x_b[i] * sig_v;
-                                *gs += g[i] * silu_v;
+                                let silu_v = x_b[i] * sig_v; // 与 forward 的 silu 逐位相同
                                 let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
-                                *xs += g[i] * g_b[i] * dsig;
+                                *slot += g[i] * silu_v + g[i] * g_b[i] * dsig;
                             }
                         });
-                }
-            }));
+                    } else {
+                        let mut gx = sx.borrow_mut();
+                        let mut gg = sg.borrow_mut();
+                        gx.par_chunks_mut(chunk)
+                            .zip(gg.par_chunks_mut(chunk))
+                            .enumerate()
+                            .for_each(|(ci, (gxc, ggc))| {
+                                let base = ci * chunk;
+                                for (j, (xs, gs)) in gxc.iter_mut().zip(ggc.iter_mut()).enumerate()
+                                {
+                                    let i = base + j;
+                                    if i >= len {
+                                        break;
+                                    }
+                                    let sig_v = sig[i];
+                                    let silu_v = x_b[i] * sig_v;
+                                    *gs += g[i] * silu_v;
+                                    let dsig = sig_v * (1.0 + x_b[i] * (1.0 - sig_v));
+                                    *xs += g[i] * g_b[i] * dsig;
+                                }
+                            });
+                    }
+                }),
+            );
         }
         result
     }
@@ -3080,19 +3273,27 @@ impl Tensor {
         let sd = x.decode();
         let data: Vec<f32> = sd.iter().map(|&a| a.max(EPS).ln()).collect();
         drop(sd);
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let sd = x.data.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let sd_b = sd.decode();
-                let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i] / sd_b[i].max(EPS);
-                }
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let sd_b = sd.decode();
+                    let mut sgm = sg.borrow_mut();
+                    for i in 0..g.len() {
+                        sgm[i] += g[i] / sd_b[i].max(EPS);
+                    }
+                }),
+            );
         }
         result
     }
@@ -3104,19 +3305,27 @@ impl Tensor {
         let sd = x.decode();
         let data: Vec<f32> = sd.iter().map(|&a| a.powf(p)).collect();
         drop(sd);
-        let result = x.new_like(data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let sd = x.data.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let sd_b = sd.decode();
-                let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i] += g[i] * p * sd_b[i].powf(p - 1.0);
-                }
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let sd_b = sd.decode();
+                    let mut sgm = sg.borrow_mut();
+                    for i in 0..g.len() {
+                        sgm[i] += g[i] * p * sd_b[i].powf(p - 1.0);
+                    }
+                }),
+            );
         }
         result
     }
@@ -3158,9 +3367,12 @@ impl Tensor {
         // 分给多核 —— 生成路径上每 token 少一次 519 MiB 级的整表拷贝。
         let b_t = a.rank() == 2
             && other.is_transposed_2d_view()
-            && (a.shape[0] == 1
-                || gpu_would_use_matmul(a.shape[0], a.shape[1], other.shape[1]));
-        let b = if b_t { other.clone() } else { other.contiguous() };
+            && (a.shape[0] == 1 || gpu_would_use_matmul(a.shape[0], a.shape[1], other.shape[1]));
+        let b = if b_t {
+            other.clone()
+        } else {
+            other.contiguous()
+        };
         if a.rank() == 2 {
             return a.matmul_2d(&b, b_t);
         }
@@ -3174,7 +3386,11 @@ impl Tensor {
         // bf16 权重也不再整块 decode：锁内原始借位成 MatOperand，内核逐元素转换
         let same_data = Shared::ptr_eq(&a.data, &b.data);
         let sd = a.data.borrow();
-        let od = if same_data { None } else { Some(b.data.borrow()) };
+        let od = if same_data {
+            None
+        } else {
+            Some(b.data.borrow())
+        };
         let sa = MatOperand::of(&sd, &a.data);
         let sb = od
             .as_deref()
@@ -3197,19 +3413,23 @@ impl Tensor {
     fn matmul_2d(&self, other: &Tensor, b_t: bool) -> Tensor {
         // 入口物化（matmul 已物化过，这里承接直接调用者）；b_t 时 other 保持视图不物化
         let a = self.contiguous();
-        let b = if b_t { other.clone() } else { other.contiguous() };
+        let b = if b_t {
+            other.clone()
+        } else {
+            other.contiguous()
+        };
         let (m, k1) = (a.shape[0], a.shape[1]);
         let (k2, n) = (b.shape[0], b.shape[1]);
-        assert_eq!(
-            k1, k2,
-            "矩阵乘法维度不匹配：{:?} x {:?}",
-            a.shape, b.shape
-        );
+        assert_eq!(k1, k2, "矩阵乘法维度不匹配：{:?} x {:?}", a.shape, b.shape);
 
         // x@x：判同一后只借一把锁（Mutex 不可重入），两个视图都指向它
         let same_data = Shared::ptr_eq(&a.data, &b.data);
         let sd = a.data.borrow();
-        let od = if same_data { None } else { Some(b.data.borrow()) };
+        let od = if same_data {
+            None
+        } else {
+            Some(b.data.borrow())
+        };
         let sa = MatOperand::of(&sd, &a.data);
         let sb = od
             .as_deref()
@@ -3244,16 +3464,16 @@ impl Tensor {
         assert_eq!(w.rank(), 2, "matmul_frozen 的右操作数必须为 2D");
         let (m, k1) = (a.shape[0], a.shape[1]);
         let (k2, n) = (w.shape[0], w.shape[1]);
-        assert_eq!(
-            k1, k2,
-            "矩阵乘法维度不匹配：{:?} x {:?}",
-            a.shape, w.shape
-        );
+        assert_eq!(k1, k2, "矩阵乘法维度不匹配：{:?} x {:?}", a.shape, w.shape);
 
         // x@W：W 是独立权重参数，正常不会与 x 同一张量；仍判同一防 Mutex 死锁
         let same_data = Shared::ptr_eq(&a.data, &w.data);
         let sd = a.data.borrow();
-        let wd = if same_data { None } else { Some(w.data.borrow()) };
+        let wd = if same_data {
+            None
+        } else {
+            Some(w.data.borrow())
+        };
         let sa = MatOperand::of(&sd, &a.data);
         let sw = wd
             .as_deref()
@@ -3311,19 +3531,26 @@ impl Tensor {
         // 并行归约：各线程按固定块算部分和，合并顺序固定 → 大张量求和不再占满一个核，
         // 同时保持确定性
         let data = a.decode();
-        let partials: Vec<f32> = data.par_chunks(4096).map(|c| c.iter().sum::<f32>()).collect();
+        let partials: Vec<f32> = data
+            .par_chunks(4096)
+            .map(|c| c.iter().sum::<f32>())
+            .collect();
         let total: f32 = partials.iter().sum();
         drop(data); // 先释放解码视图，下面才能把 `a` move 进 new_like
         let result = a.new_like(vec![total], vec![], a.requires_grad.load(Ordering::Relaxed));
         if a.req() {
             let rg = result.grad.clone();
             let sg = a.grad.clone();
-            record(&result, vec![a], Arc::new(move || {
-                let g = rg.borrow()[0];
-                let mut sgm = sg.borrow_mut();
-                // 并行：标量梯度均匀摊给每个元素，各写各的槽、无冲突
-                sgm.par_iter_mut().for_each(|v| *v += g);
-            }));
+            record(
+                &result,
+                vec![a],
+                Arc::new(move || {
+                    let g = rg.borrow()[0];
+                    let mut sgm = sg.borrow_mut();
+                    // 并行：标量梯度均匀摊给每个元素，各写各的槽、无冲突
+                    sgm.par_iter_mut().for_each(|v| *v += g);
+                }),
+            );
         }
         result
     }
@@ -3338,20 +3565,14 @@ impl Tensor {
         assert!(self.rank() >= 1, "sum_last_dim 需要至少 1 维");
         // 非连续（permute 视图）先物化，下文按行主序线性读
         let a = self.contiguous();
-        let (pre, d) = (
-            a.numel() / a.shape[a.rank() - 1],
-            a.shape[a.rank() - 1],
-        );
+        let (pre, d) = (a.numel() / a.shape[a.rank() - 1], a.shape[a.rank() - 1]);
         let sd = a.decode();
         let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; pre];
         // 并行：每行（长度 d）独立求和，行间无依赖；行内求和顺序不变
-        out_data
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(p, slot)| {
-                *slot = sd_ref[p * d..p * d + d].iter().sum();
-            });
+        out_data.par_iter_mut().enumerate().for_each(|(p, slot)| {
+            *slot = sd_ref[p * d..p * d + d].iter().sum();
+        });
         drop(sd);
         let mut new_shape = a.shape.clone();
         *new_shape.last_mut().unwrap() = 1;
@@ -3360,19 +3581,23 @@ impl Tensor {
         if a.req() {
             let rg = result.grad.clone();
             let sg = a.grad.clone();
-            record(&result, vec![a], Arc::new(move || {
-                let g = rg.borrow();
-                let g_ref: &[f32] = &g;
-                let mut sgm = sg.borrow_mut();
-                // 并行：按行切分，每行只写自己那 d 个元素，行间无依赖
-                sgm.par_chunks_mut(d)
-                    .zip(g_ref.par_iter())
-                    .for_each(|(row, &gv)| {
-                        for v in row.iter_mut() {
-                            *v += gv;
-                        }
-                    });
-            }));
+            record(
+                &result,
+                vec![a],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let g_ref: &[f32] = &g;
+                    let mut sgm = sg.borrow_mut();
+                    // 并行：按行切分，每行只写自己那 d 个元素，行间无依赖
+                    sgm.par_chunks_mut(d)
+                        .zip(g_ref.par_iter())
+                        .for_each(|(row, &gv)| {
+                            for v in row.iter_mut() {
+                                *v += gv;
+                            }
+                        });
+                }),
+            );
         }
         result
     }
@@ -3385,10 +3610,7 @@ impl Tensor {
         assert!(self.rank() >= 1, "softmax_last_dim 需要至少 1 维");
         // 非连续先物化，下文按行主序线性读
         let a = self.contiguous();
-        let (rows, d) = (
-            a.numel() / a.shape[a.rank() - 1],
-            a.shape[a.rank() - 1],
-        );
+        let (rows, d) = (a.numel() / a.shape[a.rank() - 1], a.shape[a.rank() - 1]);
         let sd = a.decode();
         let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; rows * d];
@@ -3412,24 +3634,32 @@ impl Tensor {
         });
         drop(sd);
 
-        let result = a.new_like(out_data.clone(), a.shape.clone(), a.requires_grad.load(Ordering::Relaxed));
+        let result = a.new_like(
+            out_data.clone(),
+            a.shape.clone(),
+            a.requires_grad.load(Ordering::Relaxed),
+        );
         if a.req() {
             let rg = result.grad.clone();
             let sg = a.grad.clone();
             let (_rows, d) = (rows, d);
-            record(&result, vec![a], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for r in 0.._rows {
-                    let mut dot = 0.0;
-                    for j in 0..d {
-                        dot += g[r * d + j] * out_data[r * d + j];
+            record(
+                &result,
+                vec![a],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    for r in 0.._rows {
+                        let mut dot = 0.0;
+                        for j in 0..d {
+                            dot += g[r * d + j] * out_data[r * d + j];
+                        }
+                        for i in 0..d {
+                            sgm[r * d + i] += out_data[r * d + i] * (g[r * d + i] - dot);
+                        }
                     }
-                    for i in 0..d {
-                        sgm[r * d + i] += out_data[r * d + i] * (g[r * d + i] - dot);
-                    }
-                }
-            }));
+                }),
+            );
         }
         result
     }
@@ -3447,10 +3677,7 @@ impl Tensor {
         assert!(self.rank() >= 1, "logsumexp_last_dim 需要至少 1 维");
         // 非连续先物化，下文按行主序线性读
         let a = self.contiguous();
-        let (pre, d) = (
-            a.numel() / a.shape[a.rank() - 1],
-            a.shape[a.rank() - 1],
-        );
+        let (pre, d) = (a.numel() / a.shape[a.rank() - 1], a.shape[a.rank() - 1]);
         let sd = a.decode();
         let mut out_data = vec![0.0f32; pre];
         let mut sm = vec![0.0f32; pre * d]; // 归一化前是 exp，归一化后是 softmax（反向要用）
@@ -3479,15 +3706,19 @@ impl Tensor {
         if a.req() {
             let rg = result.grad.clone();
             let sg = a.grad.clone();
-            record(&result, vec![a], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for p in 0..pre {
-                    for j in 0..d {
-                        sgm[p * d + j] += g[p] * sm[p * d + j];
+            record(
+                &result,
+                vec![a],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    for p in 0..pre {
+                        for j in 0..d {
+                            sgm[p * d + j] += g[p] * sm[p * d + j];
+                        }
                     }
-                }
-            }));
+                }),
+            );
         }
         result
     }
@@ -3511,7 +3742,10 @@ impl Tensor {
         let d = *x.shape.last().unwrap();
         assert_eq!(gamma.rank(), 1, "LayerNorm 的 γ 必须是一维");
         assert_eq!(gamma.shape, beta.shape, "LayerNorm 的 γ/β 形状必须一致");
-        assert_eq!(gamma.shape[0], d, "LayerNorm 的 γ/β 长度必须等于输入最后一维");
+        assert_eq!(
+            gamma.shape[0], d,
+            "LayerNorm 的 γ/β 长度必须等于输入最后一维"
+        );
         let rows = x.numel() / d;
         let sd = x.decode();
         let gv = gamma.decode();
@@ -3560,83 +3794,91 @@ impl Tensor {
             let sb = beta.grad.clone();
             let xd = x.data.clone();
             let gd = gamma.data.clone();
-            record(&result, vec![x, gamma.clone(), beta.clone()], Arc::new(move || {
-                // 不做 to_vec 拷贝：decode 一次转只读切片，两遍计算共享同一份数据
-                // （切片是 Sync，可安全带进下面的并行闭包）
-                let g_b = rg.borrow();
-                let x_bd = xd.decode();
-                let gam_b = gd.decode();
-                let g: &[f32] = &g_b;
-                let x_b: &[f32] = &x_bd;
-                let gam: &[f32] = &gam_b;
-                let mut gx = sx.borrow_mut();
-                let mut gg = sg.borrow_mut();
-                let mut gb = sb.borrow_mut();
-                // 第一遍：dγ/dβ 是**跨行**归约。按**列**切分即可并行：每列独立、
-                // 列内仍按 r 升序累加 ⇒ 与串行写法逐位一致（原注释"无法并行"
-                // 只对"按行切分"成立，那是把归约拆成了有竞争的读改写）。
-                let mut dg = vec![0.0f32; d];
-                let mut db = vec![0.0f32; d];
-                let cw = (d / (rayon::current_num_threads().max(1) * 2)).max(16);
-                if rows * d >= 65_536 && cw < d {
-                    dg.par_chunks_mut(cw)
-                        .zip(db.par_chunks_mut(cw))
+            record(
+                &result,
+                vec![x, gamma.clone(), beta.clone()],
+                Arc::new(move || {
+                    // 不做 to_vec 拷贝：decode 一次转只读切片，两遍计算共享同一份数据
+                    // （切片是 Sync，可安全带进下面的并行闭包）
+                    let g_b = rg.borrow();
+                    let x_bd = xd.decode();
+                    let gam_b = gd.decode();
+                    let g: &[f32] = &g_b;
+                    let x_b: &[f32] = &x_bd;
+                    let gam: &[f32] = &gam_b;
+                    let mut gx = sx.borrow_mut();
+                    let mut gg = sg.borrow_mut();
+                    let mut gb = sb.borrow_mut();
+                    // 第一遍：dγ/dβ 是**跨行**归约。按**列**切分即可并行：每列独立、
+                    // 列内仍按 r 升序累加 ⇒ 与串行写法逐位一致（原注释"无法并行"
+                    // 只对"按行切分"成立，那是把归约拆成了有竞争的读改写）。
+                    let mut dg = vec![0.0f32; d];
+                    let mut db = vec![0.0f32; d];
+                    let cw = (d / (rayon::current_num_threads().max(1) * 2)).max(16);
+                    if rows * d >= 65_536 && cw < d {
+                        dg.par_chunks_mut(cw)
+                            .zip(db.par_chunks_mut(cw))
+                            .enumerate()
+                            .for_each(|(ci, (dgc, dbc))| {
+                                let c0 = ci * cw;
+                                for r in 0..rows {
+                                    let base = r * d + c0;
+                                    let is = inv_std[r];
+                                    let mu = mean[r];
+                                    for (k, (ag, ab)) in
+                                        dgc.iter_mut().zip(dbc.iter_mut()).enumerate()
+                                    {
+                                        let dy = g[base + k];
+                                        *ag += dy * (x_b[base + k] - mu) * is;
+                                        *ab += dy;
+                                    }
+                                }
+                            });
+                    } else {
+                        for r in 0..rows {
+                            let base = r * d;
+                            let is = inv_std[r];
+                            let mu = mean[r];
+                            for j in 0..d {
+                                let dy = g[base + j];
+                                dg[j] += dy * (x_b[base + j] - mu) * is;
+                                db[j] += dy;
+                            }
+                        }
+                    }
+                    for j in 0..d {
+                        gg[j] += dg[j];
+                        gb[j] += db[j];
+                    }
+                    // 第二遍：并行计算 gx（行间无写冲突）
+                    let chunk_size = 1024;
+                    gx.par_chunks_mut(d * chunk_size)
                         .enumerate()
-                        .for_each(|(ci, (dgc, dbc))| {
-                            let c0 = ci * cw;
-                            for r in 0..rows {
-                                let base = r * d + c0;
+                        .for_each(|(ci, gx_chunk)| {
+                            let start_row = ci * chunk_size;
+                            let chunk_rows = gx_chunk.len() / d;
+                            for ri in 0..chunk_rows {
+                                let r = start_row + ri;
+                                let base = r * d;
                                 let is = inv_std[r];
-                                let mu = mean[r];
-                                for (k, (ag, ab)) in
-                                    dgc.iter_mut().zip(dbc.iter_mut()).enumerate()
-                                {
-                                    let dy = g[base + k];
-                                    *ag += dy * (x_b[base + k] - mu) * is;
-                                    *ab += dy;
+                                let mut m1 = 0.0f32;
+                                let mut m2 = 0.0f32;
+                                for j in 0..d {
+                                    let dy_g = g[base + j] * gam[j];
+                                    m1 += dy_g;
+                                    m2 += dy_g * (x_b[base + j] - mean[r]) * is;
+                                }
+                                m1 /= d as f32;
+                                m2 /= d as f32;
+                                for j in 0..d {
+                                    let norm = (x_b[base + j] - mean[r]) * is;
+                                    gx_chunk[ri * d + j] +=
+                                        is * (g[base + j] * gam[j] - m1 - m2 * norm);
                                 }
                             }
                         });
-                } else {
-                    for r in 0..rows {
-                        let base = r * d;
-                        let is = inv_std[r];
-                        let mu = mean[r];
-                        for j in 0..d {
-                            let dy = g[base + j];
-                            dg[j] += dy * (x_b[base + j] - mu) * is;
-                            db[j] += dy;
-                        }
-                    }
-                }
-                for j in 0..d { gg[j] += dg[j]; gb[j] += db[j]; }
-                // 第二遍：并行计算 gx（行间无写冲突）
-                let chunk_size = 1024;
-                gx.par_chunks_mut(d * chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, gx_chunk)| {
-                        let start_row = ci * chunk_size;
-                        let chunk_rows = gx_chunk.len() / d;
-                        for ri in 0..chunk_rows {
-                            let r = start_row + ri;
-                            let base = r * d;
-                            let is = inv_std[r];
-                            let mut m1 = 0.0f32;
-                            let mut m2 = 0.0f32;
-                            for j in 0..d {
-                                let dy_g = g[base + j] * gam[j];
-                                m1 += dy_g;
-                                m2 += dy_g * (x_b[base + j] - mean[r]) * is;
-                            }
-                            m1 /= d as f32;
-                            m2 /= d as f32;
-                            for j in 0..d {
-                                let norm = (x_b[base + j] - mean[r]) * is;
-                                gx_chunk[ri * d + j] += is * (g[base + j] * gam[j] - m1 - m2 * norm);
-                            }
-                        }
-                    });
-            }));
+                }),
+            );
         }
         result
     }
@@ -3698,66 +3940,72 @@ impl Tensor {
             let xd = x.data.clone();
             let gd = gamma.data.clone();
             let ir = inv_rms;
-            record(&result, vec![x, gamma.clone()], Arc::new(move || {
-                // 不做 to_vec 拷贝：decode 一次转只读切片，供两遍计算共享（见 layer_norm 反向的注释）
-                let g_b = rg.borrow();
-                let x_bd = xd.decode();
-                let gam_b = gd.decode();
-                let g: &[f32] = &g_b;
-                let x_b: &[f32] = &x_bd;
-                let gam: &[f32] = &gam_b;
-                let mut gx = sx.borrow_mut();
-                let mut gg = sg.borrow_mut();
-                // 第一遍：dγ 是跨行归约 —— 按列切分后逐列独立、列内 r 升序累加，
-                // 与串行写法逐位一致（见 layer_norm 反向的同类说明）
-                let mut dg = vec![0.0f32; d];
-                let cw = (d / (rayon::current_num_threads().max(1) * 2)).max(16);
-                if rows * d >= 65_536 && cw < d {
-                    dg.par_chunks_mut(cw).enumerate().for_each(|(ci, dgc)| {
-                        let c0 = ci * cw;
-                        for r in 0..rows {
-                            let base = r * d + c0;
-                            let is = ir[r];
-                            for (k, ag) in dgc.iter_mut().enumerate() {
-                                *ag += g[base + k] * x_b[base + k] * is;
+            record(
+                &result,
+                vec![x, gamma.clone()],
+                Arc::new(move || {
+                    // 不做 to_vec 拷贝：decode 一次转只读切片，供两遍计算共享（见 layer_norm 反向的注释）
+                    let g_b = rg.borrow();
+                    let x_bd = xd.decode();
+                    let gam_b = gd.decode();
+                    let g: &[f32] = &g_b;
+                    let x_b: &[f32] = &x_bd;
+                    let gam: &[f32] = &gam_b;
+                    let mut gx = sx.borrow_mut();
+                    let mut gg = sg.borrow_mut();
+                    // 第一遍：dγ 是跨行归约 —— 按列切分后逐列独立、列内 r 升序累加，
+                    // 与串行写法逐位一致（见 layer_norm 反向的同类说明）
+                    let mut dg = vec![0.0f32; d];
+                    let cw = (d / (rayon::current_num_threads().max(1) * 2)).max(16);
+                    if rows * d >= 65_536 && cw < d {
+                        dg.par_chunks_mut(cw).enumerate().for_each(|(ci, dgc)| {
+                            let c0 = ci * cw;
+                            for r in 0..rows {
+                                let base = r * d + c0;
+                                let is = ir[r];
+                                for (k, ag) in dgc.iter_mut().enumerate() {
+                                    *ag += g[base + k] * x_b[base + k] * is;
+                                }
                             }
-                        }
-                    });
-                } else {
-                    for r in 0..rows {
-                        let base = r * d;
-                        let is = ir[r];
-                        for j in 0..d {
-                            dg[j] += g[base + j] * x_b[base + j] * is;
-                        }
-                    }
-                }
-                for j in 0..d { gg[j] += dg[j]; }
-                // 第二遍：并行计算 gx
-                let chunk_size = 1024;
-                gx.par_chunks_mut(d * chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, gx_chunk)| {
-                        let start_row = ci * chunk_size;
-                        let chunk_rows = gx_chunk.len() / d;
-                        for ri in 0..chunk_rows {
-                            let r = start_row + ri;
+                        });
+                    } else {
+                        for r in 0..rows {
                             let base = r * d;
                             let is = ir[r];
-                            let mut sxg = 0.0f32;
                             for j in 0..d {
-                                let dy_g = g[base + j] * gam[j];
-                                sxg += x_b[base + j] * dy_g;
-                            }
-                            sxg /= d as f32;
-                            let is2 = is * is;
-                            for j in 0..d {
-                                let dy_g = g[base + j] * gam[j];
-                                gx_chunk[ri * d + j] += is * (dy_g - sxg * is2 * x_b[base + j]);
+                                dg[j] += g[base + j] * x_b[base + j] * is;
                             }
                         }
-                    });
-            }));
+                    }
+                    for j in 0..d {
+                        gg[j] += dg[j];
+                    }
+                    // 第二遍：并行计算 gx
+                    let chunk_size = 1024;
+                    gx.par_chunks_mut(d * chunk_size)
+                        .enumerate()
+                        .for_each(|(ci, gx_chunk)| {
+                            let start_row = ci * chunk_size;
+                            let chunk_rows = gx_chunk.len() / d;
+                            for ri in 0..chunk_rows {
+                                let r = start_row + ri;
+                                let base = r * d;
+                                let is = ir[r];
+                                let mut sxg = 0.0f32;
+                                for j in 0..d {
+                                    let dy_g = g[base + j] * gam[j];
+                                    sxg += x_b[base + j] * dy_g;
+                                }
+                                sxg /= d as f32;
+                                let is2 = is * is;
+                                for j in 0..d {
+                                    let dy_g = g[base + j] * gam[j];
+                                    gx_chunk[ri * d + j] += is * (dy_g - sxg * is2 * x_b[base + j]);
+                                }
+                            }
+                        });
+                }),
+            );
         }
         result
     }
@@ -3950,167 +4198,185 @@ impl Tensor {
             let sv = v.grad.clone();
             let k_data = k.data.clone();
             let v_data = v.data.clone();
-            record(&result, vec![q.clone(), k.clone(), v.clone()], Arc::new(move || {
-                let g = rg.borrow();
-                // 常驻显存路径：dV/dP/dS/dQ/dK 五个算子录进一次提交，只回读 dQ/dK/dV（各 4.2MB）
-                #[cfg(feature = "gpu")]
-                if let AttnCache::Gpu(r) = &cache {
-                    if let Some((dq_out, dk_out, dv_out)) = r.backward(&g) {
-                        {
-                            let mut sgm = sq.borrow_mut();
-                            for (i, v) in dq_out.iter().enumerate() {
-                                sgm[i] += v * scale;
+            record(
+                &result,
+                vec![q.clone(), k.clone(), v.clone()],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    // 常驻显存路径：dV/dP/dS/dQ/dK 五个算子录进一次提交，只回读 dQ/dK/dV（各 4.2MB）
+                    #[cfg(feature = "gpu")]
+                    if let AttnCache::Gpu(r) = &cache {
+                        if let Some((dq_out, dk_out, dv_out)) = r.backward(&g) {
+                            {
+                                let mut sgm = sq.borrow_mut();
+                                for (i, v) in dq_out.iter().enumerate() {
+                                    sgm[i] += v * scale;
+                                }
                             }
-                        }
-                        // GQA：GPU 收到的是核外展开后的 dK/dV（bh 组），按 n_rep
-                        // 相邻副本求和折回 kv_bh 组再写父梯度；n_rep==1 直接 move 零拷贝
-                        let dk_final =
-                            if n_rep > 1 { fold_repeat_grad(&dk_out, kv_bh, n_rep) } else { dk_out };
-                        let dv_final =
-                            if n_rep > 1 { fold_repeat_grad(&dv_out, kv_bh, n_rep) } else { dv_out };
-                        {
-                            let mut sgm = sk.borrow_mut();
-                            for (i, v) in dk_final.iter().enumerate() {
-                                sgm[i] += v;
+                            // GQA：GPU 收到的是核外展开后的 dK/dV（bh 组），按 n_rep
+                            // 相邻副本求和折回 kv_bh 组再写父梯度；n_rep==1 直接 move 零拷贝
+                            let dk_final = if n_rep > 1 {
+                                fold_repeat_grad(&dk_out, kv_bh, n_rep)
+                            } else {
+                                dk_out
+                            };
+                            let dv_final = if n_rep > 1 {
+                                fold_repeat_grad(&dv_out, kv_bh, n_rep)
+                            } else {
+                                dv_out
+                            };
+                            {
+                                let mut sgm = sk.borrow_mut();
+                                for (i, v) in dk_final.iter().enumerate() {
+                                    sgm[i] += v;
+                                }
                             }
-                        }
-                        {
-                            let mut sgm = sv.borrow_mut();
-                            for (i, v) in dv_final.iter().enumerate() {
-                                sgm[i] += v;
+                            {
+                                let mut sgm = sv.borrow_mut();
+                                for (i, v) in dv_final.iter().enumerate() {
+                                    sgm[i] += v;
+                                }
                             }
+                            return;
                         }
-                        return;
                     }
-                }
-                // CPU 路径（也兜底 GPU 常驻反向失败）：前后向之间不保留 P，
-                // 反向用矩阵乘重算 scores = Q'·Kᵀ，再由 `attn_softmax_cpu` 归一化出 P
-                // （它同样接受 `mask: Option<&[f32]>`：`None` 按核内后缀因果截断、
-                // `Some` 则逐行加掩码扫满 `T_total`，与前向 `flash_forward_cpu` 逐位一致）。
-                // dP/dS 本来就是 O(T²)，重算 scores 不改变反向工作集的量级。
-                // 反向：全部交给矩阵乘内核（旧的标量三重循环只有 0.24 GFLOP/s，慢 100 倍）
-                // softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]·P[i,k])
-                // 注意必须用 V 算 dP（out_i = Σ_j P_ij·V_j，故 ∂out_i/∂P_ij 的因子是 V_j）；
-                // 用 K 会让 dP/dS/dQ/dK 全部错误（实测 dQ 偏差 2.7 倍）。
-                let kd_b = k_data.decode();
-                let vd_b = v_data.decode();
-                // GQA：核内索引只在前向省物化；反向 matmul 链要求 Q/K 扁平 bh 相等，
-                // 这里把 K/V 物化展开到 bh 组参与计算，dK/dV 算完再折回 kv_bh 组
-                let k_exp: Option<Vec<f32>> =
-                    (n_rep > 1).then(|| repeat_flat(&kd_b, kv_bh, n_rep));
-                let v_exp: Option<Vec<f32>> =
-                    (n_rep > 1).then(|| repeat_flat(&vd_b, kv_bh, n_rep));
-                let kd_use: &[f32] = match &k_exp {
-                    Some(v) => v,
-                    None => &kd_b,
-                };
-                let vd_use: &[f32] = match &v_exp {
-                    Some(v) => v,
-                    None => &vd_b,
-                };
-                // 重算 scores 并按**同一掩码口径**归一化，得到与前向逐位一致的 P
-                // （含掩码位置为 0）——反向必须复用同一张掩码，否则梯度会漏回被屏蔽的键
-                // （参数顺序与 attn_forward_ops 一致：m=t, k=head_dim, n=t_total）
-                let scores = matmul_data(
-                    MatOperand::F32(&q_scaled),
-                    MatOperand::F32(kd_use),
-                    t,
-                    head_dim,
-                    t_total,
-                    bh,
-                    false,
-                    true,
-                );
-                let p = attn_softmax_cpu(
-                    &scores,
-                    bh * t,
-                    t,
-                    t_total,
-                    visible_before,
-                    user_mask.as_deref(),
-                );
-                // dV = Pᵀ·dO
-                let dv_out = matmul_data(
-                    MatOperand::F32(&p),
-                    MatOperand::F32(&g),
-                    t_total,
-                    t,
-                    head_dim,
-                    bh,
-                    true,
-                    false,
-                );
-                // dP = dO·Vᵀ
-                let mut ds = matmul_data(
-                    MatOperand::F32(&g),
-                    MatOperand::F32(vd_use),
-                    t,
-                    head_dim,
-                    t_total,
-                    bh,
-                    false,
-                    true,
-                );
-                drop(g);
-                drop(vd_b);
-                drop(v_exp);
-                // dS ← P ⊙ (dP - Σ_j dP·P)：逐行独立，按行并行（一行读两遍写一遍）
-                let p_ref: &[f32] = &p;
-                ds.par_chunks_mut(t_total).enumerate().for_each(|(r, drow)| {
-                    let base = r * t_total;
-                    let mut dot = 0.0f32;
-                    for j in 0..t_total {
-                        dot += drow[j] * p_ref[base + j];
+                    // CPU 路径（也兜底 GPU 常驻反向失败）：前后向之间不保留 P，
+                    // 反向用矩阵乘重算 scores = Q'·Kᵀ，再由 `attn_softmax_cpu` 归一化出 P
+                    // （它同样接受 `mask: Option<&[f32]>`：`None` 按核内后缀因果截断、
+                    // `Some` 则逐行加掩码扫满 `T_total`，与前向 `flash_forward_cpu` 逐位一致）。
+                    // dP/dS 本来就是 O(T²)，重算 scores 不改变反向工作集的量级。
+                    // 反向：全部交给矩阵乘内核（旧的标量三重循环只有 0.24 GFLOP/s，慢 100 倍）
+                    // softmax 反向：dS[i,j] = P[i,j] * (dP[i,j] - Σ_k dP[i,k]·P[i,k])
+                    // 注意必须用 V 算 dP（out_i = Σ_j P_ij·V_j，故 ∂out_i/∂P_ij 的因子是 V_j）；
+                    // 用 K 会让 dP/dS/dQ/dK 全部错误（实测 dQ 偏差 2.7 倍）。
+                    let kd_b = k_data.decode();
+                    let vd_b = v_data.decode();
+                    // GQA：核内索引只在前向省物化；反向 matmul 链要求 Q/K 扁平 bh 相等，
+                    // 这里把 K/V 物化展开到 bh 组参与计算，dK/dV 算完再折回 kv_bh 组
+                    let k_exp: Option<Vec<f32>> =
+                        (n_rep > 1).then(|| repeat_flat(&kd_b, kv_bh, n_rep));
+                    let v_exp: Option<Vec<f32>> =
+                        (n_rep > 1).then(|| repeat_flat(&vd_b, kv_bh, n_rep));
+                    let kd_use: &[f32] = match &k_exp {
+                        Some(v) => v,
+                        None => &kd_b,
+                    };
+                    let vd_use: &[f32] = match &v_exp {
+                        Some(v) => v,
+                        None => &vd_b,
+                    };
+                    // 重算 scores 并按**同一掩码口径**归一化，得到与前向逐位一致的 P
+                    // （含掩码位置为 0）——反向必须复用同一张掩码，否则梯度会漏回被屏蔽的键
+                    // （参数顺序与 attn_forward_ops 一致：m=t, k=head_dim, n=t_total）
+                    let scores = matmul_data(
+                        MatOperand::F32(&q_scaled),
+                        MatOperand::F32(kd_use),
+                        t,
+                        head_dim,
+                        t_total,
+                        bh,
+                        false,
+                        true,
+                    );
+                    let p = attn_softmax_cpu(
+                        &scores,
+                        bh * t,
+                        t,
+                        t_total,
+                        visible_before,
+                        user_mask.as_deref(),
+                    );
+                    // dV = Pᵀ·dO
+                    let dv_out = matmul_data(
+                        MatOperand::F32(&p),
+                        MatOperand::F32(&g),
+                        t_total,
+                        t,
+                        head_dim,
+                        bh,
+                        true,
+                        false,
+                    );
+                    // dP = dO·Vᵀ
+                    let mut ds = matmul_data(
+                        MatOperand::F32(&g),
+                        MatOperand::F32(vd_use),
+                        t,
+                        head_dim,
+                        t_total,
+                        bh,
+                        false,
+                        true,
+                    );
+                    drop(g);
+                    drop(vd_b);
+                    drop(v_exp);
+                    // dS ← P ⊙ (dP - Σ_j dP·P)：逐行独立，按行并行（一行读两遍写一遍）
+                    let p_ref: &[f32] = &p;
+                    ds.par_chunks_mut(t_total)
+                        .enumerate()
+                        .for_each(|(r, drow)| {
+                            let base = r * t_total;
+                            let mut dot = 0.0f32;
+                            for j in 0..t_total {
+                                dot += drow[j] * p_ref[base + j];
+                            }
+                            for j in 0..t_total {
+                                drow[j] = p_ref[base + j] * (drow[j] - dot);
+                            }
+                        });
+                    // dQ = (dS·K)·scale（前向里 Q 先被缩成 Q' = Q·scale，故 dQ 要乘回来）；dK = dSᵀ·Q'
+                    let dq_out = matmul_data(
+                        MatOperand::F32(&ds),
+                        MatOperand::F32(kd_use),
+                        t,
+                        t_total,
+                        head_dim,
+                        bh,
+                        false,
+                        false,
+                    );
+                    let dk_out = matmul_data(
+                        MatOperand::F32(&ds),
+                        MatOperand::F32(&q_scaled),
+                        t_total,
+                        t,
+                        head_dim,
+                        bh,
+                        true,
+                        false,
+                    );
+                    drop(kd_b);
+                    drop(k_exp);
+                    // 三笔梯度回写都走 `add_assign_slice`：大张量按块并行（dq/dk/dv 各是
+                    // bh·t·hd 个元素，t=1024 时每份 ~29 MB，单核搬三遍每层白扔近 10 ms），
+                    // 小张量走串行（rayon 任务开销不该压在小模型上）。
+                    {
+                        let mut sgm = sq.borrow_mut();
+                        add_assign_slice(&mut sgm, &dq_out, scale);
                     }
-                    for j in 0..t_total {
-                        drow[j] = p_ref[base + j] * (drow[j] - dot);
+                    // GQA：dK/dV 是展开后（bh 组）的结果，按 n_rep 相邻副本求和折回
+                    // kv_bh 组再写父梯度（n_rep==1 直接 move 零拷贝）
+                    let dk_final = if n_rep > 1 {
+                        fold_repeat_grad(&dk_out, kv_bh, n_rep)
+                    } else {
+                        dk_out
+                    };
+                    let dv_final = if n_rep > 1 {
+                        fold_repeat_grad(&dv_out, kv_bh, n_rep)
+                    } else {
+                        dv_out
+                    };
+                    {
+                        let mut sgm = sk.borrow_mut();
+                        add_assign_slice(&mut sgm, &dk_final, 1.0);
                     }
-                });
-                // dQ = (dS·K)·scale（前向里 Q 先被缩成 Q' = Q·scale，故 dQ 要乘回来）；dK = dSᵀ·Q'
-                let dq_out = matmul_data(
-                    MatOperand::F32(&ds),
-                    MatOperand::F32(kd_use),
-                    t,
-                    t_total,
-                    head_dim,
-                    bh,
-                    false,
-                    false,
-                );
-                let dk_out = matmul_data(
-                    MatOperand::F32(&ds),
-                    MatOperand::F32(&q_scaled),
-                    t_total,
-                    t,
-                    head_dim,
-                    bh,
-                    true,
-                    false,
-                );
-                drop(kd_b);
-                drop(k_exp);
-                // 三笔梯度回写都走 `add_assign_slice`：大张量按块并行（dq/dk/dv 各是
-                // bh·t·hd 个元素，t=1024 时每份 ~29 MB，单核搬三遍每层白扔近 10 ms），
-                // 小张量走串行（rayon 任务开销不该压在小模型上）。
-                {
-                    let mut sgm = sq.borrow_mut();
-                    add_assign_slice(&mut sgm, &dq_out, scale);
-                }
-                // GQA：dK/dV 是展开后（bh 组）的结果，按 n_rep 相邻副本求和折回
-                // kv_bh 组再写父梯度（n_rep==1 直接 move 零拷贝）
-                let dk_final =
-                    if n_rep > 1 { fold_repeat_grad(&dk_out, kv_bh, n_rep) } else { dk_out };
-                let dv_final =
-                    if n_rep > 1 { fold_repeat_grad(&dv_out, kv_bh, n_rep) } else { dv_out };
-                {
-                    let mut sgm = sk.borrow_mut();
-                    add_assign_slice(&mut sgm, &dk_final, 1.0);
-                }
-                {
-                    let mut sgm = sv.borrow_mut();
-                    add_assign_slice(&mut sgm, &dv_final, 1.0);
-                }
-            }));
+                    {
+                        let mut sgm = sv.borrow_mut();
+                        add_assign_slice(&mut sgm, &dv_final, 1.0);
+                    }
+                }),
+            );
         }
         result
     }
@@ -4164,27 +4430,31 @@ impl Tensor {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let out = out_shared;
-            record(&result, vec![x, mask], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                // 反向同样优先 GPU（p = 前向概率），失败回退 CPU
-                #[cfg(feature = "gpu")]
-                if let Some(dx) = crate::gpu::softmax_mask_backward(&g, &out, rows, d) {
-                    for (i, v) in dx.iter().enumerate() {
-                        sgm[i] += v;
+            record(
+                &result,
+                vec![x, mask],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    // 反向同样优先 GPU（p = 前向概率），失败回退 CPU
+                    #[cfg(feature = "gpu")]
+                    if let Some(dx) = crate::gpu::softmax_mask_backward(&g, &out, rows, d) {
+                        for (i, v) in dx.iter().enumerate() {
+                            sgm[i] += v;
+                        }
+                        return;
                     }
-                    return;
-                }
-                for r in 0..rows {
-                    let mut dot = 0.0;
-                    for j in 0..d {
-                        dot += g[r * d + j] * out[r * d + j];
+                    for r in 0..rows {
+                        let mut dot = 0.0;
+                        for j in 0..d {
+                            dot += g[r * d + j] * out[r * d + j];
+                        }
+                        for i in 0..d {
+                            sgm[r * d + i] += out[r * d + i] * (g[r * d + i] - dot);
+                        }
                     }
-                    for i in 0..d {
-                        sgm[r * d + i] += out[r * d + i] * (g[r * d + i] - dot);
-                    }
-                }
-            }));
+                }),
+            );
         }
         result
     }
@@ -4201,10 +4471,7 @@ impl Tensor {
         assert!(self.rank() >= 1, "log_softmax 至少需要 1 维");
         // 非连续先物化，下文按行主序线性读
         let a = self.contiguous();
-        let (rows, d) = (
-            a.numel() / a.shape[a.rank() - 1],
-            a.shape[a.rank() - 1],
-        );
+        let (rows, d) = (a.numel() / a.shape[a.rank() - 1], a.shape[a.rank() - 1]);
         let sd = a.decode();
         let sd_ref: &[f32] = &sd;
         let mut out_data = vec![0.0f32; rows * d];
@@ -4237,28 +4504,36 @@ impl Tensor {
             });
         drop(sd);
 
-        let result = a.new_like(out_data, a.shape.clone(), a.requires_grad.load(Ordering::Relaxed));
+        let result = a.new_like(
+            out_data,
+            a.shape.clone(),
+            a.requires_grad.load(Ordering::Relaxed),
+        );
         if a.req() {
             let rg = result.grad.clone();
             let sg = a.grad.clone();
-            record(&result, vec![a], Arc::new(move || {
-                // 不做 to_vec 拷贝：borrow 后转只读切片，再 borrow_mut 梯度槽
-                // （rg 与 sg 是两把不同的锁，顺序无关）
-                let g_b = rg.borrow();
-                let g: &[f32] = &g_b;
-                let mut sgm = sg.borrow_mut();
-                // 并行：同样按行切分，行间无依赖（每一行只写自己的 d 个元素）
-                sgm.par_chunks_mut(d).enumerate().for_each(|(r, grow)| {
-                    let base = r * d;
-                    let mut dot = 0.0;
-                    for j in 0..d {
-                        dot += g[base + j];
-                    }
-                    for i in 0..d {
-                        grow[i] += g[base + i] - softmax_data[base + i] * dot;
-                    }
-                });
-            }));
+            record(
+                &result,
+                vec![a],
+                Arc::new(move || {
+                    // 不做 to_vec 拷贝：borrow 后转只读切片，再 borrow_mut 梯度槽
+                    // （rg 与 sg 是两把不同的锁，顺序无关）
+                    let g_b = rg.borrow();
+                    let g: &[f32] = &g_b;
+                    let mut sgm = sg.borrow_mut();
+                    // 并行：同样按行切分，行间无依赖（每一行只写自己的 d 个元素）
+                    sgm.par_chunks_mut(d).enumerate().for_each(|(r, grow)| {
+                        let base = r * d;
+                        let mut dot = 0.0;
+                        for j in 0..d {
+                            dot += g[base + j];
+                        }
+                        for i in 0..d {
+                            grow[i] += g[base + i] - softmax_data[base + i] * dot;
+                        }
+                    });
+                }),
+            );
         }
         result
     }
@@ -4279,7 +4554,10 @@ impl Tensor {
     /// 每次调用推进一次计数器，因此同一张量在不同步会拿到不同 mask；
     /// 训练是单线程的，调用顺序确定，所以结果仍可复现。
     pub fn dropout(&self, p: f32, training: bool) -> Tensor {
-        assert!((0.0..=1.0).contains(&p), "dropout 概率 p 必须在 [0, 1] 之间");
+        assert!(
+            (0.0..=1.0).contains(&p),
+            "dropout 概率 p 必须在 [0, 1] 之间"
+        );
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
         if !training || p == 0.0 {
@@ -4289,7 +4567,11 @@ impl Tensor {
             return x.new_like(id, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
         }
         if p >= 1.0 {
-            return x.new_like(vec![0.0; x.numel()], x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+            return x.new_like(
+                vec![0.0; x.numel()],
+                x.shape.clone(),
+                x.requires_grad.load(Ordering::Relaxed),
+            );
         }
         let keep = 1.0 - p;
         let scale = 1.0 / keep;
@@ -4326,26 +4608,34 @@ impl Tensor {
         }
         drop(sd);
 
-        let result = x.new_like(out_data, x.shape.clone(), x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            out_data,
+            x.shape.clone(),
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                // 逐元素独立 ⇒ 按块并行（原先单核扫全长）
-                let g: &[f32] = &g;
-                let mask: &[f32] = &mask;
-                sgm.par_chunks_mut(4096)
-                    .zip(mask.par_chunks(4096))
-                    .enumerate()
-                    .for_each(|(ci, (ch, mch))| {
-                        let base = ci * 4096;
-                        for (j, (s, &m)) in ch.iter_mut().zip(mch).enumerate() {
-                            *s += g[base + j] * m;
-                        }
-                    });
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    // 逐元素独立 ⇒ 按块并行（原先单核扫全长）
+                    let g: &[f32] = &g;
+                    let mask: &[f32] = &mask;
+                    sgm.par_chunks_mut(4096)
+                        .zip(mask.par_chunks(4096))
+                        .enumerate()
+                        .for_each(|(ci, (ch, mch))| {
+                            let base = ci * 4096;
+                            for (j, (s, &m)) in ch.iter_mut().zip(mch).enumerate() {
+                                *s += g[base + j] * m;
+                            }
+                        });
+                }),
+            );
         }
         result
     }
@@ -4413,25 +4703,33 @@ impl Tensor {
         }
         let idx_vec = indices.to_vec();
 
-        let result = x.new_like(out_data, vec![n, d], x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            out_data,
+            vec![n, d],
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let d2 = d;
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                // 索引可能重复（同一行被多次 gather）⇒ 目标槽位会被多行命中，
-                // 不能按 i 并行。保持 i 升序串行，但把内层换成按行切片 zip，
-                // 让编译器把整行累加向量化（原先逐元素 + bounds check）。
-                for (i, &row) in idx_vec.iter().enumerate() {
-                    let gs = &g[i * d2..(i + 1) * d2];
-                    let dst = &mut sgm[row * d2..(row + 1) * d2];
-                    for (a, &b) in dst.iter_mut().zip(gs) {
-                        *a += b;
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    // 索引可能重复（同一行被多次 gather）⇒ 目标槽位会被多行命中，
+                    // 不能按 i 并行。保持 i 升序串行，但把内层换成按行切片 zip，
+                    // 让编译器把整行累加向量化（原先逐元素 + bounds check）。
+                    for (i, &row) in idx_vec.iter().enumerate() {
+                        let gs = &g[i * d2..(i + 1) * d2];
+                        let dst = &mut sgm[row * d2..(row + 1) * d2];
+                        for (a, &b) in dst.iter_mut().zip(gs) {
+                            *a += b;
+                        }
                     }
-                }
-            }));
+                }),
+            );
         }
         result
     }
@@ -4472,32 +4770,40 @@ impl Tensor {
         drop(sd);
         let idx_vec = indices.to_vec();
 
-        let result = x.new_like(out_data, vec![n_out, d], x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            out_data,
+            vec![n_out, d],
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let d2 = d;
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                // 前向的伴随：d_rows[i] = g[row]（与 gather 前向同形）。
-                // 每个 i 写的是**自己那一行**，行间无冲突 ⇒ 可以按行并行
-                // （即使 indices 有重复，写入位置也只取决于 i）。同样按字节量分批。
-                let g: &[f32] = &g;
-                let rows_per = (64 * 1024 / d2).max(1);
-                sgm.par_chunks_mut(d2 * rows_per)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let i0 = ci * rows_per;
-                        for (k, row_dst) in chunk.chunks_mut(d2).enumerate() {
-                            let src = idx_vec[i0 + k] * d2;
-                            let gs = &g[src..src + d2];
-                            for (a, &b) in row_dst.iter_mut().zip(gs) {
-                                *a += b;
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    // 前向的伴随：d_rows[i] = g[row]（与 gather 前向同形）。
+                    // 每个 i 写的是**自己那一行**，行间无冲突 ⇒ 可以按行并行
+                    // （即使 indices 有重复，写入位置也只取决于 i）。同样按字节量分批。
+                    let g: &[f32] = &g;
+                    let rows_per = (64 * 1024 / d2).max(1);
+                    sgm.par_chunks_mut(d2 * rows_per)
+                        .enumerate()
+                        .for_each(|(ci, chunk)| {
+                            let i0 = ci * rows_per;
+                            for (k, row_dst) in chunk.chunks_mut(d2).enumerate() {
+                                let src = idx_vec[i0 + k] * d2;
+                                let gs = &g[src..src + d2];
+                                for (a, &b) in row_dst.iter_mut().zip(gs) {
+                                    *a += b;
+                                }
                             }
-                        }
-                    });
-            }));
+                        });
+                }),
+            );
         }
         result
     }
@@ -4522,18 +4828,26 @@ impl Tensor {
         }
         drop(sd);
 
-        let result = x.new_like(out_data, vec![rows, 1], x.requires_grad.load(Ordering::Relaxed));
+        let result = x.new_like(
+            out_data,
+            vec![rows, 1],
+            x.requires_grad.load(Ordering::Relaxed),
+        );
         if x.req() {
             let rg = result.grad.clone();
             let sg = x.grad.clone();
             let c2 = cols;
-            record(&result, vec![x], Arc::new(move || {
-                let g = rg.borrow();
-                let mut sgm = sg.borrow_mut();
-                for i in 0..g.len() {
-                    sgm[i * c2 + col] += g[i];
-                }
-            }));
+            record(
+                &result,
+                vec![x],
+                Arc::new(move || {
+                    let g = rg.borrow();
+                    let mut sgm = sg.borrow_mut();
+                    for i in 0..g.len() {
+                        sgm[i * c2 + col] += g[i];
+                    }
+                }),
+            );
         }
         result
     }
@@ -4543,7 +4857,7 @@ impl Tensor {
 
 impl std::fmt::Display for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Tensor shape={:?}:\n", self.shape)?;
+        writeln!(f, "Tensor shape={:?}:", self.shape)?;
         // data() 按逻辑序返回（非连续视图会 gather），打印与形状一致
         let data = self.data();
         if self.rank() == 0 {
@@ -4564,7 +4878,7 @@ impl std::fmt::Display for Tensor {
                     for j in 0..cols {
                         write!(f, "{} ", data[i * cols + j])?;
                     }
-                    write!(f, "]\n")?;
+                    writeln!(f, "]")?;
                 }
                 Ok(())
             }
@@ -4640,7 +4954,9 @@ mod tests {
     fn test_matmul_transposed_rhs_view_single_row() {
         let (k, n) = (1024usize, 1024usize); // n*k = 1<<20，正好跨进单行快路的门槛
         let x_data: Vec<f32> = (0..k).map(|i| (i % 97) as f32 * 0.01 - 0.3).collect();
-        let w_data: Vec<f32> = (0..n * k).map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5).collect();
+        let w_data: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+            .collect();
 
         let run = |materialize: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let x = Tensor::param(x_data.clone(), vec![1, k]);
@@ -4706,7 +5022,7 @@ mod tests {
                 let v = matmul_data(a, b, m, k, n, 1, a_t, false);
                 (t.elapsed().as_secs_f64(), v)
             };
-            let mut measure = |on: bool| -> (f64, Vec<f32>) {
+            let measure = |on: bool| -> (f64, Vec<f32>) {
                 unsafe {
                     if on {
                         std::env::set_var("LLM_CPU_FMA", "1");
@@ -4773,7 +5089,7 @@ mod tests {
                 let v = matmul_data(a, b, m, k, n, 1, true, false);
                 (t.elapsed().as_secs_f64(), v)
             };
-            let mut measure = |split: bool| -> (f64, Vec<f32>) {
+            let measure = |split: bool| -> (f64, Vec<f32>) {
                 unsafe {
                     if split {
                         std::env::remove_var("LLM_MM_NO_COLSPLIT");
@@ -4839,7 +5155,7 @@ mod tests {
                 let v = matmul_data(a, b, m, k, n, 1, true, false);
                 (t.elapsed().as_secs_f64(), v)
             };
-            let mut measure = |fma: bool, no_packed: bool| -> (f64, Vec<f32>) {
+            let measure = |fma: bool, no_packed: bool| -> (f64, Vec<f32>) {
                 unsafe {
                     if fma {
                         std::env::set_var("LLM_CPU_FMA", "1");
@@ -4906,8 +5222,8 @@ mod tests {
         let x = Tensor::param(x_data.clone(), vec![2, 3]);
         let w = Tensor::param(w_data.clone(), vec![3, 2]);
         let y = x.matmul_frozen(&w);
-        let y_ref = Tensor::from_vec(x_data, vec![2, 3])
-            .matmul(&Tensor::from_vec(w_data, vec![3, 2]));
+        let y_ref =
+            Tensor::from_vec(x_data, vec![2, 3]).matmul(&Tensor::from_vec(w_data, vec![3, 2]));
         assert_eq!(y.shape(), &[2, 2]);
         assert_eq!(y.data(), y_ref.data());
 
@@ -4978,7 +5294,10 @@ mod tests {
         let b2 = Tensor::param(beta_data, vec![3]);
         let mean = x2.sum_last_dim().mul_scalar(1.0 / d as f32);
         let centered = x2.sub(&mean);
-        let var = centered.mul(&centered).sum_last_dim().mul_scalar(1.0 / d as f32);
+        let var = centered
+            .mul(&centered)
+            .sum_last_dim()
+            .mul_scalar(1.0 / d as f32);
         let norm = centered.div(&var.add_scalar(1e-5).sqrt());
         let y2 = norm.mul(&g2).add(&b2);
         // 前向一致
@@ -5015,18 +5334,9 @@ mod tests {
     #[test]
     fn test_masked_softmax_matches_chain() {
         // 融合 mask+softmax 与 add+softmax 参考实现对比：前向 + 梯度
-        let data = vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0,
-        ];
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0];
         let mask = Tensor::from_vec(
-            vec![
-                0.0,
-                f32::NEG_INFINITY,
-                0.0,
-                0.0,
-                0.0,
-                f32::NEG_INFINITY,
-            ],
+            vec![0.0, f32::NEG_INFINITY, 0.0, 0.0, 0.0, f32::NEG_INFINITY],
             vec![2, 3],
         );
         let x1 = Tensor::param(data.clone(), vec![2, 2, 3]);
@@ -5120,7 +5430,12 @@ mod tests {
         let d1 = ls.data();
         let d2 = log_s.data();
         for (a, b) in d1.iter().zip(d2.iter()) {
-            assert!((a - b).abs() < 1e-5, "log_softmax vs log(softmax): {} vs {}", a, b);
+            assert!(
+                (a - b).abs() < 1e-5,
+                "log_softmax vs log(softmax): {} vs {}",
+                a,
+                b
+            );
         }
         // 反向梯度也应一致
         let loss1 = ls.sum();
@@ -5272,10 +5587,7 @@ mod tests {
         use crate::rng::Rng;
         let mut rng = Rng::new(0);
         // 3D 输入走 Linear（内部 reshape 2D -> matmul -> reshape 3D）
-        let x = Tensor::param(
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            vec![2, 2, 2],
-        );
+        let x = Tensor::param(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 2, 2]);
         let fc = Linear::new(2, 3, &mut rng);
         let y = fc.forward(&x); // [2,2,3]
         let loss = y.mul(&y).sum(); // 标量
@@ -5394,7 +5706,10 @@ mod tests {
         assert_ne!(a, b, "连续两次 dropout 产生了相同 mask（种子未推进）");
 
         let frac = a.iter().filter(|&&v| v == 0.0).count() as f32 / a.len() as f32;
-        assert!((frac - 0.5).abs() < 0.1, "丢弃比例 {frac:.3} 偏离 0.5 过多（mask 分布异常）");
+        assert!(
+            (frac - 0.5).abs() < 0.1,
+            "丢弃比例 {frac:.3} 偏离 0.5 过多（mask 分布异常）"
+        );
         assert!(
             a.iter().all(|&v| v == 0.0 || (v - 2.0).abs() < 1e-6),
             "保留元素未按 1/(1-p) = 2 缩放"
@@ -5562,7 +5877,11 @@ mod tests {
         out_gqa.sum().backward();
 
         // 前向逐位一致
-        for (i, (a, b)) in out_std_data.iter().zip(out_gqa.data().as_slice()).enumerate() {
+        for (i, (a, b)) in out_std_data
+            .iter()
+            .zip(out_gqa.data().as_slice())
+            .enumerate()
+        {
             assert!(
                 (a - b).abs() < 1e-5 * a.abs().max(1.0),
                 "前向第 {i} 个元素不一致：{a} vs {b}"
@@ -5588,7 +5907,11 @@ mod tests {
             .zip(got)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
-        let ref_mag = want.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let ref_mag = want
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-6);
         assert!(
             max_err / ref_mag < 1e-3,
             "{name} 梯度不一致：最大绝对误差 {max_err}（参考量级 {ref_mag}）"
@@ -5778,7 +6101,10 @@ mod tests {
         // decode 数值在 bf16 相对误差（2^-8）内
         for (orig, dec) in vals.iter().zip(t.data().iter()) {
             let rel = ((dec - orig) / orig.abs().max(1e-6)).abs();
-            assert!(rel <= 2.0f32.powi(-8) * 1.01, "{orig} -> {dec} 相对误差 {rel}");
+            assert!(
+                rel <= 2.0f32.powi(-8) * 1.01,
+                "{orig} -> {dec} 相对误差 {rel}"
+            );
         }
         // 重复转换幂等
         t.to_bf16();
@@ -5822,7 +6148,10 @@ mod tests {
         let got = p.matmul(&q).data();
         for (r, g) in pref.iter().zip(&got) {
             let rel = ((g - r) / r.abs().max(1e-6)).abs();
-            assert!(rel <= 2.0f32.powi(-6), "参考 {r} vs bf16 {g} 相对误差 {rel}");
+            assert!(
+                rel <= 2.0f32.powi(-6),
+                "参考 {r} vs bf16 {g} 相对误差 {rel}"
+            );
         }
     }
 
@@ -5891,7 +6220,10 @@ mod tests {
         let mask = Tensor::from_vec(md, vec![t, t]);
         let masked = Tensor::flash_attention(&q, &k, &v, Some(&mask), 2).data();
         assert_ne!(free, masked, "掩码必须真的改变输出");
-        assert!(masked.iter().all(|x| x.is_finite()), "掩码路径不该产生 NaN：{masked:?}");
+        assert!(
+            masked.iter().all(|x| x.is_finite()),
+            "掩码路径不该产生 NaN：{masked:?}"
+        );
 
         // 2b) 把 query 0 的**所有** key 都屏蔽：该行没有任何可见 key
         //     ⇒ 输出全 0，且绝不能出现 `-inf - (-inf) = NaN`
@@ -5906,11 +6238,45 @@ mod tests {
             "整行被屏蔽时输出应为全 0：{:?}",
             &out2[..hd]
         );
-        assert!(out2.iter().all(|x| x.is_finite()), "全屏蔽行不该产生 NaN：{out2:?}");
+        assert!(
+            out2.iter().all(|x| x.is_finite()),
+            "全屏蔽行不该产生 NaN：{out2:?}"
+        );
         // 其它 query 不受影响（只有 query 0 被全屏蔽）
         assert!(
             out2[hd..2 * hd].iter().any(|x| *x != 0.0),
             "只有 query 0 被全屏蔽，query 1 应正常：{out2:?}"
         );
     }
-}
+
+    /// bias 广播加法（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release tensor::tests::probe_bias_add_speed -- --ignored --nocapture
+    /// ```
+    /// `[m,n] + [n]` 的理论下限：读 `m*n*4` + 写 `m*n*4`（bias 可忽略），
+    /// 按本机 20 线程实测 32.5 GB/s 算 ⇒ 4096×4864 约 5.1 ms。
+    /// 通用路径每元素一次 `t % n` 时是 6.87 ms（23 GB/s），改成按行配对标定在带宽上限。
+    #[test]
+    #[ignore]
+    fn probe_bias_add_speed() {
+        use std::time::Instant;
+        let (m, n) = (4096usize, 4864usize);
+        let a = Tensor::param(vec![0.5f32; m * n], vec![m, n]);
+        let b = Tensor::param(vec![0.25f32; n], vec![n]);
+        let bytes = (m * n * 4 * 2) as f64;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let _y = a.add(&b);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "add [{}x{}] + [{}]：{:.2} ms | 有效带宽 {:.1} GB/s（本机上限 32.5）",
+            m,
+            n,
+            n,
+            best * 1e3,
+            bytes / best / 1e9
+        );
+    }}

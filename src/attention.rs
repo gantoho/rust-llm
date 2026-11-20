@@ -316,7 +316,12 @@ impl KVCache {
             self.latent,
             "当前缓存不是 MLA 模式（构造时用 KVCache::new_latent），收不到 latent"
         );
-        assert_eq!(latent.rank(), 3, "latent 必须为 3D [1, T, r]，实际 {:?}", latent.shape());
+        assert_eq!(
+            latent.rank(),
+            3,
+            "latent 必须为 3D [1, T, r]，实际 {:?}",
+            latent.shape()
+        );
         assert_eq!(latent.shape()[0], 1, "KV cache 只支持 batch = 1");
         let t = latent.shape()[1];
         let d = latent.shape()[2];
@@ -565,8 +570,18 @@ impl MultiHeadAttention {
         rng: &mut Rng,
     ) -> Self {
         Self::new_full(
-            n_embd, n_head, n_kv_head, kv_lora_rank, qk_norm, rope, mla_rope_dim, mla_absorb, 0, true,
-            true, rng,
+            n_embd,
+            n_head,
+            n_kv_head,
+            kv_lora_rank,
+            qk_norm,
+            rope,
+            mla_rope_dim,
+            mla_absorb,
+            0,
+            true,
+            true,
+            rng,
         )
     }
 
@@ -587,7 +602,10 @@ impl MultiHeadAttention {
         rng: &mut Rng,
     ) -> Self {
         let n_kv = if n_kv_head == 0 { n_head } else { n_kv_head };
-        assert!(n_head % n_kv == 0, "n_head 必须能被 n_kv_head 整除");
+        assert!(
+            n_head.is_multiple_of(n_kv),
+            "n_head 必须能被 n_kv_head 整除"
+        );
         // `head_dim_cfg = 0` = 由 `n_embd / n_head` 推出（历史默认，逐位不变）；
         // HF 的部分配置会显式给 head_dim，此时必须满足 `n_head × head_dim == n_embd`，
         // 否则 Q/K/V 的宽度与残差流维度对不上（残差加法会在前向里炸）。
@@ -649,12 +667,23 @@ impl MultiHeadAttention {
             )
         };
         let c_proj = Linear::new_with_bias(n_embd, n_embd, o_bias, rng);
-        let c_kv = (kv_lora_rank > 0).then(|| Linear::new_with_bias(n_embd, kv_lora_rank, qkv_bias, rng));
+        let c_kv =
+            (kv_lora_rank > 0).then(|| Linear::new_with_bias(n_embd, kv_lora_rank, qkv_bias, rng));
         // 解耦 RoPE 的两条旋转投影：**最后构造**，`mla_rope_dim = 0` 时不消耗随机数。
         let (c_qr, c_kr) = if decoupled {
             (
-                Some(Linear::new_with_bias(n_embd, n_head * hd_rope, qkv_bias, rng)),
-                Some(Linear::new_with_bias(n_embd, n_head * hd_rope, qkv_bias, rng)),
+                Some(Linear::new_with_bias(
+                    n_embd,
+                    n_head * hd_rope,
+                    qkv_bias,
+                    rng,
+                )),
+                Some(Linear::new_with_bias(
+                    n_embd,
+                    n_head * hd_rope,
+                    qkv_bias,
+                    rng,
+                )),
             )
         } else {
             (None, None)
@@ -732,13 +761,13 @@ impl MultiHeadAttention {
         for _ in 0..b {
             positions.extend(base..base + t);
         }
-        let (q, k) = q
-            .reshape(vec![b * t, d])
-            .rotary_pair(&k.reshape(vec![b * t, kv_dim]), &positions, head_dim, &self.rope);
-        let (q, k) = (
-            q.reshape(vec![b, t, d]),
-            k.reshape(vec![b, t, kv_dim]),
+        let (q, k) = q.reshape(vec![b * t, d]).rotary_pair(
+            &k.reshape(vec![b * t, kv_dim]),
+            &positions,
+            head_dim,
+            &self.rope,
         );
+        let (q, k) = (q.reshape(vec![b, t, d]), k.reshape(vec![b, t, kv_dim]));
 
         // 3. KV cache（缓存里存的是**已旋转的** K，历史直接复用，新 token 只算新块）
         //    CSA（第 49 课）只在无缓存的全量前向生效；带缓存时回退 flash 路径。
@@ -766,7 +795,7 @@ impl MultiHeadAttention {
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
-        mut kv_cache: Option<&mut KVCache>,
+        kv_cache: Option<&mut KVCache>,
         base: usize,
     ) -> Tensor {
         // 解耦 RoPE（decoupled RoPE）：走另一条前向（可选权重吸收）
@@ -776,14 +805,17 @@ impl MultiHeadAttention {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
         let head_dim = d / self.n_head;
         let kv_dim = self.n_kv_head * head_dim;
-        let c_kv = self.c_kv.as_ref().expect("forward_mla 只应在 MLA 模式下调用");
+        let c_kv = self
+            .c_kv
+            .as_ref()
+            .expect("forward_mla 只应在 MLA 模式下调用");
 
         // 1. Q 投影 + latent 压缩投影
         let q = self.c_q.forward(x).reshape(vec![b, t, d]);
         let latent = c_kv.forward(x).reshape(vec![b, t, self.kv_lora_rank]);
 
         // 2. latent 进缓存（MLA 省显存的地方就在这一步：只存这一份）
-        let (latent, k_pos) = match kv_cache.as_deref_mut() {
+        let (latent, k_pos) = match kv_cache {
             Some(cache) => {
                 assert!(
                     cache.is_latent(),
@@ -840,7 +872,7 @@ impl MultiHeadAttention {
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
-        mut kv_cache: Option<&mut KVCache>,
+        kv_cache: Option<&mut KVCache>,
         base: usize,
     ) -> Tensor {
         let (b, t, d) = (x.shape()[0], x.shape()[1], x.shape()[2]);
@@ -849,7 +881,10 @@ impl MultiHeadAttention {
         let hd_rope = self.mla_rope_dim;
         let hd_nope = head_dim - hd_rope;
         let r = self.kv_lora_rank;
-        let c_kv = self.c_kv.as_ref().expect("forward_mla_decoupled 只应在 MLA 模式下调用");
+        let c_kv = self
+            .c_kv
+            .as_ref()
+            .expect("forward_mla_decoupled 只应在 MLA 模式下调用");
         let c_qr = self.c_qr.as_ref().expect("解耦 RoPE 需要 c_qr");
         let c_kr = self.c_kr.as_ref().expect("解耦 RoPE 需要 c_kr");
 
@@ -882,7 +917,7 @@ impl MultiHeadAttention {
         let latent = c_kv.forward(x).reshape(vec![b, t, r]);
 
         // 4. 缓存：一份拼接流 [latent ‖ rotated_k_rope]
-        let (latent_all, k_rope_all) = if let Some(cache) = kv_cache.as_deref_mut() {
+        let (latent_all, k_rope_all) = if let Some(cache) = kv_cache {
             assert!(
                 cache.is_latent(),
                 "MLA 模型必须配 MLA 模式的缓存（Transformer::new_kv_cache 会按配置自动选）"
@@ -898,7 +933,16 @@ impl MultiHeadAttention {
         // 5. 权重吸收：无梯度推理时，把 W_UK 吸进 Q，不物化 K/V
         if self.mla_absorb && !crate::tensor::grad_enabled() {
             return self.absorb_attention(
-                &q_nope, &q_rope, &latent_all, &k_rope_all, mask, b, t, tk, hd_nope, hd_rope,
+                &q_nope,
+                &q_rope,
+                &latent_all,
+                &k_rope_all,
+                mask,
+                b,
+                t,
+                tk,
+                hd_nope,
+                hd_rope,
                 head_dim,
             );
         }
@@ -959,7 +1003,8 @@ impl MultiHeadAttention {
                 .permute(&[0, 2, 1, 3])
                 .reshape(vec![b * n_head, rows, w])
         };
-        let qa = to_bh(q_nope, t, hd_nope).matmul(&absorbed_k_weight(&self.c_k, b, n_head, hd_nope, r));
+        let qa =
+            to_bh(q_nope, t, hd_nope).matmul(&absorbed_k_weight(&self.c_k, b, n_head, hd_nope, r));
         let qr = to_bh(q_rope, t, hd_rope);
         // k_rope 已是 [b,tk,n_head·hd_rope]，同样挪头；latent 在头间共享 → 复制 n_head 份
         let kr = to_bh(k_rope, tk, hd_rope);
@@ -981,7 +1026,10 @@ impl MultiHeadAttention {
             .add(&absorbed_v_bias(&self.c_v, b, n_head, hd_nope)); // [b·n_head, t, hd_nope]
 
         // 补零到完整 head_dim（与朴素路径的 v 补零口径一致），再合并回 [b, t, d]
-        let zeros = Tensor::from_vec(vec![0.0f32; b * n_head * t * hd_rope], vec![b * n_head, t, hd_rope]);
+        let zeros = Tensor::from_vec(
+            vec![0.0f32; b * n_head * t * hd_rope],
+            vec![b * n_head, t, hd_rope],
+        );
         let out = crate::csa::concat_last(&[out, zeros])
             .reshape(vec![b, n_head, t, head_dim])
             .permute(&[0, 2, 1, 3])
@@ -1096,7 +1144,12 @@ impl MultiHeadAttention {
     }
 
     fn linears_mut(&mut self) -> Vec<&mut Linear> {
-        let mut v = vec![&mut self.c_q, &mut self.c_k, &mut self.c_v, &mut self.c_proj];
+        let mut v = vec![
+            &mut self.c_q,
+            &mut self.c_k,
+            &mut self.c_v,
+            &mut self.c_proj,
+        ];
         if let Some(c) = self.c_kv.as_mut() {
             v.push(c);
         }
@@ -1242,7 +1295,8 @@ fn join_head_parts(
     let r = rope.reshape(vec![b, rows, n_head, hd_rope]);
     let cat = crate::csa::concat_last(&[n, r]); // [b, rows, n_head, head_dim]
     let head_dim = hd_nope + hd_rope;
-    cat.permute(&[0, 2, 1, 3]).reshape(vec![b * n_head, rows, head_dim])
+    cat.permute(&[0, 2, 1, 3])
+        .reshape(vec![b * n_head, rows, head_dim])
 }
 
 /// 沿最后一维把 `[…, first + second]` 切成两块（**仅用于无缓存/缓存的 f32 读取，无梯度**）。
@@ -1286,7 +1340,11 @@ fn repeat_batch_heads(x: &Tensor, n_head: usize) -> Tensor {
 fn absorbed_k_weight(c_k: &Linear, b: usize, n_head: usize, hd_nope: usize, r: usize) -> Tensor {
     assert!(!c_k.has_quant(), "权重吸收路径要求 c_k 权重未被量化");
     let (rows, cols) = c_k.dims();
-    assert_eq!((rows, cols), (r, n_head * hd_nope), "c_k 权重形状与解耦 MLA 不符");
+    assert_eq!(
+        (rows, cols),
+        (r, n_head * hd_nope),
+        "c_k 权重形状与解耦 MLA 不符"
+    );
     let w = c_k.weight.data_ref();
     let mut out = vec![0.0f32; b * n_head * hd_nope * r];
     for i in 0..b * n_head {
@@ -1306,7 +1364,11 @@ fn absorbed_k_weight(c_k: &Linear, b: usize, n_head: usize, hd_nope: usize, r: u
 fn absorbed_v_weight(c_v: &Linear, b: usize, n_head: usize, r: usize, hd_nope: usize) -> Tensor {
     assert!(!c_v.has_quant(), "权重吸收路径要求 c_v 权重未被量化");
     let (rows, cols) = c_v.dims();
-    assert_eq!((rows, cols), (r, n_head * hd_nope), "c_v 权重形状与解耦 MLA 不符");
+    assert_eq!(
+        (rows, cols),
+        (r, n_head * hd_nope),
+        "c_v 权重形状与解耦 MLA 不符"
+    );
     let w = c_v.weight.data_ref();
     let mut out = vec![0.0f32; b * n_head * r * hd_nope];
     for i in 0..b * n_head {
@@ -1380,7 +1442,13 @@ pub fn absorbed_mla_macs(t: usize, n_head: usize, hd_nope: usize, r: usize) -> u
 /// 唯一调用点在 `model.rs` 的 `#[cfg(feature = "gpu")]` 函数里，
 /// 不带 gpu feature 编译时它是"死代码"——这不是真死代码，别删（单测也在用它）。
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-pub(crate) fn expand_kv_head(src: &[f32], rows: usize, n_kv: usize, hd: usize, n_rep: usize) -> Vec<f32> {
+pub(crate) fn expand_kv_head(
+    src: &[f32],
+    rows: usize,
+    n_kv: usize,
+    hd: usize,
+    n_rep: usize,
+) -> Vec<f32> {
     let n_head = n_kv * n_rep;
     let mut out = vec![0.0f32; rows * n_head * hd];
     for r in 0..rows {
@@ -1401,7 +1469,13 @@ pub(crate) fn expand_kv_head(src: &[f32], rows: usize, n_kv: usize, hd: usize, n
 /// 数学上与「先求和再乘」是同一个结果：展开空间里 `dWk[:, hh] = xnᵀ·dk_pre'[:, hh]`，
 /// 按 `hh / n_rep` 分组相加后正是 `xnᵀ·(Σ_r dk_pre'[:, …])`，也就是未展开时的 `dWk`。
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-pub(crate) fn fold_kv_head_grad(g: &[f32], rows: usize, n_kv: usize, hd: usize, n_rep: usize) -> Vec<f32> {
+pub(crate) fn fold_kv_head_grad(
+    g: &[f32],
+    rows: usize,
+    n_kv: usize,
+    hd: usize,
+    n_rep: usize,
+) -> Vec<f32> {
     let n_head = n_kv * n_rep;
     let mut out = vec![0.0f32; rows * n_kv * hd];
     for r in 0..rows {
@@ -1595,7 +1669,10 @@ mod tests {
         assert_eq!(a.seq_len(), 3);
         assert_eq!(a.positions_seen(), 3);
         assert_eq!(base.positions_seen(), 2);
-        assert!(b.k().data().iter().all(|v| *v < 3.0), "b 不应看到 a 追加的行");
+        assert!(
+            b.k().data().iter().all(|v| *v < 3.0),
+            "b 不应看到 a 追加的行"
+        );
     }
 
     /// [`KVCache::rollback`] 撤掉末尾若干行后，缓存必须与"一开始就没喂过这些行"逐位一致，
@@ -1607,12 +1684,18 @@ mod tests {
         let d = 3;
         let row = |i: usize| {
             Tensor::from_vec(
-                (0..d).map(|j| ((i * 5 + j * 3) % 11) as f32 * 0.13 - 0.7).collect(),
+                (0..d)
+                    .map(|j| ((i * 5 + j * 3) % 11) as f32 * 0.13 - 0.7)
+                    .collect(),
                 vec![1, 1, d],
             )
         };
         for bits in [None, Some(QBits::Int8), Some(QBits::Int4)] {
-            let mut c = KVCache::new(KvCacheOpts { window: 0, sink: 0, bits });
+            let mut c = KVCache::new(KvCacheOpts {
+                window: 0,
+                sink: 0,
+                bits,
+            });
             for i in 0..4 {
                 c.append(&row(i), &row(i));
             }
@@ -1620,17 +1703,27 @@ mod tests {
             c.append(&row(5), &row(5));
             c.rollback(2);
 
-            let mut fresh = KVCache::new(KvCacheOpts { window: 0, sink: 0, bits });
+            let mut fresh = KVCache::new(KvCacheOpts {
+                window: 0,
+                sink: 0,
+                bits,
+            });
             for i in 0..4 {
                 fresh.append(&row(i), &row(i));
             }
             assert_eq!(c.seq_len(), 4, "{bits:?}：回滚后的行数");
             assert_eq!(c.positions_seen(), 4, "{bits:?}：位置计数要一起回退");
             for (a, b) in c.k().data().iter().zip(fresh.k().data()) {
-                assert!((a - b).abs() < 1e-6, "{bits:?}：回滚后的 K 应与全新缓存一致");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "{bits:?}：回滚后的 K 应与全新缓存一致"
+                );
             }
             for (a, b) in c.v().data().iter().zip(fresh.v().data()) {
-                assert!((a - b).abs() < 1e-6, "{bits:?}：回滚后的 V 应与全新缓存一致");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "{bits:?}：回滚后的 V 应与全新缓存一致"
+                );
             }
             // 回滚之后继续追加：位置接在 4 上，与从未草稿过一样
             c.append(&row(9), &row(9));
@@ -1715,7 +1808,9 @@ mod tests {
     ) -> (MultiHeadAttention, Vec<f32>) {
         let mut rng = Rng::new(seed);
         let attn = MultiHeadAttention::new(d, n_head, n_kv, r, false, spec(), 0, false, &mut rng);
-        let data: Vec<f32> = (0..t * d).map(|i| ((i * 7 % 23) as f32 * 0.31).sin()).collect();
+        let data: Vec<f32> = (0..t * d)
+            .map(|i| ((i * 7 % 23) as f32 * 0.31).sin())
+            .collect();
         (attn, data)
     }
 
@@ -1851,7 +1946,11 @@ mod tests {
             let _ = attn.forward(&xi, None, Some(&mut cache), i);
         }
         assert_eq!(cache.seq_len(), 3);
-        assert_eq!(cache.positions(), vec![0, 4, 5], "0 是注意力汇，另两个名额给最近的行");
+        assert_eq!(
+            cache.positions(),
+            vec![0, 4, 5],
+            "0 是注意力汇，另两个名额给最近的行"
+        );
         // 缓存里的三行 = 位置 0/4/5 各自的 latent（latent 逐 token 独立，不跨位置混合）
         let got = cache.k().data();
         for (k, src) in [0usize, 4, 5].iter().enumerate() {
@@ -1910,7 +2009,10 @@ mod tests {
         let loss = attn.forward(&x, None, None, 0).sum();
         loss.backward();
         let peak = |t: &Tensor| t.grad().iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        assert!(peak(&attn.c_kv.as_ref().unwrap().weight) > 0.0, "压缩投影 c_kv 没拿到梯度");
+        assert!(
+            peak(&attn.c_kv.as_ref().unwrap().weight) > 0.0,
+            "压缩投影 c_kv 没拿到梯度"
+        );
         assert!(peak(&attn.c_k.weight) > 0.0, "升维投影 c_k 没拿到梯度");
         assert!(peak(&attn.c_v.weight) > 0.0, "升维投影 c_v 没拿到梯度");
         assert!(peak(&attn.c_q.weight) > 0.0, "Q 投影没拿到梯度");
@@ -1932,10 +2034,18 @@ mod tests {
     // ==================== QK-Norm（Q/K 逐头归一化） ====================
 
     /// 造一个开了 QK-Norm 的普通注意力 + 一段输入（`[1, t, d]` 展平数据）
-    fn qk_fixture(d: usize, n_head: usize, n_kv: usize, t: usize, seed: u64) -> (MultiHeadAttention, Vec<f32>) {
+    fn qk_fixture(
+        d: usize,
+        n_head: usize,
+        n_kv: usize,
+        t: usize,
+        seed: u64,
+    ) -> (MultiHeadAttention, Vec<f32>) {
         let mut rng = Rng::new(seed);
         let attn = MultiHeadAttention::new(d, n_head, n_kv, 0, true, spec(), 0, false, &mut rng);
-        let data: Vec<f32> = (0..t * d).map(|i| ((i * 11 % 29) as f32 * 0.43).sin()).collect();
+        let data: Vec<f32> = (0..t * d)
+            .map(|i| ((i * 11 % 29) as f32 * 0.43).sin())
+            .collect();
         (attn, data)
     }
 
@@ -1951,7 +2061,9 @@ mod tests {
 
         // 输入放大 1000 倍：RMSNorm 对正尺度不变，归一化后的范数不该变
         for scale in [1.0f32, 1e3] {
-            let data: Vec<f32> = (0..2 * d).map(|i| ((i as f32 * 0.7).sin()) * scale).collect();
+            let data: Vec<f32> = (0..2 * d)
+                .map(|i| ((i as f32 * 0.7).sin()) * scale)
+                .collect();
             let x = Tensor::from_vec(data, vec![1, 2, d]);
             let out = attn.apply_qk_norm(x, &attn.q_norm, n_head);
             assert_eq!(out.shape(), vec![1, 2, d]);
@@ -1991,7 +2103,11 @@ mod tests {
         assert!(plain.q_norm.is_none() && plain.k_norm.is_none());
         // 4 个 Linear × (weight + bias) = 8；开启后每层多 Q、K 两个 gamma
         assert_eq!(plain.parameters().len(), 8, "关闭时不应多出任何参数");
-        assert_eq!(qk.parameters().len(), 10, "开启时应多出 q_norm/k_norm 两个 gamma");
+        assert_eq!(
+            qk.parameters().len(),
+            10,
+            "开启时应多出 q_norm/k_norm 两个 gamma"
+        );
         assert_eq!(qk.q_norm.as_ref().unwrap().gamma.numel(), d / n_head);
         assert_eq!(qk.k_norm.as_ref().unwrap().gamma.numel(), d / n_head);
     }
@@ -2003,8 +2119,14 @@ mod tests {
         let x = Tensor::from_vec(data, vec![1, 3, 16]);
         attn.forward(&x, None, None, 0).sum().backward();
         let peak = |t: &Tensor| t.grad().iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        assert!(peak(&attn.q_norm.as_ref().unwrap().gamma) > 0.0, "q_norm.gamma 没拿到梯度");
-        assert!(peak(&attn.k_norm.as_ref().unwrap().gamma) > 0.0, "k_norm.gamma 没拿到梯度");
+        assert!(
+            peak(&attn.q_norm.as_ref().unwrap().gamma) > 0.0,
+            "q_norm.gamma 没拿到梯度"
+        );
+        assert!(
+            peak(&attn.k_norm.as_ref().unwrap().gamma) > 0.0,
+            "k_norm.gamma 没拿到梯度"
+        );
     }
 
     /// QK-Norm 与增量推理共存：普通（已旋转 K 进缓存）路径下，逐 token 增量前向
@@ -2042,7 +2164,9 @@ mod tests {
         let (d, n_head, n_kv, r, t) = (24usize, 3usize, 3usize, 6usize, 5usize);
         let mut rng = Rng::new(31);
         let attn = MultiHeadAttention::new(d, n_head, n_kv, r, true, spec(), 0, false, &mut rng);
-        let rows: Vec<f32> = (0..t * d).map(|i| ((i * 13 % 31) as f32 * 0.29).sin()).collect();
+        let rows: Vec<f32> = (0..t * d)
+            .map(|i| ((i * 13 % 31) as f32 * 0.29).sin())
+            .collect();
 
         let x = Tensor::from_vec(rows.clone(), vec![1, t, d]);
         let full = attn.forward(&x, None, None, 0).data();
@@ -2074,7 +2198,9 @@ mod tests {
         let (d, n_head, r) = (16usize, 4usize, 6usize);
         let mut rng = Rng::new(seed);
         let attn = MultiHeadAttention::new(d, n_head, 0, r, false, spec(), 2, absorb, &mut rng);
-        let data: Vec<f32> = (0..t * d).map(|i| ((i * 7 % 19) as f32 * 0.37).sin()).collect();
+        let data: Vec<f32> = (0..t * d)
+            .map(|i| ((i * 7 % 19) as f32 * 0.37).sin())
+            .collect();
         (attn, data)
     }
 
@@ -2112,12 +2238,16 @@ mod tests {
     fn test_mla_absorb_matches_naive_same_weights() {
         let (d, n_head, t, hd_nope) = (16usize, 4usize, 4usize, 2usize);
         let (mut attn, data) = decoupled_fixture(9, t, false);
-        attn.c_k
-            .bias
-            .set_data((0..n_head * hd_nope).map(|i| 0.05 * (i as f32 + 1.0)).collect());
-        attn.c_v
-            .bias
-            .set_data((0..n_head * hd_nope).map(|i| -0.03 * (i as f32 + 1.0)).collect());
+        attn.c_k.bias.set_data(
+            (0..n_head * hd_nope)
+                .map(|i| 0.05 * (i as f32 + 1.0))
+                .collect(),
+        );
+        attn.c_v.bias.set_data(
+            (0..n_head * hd_nope)
+                .map(|i| -0.03 * (i as f32 + 1.0))
+                .collect(),
+        );
 
         let x = Tensor::from_vec(data.clone(), vec![1, t, d]);
         let naive = attn.forward(&x, None, None, 0).data();

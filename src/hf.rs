@@ -41,7 +41,7 @@ use std::io::{Read, Seek, SeekFrom};
 use serde::Deserialize;
 
 use crate::model::{Transformer, TransformerConfig};
-use crate::rope::{RopeScaling, RopeStyle, ROPE_BASE};
+use crate::rope::{ROPE_BASE, RopeScaling, RopeStyle};
 
 // ==================== 半精度解码 ====================
 
@@ -148,8 +148,8 @@ impl SafeTensors {
         let mut head = vec![0u8; n];
         file.read_exact(&mut head)
             .map_err(|e| format!("{path} 头部损坏（声明的 {n} 字节读不满）: {e}"))?;
-        let json: serde_json::Value = serde_json::from_slice(&head)
-            .map_err(|e| format!("{path} 头部不是合法 JSON: {e}"))?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&head).map_err(|e| format!("{path} 头部不是合法 JSON: {e}"))?;
         let obj = json
             .as_object()
             .ok_or_else(|| format!("{path} 头部应为 JSON 对象"))?;
@@ -183,9 +183,22 @@ impl SafeTensors {
                     "{path} 的 {name}：data_offsets {start}..{end} 与 shape {shape:?} × {dtype:?} 对不上（应为 {want} 字节）"
                 ));
             }
-            entries.insert(name.clone(), Entry { dtype, shape, start, end });
+            entries.insert(
+                name.clone(),
+                Entry {
+                    dtype,
+                    shape,
+                    start,
+                    end,
+                },
+            );
         }
-        Ok(SafeTensors { path: path.to_string(), file, data_start: (8 + n) as u64, entries })
+        Ok(SafeTensors {
+            path: path.to_string(),
+            file,
+            data_start: (8 + n) as u64,
+            entries,
+        })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -217,15 +230,21 @@ impl SafeTensors {
             .map_err(|err| format!("读 {} 的 {name} 失败: {err}", self.path))?;
         Ok(match e.dtype {
             DType::F32 => buf
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
             DType::F16 => buf
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
             DType::Bf16 => buf
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
         })
@@ -237,6 +256,7 @@ impl SafeTensors {
 /// HF `config.json` 里我们关心的字段（其余一律忽略；用不到的字段靠 `Option` 兜住）
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct HfConfig {
     pub model_type: Option<String>,
     pub architectures: Vec<String>,
@@ -270,39 +290,6 @@ pub struct HfConfig {
     pub rope_scaling: Option<serde_json::Value>,
 }
 
-impl Default for HfConfig {
-    fn default() -> Self {
-        HfConfig {
-            model_type: None,
-            architectures: Vec::new(),
-            hidden_size: 0,
-            num_attention_heads: 0,
-            num_key_value_heads: None,
-            num_hidden_layers: 0,
-            intermediate_size: 0,
-            max_position_embeddings: None,
-            vocab_size: None,
-            rms_norm_eps: None,
-            layer_norm_eps: None,
-            rope_theta: None,
-            head_dim: None,
-            tie_word_embeddings: None,
-            attention_bias: None,
-            mlp_bias: None,
-            hidden_act: None,
-            num_local_experts: None,
-            num_experts: None,
-            n_routed_experts: None,
-            kv_lora_rank: None,
-            q_lora_rank: None,
-            sliding_window: None,
-            use_sliding_window: None,
-            partial_rotary_factor: None,
-            rope_scaling: None,
-        }
-    }
-}
-
 impl HfConfig {
     /// 结构层面的硬性检查：命中任何一条都直接报错（这些都不是"能凑合跑"的差异）
     pub fn check_supported(&self) -> Result<(), String> {
@@ -331,20 +318,20 @@ impl HfConfig {
                 self.sliding_window.unwrap()
             ));
         }
-        if let Some(p) = self.partial_rotary_factor {
-            if (p - 1.0).abs() > 1e-6 {
-                return Err(format!(
-                    "partial_rotary_factor = {p} ≠ 1：只对一部分维度做 RoPE，本仓库的普通路径不支持（MLA 解耦 RoPE 口径不同）"
-                ));
-            }
+        if let Some(p) = self.partial_rotary_factor
+            && (p - 1.0).abs() > 1e-6
+        {
+            return Err(format!(
+                "partial_rotary_factor = {p} ≠ 1：只对一部分维度做 RoPE，本仓库的普通路径不支持（MLA 解耦 RoPE 口径不同）"
+            ));
         }
-        if let Some(rs) = &self.rope_scaling {
-            if !rs.is_null() {
-                return Err(format!(
-                    "config.json 带 rope_scaling（{rs}）：本仓库只实现了 linear / ntk / yarn 三种，\
+        if let Some(rs) = &self.rope_scaling
+            && !rs.is_null()
+        {
+            return Err(format!(
+                "config.json 带 rope_scaling（{rs}）：本仓库只实现了 linear / ntk / yarn 三种，\
                      HF 的 llama3 / longrope / dynamic 等口径不同，需要先手工换算（见 docs/20「实现更正：频率表是逐头重复的」一节）"
-                ));
-            }
+            ));
         }
         match self.hidden_act.as_deref() {
             None | Some("silu") | Some("swish") => {}
@@ -383,8 +370,10 @@ impl HfConfig {
         // 反过来 config 说 true 而文件里确实没有 lm_head，则绑定词嵌入也对。
         let n_head = self.num_attention_heads;
         let n_kv = self.num_key_value_heads.unwrap_or(n_head);
-        if n_kv == 0 || n_head % n_kv != 0 {
-            return Err(format!("n_head = {n_head} 必须能被 num_key_value_heads = {n_kv} 整除"));
+        if n_kv == 0 || !n_head.is_multiple_of(n_kv) {
+            return Err(format!(
+                "n_head = {n_head} 必须能被 num_key_value_heads = {n_kv} 整除"
+            ));
         }
         let vocab = self
             .vocab_size
@@ -447,10 +436,11 @@ pub fn map_hf_name(name: &str) -> Result<Option<Mapped>, String> {
         "model.norm.weight" => return m("ln_f.gamma".to_string(), false),
         "model.norm.bias" => return m("ln_f.beta".to_string(), false),
         // 旋转角度的频率表是算出来的，HF 里带一份也不该读
-        n if n.ends_with(".rotary_emb.inv_freq") || n.ends_with(".rotary_emb.cos_cached")
+        n if n.ends_with(".rotary_emb.inv_freq")
+            || n.ends_with(".rotary_emb.cos_cached")
             || n.ends_with(".rotary_emb.sin_cached") =>
         {
-            return Ok(None)
+            return Ok(None);
         }
         _ => {}
     }
@@ -461,9 +451,7 @@ pub fn map_hf_name(name: &str) -> Result<Option<Mapped>, String> {
     let (idx, tail) = rest
         .split_once('.')
         .ok_or_else(|| format!("无法解析层号：{name}"))?;
-    let i: usize = idx
-        .parse()
-        .map_err(|_| format!("层号不是数字：{name}"))?;
+    let i: usize = idx.parse().map_err(|_| format!("层号不是数字：{name}"))?;
     let p = format!("blocks.{i}");
     let (ours, transpose) = match tail {
         "input_layernorm.weight" => (format!("{p}.ln1.gamma"), false),
@@ -490,22 +478,28 @@ pub fn map_hf_name(name: &str) -> Result<Option<Mapped>, String> {
         "mlp.gate.weight" => {
             return Err(format!(
                 "{p}.mlp.gate.weight 是 MoE 路由器（第 {i} 层）：本仓库的 MoE 与 HF 的专家布局不通用，暂不支持"
-            ))
+            ));
         }
         t if t.starts_with("mlp.experts.") => {
-            return Err(format!("{p}.{t} 是 MoE 专家权重：暂不支持导入 MoE 模型"))
+            return Err(format!("{p}.{t} 是 MoE 专家权重：暂不支持导入 MoE 模型"));
         }
         t if t.starts_with("self_attn.q_a") || t.starts_with("self_attn.kv_a") => {
-            return Err(format!("{p}.{t} 是 MLA 的低秩投影：暂不支持导入 MLA 模型"))
+            return Err(format!("{p}.{t} 是 MLA 的低秩投影：暂不支持导入 MLA 模型"));
         }
         t if t.starts_with("pre_feedforward")
             || t.starts_with("post_feedforward")
             || t.contains("router")
             || t.contains("sliding") =>
         {
-            return Err(format!("{p}.{t} 属于本仓库未实现的层结构（Gemma 式双 norm / 路由器 / SWA）"))
+            return Err(format!(
+                "{p}.{t} 属于本仓库未实现的层结构（Gemma 式双 norm / 路由器 / SWA）"
+            ));
         }
-        other => return Err(format!("无法识别的 HF 权重名：{name}（层内片段 `{other}`）")),
+        other => {
+            return Err(format!(
+                "无法识别的 HF 权重名：{name}（层内片段 `{other}`）"
+            ));
+        }
     };
     m(ours, transpose)
 }
@@ -535,8 +529,12 @@ pub struct HfModel {
 /// 从 HF 模型目录导入（`config.json` + 一个或多个 `*.safetensors`）
 pub fn load_hf_dir(dir: &str) -> Result<HfModel, String> {
     let cfg_path = std::path::Path::new(dir).join("config.json");
-    let text = std::fs::read_to_string(&cfg_path)
-        .map_err(|e| format!("读不到 {}: {e}（--model-dir 应指向 HF 模型目录）", cfg_path.display()))?;
+    let text = std::fs::read_to_string(&cfg_path).map_err(|e| {
+        format!(
+            "读不到 {}: {e}（--model-dir 应指向 HF 模型目录）",
+            cfg_path.display()
+        )
+    })?;
     let hf: HfConfig = serde_json::from_str(&text)
         .map_err(|e| format!("解析 {} 失败: {e}", cfg_path.display()))?;
     hf.check_supported()?;
@@ -560,7 +558,9 @@ pub fn load_hf_dir(dir: &str) -> Result<HfModel, String> {
             })
             .unwrap_or(false);
         return Err(if has_bin {
-            format!("{dir} 里只有 pytorch_model.bin：请先在 HF 侧另存为 safetensors（`save_pretrained(..., safe_serialization=True)`）")
+            format!(
+                "{dir} 里只有 pytorch_model.bin：请先在 HF 侧另存为 safetensors（`save_pretrained(..., safe_serialization=True)`）"
+            )
         } else {
             format!("{dir} 里没有 *.safetensors")
         });
@@ -622,13 +622,21 @@ pub fn load_hf_dir(dir: &str) -> Result<HfModel, String> {
             "口径：rope_style={} base={} | qkv_bias={qkv_bias} o_bias={o_bias} mlp_bias={mlp_bias} | 输出头{}",
             cfg.rope_style.describe(),
             cfg.rope_base,
-            if cfg.tie_embeddings { "绑定词嵌入" } else { "独立（head.weight）" }
+            if cfg.tie_embeddings {
+                "绑定词嵌入"
+            } else {
+                "独立（head.weight）"
+            }
         ),
     ];
     if ignored > 0 {
         notes.push(format!("按设计忽略 {ignored} 个键（旋转频率表缓存等）"));
     }
-    Ok(HfModel { cfg, tensors, notes })
+    Ok(HfModel {
+        cfg,
+        tensors,
+        notes,
+    })
 }
 
 /// 把导入的张量**严格**灌进模型：每个模型参数都必须有对应数据、形状必须一致，
@@ -643,7 +651,10 @@ pub fn assign_named_parameters(
     let want = model.named_parameters();
     let mut got: HashMap<&str, (&[usize], &[f32])> = HashMap::new();
     for (n, s, d) in tensors {
-        if got.insert(n.as_str(), (s.as_slice(), d.as_slice())).is_some() {
+        if got
+            .insert(n.as_str(), (s.as_slice(), d.as_slice()))
+            .is_some()
+        {
             return Err(format!("导入数据里出现重复参数名 {n}"));
         }
     }
@@ -657,7 +668,11 @@ pub fn assign_named_parameters(
                 if *s != t.shape() {
                     bad_shape.push(format!("{name}：导入 {:?} vs 模型 {:?}", s, t.shape()));
                 } else if d.len() != t.numel() {
-                    bad_shape.push(format!("{name}：数据 {} 个元素 vs 模型 {} 个", d.len(), t.numel()));
+                    bad_shape.push(format!(
+                        "{name}：数据 {} 个元素 vs 模型 {} 个",
+                        d.len(),
+                        t.numel()
+                    ));
                 } else {
                     t.set_data(d.to_vec());
                     used += 1;
@@ -673,13 +688,25 @@ pub fn assign_named_parameters(
     if !missing.is_empty() || !bad_shape.is_empty() || !extra.is_empty() {
         let mut msg = String::from("导入对账失败：\n");
         if !missing.is_empty() {
-            msg.push_str(&format!("  模型需要但导入数据里没有（{} 个）：{:?}\n", missing.len(), &missing[..missing.len().min(8)]));
+            msg.push_str(&format!(
+                "  模型需要但导入数据里没有（{} 个）：{:?}\n",
+                missing.len(),
+                &missing[..missing.len().min(8)]
+            ));
         }
         if !bad_shape.is_empty() {
-            msg.push_str(&format!("  形状不一致（{} 个）：{:?}\n", bad_shape.len(), &bad_shape[..bad_shape.len().min(8)]));
+            msg.push_str(&format!(
+                "  形状不一致（{} 个）：{:?}\n",
+                bad_shape.len(),
+                &bad_shape[..bad_shape.len().min(8)]
+            ));
         }
         if !extra.is_empty() {
-            msg.push_str(&format!("  导入数据里多出来（{} 个）：{:?}\n", extra.len(), &extra[..extra.len().min(8)]));
+            msg.push_str(&format!(
+                "  导入数据里多出来（{} 个）：{:?}\n",
+                extra.len(),
+                &extra[..extra.len().min(8)]
+            ));
         }
         return Err(msg);
     }
@@ -728,7 +755,11 @@ mod tests {
             if want.is_nan() {
                 assert!(got.is_nan(), "码 {h:#06x} 应为 NaN，实得 {got}");
             } else {
-                assert_eq!(got.to_bits(), want.to_bits(), "码 {h:#06x}: {got} vs {want}");
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "码 {h:#06x}: {got} vs {want}"
+                );
             }
         }
     }
@@ -768,8 +799,14 @@ mod tests {
         let ps = p.to_string_lossy().to_string();
         let f32s: Vec<f32> = vec![1.0, -2.5, 3.25, 0.0];
         let f32b: Vec<u8> = f32s.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let f16b: Vec<u8> = [0x3c00u16, 0xc000, 0x3800].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let bf16b: Vec<u8> = [0x3f80u16, 0xc000, 0x0000].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f16b: Vec<u8> = [0x3c00u16, 0xc000, 0x3800]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let bf16b: Vec<u8> = [0x3f80u16, 0xc000, 0x0000]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         write_st(
             &ps,
             &[
@@ -779,7 +816,10 @@ mod tests {
             ],
         );
         let mut st = SafeTensors::open(&ps).unwrap();
-        assert_eq!(st.names(), vec!["b".to_string(), "h".to_string(), "w".to_string()]);
+        assert_eq!(
+            st.names(),
+            vec!["b".to_string(), "h".to_string(), "w".to_string()]
+        );
         assert_eq!(st.read_f32("w").unwrap(), f32s);
         assert_eq!(st.read_f32("h").unwrap(), vec![1.0, -2.0, 0.5]);
         assert_eq!(st.read_f32("b").unwrap(), vec![1.0, -2.0, 0.0]);
@@ -809,7 +849,10 @@ mod tests {
             Ok(_) => panic!("形状与字节数不符时必须报错"),
             Err(e) => e,
         };
-        assert!(err.contains("对不上"), "错误信息应指出形状/字节数不符：{err}");
+        assert!(
+            err.contains("对不上"),
+            "错误信息应指出形状/字节数不符：{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -821,18 +864,66 @@ mod tests {
             ("model.embed_tokens.weight", "tok_emb.table", false),
             ("lm_head.weight", "head.weight", false),
             ("model.norm.weight", "ln_f.gamma", false),
-            ("model.layers.0.input_layernorm.weight", "blocks.0.ln1.gamma", false),
-            ("model.layers.3.post_attention_layernorm.weight", "blocks.3.ln2.gamma", false),
-            ("model.layers.1.self_attn.q_proj.weight", "blocks.1.attn.c_q.weight", true),
-            ("model.layers.1.self_attn.k_proj.weight", "blocks.1.attn.c_k.weight", true),
-            ("model.layers.1.self_attn.v_proj.weight", "blocks.1.attn.c_v.weight", true),
-            ("model.layers.1.self_attn.o_proj.weight", "blocks.1.attn.c_proj.weight", true),
-            ("model.layers.1.self_attn.q_proj.bias", "blocks.1.attn.c_q.bias", false),
-            ("model.layers.1.self_attn.q_norm.weight", "blocks.1.attn.q_norm.gamma", false),
-            ("model.layers.2.mlp.gate_proj.weight", "blocks.2.mlp.w_gate.weight", true),
-            ("model.layers.2.mlp.up_proj.weight", "blocks.2.mlp.w_up.weight", true),
-            ("model.layers.2.mlp.down_proj.weight", "blocks.2.mlp.w_down.weight", true),
-            ("model.layers.2.mlp.down_proj.bias", "blocks.2.mlp.w_down.bias", false),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "blocks.0.ln1.gamma",
+                false,
+            ),
+            (
+                "model.layers.3.post_attention_layernorm.weight",
+                "blocks.3.ln2.gamma",
+                false,
+            ),
+            (
+                "model.layers.1.self_attn.q_proj.weight",
+                "blocks.1.attn.c_q.weight",
+                true,
+            ),
+            (
+                "model.layers.1.self_attn.k_proj.weight",
+                "blocks.1.attn.c_k.weight",
+                true,
+            ),
+            (
+                "model.layers.1.self_attn.v_proj.weight",
+                "blocks.1.attn.c_v.weight",
+                true,
+            ),
+            (
+                "model.layers.1.self_attn.o_proj.weight",
+                "blocks.1.attn.c_proj.weight",
+                true,
+            ),
+            (
+                "model.layers.1.self_attn.q_proj.bias",
+                "blocks.1.attn.c_q.bias",
+                false,
+            ),
+            (
+                "model.layers.1.self_attn.q_norm.weight",
+                "blocks.1.attn.q_norm.gamma",
+                false,
+            ),
+            (
+                "model.layers.2.mlp.gate_proj.weight",
+                "blocks.2.mlp.w_gate.weight",
+                true,
+            ),
+            (
+                "model.layers.2.mlp.up_proj.weight",
+                "blocks.2.mlp.w_up.weight",
+                true,
+            ),
+            (
+                "model.layers.2.mlp.down_proj.weight",
+                "blocks.2.mlp.w_down.weight",
+                true,
+            ),
+            (
+                "model.layers.2.mlp.down_proj.bias",
+                "blocks.2.mlp.w_down.bias",
+                false,
+            ),
         ];
         for (hf, ours, tr) in cases {
             let got = map_hf_name(hf).unwrap().unwrap();
@@ -840,7 +931,11 @@ mod tests {
             assert_eq!(got.transpose, tr, "{hf} 的转置标志");
         }
         // 按设计忽略
-        assert!(map_hf_name("model.layers.0.self_attn.rotary_emb.inv_freq").unwrap().is_none());
+        assert!(
+            map_hf_name("model.layers.0.self_attn.rotary_emb.inv_freq")
+                .unwrap()
+                .is_none()
+        );
         // 不支持 / 未识别：必须报错且信息可读
         for bad in [
             "model.layers.0.mlp.gate.weight",
@@ -877,10 +972,14 @@ mod tests {
             "mlp_bias": false,
             "tie_word_embeddings": !with_lm_head,
         });
-        std::fs::write(dir.join("config.json"), serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
 
         // 用确定性公式造权重：值 = f(名字, 下标)，非对称且各不相同
-        let mut mk = |name: &str, rows: usize, cols: usize| -> (Vec<usize>, Vec<u8>) {
+        let mk = |name: &str, rows: usize, cols: usize| -> (Vec<usize>, Vec<u8>) {
             let n = rows * cols;
             let vals: Vec<f32> = (0..n)
                 .map(|k| {
@@ -890,24 +989,32 @@ mod tests {
                 .collect();
             let bytes: Vec<u8> = match dtype {
                 DType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                DType::F16 => vals.iter().map(|v| f32_to_f16_for_test(*v)).flat_map(|h| h.to_le_bytes()).collect(),
+                DType::F16 => vals
+                    .iter()
+                    .map(|v| f32_to_f16_for_test(*v))
+                    .flat_map(|h| h.to_le_bytes())
+                    .collect(),
                 DType::Bf16 => vals
                     .iter()
-                    .map(|v| ((v.to_bits() >> 16) as u16))
+                    .map(|v| (v.to_bits() >> 16) as u16)
                     .flat_map(|h| h.to_le_bytes())
                     .collect(),
             };
             (vec![rows, cols], bytes)
         };
         // 归一化权重要"够非平凡"但不能把数值搞爆：用小的正数
-        let mut mk_norm = |name: &str, n: usize| -> (Vec<usize>, Vec<u8>) {
+        let mk_norm = |name: &str, n: usize| -> (Vec<usize>, Vec<u8>) {
             let vals: Vec<f32> = (0..n).map(|k| 0.5 + (k % 5) as f32 * 0.1).collect();
             let bytes: Vec<u8> = match dtype {
                 DType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                DType::F16 => vals.iter().map(|v| f32_to_f16_for_test(*v)).flat_map(|h| h.to_le_bytes()).collect(),
+                DType::F16 => vals
+                    .iter()
+                    .map(|v| f32_to_f16_for_test(*v))
+                    .flat_map(|h| h.to_le_bytes())
+                    .collect(),
                 DType::Bf16 => vals
                     .iter()
-                    .map(|v| ((v.to_bits() >> 16) as u16))
+                    .map(|v| (v.to_bits() >> 16) as u16)
                     .flat_map(|h| h.to_le_bytes())
                     .collect(),
             };
@@ -916,7 +1023,9 @@ mod tests {
         };
 
         let mut ts: Vec<(&str, Vec<usize>, DType, Vec<u8>)> = Vec::new();
-        let mut push = |ts: &mut Vec<(&str, Vec<usize>, DType, Vec<u8>)>, name: &'static str, s: (Vec<usize>, Vec<u8>)| {
+        let push = |ts: &mut Vec<(&str, Vec<usize>, DType, Vec<u8>)>,
+                    name: &'static str,
+                    s: (Vec<usize>, Vec<u8>)| {
             ts.push((name, s.0, dtype, s.1));
         };
         push(&mut ts, "model.embed_tokens.weight", mk("embed", 12, 8));
@@ -924,16 +1033,52 @@ mod tests {
             push(&mut ts, "lm_head.weight", mk("lmhead", 12, 8));
         }
         push(&mut ts, "model.norm.weight", mk_norm("norm", 8));
-        push(&mut ts, "model.layers.0.input_layernorm.weight", mk_norm("ln1", 8));
-        push(&mut ts, "model.layers.0.post_attention_layernorm.weight", mk_norm("ln2", 8));
+        push(
+            &mut ts,
+            "model.layers.0.input_layernorm.weight",
+            mk_norm("ln1", 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.post_attention_layernorm.weight",
+            mk_norm("ln2", 8),
+        );
         // HF 的 Linear 是 [out, in]
-        push(&mut ts, "model.layers.0.self_attn.q_proj.weight", mk("q", 8, 8));
-        push(&mut ts, "model.layers.0.self_attn.k_proj.weight", mk("k", 4, 8));
-        push(&mut ts, "model.layers.0.self_attn.v_proj.weight", mk("v", 4, 8));
-        push(&mut ts, "model.layers.0.self_attn.o_proj.weight", mk("o", 8, 8));
-        push(&mut ts, "model.layers.0.mlp.gate_proj.weight", mk("gate", 16, 8));
-        push(&mut ts, "model.layers.0.mlp.up_proj.weight", mk("up", 16, 8));
-        push(&mut ts, "model.layers.0.mlp.down_proj.weight", mk("down", 8, 16));
+        push(
+            &mut ts,
+            "model.layers.0.self_attn.q_proj.weight",
+            mk("q", 8, 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.self_attn.k_proj.weight",
+            mk("k", 4, 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.self_attn.v_proj.weight",
+            mk("v", 4, 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.self_attn.o_proj.weight",
+            mk("o", 8, 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.mlp.gate_proj.weight",
+            mk("gate", 16, 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.mlp.up_proj.weight",
+            mk("up", 16, 8),
+        );
+        push(
+            &mut ts,
+            "model.layers.0.mlp.down_proj.weight",
+            mk("down", 8, 16),
+        );
         let p = dir.join("model.safetensors").to_string_lossy().to_string();
         write_st(&p, &ts);
     }
@@ -968,28 +1113,54 @@ mod tests {
         assert_eq!(m.cfg.ffn_hidden, 16);
         assert_eq!(m.cfg.vocab_size, 12);
         assert_eq!(m.cfg.block_size, 32);
-        assert_eq!(m.cfg.rope_style, RopeStyle::Half, "HF 权重必须按 rotate_half 口径解释");
+        assert_eq!(
+            m.cfg.rope_style,
+            RopeStyle::Half,
+            "HF 权重必须按 rotate_half 口径解释"
+        );
         assert_eq!(m.cfg.rms_eps, 1e-5);
-        assert!(!m.cfg.qkv_bias && !m.cfg.o_bias && !m.cfg.mlp_bias, "LLaMA 无 bias");
+        assert!(
+            !m.cfg.qkv_bias && !m.cfg.o_bias && !m.cfg.mlp_bias,
+            "LLaMA 无 bias"
+        );
         assert!(!m.cfg.tie_embeddings, "有 lm_head 就应是不绑定");
 
         // 名字与形状（Linear 必须是 [in, out]）
-        let find = |n: &str| m.tensors.iter().find(|(x, _, _)| x == n).map(|(_, s, d)| (s.clone(), d.clone()));
+        let find = |n: &str| {
+            m.tensors
+                .iter()
+                .find(|(x, _, _)| x == n)
+                .map(|(_, s, d)| (s.clone(), d.clone()))
+        };
         assert_eq!(find("tok_emb.table").unwrap().0, vec![12, 8]);
         assert_eq!(find("head.weight").unwrap().0, vec![12, 8]);
-        assert_eq!(find("blocks.0.attn.c_q.weight").unwrap().0, vec![8, 8], "q_proj 转置后应仍是 8×8");
-        assert_eq!(find("blocks.0.attn.c_k.weight").unwrap().0, vec![8, 4], "k_proj [4,8] → [8,4]");
+        assert_eq!(
+            find("blocks.0.attn.c_q.weight").unwrap().0,
+            vec![8, 8],
+            "q_proj 转置后应仍是 8×8"
+        );
+        assert_eq!(
+            find("blocks.0.attn.c_k.weight").unwrap().0,
+            vec![8, 4],
+            "k_proj [4,8] → [8,4]"
+        );
         assert_eq!(find("blocks.0.mlp.w_gate.weight").unwrap().0, vec![8, 16]);
         assert_eq!(find("blocks.0.mlp.w_down.weight").unwrap().0, vec![16, 8]);
         assert_eq!(find("ln_f.gamma").unwrap().0, vec![8]);
 
         // **转置必须真的发生过**：用非对称矩阵核对
         let mut st = SafeTensors::open(&dir.join("model.safetensors").to_string_lossy()).unwrap();
-        let hf_k = st.read_f32("model.layers.0.self_attn.k_proj.weight").unwrap(); // [4, 8]
+        let hf_k = st
+            .read_f32("model.layers.0.self_attn.k_proj.weight")
+            .unwrap(); // [4, 8]
         let (_, ours_k) = find("blocks.0.attn.c_k.weight").unwrap(); // [8, 4]
         for r in 0..4 {
             for c in 0..8 {
-                assert_eq!(ours_k[c * 4 + r], hf_k[r * 8 + c], "转置错位 (r={r}, c={c})");
+                assert_eq!(
+                    ours_k[c * 4 + r],
+                    hf_k[r * 8 + c],
+                    "转置错位 (r={r}, c={c})"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1070,8 +1241,14 @@ mod tests {
             (serde_json::json!({"num_local_experts": 8}), "MoE"),
             (serde_json::json!({"kv_lora_rank": 512}), "MLA"),
             (serde_json::json!({"sliding_window": 4096}), "滑动窗口"),
-            (serde_json::json!({"partial_rotary_factor": 0.25}), "partial_rotary_factor"),
-            (serde_json::json!({"rope_scaling": {"type": "llama3", "factor": 8.0}}), "rope_scaling"),
+            (
+                serde_json::json!({"partial_rotary_factor": 0.25}),
+                "partial_rotary_factor",
+            ),
+            (
+                serde_json::json!({"rope_scaling": {"type": "llama3", "factor": 8.0}}),
+                "rope_scaling",
+            ),
             (serde_json::json!({"hidden_act": "gelu"}), "hidden_act"),
         ] {
             let e = base(extra).check_supported().unwrap_err();
@@ -1089,7 +1266,10 @@ mod tests {
 
     impl<'a> Ref<'a> {
         fn get(&self, name: &str) -> &'a [f32] {
-            self.t.get(name).unwrap_or_else(|| panic!("参考前向缺张量 {name}")).1
+            self.t
+                .get(name)
+                .unwrap_or_else(|| panic!("参考前向缺张量 {name}"))
+                .1
         }
         /// `y = x·W + b`（W 是本仓库口径 `[in, out]`）
         fn lin(&self, x: &[f32], name: &str, out: usize) -> Vec<f32> {
@@ -1149,8 +1329,18 @@ mod tests {
             let mut vs = Vec::with_capacity(t);
             for pos in 0..t {
                 let n = self.rmsnorm(&hidden[pos], "blocks.0.ln1.gamma");
-                let q = self.rope(&self.lin(&n, "blocks.0.attn.c_q.weight", cfg.n_head * hd), hd, pos, cfg.rope_base);
-                let k = self.rope(&self.lin(&n, "blocks.0.attn.c_k.weight", cfg.n_kv_head * hd), hd, pos, cfg.rope_base);
+                let q = self.rope(
+                    &self.lin(&n, "blocks.0.attn.c_q.weight", cfg.n_head * hd),
+                    hd,
+                    pos,
+                    cfg.rope_base,
+                );
+                let k = self.rope(
+                    &self.lin(&n, "blocks.0.attn.c_k.weight", cfg.n_kv_head * hd),
+                    hd,
+                    pos,
+                    cfg.rope_base,
+                );
                 let v = self.lin(&n, "blocks.0.attn.c_v.weight", cfg.n_kv_head * hd);
                 qs.push(q);
                 ks.push(k);
@@ -1180,7 +1370,12 @@ mod tests {
                     }
                 }
                 let o = self.lin(&out, "blocks.0.attn.c_proj.weight", d);
-                x_attn.push(o.iter().zip(&hidden[i]).map(|(a, b)| a + b).collect::<Vec<f32>>());
+                x_attn.push(
+                    o.iter()
+                        .zip(&hidden[i])
+                        .map(|(a, b)| a + b)
+                        .collect::<Vec<f32>>(),
+                );
             }
             for (i, xa) in x_attn.iter().enumerate() {
                 let n = self.rmsnorm(xa, "blocks.0.ln2.gamma");
@@ -1226,13 +1421,19 @@ mod tests {
         assert!(n > 0);
 
         let ids = [1usize, 5, 7, 3];
-        let got = model.forward(&ids, 1, ids.len(), None, false).data().to_vec();
+        let got = model
+            .forward(&ids, 1, ids.len(), None, false)
+            .data()
+            .to_vec();
 
         let mut t = HashMap::new();
         for (name, shape, data) in &m.tensors {
             t.insert(name.as_str(), (shape.as_slice(), data.as_slice()));
         }
-        let rf = Ref { t, cfg: m.cfg.clone() };
+        let rf = Ref {
+            t,
+            cfg: m.cfg.clone(),
+        };
         let want = rf.forward(&ids);
         let vocab = m.cfg.vocab_size;
         for (i, row) in want.iter().enumerate() {

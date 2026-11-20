@@ -22,13 +22,15 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::distributed::{chunk_range, rotate_chunks, wrap, DistConfig};
+use crate::distributed::{DistConfig, chunk_range, rotate_chunks, wrap};
 
-/// 通信组 tag（帧头的组号）：三个维度各占一个，同一对 rank 上的
-/// TP / DP / PP 流量互不串包。值本身无大小含义，只要互不相同。
+/// 通信组 tag（帧头的组号）：两个维度各占一个，同一对 rank 上的
+/// TP / DP 流量互不串包。值本身无大小含义，只要互不相同。
+///
+/// PP 没有组 tag：流水线只在 `prev_stage` / `next_stage` 之间做**点对点**
+/// `send`/`recv`，不存在 PP 集合通信，所以不需要"组"这个抽象。
 pub const GROUP_TP: u32 = 1;
 pub const GROUP_DP: u32 = 2;
-pub const GROUP_PP: u32 = 3;
 
 /// 单帧头长度：组 tag（4 字节）+ 载荷字节数（4 字节），大端。
 const HEADER_LEN: usize = 8;
@@ -37,19 +39,12 @@ const HEADER_LEN: usize = 8;
 /// 超时要放得足够宽，只用于把"真的断了"和"慢"区分开。可用 `DIST_RECV_TIMEOUT_SECS` 覆盖。
 const DEFAULT_RECV_TIMEOUT_SECS: u64 = 600;
 
-/// f32 → 小端字节。逐元素 `to_le_bytes` 是安全代码，比 cast 字节数组慢一点，
-/// 但梯度传输本来就不是瓶颈（TCP loopback 上瓶颈在 RTT 而非拷贝）。
-fn encode(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
-    for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out
-}
 
 /// 小端字节 → f32。`chunks_exact(4)` 保证不会读到半截元素。
 fn decode(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
+    b.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -127,9 +122,7 @@ impl Comm {
             world,
             tx: (0..world).map(|_| None).collect(),
             rx: (0..world).map(|_| None).collect(),
-            queued: (0..world)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
+            queued: (0..world).map(|_| Mutex::new(HashMap::new())).collect(),
             recv_timeout,
         };
         if world > 1 {
@@ -142,7 +135,10 @@ impl Comm {
     /// `MASTER_ADDR`、`MASTER_PORT`。缺省时退化成 world=1 的单进程空实现，
     /// 所以不设环境变量的普通训练完全不受影响。
     pub fn from_env() -> Self {
-        let rank: usize = std::env::var("RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rank: usize = std::env::var("RANK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let world: usize = std::env::var("WORLD_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -157,8 +153,14 @@ impl Comm {
 
     fn connect_all(&mut self, addr: &str, base_port: u16) {
         // 监听本 rank 的端口，收下所有"比我小"的 rank 的拨号
-        let listener = TcpListener::bind(("0.0.0.0", base_port + self.rank as u16))
-            .unwrap_or_else(|e| panic!("rank {} 监听端口 {} 失败：{e}", self.rank, base_port + self.rank as u16));
+        let listener =
+            TcpListener::bind(("0.0.0.0", base_port + self.rank as u16)).unwrap_or_else(|e| {
+                panic!(
+                    "rank {} 监听端口 {} 失败：{e}",
+                    self.rank,
+                    base_port + self.rank as u16
+                )
+            });
 
         // 拨号所有"比我大"的 rank（小拨大，方向唯一）
         for peer in self.rank + 1..self.world {
@@ -176,7 +178,10 @@ impl Comm {
                 .read_exact(&mut id_buf)
                 .unwrap_or_else(|e| panic!("rank {} 握手读取失败：{e}", self.rank));
             let peer = u32::from_be_bytes(id_buf) as usize;
-            assert!(peer < self.world && peer != self.rank, "握手收到非法 rank {peer}");
+            assert!(
+                peer < self.world && peer != self.rank,
+                "握手收到非法 rank {peer}"
+            );
             self.install(peer, stream);
         }
     }
@@ -189,15 +194,20 @@ impl Comm {
         self.rx[peer] = Some(spawn_reader(read_end));
     }
 
-    /// 发一帧给 `dst`。帧 = 头（组 tag + 字节数）+ 小端 f32 载荷，一次写入。
+    /// 发一帧给 `dst`。帧 = 头（组 tag + 字节数）+ 小端 f32 载荷，**一次写入**。
+    ///
+    /// 编排放进同一块缓冲里，避免"先 `encode` 出一份 payload、再 `extend` 进 buf"的
+    /// 全量拷贝 —— all-reduce 每步 2 GB 量级时，那是一次实打实的 memcpy。
     fn send_frame(&self, dst: usize, group: u32, data: &[f32]) {
         assert!(dst < self.world && dst != self.rank, "非法发送目标 {dst}");
-        let payload = encode(data);
-        assert!(payload.len() <= u32::MAX as usize, "单帧超过 4GiB");
-        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
+        let n_bytes = data.len() * std::mem::size_of::<f32>();
+        assert!(n_bytes <= u32::MAX as usize, "单帧超过 4GiB");
+        let mut buf = Vec::with_capacity(HEADER_LEN + n_bytes);
         buf.extend_from_slice(&group.to_be_bytes());
-        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&(n_bytes as u32).to_be_bytes());
+        for &x in data {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
         let guard: MutexGuard<TcpStream> = self.tx[dst]
             .as_ref()
             .unwrap_or_else(|| panic!("rank {} 没有到 rank {dst} 的连接", self.rank))
@@ -217,10 +227,10 @@ impl Comm {
         loop {
             {
                 let mut q = self.queued[src].lock().unwrap();
-                if let Some(deque) = q.get_mut(&group) {
-                    if let Some(v) = deque.pop_front() {
-                        return v;
-                    }
+                if let Some(deque) = q.get_mut(&group)
+                    && let Some(v) = deque.pop_front()
+                {
+                    return v;
                 }
             }
             let rx = self.rx[src]
@@ -243,10 +253,9 @@ impl Comm {
                     self.rank,
                     self.recv_timeout.as_secs()
                 ),
-                Err(RecvTimeoutError::Disconnected) => panic!(
-                    "rank {} 与 rank {src} 的连接断开（组 {group}）",
-                    self.rank
-                ),
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("rank {} 与 rank {src} 的连接断开（组 {group}）", self.rank)
+                }
             }
         }
     }
@@ -271,8 +280,16 @@ impl Comm {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), n, "通信组成员重复");
-        assert!(sorted.contains(&self.rank), "本 rank {} 不在通信组内", self.rank);
-        CommGroup { comm: self, id, members: sorted }
+        assert!(
+            sorted.contains(&self.rank),
+            "本 rank {} 不在通信组内",
+            self.rank
+        );
+        CommGroup {
+            comm: self,
+            id,
+            members: sorted,
+        }
     }
 }
 
@@ -483,11 +500,13 @@ impl CommGroup<'_> {
 /// | `LOCAL_RANK` | 本机内的序号（选 GPU adapter 用） |
 /// | `MASTER_ADDR` / `MASTER_PORT` | 建连地址与基准端口 |
 ///
-/// 三个组句柄（[`CommGroup`]）按 [`DistConfig`] 的 rank 编号约定圈定成员，
-/// 组 tag 固定为 [`GROUP_TP`] / [`GROUP_DP`] / [`GROUP_PP`]：
+/// 两个组句柄（[`CommGroup`]）按 [`DistConfig`] 的 rank 编号约定圈定成员，
+/// 组 tag 固定为 [`GROUP_TP`] / [`GROUP_DP`]：
 /// - TP 组内做每层两次的 allreduce（通信最密）；
-/// - DP 组内做每步一次的梯度 allreduce；
-/// - PP 组只用点对点 `send`/`recv` 在相邻 stage 间传激活与梯度。
+/// - DP 组内做每步一次的梯度 allreduce。
+///
+/// PP 不需要组句柄：stage 间只用点对点 `send`/`recv`（见 [`Self::prev_stage`] /
+/// [`Self::next_stage`]），没有集合通信。
 pub struct DistRuntime {
     pub comm: Comm,
     pub cfg: DistConfig,
@@ -516,13 +535,21 @@ impl DistRuntime {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        DistRuntime { comm, cfg, local_rank }
+        DistRuntime {
+            comm,
+            cfg,
+            local_rank,
+        }
     }
 
     /// 单进程退化（无环境变量时 world=1）：普通训练路径零改动地复用同一套代码。
     pub fn single(cfg: DistConfig) -> Self {
         assert_eq!(cfg.world_size(), 1, "single() 只接受 world=1 的配置");
-        DistRuntime { comm: Comm::new(0, 1, "127.0.0.1", 0), cfg, local_rank: 0 }
+        DistRuntime {
+            comm: Comm::new(0, 1, "127.0.0.1", 0),
+            cfg,
+            local_rank: 0,
+        }
     }
 
     /// 多进程入口：`WORLD_SIZE > 1` 时按 [`DistConfig::from_env`] 建运行时，否则返回
@@ -548,18 +575,14 @@ impl DistRuntime {
 
     /// TP 组：层内权重通信（组 tag [`GROUP_TP`]）
     pub fn tp_group(&self) -> CommGroup<'_> {
-        self.comm.group(GROUP_TP, self.cfg.tp_group(self.comm.rank()))
+        self.comm
+            .group(GROUP_TP, self.cfg.tp_group(self.comm.rank()))
     }
 
     /// DP 组：梯度同步（组 tag [`GROUP_DP`]）
     pub fn dp_group(&self) -> CommGroup<'_> {
-        self.comm.group(GROUP_DP, self.cfg.dp_group(self.comm.rank()))
-    }
-
-    /// PP 组：stage 间点对点传激活（组 tag [`GROUP_PP`]）。
-    /// 组句柄用于 `send`/`recv`；成员是同一条流水线上的全部 stage。
-    pub fn pp_group(&self) -> CommGroup<'_> {
-        self.comm.group(GROUP_PP, self.cfg.pp_group(self.comm.rank()))
+        self.comm
+            .group(GROUP_DP, self.cfg.dp_group(self.comm.rank()))
     }
 
     /// 上游 stage（`None` = 第一段）
@@ -581,7 +604,11 @@ mod tests {
     /// 拼一个测试用输入集：`n` 个 rank，长度 `len`
     fn inputs(n: usize, len: usize) -> Vec<Vec<f32>> {
         (0..n)
-            .map(|r| (0..len).map(|i| (r * 1000 + i) as f32 * 0.25 - 7.0).collect())
+            .map(|r| {
+                (0..len)
+                    .map(|i| (r * 1000 + i) as f32 * 0.25 - 7.0)
+                    .collect()
+            })
             .collect()
     }
 
@@ -671,7 +698,9 @@ mod tests {
     #[test]
     fn test_tcp_encode_decode_roundtrip() {
         let v: Vec<f32> = (0..17).map(|i| i as f32 * -0.125 + 3.5).collect();
-        assert_eq!(decode(&encode(&v)), v);
+        // encode 已内联进 send_frame（避免整帧多一次拷贝），这里按同样口径构造字节流验证往返
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_eq!(decode(&bytes), v);
     }
 
     /// DistRuntime 的三维组圈定 + 各组独立通信：4 进程（dp=2 × tp=2 × pp=1），
@@ -698,13 +727,11 @@ mod tests {
                     // TP 组 allreduce：输入带 rank 标记，期望 = TP 成员之和
                     let mine = [10.0 + r as f32];
                     let tp_sum = tp.all_reduce_sum(&mine);
-                    let want: f32 =
-                        cfg.tp_group(r).iter().map(|&x| 10.0 + x as f32).sum();
+                    let want: f32 = cfg.tp_group(r).iter().map(|&x| 10.0 + x as f32).sum();
                     assert_eq!(tp_sum, vec![want], "rank {r} TP 组 allreduce 不对");
                     // DP 组 allreduce：同一 (tp,pp) 坐标上的 dp 个 rank 求和
                     let dp_sum = dp.all_reduce_sum(&mine);
-                    let want: f32 =
-                        cfg.dp_group(r).iter().map(|&x| 10.0 + x as f32).sum();
+                    let want: f32 = cfg.dp_group(r).iter().map(|&x| 10.0 + x as f32).sum();
                     assert_eq!(dp_sum, vec![want], "rank {r} DP 组 allreduce 不对");
                     // rank 编号约定：tp 在最低位
                     assert_eq!(r % cfg.tp, cfg.coord(r).tp, "rank {r} 坐标换算不对");
@@ -727,7 +754,11 @@ mod tests {
         let hs: Vec<_> = (0..n)
             .map(|r| {
                 thread::spawn(move || {
-                    let rt = DistRuntime { comm: Comm::new(r, n, "127.0.0.1", base), cfg, local_rank: r };
+                    let rt = DistRuntime {
+                        comm: Comm::new(r, n, "127.0.0.1", base),
+                        cfg,
+                        local_rank: r,
+                    };
                     let p = crate::tensor::Tensor::param(vec![0.0; len], vec![len]);
                     *p.grad.borrow_mut() = (0..len).map(|i| (r * 100 + i) as f32).collect();
                     let dp = rt.dp_group();
@@ -736,8 +767,10 @@ mod tests {
                 })
             })
             .collect();
-        let got: Vec<Vec<f32>> =
-            hs.into_iter().map(|h| h.join().expect("工作线程 panic")).collect();
+        let got: Vec<Vec<f32>> = hs
+            .into_iter()
+            .map(|h| h.join().expect("工作线程 panic"))
+            .collect();
         let want: Vec<f32> = (0..len)
             .map(|i| (0..n).map(|r| (r * 100 + i) as f32).sum::<f32>() * (1.0 / n as f32))
             .collect();
@@ -751,10 +784,14 @@ mod tests {
     /// 只有全都干净时才允许更新参数（否则 scale 会分叉）。
     #[test]
     fn test_tcp_sync_overflow_any_rank_wins() {
-        for (i, (local_flags, want)) in
-            [([false, false], false), ([true, false], true), ([false, true], true), ([true, true], true)]
-                .into_iter()
-                .enumerate()
+        for (i, (local_flags, want)) in [
+            ([false, false], false),
+            ([true, false], true),
+            ([false, true], true),
+            ([true, true], true),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let cfg = DistConfig::new(2, 1, 1);
             // 每轮换一组端口：上一轮的监听套接字可能还在 TIME_WAIT 里
@@ -763,14 +800,20 @@ mod tests {
                 .map(|r| {
                     let local = local_flags[r];
                     thread::spawn(move || {
-                        let rt = DistRuntime { comm: Comm::new(r, n, "127.0.0.1", base), cfg, local_rank: r };
+                        let rt = DistRuntime {
+                            comm: Comm::new(r, n, "127.0.0.1", base),
+                            cfg,
+                            local_rank: r,
+                        };
                         let dp = rt.dp_group();
                         sync_overflow(&dp, local)
                     })
                 })
                 .collect();
-            let got: Vec<bool> =
-                hs.into_iter().map(|h| h.join().expect("工作线程 panic")).collect();
+            let got: Vec<bool> = hs
+                .into_iter()
+                .map(|h| h.join().expect("工作线程 panic"))
+                .collect();
             for (r, g) in got.iter().enumerate() {
                 assert_eq!(
                     *g, want,
@@ -796,7 +839,11 @@ mod tests {
         let hs: Vec<_> = (0..n)
             .map(|r| {
                 thread::spawn(move || {
-                    let rt = DistRuntime { comm: Comm::new(r, n, "127.0.0.1", base), cfg, local_rank: r };
+                    let rt = DistRuntime {
+                        comm: Comm::new(r, n, "127.0.0.1", base),
+                        cfg,
+                        local_rank: r,
+                    };
                     let mcfg = TransformerConfig {
                         n_embd: 16,
                         n_head: 2,
@@ -812,8 +859,11 @@ mod tests {
                     let layers = model.moe_bias_layer_count();
                     assert!(layers > 0, "本测试需要开了 aux-loss-free 均衡的 MoE 配置");
                     let flat = model.moe_balance_flat();
-                    let mine: Vec<f32> =
-                        flat.iter().enumerate().map(|(i, _)| (r * 10 + i) as f32).collect();
+                    let mine: Vec<f32> = flat
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| (r * 10 + i) as f32)
+                        .collect();
                     model.set_moe_balance_flat(&mine);
 
                     let dp = rt.dp_group();
@@ -822,8 +872,10 @@ mod tests {
                 })
             })
             .collect();
-        let got: Vec<Vec<f32>> =
-            hs.into_iter().map(|h| h.join().expect("工作线程 panic")).collect();
+        let got: Vec<Vec<f32>> = hs
+            .into_iter()
+            .map(|h| h.join().expect("工作线程 panic"))
+            .collect();
         let len = got[0].len();
         assert!(len > 0, "均衡偏置不该是空表");
         let want: Vec<f32> = (0..len)

@@ -362,7 +362,9 @@ impl<'a> SpecDecoder<'a> {
         opts: SampleOpts,
         vocab: Option<&'a [Vec<u8>]>,
     ) -> Self {
-        let gamma = gamma.max(1).min(model.cfg.block_size.saturating_sub(1).max(1));
+        let gamma = gamma
+            .max(1)
+            .min(model.cfg.block_size.saturating_sub(1).max(1));
         SpecDecoder {
             target: TargetStream::new(model, kv),
             gamma,
@@ -396,7 +398,7 @@ impl<'a> SpecDecoder<'a> {
         assert!(!proposals.is_empty(), "草稿至少要给出一个候选");
         let gamma = proposals.len();
         assert!(
-            gamma + 1 <= self.target.window().max(1),
+            gamma < self.target.window().max(1),
             "一轮要喂 γ+1 = {} 个 token，超过缓存窗口 {}；请调小 gamma",
             gamma + 1,
             self.target.window()
@@ -563,7 +565,9 @@ impl MtpHeads {
     pub fn new(n_embd: usize, vocab: usize, n_heads: usize, rng: &mut Rng) -> Self {
         assert!(n_heads >= 1, "至少要有一个预测头");
         MtpHeads {
-            heads: (0..n_heads).map(|_| Linear::new(n_embd, vocab, rng)).collect(),
+            heads: (0..n_heads)
+                .map(|_| Linear::new(n_embd, vocab, rng))
+                .collect(),
             n_embd,
             vocab,
         }
@@ -588,7 +592,11 @@ impl MtpHeads {
 
     /// 第 k 个头（0 = 预测下一个 token）对每一行隐状态出 logits：`[n, n_embd] -> [n, vocab]`
     pub fn logits(&self, hidden: &Tensor, k: usize) -> Tensor {
-        assert!(k < self.heads.len(), "第 {k} 个头不存在（共 {} 个）", self.heads.len());
+        assert!(
+            k < self.heads.len(),
+            "第 {k} 个头不存在（共 {} 个）",
+            self.heads.len()
+        );
         self.heads[k].forward(hidden)
     }
 
@@ -649,12 +657,7 @@ impl<'a> MtpDrafter<'a> {
     /// `backbone` 一般就是目标模型（MTP 头本来就挂在它的隐状态上），
     /// 也可以传一个更小的模型当草稿底座。
     pub fn new(backbone: &'a Transformer, n_heads: usize, kv: KvOpts, rng: &mut Rng) -> Self {
-        let heads = MtpHeads::new(
-            backbone.cfg.n_embd,
-            backbone.cfg.vocab_size,
-            n_heads,
-            rng,
-        );
+        let heads = MtpHeads::new(backbone.cfg.n_embd, backbone.cfg.vocab_size, n_heads, rng);
         MtpDrafter {
             backbone,
             stream: TargetStream::new(backbone, kv),
@@ -666,7 +669,6 @@ impl<'a> MtpDrafter<'a> {
     pub fn heads(&self) -> &MtpHeads {
         &self.heads
     }
-
 }
 
 impl Drafter for MtpDrafter<'_> {
@@ -750,10 +752,13 @@ pub fn speculative_generate(
             // 命中停止标记就收：只在**新生成的部分**里查找（prompt 自己就含标记）
             if !opts.stop.is_empty() {
                 let text = tokenizer.decode(&ids);
-                if let Some(generated) = text.get(prompt.len()..) {
-                    if let Some(rel) = opts.stop.iter().filter_map(|s| generated.find(s)).min() {
-                        return (text[..prompt.len() + rel].trim_end().to_string(), *dec.stats());
-                    }
+                if let Some(generated) = text.get(prompt.len()..)
+                    && let Some(rel) = opts.stop.iter().filter_map(|s| generated.find(s)).min()
+                {
+                    return (
+                        text[..prompt.len() + rel].trim_end().to_string(),
+                        *dec.stats(),
+                    );
                 }
             }
             produced += 1;
@@ -881,8 +886,14 @@ mod tests {
             &mut Rng::new(7),
         );
 
-        assert_eq!(spec, plain, "贪心推测解码必须与目标模型贪心解码逐 token 一致");
-        assert_eq!(stats.target_forwards, stats.rounds, "每轮只该有一次目标前向");
+        assert_eq!(
+            spec, plain,
+            "贪心推测解码必须与目标模型贪心解码逐 token 一致"
+        );
+        assert_eq!(
+            stats.target_forwards, stats.rounds,
+            "每轮只该有一次目标前向"
+        );
         assert!(stats.emitted >= 24);
     }
 
@@ -935,12 +946,18 @@ mod tests {
             tv < 0.05,
             "{label}：推测解码的首 token 分布应等于目标分布，总变差 {tv:.4}\n\
              经验频率 {:?}\n目标概率 {:?}",
-            counts.iter().map(|c| *c as f32 / n as f32).collect::<Vec<_>>(),
+            counts
+                .iter()
+                .map(|c| *c as f32 / n as f32)
+                .collect::<Vec<_>>(),
             (0..vocab)
                 .map(|i| prob_of(&p_ids, &p_probs, i))
                 .collect::<Vec<_>>()
         );
-        assert!(corrected > 0, "{label}：应当有被拒的轮次（否则没覆盖残差修正）");
+        assert!(
+            corrected > 0,
+            "{label}：应当有被拒的轮次（否则没覆盖残差修正）"
+        );
     }
 
     /// 退化草稿（q 是单点分布）：接受概率就是 p(x)，被拒时残差把剩下的概率质量补回来
@@ -971,7 +988,10 @@ mod tests {
 
         assert_eq!(emitted.len(), 5, "γ=4 全部被接受 → 4 + 1 个 token");
         assert_eq!(dec.stats().target_forwards, 1, "整轮只该有一次目标前向");
-        assert!(dec.stats().tokens_per_forward() > 1.0, "一次前向产出应大于 1 个 token");
+        assert!(
+            dec.stats().tokens_per_forward() > 1.0,
+            "一次前向产出应大于 1 个 token"
+        );
         assert_eq!(dec.stats().bonus, 1, "白拿了一个 token");
         assert_eq!(dec.stats().corrected, 0);
         assert_eq!(dec.stats().acceptance_rate(), 1.0);
@@ -1000,7 +1020,13 @@ mod tests {
             ids: vec![0],
             probs: vec![1.0],
         };
-        let mut dec = SpecDecoder::new(&model, KvOpts::on(0, None), 3, opts, tokenizer.vocab_bytes());
+        let mut dec = SpecDecoder::new(
+            &model,
+            KvOpts::on(0, None),
+            3,
+            opts,
+            tokenizer.vocab_bytes(),
+        );
         let mut rng = Rng::new(1);
 
         for round in 0..8 {
@@ -1057,14 +1083,8 @@ mod tests {
         for (i, head) in heads.heads().iter().enumerate() {
             let gw = head.weight.grad();
             let gb = head.bias.grad();
-            assert!(
-                gw.iter().any(|&v| v != 0.0),
-                "第 {i} 个头的权重梯度应非零"
-            );
-            assert!(
-                gb.iter().any(|&v| v != 0.0),
-                "第 {i} 个头的偏置梯度应非零"
-            );
+            assert!(gw.iter().any(|&v| v != 0.0), "第 {i} 个头的权重梯度应非零");
+            assert!(gb.iter().any(|&v| v != 0.0), "第 {i} 个头的偏置梯度应非零");
         }
     }
 
