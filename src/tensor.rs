@@ -6290,4 +6290,62 @@ mod tests {
             bytes / best / 1e9
         );
     }
+
+    /// bf16 解码的**带宽定位**探针（默认不跑）
+    ///
+    /// 同一份数据量（`n × k` 个权重元素，取 0.5B 输出头形状），三种读法：
+    /// ① 纯读 u16 求和（无转换、无 FMA）—— 内存带宽上限
+    /// ② bf16 点积（生产路径）
+    /// ③ f32 点积（对照，流量 2×）
+    ///
+    /// 判读：若 ② 与 ① 接近 ⇒ 已经带宽受限，无优化空间；
+    /// 若 ② 明显低于 ① ⇒ 转换/FMA 是瓶颈，值得做寄存器分块。
+    #[test]
+    #[ignore]
+    fn probe_bf16_decode_bandwidth() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+        let (n, k) = (151936usize, 896usize); // 0.5B 输出头
+        let x: Vec<f32> = (0..k).map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5).collect();
+        let w16: Vec<u16> = (0..n * k)
+            .map(|i| f32_to_bf16(((i % 97) as f32) * 0.01 - 0.3))
+            .collect();
+        let w32: Vec<f32> = w16.iter().map(|&u| bf16_to_f32(u)).collect();
+        let nt = rayon::current_num_threads().max(1);
+        let chunk = n.div_ceil(nt * 4).max(64);
+        let idx: Vec<usize> = (0..n).collect();
+        println!("  threads={nt} chunk={chunk} 权重 {:.0} MB (bf16)", (n * k * 2) as f64 / 1e6);
+        let bench = |name: &str, bytes: f64, f: &(dyn Fn(usize) -> f32 + Sync)| {
+            let t0 = Instant::now();
+            let s: f32 = idx
+                .par_chunks(chunk)
+                .map(|c| c.iter().map(|&j| f(j)).sum::<f32>())
+                .sum();
+            let dt = t0.elapsed().as_secs_f64();
+            println!(
+                "  {name:<12}: {:>7.1} ms | {:>5.1} GB/s | 校验和 {:.1}",
+                dt * 1e3,
+                bytes / dt / 1e9,
+                s
+            );
+        };
+        bench("纯读 u16", (n * k * 2) as f64, &|j| {
+            let mut s = 0.0f32;
+            for &v in &w16[j * k..(j + 1) * k] {
+                s += v as f32;
+            }
+            s
+        });
+        bench("bf16_dot", (n * k * 2) as f64, &|j| {
+            bf16_dot(&x, &w16[j * k..(j + 1) * k])
+        });
+        bench("f32 点积", (n * k * 4) as f64, &|j| {
+            let row = &w32[j * k..(j + 1) * k];
+            let mut s = 0.0f32;
+            for (kk, &bv) in row.iter().enumerate() {
+                s += x[kk] * bv;
+            }
+            s
+        });
+    }
 }
