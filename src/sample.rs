@@ -498,7 +498,10 @@ impl<'m, 'r> Generator<'m, 'r> {
                         Some(c),
                         false,
                     )
-                } else if self.ids.len() == self.n_prompt && cached > 0 && self.ids.len() > cached + 1 {
+                } else if self.ids.len() == self.n_prompt
+                    && cached > 0
+                    && self.ids.len() > cached + 1
+                {
                     // 只有**首步**（还没生成任何 token）才可能是注入的前缀缓存。
                     // 滑窗缓存下 `seq_len()` 会封顶在窗口大小、而 `ids` 继续增长，
                     // 若拿"缓存比 ids 短"当复用判据，就会每步重复喂 token，最终 t 超窗口。
@@ -569,7 +572,8 @@ impl<'m, 'r> Generator<'m, 'r> {
             self.reason = Some(StopReason::MaxNew);
             return false;
         }
-        self.remaining -= 1;        let recent = if self.opts.repetition_window == 0 || self.img_seg.is_some() {
+        self.remaining -= 1;
+        let recent = if self.opts.repetition_window == 0 || self.img_seg.is_some() {
             &[][..]
         } else {
             let start = self.ids.len().saturating_sub(self.opts.repetition_window);
@@ -1616,7 +1620,11 @@ mod tests {
         let mut r2 = Rng::new(7);
         let mut g2 =
             Generator::new(&model, &tokenizer, prompt, 6, &o, kv, &mut r2).with_cache(cache);
-        assert_eq!(run(&mut g2), want, "prefix 复用与整段 prefill 的输出必须逐字相同");
+        assert_eq!(
+            run(&mut g2),
+            want,
+            "prefix 复用与整段 prefill 的输出必须逐字相同"
+        );
     }
 
     /// C6 ③ 的**批处理协议**：两条序列各自 `step()` 走完 prefill，之后每轮
@@ -1671,7 +1679,11 @@ mod tests {
             alive.retain(|&i| gens[i].reason.is_none());
         }
         for (i, g) in gens.into_iter().enumerate() {
-            assert_eq!(g.into_output().generated, want[i], "第 {i} 条序列的批处理输出与逐条不一致");
+            assert_eq!(
+                g.into_output().generated,
+                want[i],
+                "第 {i} 条序列的批处理输出与逐条不一致"
+            );
         }
     }
 }

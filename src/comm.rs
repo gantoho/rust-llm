@@ -39,7 +39,6 @@ const HEADER_LEN: usize = 8;
 /// 超时要放得足够宽，只用于把"真的断了"和"慢"区分开。可用 `DIST_RECV_TIMEOUT_SECS` 覆盖。
 const DEFAULT_RECV_TIMEOUT_SECS: u64 = 600;
 
-
 /// 小端字节 → f32。`chunks_exact(4)` 保证不会读到半截元素。
 fn decode(b: &[u8]) -> Vec<f32> {
     b.as_chunks::<4>()

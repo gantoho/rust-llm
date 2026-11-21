@@ -299,9 +299,7 @@ impl BatchEngine {
         }
         self.cv.notify_one();
         // 超时只为兜底（驱动线程不会死，除非 decode_batch panic）
-        let out = rx
-            .recv_timeout(std::time::Duration::from_secs(300))
-            .ok();
+        let out = rx.recv_timeout(std::time::Duration::from_secs(300)).ok();
         self.active.fetch_sub(1, Ordering::Relaxed);
         out
     }
@@ -311,50 +309,56 @@ impl BatchEngine {
 fn spawn_batch_engine(engine: Arc<BatchEngine>, model: Arc<Transformer>) {
     const MAX_BATCH: usize = 16;
     const GATHER: std::time::Duration = std::time::Duration::from_millis(5);
-    thread::spawn(move || loop {
-        let mut batch: Vec<BatchSubmit> = {
-            let mut q = engine.q.lock().unwrap_or_else(|e| e.into_inner());
-            while q.is_empty() {
-                q = engine.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+    thread::spawn(move || {
+        loop {
+            let mut batch: Vec<BatchSubmit> = {
+                let mut q = engine.q.lock().unwrap_or_else(|e| e.into_inner());
+                while q.is_empty() {
+                    q = engine.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+                // 短暂聚合窗口：让几乎同时到达的提交凑成一批
+                let waiting = engine.active.load(std::sync::atomic::Ordering::Relaxed);
+                let gather = if waiting > 1 {
+                    GATHER
+                } else {
+                    std::time::Duration::ZERO
+                };
+                let deadline = Instant::now() + gather;
+                while q.len() < MAX_BATCH {
+                    if q.len() >= waiting.max(1) {
+                        break;
+                    }
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let (g, t) = engine
+                        .cv
+                        .wait_timeout(q, left)
+                        .unwrap_or_else(|e| e.into_inner());
+                    q = g;
+                    if t.timed_out() {
+                        break;
+                    }
+                }
+                std::mem::take(&mut *q)
+            };
+            if batch.is_empty() {
+                continue;
             }
-            // 短暂聚合窗口：让几乎同时到达的提交凑成一批
-            let waiting = engine.active.load(std::sync::atomic::Ordering::Relaxed);
-            let gather = if waiting > 1 { GATHER } else { std::time::Duration::ZERO };
-            let deadline = Instant::now() + gather;
-            while q.len() < MAX_BATCH {
-                if q.len() >= waiting.max(1) {
-                    break;
-                }
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                let (g, t) = engine
-                    .cv
-                    .wait_timeout(q, left)
-                    .unwrap_or_else(|e| e.into_inner());
-                q = g;
-                if t.timed_out() {
-                    break;
-                }
+            let ids: Vec<usize> = batch.iter().map(|s| s.id).collect();
+            let bases: Vec<usize> = batch.iter().map(|s| s.base).collect();
+            let mut caches: Vec<Vec<crate::attention::KVCache>> = (0..batch.len())
+                .map(|i| std::mem::take(&mut batch[i].cache))
+                .collect();
+            let logits = crate::tensor::no_grad(|| model.decode_batch(&ids, &mut caches, &bases));
+            let v = model.cfg.vocab_size;
+            let data = logits.data();
+            for (i, s) in batch.into_iter().enumerate() {
+                let row = data[i * v..(i + 1) * v].to_vec();
+                let cache = std::mem::take(&mut caches[i]);
+                let _ = s.tx.send((row, cache));
             }
-            std::mem::take(&mut *q)
-        };
-        if batch.is_empty() {
-            continue;
-        }
-        let ids: Vec<usize> = batch.iter().map(|s| s.id).collect();
-        let bases: Vec<usize> = batch.iter().map(|s| s.base).collect();
-        let mut caches: Vec<Vec<crate::attention::KVCache>> = (0..batch.len())
-            .map(|i| std::mem::take(&mut batch[i].cache))
-            .collect();
-        let logits = crate::tensor::no_grad(|| model.decode_batch(&ids, &mut caches, &bases));
-        let v = model.cfg.vocab_size;
-        let data = logits.data();
-        for (i, s) in batch.into_iter().enumerate() {
-            let row = data[i * v..(i + 1) * v].to_vec();
-            let cache = std::mem::take(&mut caches[i]);
-            let _ = s.tx.send((row, cache));
         }
     });
 }
@@ -377,10 +381,7 @@ fn batched_step(state: &State, g: &mut crate::sample::Generator<'_, '_>) -> bool
     }
 }
 /// C9：与缓存比公共前缀，命中就 fork 一份并回滚到公共长度（None = 不命中）。
-fn take_prefix_cache(
-    state: &Arc<State>,
-    ids: &[usize],
-) -> Option<Vec<crate::attention::KVCache>> {
+fn take_prefix_cache(state: &Arc<State>, ids: &[usize]) -> Option<Vec<crate::attention::KVCache>> {
     let guard = state.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
     let (cached_ids, caches) = guard.as_ref()?;
     let lcp = ids
@@ -1928,7 +1929,8 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         // C9：前缀 KV 复用 —— 与本轮 prompt 比公共前缀，命中就 fork + 回滚，跳过那段 prefill
         let mut ids: Vec<usize> = tokenizer.bos_id().into_iter().collect();
         ids.extend(tokenizer.encode(&a.prompt));
-        let reuse = take_prefix_cache(state, &ids);        let mut g = Generator::new(
+        let reuse = take_prefix_cache(state, &ids);
+        let mut g = Generator::new(
             model,
             tokenizer,
             &a.prompt,
@@ -1941,7 +1943,9 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         if let Some(px) = pixels.as_ref() {
             g = g.with_pixels(px.clone());
         }
-        if let Some(c) = reuse { g = g.with_cache(c); }
+        if let Some(c) = reuse {
+            g = g.with_cache(c);
+        }
         let n_prompt = g.prompt_tokens();
         // 与 `g.run()` 等价的手写循环：多拿一个「prefill 结束」的计时点（见 DecodeTimer）
         let mut timer = DecodeTimer::new();
@@ -2667,8 +2671,7 @@ pub fn run(
         spawn_batch_engine(std::sync::Arc::clone(&state.engine), m);
     }
     // 图片输入通路状态：与 main 的 runlog 行同源，控制台一眼能看出能不能传图
-    {
-    }
+    {}
     match &state.cfg.vision {
         Some(v) => logln!(
             "[serve] 视觉塔已启用（输入 {}px、patch {}px）：message.image_url 可用",

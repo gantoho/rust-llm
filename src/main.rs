@@ -16,16 +16,13 @@
 //! 每次训练 / 推理都会自动在 `logs/` 下生成一份运行日志（文件名含操作名与毫秒级时间），
 //! 内容包含完整命令行、完整配置与全部过程输出，见 [`runlog`]。
 
-
 // 二进制只做 CLI 分派：所有实现都在库 crate 里（`src/lib.rs`）
-use llm_from_scratch::runlog;
 use llm_from_scratch::cli;
 use llm_from_scratch::cmd;
 #[cfg(feature = "gpu")]
 use llm_from_scratch::gpu;
+use llm_from_scratch::runlog;
 use llm_from_scratch::sample;
-
-
 
 use llm_from_scratch::cli::{Cli, Cmd};
 use llm_from_scratch::sample::{KvOpts, SampleOpts};

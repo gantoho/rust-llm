@@ -118,7 +118,6 @@ where
     build(items, s)
 }
 
-
 /// 一轮 prompt 的组装结果。
 pub struct Assembled {
     /// 拼好的完整 prompt：system + '\n' + 裁剪后历史 + '\n' + 本轮 tail

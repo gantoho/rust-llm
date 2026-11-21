@@ -88,7 +88,11 @@ fn read_all(files: &[String]) -> String {
 //   "RLLMC1" + u16 版本 + u32 token 数 + 小端 u32 序列
 // 命中就跳过整段分词，直接把 token 流读回来（大语料上从"分钟"降到"毫秒"）。
 
-fn corpus_cache_path(kind: &str, tokenizer: &Tokenizer, texts: &[&str]) -> Option<std::path::PathBuf> {
+fn corpus_cache_path(
+    kind: &str,
+    tokenizer: &Tokenizer,
+    texts: &[&str],
+) -> Option<std::path::PathBuf> {
     if std::env::var("LLM_CORPUS_CACHE").ok().as_deref() != Some("1") {
         return None;
     }
@@ -1383,7 +1387,9 @@ mod tests {
         let block_size = 4;
         let val_start = 5;
         let loader = SftLoader {
-            tokens: (0..val_start + block_size + 1).map(|i| (i % 7) as u32).collect(),
+            tokens: (0..val_start + block_size + 1)
+                .map(|i| (i % 7) as u32)
+                .collect(),
             sup: vec![true; val_start + block_size + 1],
             num_conversations: 1,
             block_size,
@@ -1435,7 +1441,11 @@ mod tests {
             for d in &docs {
                 let len = 1 + tok.encode(d).len() + 1;
                 assert_eq!(loader.tokens[pos] as usize, b, "文档应以 BOS 开头");
-                assert_eq!(loader.tokens[pos + len - 1] as usize, e, "文档应以 EOS 结尾");
+                assert_eq!(
+                    loader.tokens[pos + len - 1] as usize,
+                    e,
+                    "文档应以 EOS 结尾"
+                );
                 pos += len;
             }
         }

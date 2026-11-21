@@ -6279,4 +6279,5 @@ mod tests {
             best * 1e3,
             bytes / best / 1e9
         );
-    }}
+    }
+}

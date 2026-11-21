@@ -397,7 +397,11 @@ impl QMatrix {
         let code_at = |m: usize| -> usize {
             if packed {
                 let b = bytes[m / 2];
-                let nib = if m % 2 == 0 { b & 0x0F } else { (b >> 4) & 0x0F };
+                let nib = if m % 2 == 0 {
+                    b & 0x0F
+                } else {
+                    (b >> 4) & 0x0F
+                };
                 nib as usize
             } else {
                 bytes[m] as usize
@@ -532,7 +536,11 @@ impl QMatrix {
             for j in 0..n_rem {
                 let m = off + j;
                 let b = self.bytes[m / 2];
-                let nib = if m % 2 == 0 { b & 0x0F } else { (b >> 4) & 0x0F };
+                let nib = if m % 2 == 0 {
+                    b & 0x0F
+                } else {
+                    (b >> 4) & 0x0F
+                };
                 if j % 2 == 0 {
                     out[j / 2] = nib;
                 } else {
@@ -3322,7 +3330,8 @@ mod gemv_bit_exact_tests {
                 );
             }
         }
-    }}
+    }
+}
 
 #[cfg(test)]
 mod kv_append_tests {
