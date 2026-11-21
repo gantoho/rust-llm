@@ -37,8 +37,9 @@ jobs:
       - name: check (gpu feature)
         run: cargo check --all-targets --features gpu
 
-  # 下面两项暂为**非阻塞**：仓库当前还有 12 条编译告警、且尚未跑过 rustfmt。
-  # 清干净后把 `continue-on-error` 去掉即可变成硬门禁。
+  # fmt 已是干净的（`cargo fmt --check` 0 diff）、编译告警也已是 0；
+  # clippy 仍有若干**有意保留**的 lint（见 CODE-AUDIT 的 12 条），故本 job 暂设非阻塞，
+  # 等那些 lint 也清掉后去掉 `continue-on-error` 即可变成硬门禁。
   lint:
     name: fmt & clippy (advisory)
     runs-on: ubuntu-latest

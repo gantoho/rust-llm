@@ -2476,40 +2476,10 @@ no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输�
   `0xC0000005`）：GPU 用例对时序/驱动敏感，几条"两次训练必须逐位一致"的对照用例会被
   同机并行负载影响。**排查改动请两条路都走**：按关键词过滤跑（快）与全量串行跑
   （最干净；GPU 用例串行全过）
-- **编译**：`cargo build` 与 `cargo build --features gpu` 编译通过、无 error；`cargo check --tests`
-  目前留下 **12 条**警告，**`dead_code` 已清零** —— 拆分 `lib + bin` 后 `pub` 成为真 API，
-  原先"实现完整但无人调用"的项都成了公开 API；余下主要是 4 条 `unused_mut`（都在 `src/cmd/`）
-  与只在测试/基准路径上用的分步参考实现（如 `quant.rs` 的 `cholesky_inverse`、`attention.rs` 的
-  `KVCache::with_window`），它们都有单测覆盖，**不是"零警告"**：
-  **拆分 `lib + bin` 之前**，剩下的警告除 4 条 `unused_mut`（都在 `src/cmd/`）之外都是 `dead_code`，分两类（拆分后这些项都成了公开 API，`dead_code` 已清零；下面保留当时的分类说明）。一类是**只有单测 / CLI 子命令里某条路径才用到的 API**（如 `quant.rs` 的
-  `cholesky_inverse` / `Calibration` / `awq_best_alpha`、`distributed.rs` 的 `World::barrier` / `broadcast` / `qkv_head_columns`、
-  `rag.rs` 的 `Retriever::from_text`、`attention.rs` 的 `KVCache::with_window`）——
-  它们都有单测覆盖，只是非测试构建里没有直接调用点。另一类是少数只在测试基准或 `gpu` feature 常驻路径上
-  被调用的算子：`Tensor::mul` / `div` / `sum_last_dim` / `add_scalar` 是融合算子的
-  **分步参考实现**（测试用它们串出定义式，再与融合算子比对数值），`Tensor::external` / `NormLayer::ln_params` /
-  `Gelu::gelu_weights` 的调用点全在 GPU 常驻路径，`Tensor::neg` 则是逐元素算子集里的一员。
-  后一类已按调用条件标了 `#[allow(dead_code)]` / `#[cfg_attr(not(feature = "gpu"), allow(dead_code))]` 并在注释里写明，
-  不带 gpu feature 编译时不会混进 `never used` 噪声
-- 测试覆盖：**自动微分 tape（可达集裁剪冷分支不回传、交错 micro-batch 独立反向、clear_tape 作用域、
-  finite-difference 与解析梯度对拍）**、广播、softmax、BPE 编解码、RoPE 正交性与梯度、KV cache 与全量前向一致性、
-  RMSNorm/SwiGLU 融合算子与分步实现一致性、Flash Attention 与标准注意力一致性、Dropout、线性回归收敛、
-  重复惩罚、checkpoint 二进制往返（含 NaN/±Inf）、**SFT 对话解析 / loss 掩码对齐 / 批次形状**、
-  **LoRA（零初始化前向不变、冻结主干无梯度、可训练集合、挂载位置生效、合并前后前向等价、续训保留旧数值、存档往返）**、
-  **KV cache 滑动窗口（超窗丢弃最旧行、绝对位置继续累计、单层模型下与全量窗口前向数值等价）**、
-  **AMP 动态损失缩放（开/关结果逐位一致、scale 翻倍与减半、梯度反缩放）**、
-  **Scaling Laws（幂律拟合还原已知指数、参数口径与真实建层逐位一致、Chinchilla 表自洽、20:1 与参数化闭式解两条路线、时长/电费复现文档例子、真训多规模扫描与数据量扫描）**、
-  **MoE（Top-K 路由确定性与掩码对偶、稀疏前向与稠密参考逐元素吻合、路由逐 token 无跨 token 泄漏、容量丢弃语义、辅助损失取值规律与梯度、K = 1 门控梯度陷阱、稀疏梯度、参数口径、端到端可训）**、
-  **量化（逐元素 / 逐通道 / 逐 token 量化与反量化、位打包往返、Hessian 量化分块不改结果、AWQ α 搜索、校准集合并、Hessian 逆的数值校验）**、
-  **推测解码（贪心路径逐位一致、拒绝采样的分布等价、缓存回滚不变量、MTP 头形状与梯度、多步训练 loss 下降）**、
-  **对齐（DPO = `ln 2`、PPO 裁剪梯度为 0、GRPO 优势均值 0 / 方差 1、奖励模型排序准确率高于随机）**、
-  **RAG（分块不变量、余弦相似度自比 1 / 正交 0、MMR 多样化、提示预算截断）**、
-  **分布式（环形 allreduce = 数据和、DP / ZeRO 与单进程全 batch 一致、TP 前向反向与单卡一致、PP 两种调度等价、3D 切分互不重叠且覆盖完整）**、
-  **多模态（patchify / unpatchify 互逆与行主序、ViT 输出形状、VQ-VAE 编解码往返与三项损失梯度隔离、
-  `vq.ckpt` 存取往返、VQ 预训练 smoke、`<|image|>` 展开与存档存活 / 特殊 token 校验、
-  `forward_mm` 注入视觉且纯文本路径逐位一致、VlmLoader pad / 像素携带 / 恰好一个图片字面量、
-  生成序列切换混批、图片段状态机与掩码、`with_pixels` 注入与滑窗回退、checkpoint 容忍视觉参数、
-  base64 RFC 4648 向量、`generated_image_uri` 整段解码）、
-  **CLI 进程级冒烟（`--help` 子命令齐全、`preset` 写出合法 JSON 配置）**
+- **编译**：`cargo build` 与 `cargo build --features gpu` 编译通过、**0 error / 0 warning**
+  （`cargo check --all-targets`；2026-11 清掉了 lib+bin 拆分引入的未使用导入与裸 `io::` 路径后归零）。
+  唯一需要留意的例外：`--features gpu` 构建下 `MatOperand` 的 `cell`/`ver` 字段才有读取方，
+  默认构建用 `#[cfg_attr(not(feature = "gpu"), allow(dead_code))]` 显式标注。
 - **Demo 端到端验证通过**（`cargo run --release -- demo`）：XOR 100%、BPE 往返、Transformer 训练 loss 1.30→0.16、文本生成正常
 - **工程化功能已全部集成**：监督微调（`sft`，带 loss 掩码，默认输出到 `{out_dir}-sft`，不覆盖预训练权重）、
   LoRA 微调（`finetune`，冻结主干只训适配层，实测可训练参数 1.32%，可选挂载位置 / 链式续训 / 推理合并，默认输出到 `{out_dir}-lora`）、

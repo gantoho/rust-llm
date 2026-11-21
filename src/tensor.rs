@@ -539,7 +539,10 @@ impl SrcIdxView<'_> {
 #[derive(Clone, Copy)]
 struct MatOperand<'a> {
     data: MatData<'a>,
+    // 只在 GPU 常驻路径被读取（`res_id()` 供权重跨调用复用）；默认构建下不需要
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     cell: u64,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     ver: u64,
 }
 

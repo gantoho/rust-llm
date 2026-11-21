@@ -16,11 +16,12 @@
 //! 排队反而让延迟曲线平稳；要真并发得开多进程（另起端口）或上 GPU。
 
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
+use std::io::{Cursor, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(test)] use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -2402,7 +2403,7 @@ struct SsePipe {
 
 #[cfg(test)]
 impl Read for SsePipe {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -2463,7 +2464,7 @@ fn run_embeddings(state: &Arc<State>, body: &str) -> Result<Value, ApiError> {
     };
 
     let block_size = state.cfg.block_size;
-    let (rows, prompt_tokens) = with_model(state, |model, tokenizer, shared_rng| {
+    let (rows, prompt_tokens) = with_model(state, |model, tokenizer, _shared_rng| {
         let vocab = model.cfg.vocab_size;
         let mut rows: Vec<Vec<f64>> = Vec::with_capacity(items.len());
         let mut prompt_tokens = 0usize;

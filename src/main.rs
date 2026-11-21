@@ -17,12 +17,9 @@
 //! 内容包含完整命令行、完整配置与全部过程输出，见 [`runlog`]。
 
 // 二进制只做 CLI 分派：所有实现都在库 crate 里（`src/lib.rs`）
-use llm_from_scratch::cli;
-use llm_from_scratch::cmd;
 #[cfg(feature = "gpu")]
 use llm_from_scratch::gpu;
 use llm_from_scratch::runlog;
-use llm_from_scratch::sample;
 
 use llm_from_scratch::cli::{Cli, Cmd};
 use llm_from_scratch::sample::{KvOpts, SampleOpts};
@@ -36,7 +33,7 @@ use llm_from_scratch::cmd::experiments::{
     cmd_align, cmd_csa, cmd_distill, cmd_distributed, cmd_fp4, cmd_fp8, cmd_mla, cmd_moe, cmd_rag,
     cmd_scaling, cmd_speculative, run_demo,
 };
-use llm_from_scratch::cmd::{init_console_utf8, kv_bits_from_name, stop_label};
+use llm_from_scratch::cmd::{init_console_utf8, kv_bits_from_name};
 
 fn main() {
     runlog::mark_start(); // 记下命令开始执行的时刻，作为运行日志总耗时的基准
