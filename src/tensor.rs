@@ -884,6 +884,13 @@ fn matmul_data(
     //   物化按**原宽度**转（bf16 转 bf16，不借机解码）：转置是纯位搬移，
     //   与「先解码再转」数值逐位一致，bf16 还省一半访存与分配。
     //
+    // 左操作数是 bf16（激活被 dtype 继承污染）时，先把它解码成 f32 再重入：
+    // 激活只有 t×d（几千个元素），解码代价可忽略；而不解码会落进下面的通用路径 ——
+    // 那里对 b_t 要物化整张转置表（0.5B 的输出头每 token 544 MB），实测正是 bf16 解码慢 4~5× 的主因。
+    if let MatData::Bf16(av16) = a.data {
+        let af32: Vec<f32> = av16.iter().map(|&u| bf16_to_f32(u)).collect();
+        return matmul_data(MatOperand::F32(&af32), b, m, k, n, batch, a_t, b_t);
+    }
     // ---- 单行快路：`batch*m == 1`（decode 的每个 Linear / 输出头）----
     // 行并行在只有一个输出行时完全失效（`par_chunks_mut(MC*n)` 里整个输出就一块
     // ⇒ 20 个核只用 1 个）。而且 b_t 的物理 [N,K] 布局对"单行"来说恰好是**行内连续**：

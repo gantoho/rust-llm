@@ -2458,6 +2458,7 @@ no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输�
 | 量化推理真正可用 | `QMatrix::gemv` 融合反量化（码→`code/qmax` 查表）+ `LLM_QUANT_REPLAY=1` 加载端重放 + 量化 KV 追加/淘汰从 O(T²) 降到 O(增量) | 端到端 **115 → 88 ms（1.31×）**；权重内存 **8.39 → 5.27 MB（1.59×）** |
 | SSE 首帧 | `Request::into_writer()` 拿裸 stream，自写 HTTP 头 + chunked 帧、**每帧 flush** | **ttfb 0.920 → 0.0027 s（340×）**，`total` 不变 |
 | 连续批处理（C6 ③） | `serve` 起一个驱动线程：并发请求各自 `take_cache` → 提交 → 驱动聚成一批跑一次 `decode_batch` → 回传 `(logits 行, cache)` → 各自 `step_row`；prefill 不进批。**聚合窗口双条件自适应**：只有 `waiting > 1` 才开 5 ms 窗口，且"在等的都已入队"就立刻出发 —— 单请求零等待 | 单请求 **107 ms**（同 prompt 二次；首次含 prefill 340 ms）；4 并发 **811 ms 总 / 每条 203 ms**；四条输出**逐字相同**；422 测试全过 |
+| bf16 权重解码（1.2） | 快路本来就在（`MatData::Bf16 if b_t` → AVX2 `bf16_dot`），缺的是"激活被 dtype 继承污染成 bf16"时不满足单行快路前提、落进通用路径而物化整张转置表；修法是入口处把 bf16 激活解码回 f32（激活只有 t×d） | bf16 解码 **325.4 → 68.5 ms/token**（同期 f32 87.8），**bf16 反而快 1.28×**；内存 **1.98 → 0.99 GB**；422 测试全过 |
 | 语料内存与分词缓存（E7） | ① `DataLoader`/`SftLoader` 的 `tokens` 改 `Vec<u32>`（8 → 4 B/token，**内存 −50%**，取批时 `as usize` 还原）；② `LLM_CORPUS_CACHE=1` 时把分词结果按「文本内容 + 词表大小」哈希落盘（`%TEMP%\rust-llm-corpus-cache\*.bin`，带 magic/版本/长度校验），下次启动直接读 | 语料内存 **−50%**；同语料二次训练省 **~16.5 s**（实测 33.2 → 16.6 s，loss 8.7890 不变）；422 测试全过 |
 | 前缀 KV 复用（C9） | `serve` 侧缓存上次 prompt 的前 `n-1` 个 token 的 K/V；命中就 `fork + rollback` 交给 `Generator::with_cache`，跳过那段 prefill（判据必须是"首步 + 缓存非空 + 有增量"） | 同 prompt 二次请求 **301 → 93 ms（3.2×）**；长 system（466 token）**135 → 10 ms**；命中与不命中输出**逐字相同** |
 | 掩码与 bias 快路 | 因果掩码 thread-local 缓存（原来逐层重建）；`Tensor::binary` 按行广播快路 | 每步少建 24 张 `[t,t]` 掩码；bias 加法 **23.0 → 25.2 GB/s** |
