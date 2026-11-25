@@ -54,6 +54,13 @@ impl CharTokenizer {
     }
 
     /// 文本 -> id 序列
+    /// 这段文本能否被完整编码（char 分词器的词表只含语料里出现过的字符）。
+    /// 用于"可选提示语"这类**不编码也不影响正确性**的文本：编码不了就跳过，
+    /// 而不是让整个请求 panic。
+    pub fn can_encode(&self, text: &str) -> bool {
+        text.chars().all(|c| self.stoi.contains_key(&c))
+    }
+
     pub fn encode(&self, text: &str) -> Vec<usize> {
         text.chars()
             .map(|c| {
@@ -95,7 +102,9 @@ impl CharTokenizer {
             .iter()
             .map(|v| {
                 let s = v.as_str().expect("chars 元素应为字符串");
-                assert_eq!(s.len(), s.chars().count(), "chars 元素应为单个字符");
+                // 判"单字符"只能数字符个数：`s.len()` 是**字节数**，任何非 ASCII 字符
+                // （中文 3 字节、emoji 4 字节）都会让字节数 > 1，从而误报。
+                assert_eq!(s.chars().count(), 1, "chars 元素应为单个字符，实际 {s:?}");
                 s.chars().next().unwrap()
             })
             .collect();
@@ -777,9 +786,21 @@ impl Tokenizer {
                     )
                 })
         };
-        let bos = pick(&["<s>", "<|begin_of_text|>", "<|im_start|>"], "BOS")?;
+        // BOS/EOS 的顺序要按"模型自身真正的首尾标记"排：
+        // Qwen2.5 的词表里既有字节级字面量 `</s>`/`<s>`，也有真正的 `<|im_end|>`；
+        // 先命中 `</s>` 会让模型**永远输出不了结束符**（实测 0.5B 生成跑满 max_new 才停）。
+        let bos = pick(
+            &["<|begin_of_text|>", "<|endoftext|>", "<s>", "<|im_start|>"],
+            "BOS",
+        )?;
         let eos = pick(
-            &["</s>", "<|end_of_text|>", "<|im_end|>", "<|endoftext|>"],
+            &[
+                "<|im_end|>",
+                "<|end_of_text|>",
+                "<|eot_id|>",
+                "<|endoftext|>",
+                "</s>",
+            ],
             "EOS",
         )?;
         let pad = pick(&["<pad>", "<|endoftext|>", "<unk>"], "PAD").unwrap_or(eos);
@@ -851,6 +872,10 @@ pub struct ImageTokens {
 
 impl ImageTokens {
     /// 追加到词表里的 id 总数：start + P 个占位符 + end + K 个码本 token
+    ///
+    /// 恒 ≥ 2（起止标记各一个），因此不存在"空"状态 —— clippy 的 `len_without_is_empty`
+    /// 在这里不适用。
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         2 + self.count + self.cb_count
     }
@@ -955,6 +980,14 @@ enum Inner {
 }
 
 impl Inner {
+    fn can_encode(&self, text: &str) -> bool {
+        match self {
+            // 字节级 BPE 覆盖所有字节序列，任何文本都可编码
+            Inner::Bpe(_) => true,
+            Inner::Char(c) => c.can_encode(text),
+        }
+    }
+
     fn vocab_size(&self) -> usize {
         match self {
             Inner::Char(t) => t.vocab_size(),
@@ -1005,6 +1038,13 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// 这段文本能否被完整编码（见 [`CharTokenizer::can_encode`]）。
+    ///
+    /// 字节级 BPE 恒为 `true`；char 分词器只覆盖语料里出现过的字符。
+    pub fn can_encode(&self, text: &str) -> bool {
+        self.inner.can_encode(text)
+    }
+
     /// 字符级分词器：词表 = 语料中出现的所有字符 + 3 个特殊 token
     pub fn char(text: &str) -> Self {
         Self::wrap(Inner::Char(CharTokenizer::new(text)))
@@ -2016,5 +2056,79 @@ mod hf_import_tests {
         assert_eq!(p("a   b"), vec!["a", "  ", " b"]);
         // 到末尾的空白整段成片
         assert_eq!(p("a b "), vec!["a", " b", " "]);
+    }
+
+    /// 中文字符的 char 分词器必须能存档再读回。
+    ///
+    /// 这里曾经写成 `s.len() == s.chars().count()`（字节数 vs 字符数），
+    /// 任何非 ASCII 字符（中文 3 字节）都会被误判并 panic —— 表现为
+    /// "训练能存、quant 一加载就炸"。
+    #[test]
+    fn test_char_tokenizer_roundtrips_non_ascii() {
+        let tok = Tokenizer::char("你好世界。。\n用户：助手：");
+        // 走公开的 save/load（`to_json` 是内部的）：这正是 quant 那边触发的路径
+        let dir = std::env::temp_dir().join("llm_char_roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tok.json");
+        tok.save(path.to_str().unwrap());
+        let back = Tokenizer::load(path.to_str().unwrap());
+        assert_eq!(back.vocab_size(), tok.vocab_size(), "字符数必须一致");
+        // 编码结果也必须一致（词表顺序不变）
+        assert_eq!(back.encode("你好世界"), tok.encode("你好世界"));
+        assert_eq!(back.decode(&back.encode("用户：你好")), "用户：你好");
+    }
+
+    /// char 词表按**字符首次出现顺序**编号：换语料顺序就换 id。
+    /// 这条不是"随便测测"：训练/推理必须用同一份存档，否则 id 对不上、输出变成乱码。
+    #[test]
+    fn test_char_tokenizer_order_is_first_appearance() {
+        let ab = Tokenizer::char("ab");
+        let ba = Tokenizer::char("ba");
+        assert_eq!(ab.encode("a"), vec![0], "\"ab\" 里 a 先出现");
+        assert_eq!(ab.encode("b"), vec![1]);
+        assert_eq!(ba.encode("b"), vec![0], "\"ba\" 里 b 先出现");
+        assert_eq!(ba.encode("a"), vec![1]);
+
+        // 同一段文本重复构造必须逐位一致（确定性）
+        let x = Tokenizer::char("你好世界你好");
+        let y = Tokenizer::char("你好世界你好");
+        assert_eq!(x.encode("你好世界"), y.encode("你好世界"));
+    }
+
+    /// 词表外的字符必须**明确报错**，而不是静默映射到 unk（那会让训练悄悄学错）。
+    #[test]
+    #[should_panic(expected = "词表中没有字符")]
+    fn test_char_tokenizer_unknown_char_panics() {
+        let tok = Tokenizer::char("ab");
+        let _ = tok.encode("abc");
+    }
+
+    /// char 分词器按 **Unicode 标量值**切分，不做 grapheme cluster 合并。
+    ///
+    /// 这条把行为写清楚（而不是当 bug）：
+    /// - emoji（4 字节，单个标量）算 1 个 token；
+    /// - `e` + 组合重音 U+0301 算 **2 个** token（基字符 + 组合符）；
+    /// - ZWJ 家庭 emoji（👨‍👩‍👧）算 **5 个** token（4 个 emoji + 1 个 ZWJ）。
+    /// 好处是编解码无损（拼接后与原文逐字节相同），代价是视觉上的"一个字符"可能占多个 token。
+    #[test]
+    fn test_char_tokenizer_counts_unicode_scalars_not_graphemes() {
+        let text = "e\u{0301}😀👍\u{200d}👨";
+        let tok = Tokenizer::char(text);
+        // 去重后的标量数：e / U+0301 / 😀 / 👍 / ZWJ / 👨 = 6；
+        // 再加上 3 个特殊 token（BOS/EOS/PAD），`vocab_size()` 报的是总数。
+        assert_eq!(
+            tok.vocab_size(),
+            6 + 3,
+            "内容词表 = 6 个标量，另加 3 个特殊 token"
+        );
+        assert_eq!(tok.encode(text).len(), 6, "每个标量一个 token");
+        // 无损往返（逐字节相同）
+        assert_eq!(tok.decode(&tok.encode(text)), text);
+
+        // 单个 emoji 是 1 个 token（4 字节，但一个标量）
+        let one = Tokenizer::char("😀");
+        assert_eq!(one.vocab_size(), 1 + 3, "1 个标量 + 3 个特殊 token");
+        assert_eq!(one.encode("😀").len(), 1);
+        assert_eq!(one.decode(&one.encode("😀")), "😀");
     }
 }

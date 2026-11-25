@@ -97,7 +97,7 @@ fn ensure_grad(t: &Tensor) {
 /// - `f`：链式法则闭包，体与旧实现完全一致，只换存放位置
 ///
 /// 只在 `requires_grad` 守卫内调用：no_grad / 冻结路径不登记，tape 不增长。
-/// 入口先 [`ensure_grad`] 补齐 out 与全部 parents 的空缓冲（跨模式进图兜底），
+/// 入口先 `ensure_grad` 补齐 out 与全部 parents 的空缓冲（跨模式进图兜底），
 /// 补齐完释放 grad 锁后才借本线程的 TAPE。
 pub fn record(out: &Tensor, parents: Vec<Tensor>, f: BackwardFn) {
     ensure_grad(out);
@@ -119,7 +119,10 @@ pub fn record(out: &Tensor, parents: Vec<Tensor>, f: BackwardFn) {
 /// 不需要调用本函数。唯一典型的调用方是 `main.rs` 的 `aux_only_balance`
 /// 这类 demo：它每步 forward 整张图却只反辅助损失，主损失那半张图的条目
 /// 永远不可达、无法被 backward 回收，只能整条清掉。
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))] // 仅 demo 路径使用
+#[cfg_attr(
+    not(feature = "gpu"),
+    allow(dead_code, reason = "仅 demo 路径与单测使用；训练主线走分步三步式回收")
+)] // 仅 demo 路径使用
 pub fn clear_tape() {
     TAPE.with(|t| t.borrow_mut().clear());
 }

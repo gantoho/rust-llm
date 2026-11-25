@@ -92,7 +92,7 @@ pub struct RoutePlan {
     pub dropped: usize,
     /// 每个专家被路由到的分配数（含被容量丢弃的）。与 [`RoutePlan::sel`] 的长度一比，
     /// 就能看出容量截掉了多少——诊断字段，单测已覆盖（`test_capacity_factor_drops_overflow`）。
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "诊断字段（容量丢弃数）：单测覆盖，不进前向")]
     pub routed: Vec<usize>,
 }
 
@@ -420,7 +420,10 @@ impl MoELayer {
 
     /// 只取输出（辅助损失丢弃）。训练走 [`MoELayer::forward_with_aux`]，那条路径才带均衡损失；
     /// 这里是"只想要前向结果"的入口，单测已覆盖（`test_moe_forward_matches_dense_reference` 等）。
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "只取前向结果的入口；训练走 forward_with_aux（带均衡损失）"
+    )]
     pub fn forward(&self, x: &Tensor) -> Tensor {
         self.forward_with_aux(x).0
     }
@@ -571,7 +574,7 @@ impl MoELayer {
     /// 内部按 `no_grad` 算门控，纯查询，不影响任何梯度。
     /// 单测已覆盖（`test_capacity_factor_drops_overflow`）；`moe` 子命令读的是
     /// [`MoELayer::stats`]，那条路会连专家前向的耗时一起算进去，更贴近真实开销。
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "路由计划：单测诊断用；moe 子命令读的是 stats")]
     pub fn route_plan(&self, x: &Tensor) -> RoutePlan {
         let d = self.router.weight.shape()[0];
         let n = x.numel() / d;
@@ -592,7 +595,10 @@ impl MoELayer {
     }
 
     /// 当前每个专家的均衡偏置（`moe_bias_balance = false` 时恒为全 0）。诊断/单测用。
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "均衡偏置诊断数据：单测用，训练由 update_moe_balance_bias 消费"
+    )]
     pub fn balance_bias(&self) -> Vec<f32> {
         self.bias.borrow().clone()
     }

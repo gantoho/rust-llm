@@ -98,7 +98,7 @@ pub struct Checkpoint {
     pub step: usize,
     pub best_val_loss: f32,
     pub model: TransformerConfig,
-    /// 存档时的 LoRA 形态；加载端据此在恢复参数**之前**重放注入（见 [`CkptHeader::lora`]）
+    /// 存档时的 LoRA 形态；加载端据此在恢复参数**之前**重放注入（见 `CkptHeader::lora`）
     pub lora: Option<LoRAConfig>,
     /// 存档时的量化记录；`Some` 表示这份权重当初被量化过（权重本身仍是 f32，
     /// 见 [`requantize_after_load`]）
@@ -153,7 +153,7 @@ pub fn save(
 /// 等价于把 AdamW 重置为全新状态（`opt_t` 也写 0，与零动量配对，偏置校正才自洽）。
 ///
 /// 头部 `weights_only: true` 是唯一区分两种档位的标记：读取端据此把数据段校验
-/// 从三段改成一段，旧的三段式读取路径不受影响（[`CkptHeader::weights_only`]）。
+/// 从三段改成一段，旧的三段式读取路径不受影响（`CkptHeader::weights_only`）。
 /// f32 约束与 [`save`] 相同：量化过的层必须先烘焙，否则直接断言拦下。
 pub fn save_weights(path: &str, model: &Transformer, step: usize, best_val_loss: f32) {
     let named = model.named_parameters();
@@ -238,7 +238,7 @@ fn commit_atomic(f: File, tmp: &str, path: &str) {
 /// `best_val_loss`）。原先 best 是**再序列化一遍**：0.5B 模型 = 3×2 GB = 6 GB 白写，
 /// NVMe 上约 3 s，直接表现为 step 时间直方图上的一次尖峰。
 ///
-/// 硬链接的安全性：`save` 走"写 `.tmp` 再 rename"（[`commit_atomic`]），rename 只替换
+/// 硬链接的安全性：`save` 走"写 `.tmp` 再 rename"（`commit_atomic`），rename 只替换
 /// 目录项、不改旧 inode 的内容，所以下一次写 latest 时 best 仍指向**旧的**完整档。
 pub fn link_or_copy(src: &str, dst: &str) {
     let _ = std::fs::remove_file(dst); // 覆盖语义（Windows 的 hard_link 遇到已存在会失败）
@@ -250,6 +250,9 @@ pub fn link_or_copy(src: &str, dst: &str) {
 /// 零拷贝地把 f32 切片按字节写出（参数 / 动量共用，避免逐元素 write_all 的系统调用开销）
 fn write_f32s(f: &mut File, path: &str, data: &[f32]) {
     let bytes: &[u8] =
+        // SAFETY: `f32` 的所有位模式都是合法的 `u8` 序列，重新解释不产生非法值；
+    // `as_ptr()` 指向长度 `len*4` 的有效分配（就是 `data` 本身），`bytes` 只在本语句内使用，
+    // 生命周期不会超过 `data`。
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     f.write_all(bytes)
         .unwrap_or_else(|e| panic!("写入 checkpoint {path} 失败: {e}"));
@@ -259,31 +262,50 @@ fn write_f32s(f: &mut File, path: &str, data: &[f32]) {
 /// 用于 eval / generate 先按 checkpoint 里的配置构造模型。
 /// 只读头部 + JSON，不读参数数据，大模型下也能秒开。
 pub fn load_header(path: &str) -> Checkpoint {
-    let mut f = File::open(path).unwrap_or_else(|e| panic!("无法打开 checkpoint {path}: {e}"));
-    let (h, _) = read_head(&mut f, path);
-    Checkpoint {
+    try_load_header(path).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`load_header`] 的 `Result` 版本：文件缺失/过短/魔数不符时返回可读错误，供库调用方处理。
+pub fn try_load_header(path: &str) -> Result<Checkpoint, String> {
+    let mut f = File::open(path).map_err(|e| format!("无法打开 checkpoint {path}: {e}"))?;
+    let (h, _) = try_read_head(&mut f, path)?;
+    Ok(Checkpoint {
         step: h.step,
         best_val_loss: h.best_val_loss.unwrap_or(f32::INFINITY),
         model: h.model,
         lora: h.lora,
         quant: h.quant,
         weights_only: h.weights_only,
-    }
+    })
 }
 
 /// 只加载参数，不涉及优化器（eval / generate 用）。
 /// `model` 必须先按 checkpoint 里的配置构造好，参数按名字逐个恢复。
 /// 动量数据块会被跳过（不做解码、也不读进内存），所以推理端不会为用不到的优化器状态花内存。
 pub fn load_params(path: &str, model: &Transformer) -> Checkpoint {
-    let (ckpt, metas, mut f, _) = open_ckpt(path);
-    restore_params(model, &metas, &mut f, path);
-    ckpt
+    try_load_params(path, model).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`load_params`] 的 `Result` 版本：文件损坏、参数名/形状与模型不一致时返回可读错误。
+pub fn try_load_params(path: &str, model: &Transformer) -> Result<Checkpoint, String> {
+    let (ckpt, metas, mut f, _) = try_open_ckpt(path)?;
+    try_restore_params(model, &metas, &mut f, path)?;
+    Ok(ckpt)
 }
 
 /// 加载参数并恢复优化器状态（resume 用）
 pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut dyn OptimizerState) -> Checkpoint {
-    let (ckpt, metas, mut f, opt_t) = open_ckpt(path);
-    restore_params(model, &metas, &mut f, path);
+    try_load_with_opt(path, model, opt).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`load_with_opt`] 的 `Result` 版本（续训场景）。
+pub fn try_load_with_opt(
+    path: &str,
+    model: &Transformer,
+    opt: &mut dyn OptimizerState,
+) -> Result<Checkpoint, String> {
+    let (ckpt, metas, mut f, opt_t) = try_open_ckpt(path)?;
+    try_restore_params(model, &metas, &mut f, path)?;
     // 权重 only 档（[`save_weights`]）没有 m/v 两段：按"从未更新过"从零构造，
     // 与下面词表扩展的补零同一语义——AdamW 的 m=v=0 加上偏置校正，
     // 第一步就等价于从头积累，是合法的续训起点（`opt_t` 也是 0，与零动量配对）。
@@ -297,8 +319,8 @@ pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut dyn OptimizerSta
         (zeros(), zeros())
     } else {
         (
-            read_segment(&metas, &mut f, path),
-            read_segment(&metas, &mut f, path),
+            try_read_segment(&metas, &mut f, path)?,
+            try_read_segment(&metas, &mut f, path)?,
         )
     };
     // 模型参数可以多于存档（如给纯文本存档接上 vision.* 视觉参数）：多出来的参数
@@ -316,7 +338,7 @@ pub fn load_with_opt(path: &str, model: &Transformer, opt: &mut dyn OptimizerSta
         }
     }
     opt.restore_state(opt_t, m, v);
-    ckpt
+    Ok(ckpt)
 }
 
 /// 加载后按存档头里的记录**原地重建权重量化**。
@@ -351,10 +373,14 @@ fn numel_total(metas: &[ParamMeta]) -> usize {
 }
 
 /// 按参数顺序把一段数据块读成 `Vec<Vec<f32>>`（形状与元信息一致）
-fn read_segment(metas: &[ParamMeta], f: &mut File, path: &str) -> Vec<Vec<f32>> {
+fn try_read_segment(
+    metas: &[ParamMeta],
+    f: &mut File,
+    path: &str,
+) -> Result<Vec<Vec<f32>>, String> {
     metas
         .iter()
-        .map(|m| read_block(f, path, m.shape.iter().product::<usize>()))
+        .map(|m| try_read_block(f, path, m.shape.iter().product::<usize>()))
         .collect()
 }
 
@@ -363,56 +389,56 @@ fn read_segment(metas: &[ParamMeta], f: &mut File, path: &str) -> Vec<Vec<f32>> 
 /// 存档的数据段是裸 f32 小端字节（见 [`write_f32s`]），所以读回时也可以整块读进
 /// `f32` 缓冲：小端平台上直接按字节 `read_exact`，省掉"每元素一次 `from_le_bytes`
 /// + 切片边界检查"的标量循环——1.9 GB 的档上这一步原本要 1~2 s。
-fn read_block(f: &mut File, path: &str, numel: usize) -> Vec<f32> {
+fn try_read_block(f: &mut File, path: &str, numel: usize) -> Result<Vec<f32>, String> {
     let mut data = vec![0.0f32; numel];
+    let read_err = |e: std::io::Error| format!("读取 checkpoint {path} 参数数据失败: {e}");
     if cfg!(target_endian = "little") {
         // SAFETY: `Vec<f32>` 的缓冲恰为 `numel*4` 字节连续内存；`read_exact` 写满后
         // 每个元素都是合法 f32 位模式（含 NaN/Inf），不存在读到未初始化内存的路径。
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
-        f.read_exact(bytes)
-            .unwrap_or_else(|e| panic!("读取 checkpoint {path} 参数数据失败: {e}"));
+        f.read_exact(bytes).map_err(read_err)?;
     } else {
         // 大端平台：存档固定小端，只能逐元素解码
         let mut buf = vec![0u8; numel * 4];
-        f.read_exact(&mut buf)
-            .unwrap_or_else(|e| panic!("读取 checkpoint {path} 参数数据失败: {e}"));
+        f.read_exact(&mut buf).map_err(read_err)?;
         for (i, v) in data.iter_mut().enumerate() {
             *v = f32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]]);
         }
     }
-    data
+    Ok(data)
 }
 
 /// 从文件流读取并解析 checkpoint 头部（魔数 + JSON 头），返回 (header, json 长度)。
 /// 用 `read_exact` 而非切片索引，文件过短/损坏时给出可读错误而非越界 panic。
-fn read_head(f: &mut File, path: &str) -> (CkptHeader, usize) {
+fn try_read_head(f: &mut File, path: &str) -> Result<(CkptHeader, usize), String> {
     let mut magic = [0u8; 7];
     f.read_exact(&mut magic)
-        .unwrap_or_else(|e| panic!("读取 {path} 头部失败（文件过短或损坏）: {e}"));
+        .map_err(|e| format!("读取 {path} 头部失败（文件过短或损坏）: {e}"))?;
     if &magic != MAGIC {
-        panic!(
+        return Err(format!(
             "checkpoint 魔数不匹配：{path} 不是当前格式的 checkpoint\n\
              （旧格式与当前实现不兼容，需要重新训练）"
-        );
+        ));
     }
     let mut len_buf = [0u8; 4];
     f.read_exact(&mut len_buf)
-        .unwrap_or_else(|e| panic!("读取 {path} 头长度失败（文件过短或损坏）: {e}"));
+        .map_err(|e| format!("读取 {path} 头长度失败（文件过短或损坏）: {e}"))?;
     let json_len = u32::from_le_bytes(len_buf) as usize;
     let mut json = vec![0u8; json_len];
     f.read_exact(&mut json)
-        .unwrap_or_else(|e| panic!("读取 {path} JSON 头失败（文件过短或损坏）: {e}"));
+        .map_err(|e| format!("读取 {path} JSON 头失败（文件过短或损坏）: {e}"))?;
     let header: CkptHeader =
-        serde_json::from_slice(&json).unwrap_or_else(|e| panic!("解析 checkpoint 头失败: {e}"));
+        serde_json::from_slice(&json).map_err(|e| format!("解析 checkpoint 头失败: {e}"))?;
     // 拒绝比当前实现更新的格式：新版可能改了字段语义，静默按旧语义误读比报错更危险
-    assert!(
-        header.schema_version <= SCHEMA_VERSION,
-        "checkpoint schema v{} 比当前实现（v{SCHEMA_VERSION}）更新：{path} 由新版程序写出，\
-         请用新版程序加载",
-        header.schema_version
-    );
-    (header, json_len)
+    if header.schema_version > SCHEMA_VERSION {
+        return Err(format!(
+            "checkpoint schema v{} 比当前实现（v{SCHEMA_VERSION}）更新：{path} 由新版程序写出，\
+             请用新版程序加载",
+            header.schema_version
+        ));
+    }
+    Ok((header, json_len))
 }
 
 /// 打开存档、解析头部并**校验数据段总长度**，返回 (元信息, 参数表, 文件句柄, opt_t)。
@@ -421,9 +447,9 @@ fn read_head(f: &mut File, path: &str) -> (CkptHeader, usize) {
 /// （训练档 = 3× 参数量）先读进一个 `Vec<u8>` 再逐段解码。
 /// Qwen2.5-0.5B（1.9 GB 档）的加载峰值因此从"文件字节 + 一份 f32 参数"≈ 4~6 GB
 /// 降到"一份 f32 参数"≈ 2 GB，8B 级模型才有可能在这台机器上打开。
-fn open_ckpt(path: &str) -> (Checkpoint, Vec<ParamMeta>, File, usize) {
-    let mut f = File::open(path).unwrap_or_else(|e| panic!("无法打开 checkpoint {path}: {e}"));
-    let (header, json_len) = read_head(&mut f, path);
+fn try_open_ckpt(path: &str) -> Result<(Checkpoint, Vec<ParamMeta>, File, usize), String> {
+    let mut f = File::open(path).map_err(|e| format!("无法打开 checkpoint {path}: {e}"))?;
+    let (header, json_len) = try_read_head(&mut f, path)?;
     let ckpt = Checkpoint {
         step: header.step,
         best_val_loss: header.best_val_loss.unwrap_or(f32::INFINITY),
@@ -439,12 +465,22 @@ fn open_ckpt(path: &str) -> (Checkpoint, Vec<ParamMeta>, File, usize) {
     let data_off = MAGIC.len() + 4 + json_len;
     let expect_len = (data_off + block * segs) as u64;
     let actual_len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    assert_eq!(
-        actual_len, expect_len,
-        "checkpoint 数据段长度不匹配：期望 {} 字节（头 {} + {} 段，每段 {}），实得 {}（文件可能损坏）",
-        expect_len, data_off, segs, block, actual_len
-    );
-    (ckpt, header.params, f, header.opt_t)
+    if actual_len != expect_len {
+        return Err(format!(
+            "checkpoint 数据段长度不匹配：期望 {} 字节（头 {} + {} 段，每段 {}），实得 {}（文件可能损坏）",
+            expect_len, data_off, segs, block, actual_len
+        ));
+    }
+    Ok((ckpt, header.params, f, header.opt_t))
+}
+
+/// panic 版包装：保持既有调用方的行为与错误文案
+#[allow(
+    dead_code,
+    reason = "panic 包装：既有调用方沿用，新增代码应优先用 try_ 版本"
+)]
+fn open_ckpt(path: &str) -> (Checkpoint, Vec<ParamMeta>, File, usize) {
+    try_open_ckpt(path).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// 词嵌入的名称。只有它允许"模型行数 > 存档行数"——
@@ -469,7 +505,12 @@ fn is_vocab_extension(name: &str, meta: &ParamMeta, t: &Tensor) -> bool {
 /// 存档接上视觉编码器），这些多出来的参数保持模型自身的初始化值，语义等同于
 /// "新增模块从零开始训练"。反过来，存档里的参数必须全部能在模型中找到，
 /// 否则就是配置不一致（如层数不同），一律报错。
-fn restore_params(model: &Transformer, metas: &[ParamMeta], f: &mut File, path: &str) {
+fn try_restore_params(
+    model: &Transformer,
+    metas: &[ParamMeta],
+    f: &mut File,
+    path: &str,
+) -> Result<(), String> {
     let named = model.named_parameters();
     // 存档参数名 → 模型参数下标：一次建 HashMap（原来是逐个 `position()`，
     // 参数多时是 O(n²) 次字符串比较），同时校验每个参数的形状
@@ -481,55 +522,60 @@ fn restore_params(model: &Transformer, metas: &[ParamMeta], f: &mut File, path: 
     let mut slot_of_meta: Vec<usize> = Vec::with_capacity(metas.len());
     let mut covered = vec![false; named.len()];
     for meta in metas {
-        let si = *idx_of.get(meta.name.as_str()).unwrap_or_else(|| {
-            panic!(
+        let Some(&si) = idx_of.get(meta.name.as_str()) else {
+            return Err(format!(
                 "checkpoint 参数 '{}' 在模型中不存在，请检查配置是否一致",
                 meta.name
-            )
-        });
-        assert!(!covered[si], "checkpoint 参数名重复：{}", meta.name);
+            ));
+        };
+        if covered[si] {
+            return Err(format!("checkpoint 参数名重复：{}", meta.name));
+        }
         covered[si] = true;
         slot_of_meta.push(si);
         let t = &named[si].1;
         if is_vocab_extension(&meta.name, meta, t) {
             continue; // 词表扩展：行数允许更多，下面只写前缀行
         }
-        assert_eq!(
-            t.shape(),
-            &meta.shape[..],
-            "参数 {} 形状不匹配：checkpoint={:?} vs 模型={:?}",
-            meta.name,
-            meta.shape,
-            t.shape()
-        );
+        if t.shape() != &meta.shape[..] {
+            return Err(format!(
+                "参数 {} 形状不匹配：checkpoint={:?} vs 模型={:?}",
+                meta.name,
+                meta.shape,
+                t.shape()
+            ));
+        }
     }
     // 模型多出来的参数只允许 vision.*——语言侧参数缺失意味着配置不一致
     for (i, (name, _)) in named.iter().enumerate() {
-        assert!(
-            covered[i] || name.starts_with("vision."),
-            "模型参数 '{name}' 不在 checkpoint 中（仅允许缺少 vision.* 视觉参数），请检查配置是否一致"
-        );
+        if !covered[i] && !name.starts_with("vision.") {
+            return Err(format!(
+                "模型参数 '{name}' 不在 checkpoint 中（仅允许缺少 vision.* 视觉参数），请检查配置是否一致"
+            ));
+        }
     }
     // 流式读：一次只持有一个参数的数据块（峰值内存 = 最大参数，而不是整档文件）
     for (mi, meta) in metas.iter().enumerate() {
         let numel: usize = meta.shape.iter().product();
-        let data = read_block(f, path, numel);
+        let data = try_read_block(f, path, numel)?;
         let (name, t) = &named[slot_of_meta[mi]];
         if t.numel() == data.len() {
             t.set_data(data);
         } else {
             // 词表扩展：前缀行照写，新增行保持模型里的初始化值
             let mut full = t.data_ref().to_vec();
-            assert!(
-                name == EMBEDDING_PARAM,
-                "参数 {name} 的数据长度（{}）与模型（{}）不符",
-                data.len(),
-                full.len()
-            );
+            if name != EMBEDDING_PARAM || data.len() > full.len() {
+                return Err(format!(
+                    "参数 {name} 的数据长度（{}）与模型（{}）不符",
+                    data.len(),
+                    full.len()
+                ));
+            }
             full[..data.len()].copy_from_slice(&data);
             t.set_data(full);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1112,5 +1158,91 @@ mod tests {
             err.is_err(),
             "存档参数在模型中不存在时必须报错（按名恢复的兜底约束）"
         );
+    }
+
+    /// 截断/损坏的存档必须**明确报错**，而不是读出半截参数或越界访问。
+    #[test]
+    #[should_panic]
+    fn test_load_header_on_truncated_file_panics() {
+        let dir = std::env::temp_dir().join("llm_ckpt_truncated_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bad.ckpt");
+        std::fs::write(&p, b"AAAA").unwrap();
+        let _ = load_header(p.to_str().unwrap());
+    }
+
+    // ==================== try_* 的错误路径 ====================
+
+    /// `Checkpoint` 内含 `Transformer`（没有 `Debug`），不能 `unwrap_err()`，这里取错误信息
+    fn err_of(r: Result<Checkpoint, String>) -> String {
+        match r {
+            Ok(_) => panic!("期望 Err，实际 Ok"),
+            Err(e) => e,
+        }
+    }
+
+    /// `try_load_header`：缺文件 / 截断 / 魔数错误 → 都是 `Err`，且信息能定位问题
+    #[test]
+    fn test_try_load_header_reports_errors() {
+        let missing = tmp_path("try_missing");
+        let _ = std::fs::remove_file(&missing);
+        let e = err_of(try_load_header(&missing));
+        assert!(e.contains("无法打开"), "缺文件应报打开失败：{e}");
+        assert!(e.contains(&missing), "错误信息应带路径：{e}");
+
+        let truncated = tmp_path("try_truncated");
+        std::fs::write(&truncated, b"AAAA").unwrap();
+        let e = err_of(try_load_header(&truncated));
+        assert!(e.contains("文件过短或损坏"), "截断应报文件损坏：{e}");
+
+        let bad_magic = tmp_path("try_magic");
+        let mut bytes = vec![b'X'; 7];
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&bad_magic, &bytes).unwrap();
+        let e = err_of(try_load_header(&bad_magic));
+        assert!(e.contains("魔数不匹配"), "魔数错误应被识别：{e}");
+
+        for p in [&truncated, &bad_magic] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// `try_load_header` 正常文件：step / best_val_loss / weights_only 与写出时一致
+    #[test]
+    fn test_try_load_header_ok_matches_saved() {
+        let path = tmp_path("try_ok");
+        let mut rng = Rng::new(3);
+        let model = Transformer::new(TransformerConfig::tiny(16), &mut rng);
+        save_weights(&path, &model, 7, 1.25);
+        let ckpt = try_load_header(&path).expect("应能读出头部");
+        assert_eq!(ckpt.step, 7);
+        assert!((ckpt.best_val_loss - 1.25).abs() < 1e-6);
+        assert!(ckpt.weights_only);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `try_load_params`：模型与存档形状不一致 → `Err`（而不是 panic 或读进脏数据）
+    #[test]
+    fn test_try_load_params_reports_shape_mismatch() {
+        let path = tmp_path("try_shape");
+        let mut rng = Rng::new(2);
+        let m = Transformer::new(TransformerConfig::tiny(32), &mut rng);
+        save_weights(&path, &m, 1, 0.5);
+
+        // 层数不同 ⇒ 模型多出 blocks.1.* 参数，存档里没有
+        let cfg = TransformerConfig {
+            n_layer: 3,
+            ..TransformerConfig::tiny(32)
+        };
+        let mut rng2 = Rng::new(2);
+        let other = Transformer::new(cfg, &mut rng2);
+        let e = err_of(try_load_params(&path, &other));
+        assert!(
+            e.contains("形状不匹配")
+                || e.contains("不在 checkpoint 中")
+                || e.contains("不在模型中"),
+            "应报形状/参数不一致：{e}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

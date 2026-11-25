@@ -180,9 +180,8 @@ pub(crate) fn round_ties_even(v: f32) -> f32 {
     let d = v - f;
     if d > 0.5 {
         f + 1.0
-    } else if d < 0.5 {
-        f
-    } else if (f as i64) % 2 == 0 {
+    } else if d < 0.5 || (f as i64) % 2 == 0 {
+        // 舍入规则：远离 0 的方向取更近者；正好 0.5 时取偶数（ties-to-even）
         f
     } else {
         f + 1.0

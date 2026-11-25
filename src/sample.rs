@@ -73,6 +73,16 @@ pub struct SampleOpts {
     pub repetition_penalty: f32,
     /// 重复惩罚回看窗口：只看最近 N 个 token（0 = 关闭）
     pub repetition_window: usize,
+    /// OpenAI 风格的 **presence penalty**：只要在回看窗口里出现过，就把它的 logit 减掉这么多
+    ///（`0` = 关闭；负值会鼓励重复，与 OpenAI 的 [-2, 2] 取值一致）。
+    ///
+    /// 与上面**乘法式**的 `repetition_penalty` 语义不同：那是按比例缩小 logit，
+    /// 这是减去一个与次数无关的常数。两者可同时开：先乘后加。
+    pub presence_penalty: f32,
+    /// OpenAI 风格的 **frequency penalty**：按窗口内出现次数线性减（`0` = 关闭）。
+    ///
+    /// 出现 c 次就减 `frequency_penalty × c` —— 与 presence 的差别只在"是否按次数放大"。
+    pub frequency_penalty: f32,
     /// 生成到其中任意一个字符串出现就停下，结果**不含**该标记。
     ///
     /// 用 `&'static [&'static str]` 而不是 `Vec<String>`：停止标记就是模板常量
@@ -89,7 +99,9 @@ impl Default for SampleOpts {
             top_p: 0.9,
             repetition_penalty: 1.1,
             repetition_window: 64,
+            presence_penalty: 0.0,
             stop: &[],
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -100,14 +112,61 @@ impl Default for SampleOpts {
 ///   传空切片即跳过惩罚。
 pub fn sample_token(logits: &[f32], opts: &SampleOpts, recent: &[usize], rng: &mut Rng) -> usize {
     let (ids, probs) = probs_from_logits(logits, opts, recent);
+    ids[pick_index(&probs, rng)]
+}
+
+/// 按概率（已归一化、降序）抽一个下标。**采样行为全在这里**：
+/// 先抽一个均匀数、再顺序减去累积概率；落在最后一个区间之外时取末项（浮点误差兜底）。
+fn pick_index(probs: &[f32], rng: &mut Rng) -> usize {
     let mut u = rng.next_f32();
     for (i, p) in probs.iter().enumerate() {
         if u < *p {
-            return ids[i];
+            return i;
         }
         u -= p;
     }
-    ids.last().copied().unwrap_or(0)
+    probs.len().saturating_sub(1)
+}
+
+/// 一步采样的对数概率记录（对应 OpenAI 响应的 `logprobs.content[i]`）。
+#[derive(Clone, Debug)]
+pub struct StepLogprobs {
+    /// 采样到的 token id
+    pub token: usize,
+    /// 它的对数概率（恒 ≤ 0）
+    pub logprob: f32,
+    /// top-k 备选（按概率降序；含被采样者本身）
+    pub top: Vec<(usize, f32)>,
+}
+
+/// 与 [`sample_token`] **同一套预处理**，但额外返回采样值的 logprob 与 top-k 备选。
+///
+/// 两条路径共用 [`probs_from_logits`]，所以打开 logprobs 不会改变生成结果
+/// （同一 seed 下与不记录时逐 token 相同）。
+pub fn sample_token_with_logprobs(
+    logits: &[f32],
+    opts: &SampleOpts,
+    recent: &[usize],
+    rng: &mut Rng,
+    top_k: usize,
+) -> (usize, StepLogprobs) {
+    let (ids, probs) = probs_from_logits(logits, opts, recent);
+    let idx = pick_index(&probs, rng);
+    let token = ids[idx];
+    let top = ids
+        .iter()
+        .zip(&probs)
+        .take(top_k.max(1))
+        .map(|(&id, &p)| (id, p.max(1e-30).ln()))
+        .collect();
+    (
+        token,
+        StepLogprobs {
+            token,
+            logprob: probs[idx].max(1e-30).ln(),
+            top,
+        },
+    )
 }
 
 /// 把一行 logits 变成「候选 token + 归一化概率」，即采样流程的全部预处理：
@@ -137,6 +196,27 @@ pub fn probs_from_logits(
                 } else {
                     *l * opts.repetition_penalty
                 };
+            }
+        }
+    }
+
+    // 2. 两项**加性**惩罚（OpenAI 语义）：presence 出现过就减常数、frequency 按次数线性减。
+    //    只看 `recent`（回看窗口），不是全历史 —— 这点与 OpenAI 有差异，属于资源换语义。
+    //    每个 token 只处理一次（`seen` 去重），从而**与遍历顺序无关**，保证可复现。
+    if opts.presence_penalty != 0.0 || opts.frequency_penalty != 0.0 {
+        // 先按窗口计频（整数计数，顺序无关）
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &id in recent {
+            *counts.entry(id).or_insert(0) += 1;
+        }
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &id in recent {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(l) = penalized.get_mut(id) {
+                *l -= opts.presence_penalty;
+                *l -= opts.frequency_penalty * counts[&id] as f32;
             }
         }
     }
@@ -274,7 +354,7 @@ pub fn generate(
 /// 2. 停止标记可能**横跨两次采样**（这次 decode 出「用户」，下次补上「：」），
 ///    已发出的字节必须保证不超过标记的起始位置。
 ///
-/// 因此 [`Generator::next_text`] 按 [`safe_len`] 扣掉"尾部空白 + 停止标记的真前缀"再发，
+/// 因此 `Generator::next_text` 按 `safe_len` 扣掉"尾部空白 + 停止标记的真前缀"再发，
 /// 被扣住的部分在收尾时由 [`Generator::flush`] 随最终结果一次性补齐（此刻结果已定，不再变动）。
 pub struct Generator<'m, 'r> {
     model: &'m Transformer,
@@ -303,6 +383,16 @@ pub struct Generator<'m, 'r> {
     image: Option<ImageTokens>,
     /// 图内状态机：`None` = 图外，`Some(n)` = 图内已采 n 个码本 token（n < P）
     img_seg: Option<usize>,
+    /// `Some` = 开启 JSON 约束解码（值是"已输出字节"的前缀自动机）
+    json: Option<crate::json_constraint::JsonPrefix>,
+    /// char 分词器没有 `vocab_bytes`，这里按 token 解码建一份字节表（BPE 直接借原表）
+    json_vocab: Vec<Vec<u8>>,
+    /// 是否记录每步 logprobs
+    lp_enabled: bool,
+    /// 需要的 top-k 备选数（`0` = 只记采样值本身）
+    lp_topk: usize,
+    /// 已记录的逐步 logprobs（仅 `lp_topk > 0` 时非空）
+    lp: Vec<StepLogprobs>,
     /// 图片理解的输入像素（CHW、[-1,1]、按 `vision.image_size` 加载）。
     /// 只在**带 KV cache 的首步（prefill）**与**全量无 cache 模式**下注入——
     /// 增量步没有新图像（占位符的 K/V 已进缓存），传 None 即可
@@ -350,6 +440,11 @@ impl<'m, 'r> Generator<'m, 'r> {
             model,
             tokenizer,
             opts: *opts,
+            json: None,
+            json_vocab: Vec::new(),
+            lp_enabled: false,
+            lp_topk: 0,
+            lp: Vec::new(),
             eos: tokenizer.eos_id(),
             vocab_bytes: tokenizer.vocab_bytes(),
             ids,
@@ -368,7 +463,7 @@ impl<'m, 'r> Generator<'m, 'r> {
         }
     }
 
-    /// 注入图片理解的输入像素（须在**首次 [`step`] 之前**调用）。
+    /// 注入图片理解的输入像素（须在**首次 `step` 之前**调用）。
     ///
     /// prompt 必须含 `<|image|>`（展开为 P 个占位符，见 [`crate::tokenizer::IMAGE_LITERAL`]）：
     /// 前向时视觉塔的 patch 特征会原位覆写这些占位符（[`Transformer::forward_mm`]）。
@@ -380,7 +475,41 @@ impl<'m, 'r> Generator<'m, 'r> {
     /// 典型用法：把 system + 模板这段固定前缀的 K/V 缓存起来，每个请求 fork 一份交给它，
     /// 首次 `step()` 就只补"新增的那段"，省掉整段前缀的 prefill。
     /// 传进来的 cache 必须与 `ids` 的**前 N 个 token 完全对应**（`fork` 自同一份前缀）。
-    #[allow(dead_code)] // serve 侧接线在下一轮
+    #[allow(dead_code, reason = "前缀复用（C9）的入口：单测覆盖，serve 侧暂未接线")]
+    /// 开启 **JSON 约束解码**：每步把"会让 JSON 前缀非法"的 token 掩掉。
+    ///
+    /// 词表字节表：byte-level BPE 用分词器自带的 `vocab_bytes`（零拷贝）；
+    /// char 分词器按 token 解码建一份（词表很小）。
+    pub fn with_json_constraint(mut self) -> Self {
+        if self.vocab_bytes.is_none() {
+            let n = self.tokenizer.vocab_size();
+            self.json_vocab = (0..n)
+                .map(|id| self.tokenizer.decode(&[id]).into_bytes())
+                .collect();
+        }
+        self.json = Some(crate::json_constraint::JsonPrefix::new());
+        self
+    }
+
+    /// 当前 JSON 约束状态（未开启时为 `None`）
+    pub fn json_state(&self) -> Option<&crate::json_constraint::JsonPrefix> {
+        self.json.as_ref()
+    }
+
+    /// 记录每步 logprobs（`top_k` = 需要的 top-k 备选数；`0` 表示只要采样值本身）。
+    ///
+    /// 只影响"记录"，不改变采样：与 [`sample_token_with_logprobs`] 共用预处理。
+    pub fn with_logprobs(mut self, top_k: usize) -> Self {
+        self.lp_enabled = true;
+        self.lp_topk = top_k;
+        self
+    }
+
+    /// 已记录的逐步 logprobs（与生成段 token 一一对应）
+    pub fn logprobs(&self) -> &[StepLogprobs] {
+        &self.lp
+    }
+
     pub fn with_cache(mut self, cache: Vec<KVCache>) -> Self {
         self.cache = Some(cache);
         self
@@ -389,18 +518,16 @@ impl<'m, 'r> Generator<'m, 'r> {
     ///
     /// C9 的另一半：请求结束后把快照裁回 prompt 长度（`KVCache::rollback`）并缓存起来，
     /// 下次相同前缀的请求就能 `with_cache` 直接续写，跳过整段 prefill。
-    #[allow(dead_code)] // serve 侧接线在下一轮
     /// 把 KV 缓存**移出** Generator（`None` = 本就是全量模式）。
     ///
     /// 批处理调度器需要把多条序列的 cache 交给一次 `decode_batch`，而 `Generator` 借用着
     /// `&Transformer` / `&mut Rng`、没法长期存在 slot 里 —— 所以设计成"**线程持有 Generator、
     /// 只把 cache 搬出去**"：`take_cache` → 交给驱动线程批处理 → `put_cache` 放回。
-    #[allow(dead_code)] // 调度器接线在下一轮
     /// 批处理用：**稳态解码**时下一步要喂的 token 与绝对位置。
     ///
     /// 返回 `None` 表示这一步不该进批（首次 prefill、或 prefix 复用后的首步要补中段），
     /// 由调用方退回逐条 `step()`。
-    #[allow(dead_code)] // serve 侧接线在下一轮
+    #[allow(dead_code, reason = "批解码的稳态接口：单测覆盖，调度器暂未接线")]
     pub fn batch_feed(&self) -> Option<(usize, usize)> {
         if self.reason.is_some() {
             return None;
@@ -418,7 +545,7 @@ impl<'m, 'r> Generator<'m, 'r> {
     }
 
     /// 把批处理完的 cache 放回（与 [`Self::take_cache`] 配对）。
-    #[allow(dead_code)] // 调度器接线在下一轮
+    #[allow(dead_code, reason = "批解码后放回 cache：与 take_cache 配对，单测覆盖")]
     pub fn put_cache(&mut self, cache: Vec<KVCache>) {
         self.cache = Some(cache);
     }
@@ -567,6 +694,12 @@ impl<'m, 'r> Generator<'m, 'r> {
         if self.reason.is_some() {
             return false;
         }
+        // JSON 已完整：立即收尾（否则模型只能继续吐空白，白烧算力）
+        if self.json.as_ref().is_some_and(|s| s.is_complete()) {
+            self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..]);
+            self.reason = Some(StopReason::Eos);
+            return false;
+        }
         if self.remaining == 0 {
             self.generated = self.tokenizer.decode(&self.ids[self.n_prompt..]);
             self.reason = Some(StopReason::MaxNew);
@@ -579,7 +712,51 @@ impl<'m, 'r> Generator<'m, 'r> {
             let start = self.ids.len().saturating_sub(self.opts.repetition_window);
             &self.ids[start..]
         };
-        let next = sample_token(row, &self.opts, recent, self.rng);
+        // JSON 约束：掩码必须在**这里**做——批处理路径直接调 `step_row`（跳过 `logits_row`），
+        // 若放在 `logits_row` 里，批处理就完全绕过了约束。
+        let json_row;
+        let row: &[f32] = if let Some(st) = self.json.as_ref() {
+            let vocab: &[Vec<u8>] = match self.vocab_bytes {
+                Some(v) => v,
+                None => &self.json_vocab,
+            };
+            let allowed = crate::json_constraint::allowed_mask(vocab, st);
+            let mut v = row.to_vec();
+            for (i, ok) in allowed.iter().enumerate() {
+                if !ok && let Some(x) = v.get_mut(i) {
+                    *x = f32::NEG_INFINITY;
+                }
+            }
+            json_row = v;
+            &json_row[..]
+        } else {
+            row
+        };
+
+        let next = if self.lp_enabled {
+            // 需要记录：先把回看窗口拷出来（`recent` 借着 `self.ids`，不能与 `self.lp` 同时可变借用）
+            let recent_vec = recent.to_vec();
+            let (tok, rec) = sample_token_with_logprobs(
+                row,
+                &self.opts,
+                &recent_vec,
+                self.rng,
+                self.lp_topk.max(1),
+            );
+            self.lp.push(rec);
+            tok
+        } else {
+            sample_token(row, &self.opts, recent, self.rng)
+        };
+        if let Some(st) = self.json.as_mut() {
+            let vocab: &[Vec<u8>] = match self.vocab_bytes {
+                Some(v) => v,
+                None => &self.json_vocab,
+            };
+            if let Some(bytes) = vocab.get(next) {
+                let _ = st.feed(bytes); // 掩码保证这里必然成立；失败也不该中断生成
+            }
+        }
         self.ids.push(next);
         // 推进图内状态机：图外遇 start 进图，图内计数，遇 end 出图
         self.img_seg = advance_img_seg(self.img_seg, self.image, next);
@@ -1171,7 +1348,9 @@ mod tests {
             top_p: 0.9,
             repetition_penalty: 1.1,
             repetition_window: 64,
+            presence_penalty: 0.0,
             stop: &[],
+            frequency_penalty: 0.0,
         }
     }
 
@@ -1391,7 +1570,9 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: penalty,
             repetition_window: 8,
+            presence_penalty: 0.0,
             stop: &[],
+            frequency_penalty: 0.0,
         };
 
         // id=1 领先 id=2 一点点；惩罚 2.0 之后 4.0/2.0 = 2.0 < 3.9，id=2 反超
@@ -1684,6 +1865,240 @@ mod tests {
                 want[i],
                 "第 {i} 条序列的批处理输出与逐条不一致"
             );
+        }
+    }
+
+    /// 加性惩罚（presence / frequency）的语义：
+    ///
+    /// - presence：窗口内出现过就减一个常数（与次数无关）
+    /// - frequency：按出现次数线性减
+    ///
+    /// 两者都作用在**原始 logit** 上、在 temperature 之前，与 HuggingFace/OpenAI 的顺序一致。
+    #[test]
+    fn test_additive_penalties_lower_seen_tokens() {
+        // 三个候选：[9.0, 8.0, 7.0]，窗口里有 token 0（出现 2 次）与 token 1（1 次）
+        let logits = [9.0f32, 8.0, 7.0];
+        let recent = [0usize, 1, 0];
+        let base = SampleOpts {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            repetition_window: 64,
+            ..SampleOpts::default()
+        };
+        // 无惩罚：概率按 softmax(9,8,7) 排
+        let (ids0, p0) = probs_from_logits(&logits, &base, &recent);
+        assert_eq!(ids0[0], 0, "原始分布里 token 0 最高");
+
+        // presence=2：token0 与 token1 各减 2 → logits 变 (7, 6, 7)，token 2 反而并列最高
+        let presence = SampleOpts {
+            presence_penalty: 2.0,
+            ..base
+        };
+        let (ids1, p1) = probs_from_logits(&logits, &presence, &recent);
+        // presence 惩罚后 token 0 的概率必须比原来低（它与 token 2 并列最高，所以只比概率）
+        let prob_of = |ids: &[usize], p: &[f32], want: usize| -> f32 {
+            ids.iter()
+                .position(|&i| i == want)
+                .map(|k| p[k])
+                .unwrap_or(0.0)
+        };
+        let before0 = prob_of(&ids0, &p0, 0);
+        let after0 = prob_of(&ids1, &p1, 0);
+        assert!(
+            after0 < before0 - 0.05,
+            "presence 惩罚后 token 0 的概率必须明显下降（{after0} vs {before0}）"
+        );
+
+        // frequency=1：token0 减 2、token1 减 1 → (7, 7, 7) 三者并列
+        let freq = SampleOpts {
+            frequency_penalty: 1.0,
+            ..base
+        };
+        let (ids2, p2) = probs_from_logits(&logits, &freq, &recent);
+        assert_eq!(p2.len(), 3);
+        for p in &p2 {
+            assert!((p - 1.0 / 3.0).abs() < 1e-6, "三路应等概率，实际 {p}");
+        }
+        assert!(ids2.contains(&2));
+
+        // 空窗口 ⇒ 任何惩罚都不生效（无 token 可罚）
+        let (_, p3) = probs_from_logits(&logits, &presence, &[]);
+        assert_eq!(p3, p0, "空窗口时 presence 不应改变分布");
+    }
+
+    // ==================== 采样分布的边界 ====================
+
+    fn mk_opts(temperature: f32, top_k: usize, top_p: f32) -> SampleOpts {
+        SampleOpts {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty: 1.0,
+            repetition_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            stop: &[],
+        }
+    }
+
+    /// 概率分布的基本不变量：非负、和为 1、长度等于候选数。
+    fn assert_distribution(logits: &[f32], o: &SampleOpts, label: &str) {
+        let (ids, ps) = probs_from_logits(logits, o, &[]);
+        assert_eq!(ids.len(), ps.len(), "{label}: ids/probs 长度不一致");
+        assert!(!ids.is_empty(), "{label}: 候选集为空");
+        let sum: f32 = ps.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "{label}: 概率和 {sum} 不是 1");
+        assert!(
+            ps.iter().all(|p| p.is_finite() && *p >= 0.0),
+            "{label}: 出现负数/NaN"
+        );
+    }
+
+    /// 温度趋近 0：概率应几乎全压在 argmax 上（但不能是 NaN）。
+    #[test]
+    fn test_probs_low_temperature_concentrates_on_argmax() {
+        let logits = vec![0.0, 5.0, -3.0, 1.0];
+        let o = mk_opts(0.01, 0, 1.0);
+        let (ids, ps) = probs_from_logits(&logits, &o, &[]);
+        let top = ids[0];
+        assert_eq!(top, 1, "argmax 应是 id=1");
+        assert!(ps[0] > 0.999, "低温下 argmax 概率应接近 1，实际 {}", ps[0]);
+        assert_distribution(&logits, &o, "低温");
+    }
+
+    /// 高温 → 接近均匀分布（各 token 概率差应很小）。
+    #[test]
+    fn test_probs_high_temperature_approaches_uniform() {
+        let logits = vec![0.0, 1.0, -1.0, 0.5];
+        // T=1000：logit 极差 2 → 概率比 ≤ e^{0.002} ≈ 1.002，与均匀的偏差 ~1e-4，
+        // 足以判定"趋近均匀"又不会被浮点噪声卡住。
+        let o = mk_opts(1000.0, 0, 1.0);
+        let (_, ps) = probs_from_logits(&logits, &o, &[]);
+        let expect = 1.0 / logits.len() as f32;
+        for p in &ps {
+            assert!(
+                (p - expect).abs() < 1e-3,
+                "高温下应接近均匀 {expect}，实际 {p}"
+            );
+        }
+    }
+
+    /// 全等 logits → 严格均匀；且顺序不影响结果（确定性 tie-break）。
+    #[test]
+    fn test_probs_equal_logits_are_uniform_and_order_independent() {
+        let logits = vec![2.5; 6];
+        let o = mk_opts(1.0, 0, 1.0);
+        let (ids1, ps1) = probs_from_logits(&logits, &o, &[]);
+        let (ids2, ps2) = probs_from_logits(&logits, &o, &[]);
+        assert_eq!(ids1, ids2, "同样输入必须给出同样的候选顺序");
+        assert_eq!(ps1, ps2, "同样输入必须给出同样的概率（逐位）");
+        for p in &ps1 {
+            assert!((p - 1.0 / 6.0).abs() < 1e-6, "等概率应为 1/6，实际 {p}");
+        }
+    }
+
+    /// 极端 logit（±1e9）不能产生 NaN/inf：softmax 前必须减最大值。
+    #[test]
+    fn test_probs_extreme_logits_stay_finite() {
+        let logits = vec![1e9, -1e9, 0.0, 5e8];
+        let o = mk_opts(1.0, 0, 1.0);
+        assert_distribution(&logits, &o, "极值");
+        let (ids, ps) = probs_from_logits(&logits, &o, &[]);
+        assert_eq!(ids[0], 0, "最大值应是 id=0");
+        assert!(ps[0] > 0.99, "断层极值下最大概率应接近 1，实际 {}", ps[0]);
+    }
+
+    /// top_k 大于词表 + top_p=1：等价于不过滤（候选集覆盖全部 token）。
+    #[test]
+    fn test_probs_oversized_top_k_filters_nothing() {
+        let logits = vec![1.0, 2.0, 3.0];
+        let (ids, ps) = probs_from_logits(&logits, &mk_opts(1.0, 999, 1.0), &[]);
+        let mut got = ids.clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2], "top_k 超词表时不应丢候选");
+        assert_eq!(ps.len(), 3);
+    }
+
+    /// top_p 极小：只保留最高概率的那个 token（核采样至少保留 1 个候选）。
+    #[test]
+    fn test_probs_tiny_top_p_keeps_single_candidate() {
+        let logits = vec![0.0, 4.0, 1.0];
+        let (ids, ps) = probs_from_logits(&logits, &mk_opts(1.0, 0, 1e-6), &[]);
+        assert_eq!(ids, vec![1], "核采样必须至少保留 argmax");
+        assert!((ps[0] - 1.0).abs() < 1e-6, "只剩一个候选时概率应为 1");
+    }
+
+    /// 回看窗口为空时，重复惩罚/加性惩罚都不应改变分布（逐位相同）。
+    #[test]
+    fn test_probs_empty_window_is_noop_for_penalties() {
+        let logits = vec![0.5, -1.5, 3.0, 2.0];
+        let plain = probs_from_logits(&logits, &mk_opts(1.0, 0, 1.0), &[]);
+        let mut penalized_opts = mk_opts(1.0, 0, 1.0);
+        penalized_opts.repetition_penalty = 2.0;
+        penalized_opts.presence_penalty = 1.5;
+        penalized_opts.frequency_penalty = 1.0;
+        let penalized = probs_from_logits(&logits, &penalized_opts, &[]);
+        assert_eq!(
+            plain, penalized,
+            "窗口为空（recent=[]）时惩罚没有作用对象，分布必须逐位不变"
+        );
+    }
+
+    // ==================== logprobs ====================
+
+    /// 记录到的 logprob 必须等于该 token 概率的自然对数，且 top 按概率降序、
+    /// 首项就是被采样者（`probs_from_logits` 的返回值本来就是降序）。
+    #[test]
+    fn test_sample_with_logprobs_matches_distribution() {
+        let opts = SampleOpts {
+            temperature: 1.0,
+            ..SampleOpts::default()
+        };
+        let logits = vec![2.0, 1.0, 0.5, 0.0];
+        let mut rng = Rng::new(9);
+        let (tok, rec) = sample_token_with_logprobs(&logits, &opts, &[], &mut rng, 4);
+
+        let (ids, probs) = probs_from_logits(&logits, &opts, &[]);
+        let pos = ids
+            .iter()
+            .position(|&i| i == tok)
+            .expect("采样值应在候选里");
+        assert!(
+            (rec.logprob - probs[pos].ln()).abs() < 1e-6,
+            "logprob 应为 ln(p)：{} vs {}",
+            rec.logprob,
+            probs[pos].ln()
+        );
+        assert!(rec.logprob <= 0.0, "概率 ≤ 1，logprob 必须 ≤ 0");
+        assert_eq!(rec.token, tok);
+        // 候选数受 top-k/top-p 过滤限制，不可能超过候选集的长度
+        assert_eq!(
+            rec.top.len(),
+            probs.len().min(4),
+            "备选数应为 min(候选数, top_k)"
+        );
+        assert_eq!(rec.top[0].0, ids[0], "top 首项应是概率最高的 token");
+        for w in rec.top.windows(2) {
+            assert!(w[0].1 >= w[1].1, "top 必须按 logprob 降序");
+        }
+    }
+
+    /// 打开 logprobs 不改变生成结果：同种子下与不记录时逐 token 相同。
+    #[test]
+    fn test_logprobs_do_not_change_sampling() {
+        let opts = SampleOpts {
+            temperature: 1.0,
+            ..SampleOpts::default()
+        };
+        let logits = vec![1.5, 0.5, -0.5, 2.0];
+        let mut a = Rng::new(11);
+        let mut b = Rng::new(11);
+        for _ in 0..20 {
+            let plain = sample_token(&logits, &opts, &[], &mut a);
+            let (logged, _) = sample_token_with_logprobs(&logits, &opts, &[], &mut b, 3);
+            assert_eq!(plain, logged, "记录 logprobs 不应改变采样结果");
         }
     }
 }

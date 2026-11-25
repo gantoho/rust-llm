@@ -31,7 +31,11 @@ src/train.rs    第一步打印 dispatch 分解、结尾打印稳态与「matmul
 ```
 
 - `--features gpu` 开启；**默认零 GPU 依赖**，构建轻量。
-- 初始化用 `OnceLock<Option<GpuContext>>`：失败静默置 `None`，之后全部走 CPU。
+- 初始化用 `OnceLock<Option<GpuContext>>`：失败置 `None`，之后全部走 CPU；
+  **失败原因不再被吞掉**——`create()` 返回 `Result`，`gpu::unavailable_reason()` 可查
+  （无适配器 / `request_device` 失败 / 设备上限过小各有一条可读原因）。
+- 诊断锁与缓存锁统一走 `src/syncutil.rs::lock()`：**锁中毒免疫**，一个线程 panic
+  不会让后续所有 GPU 调用跟着 panic。
 - 适配器按 `DiscreteGpu` 优先挑选（本机枚举到 Intel UHD 620 / MX150 / Basic Render Driver，选中 MX150）。
 
 ---

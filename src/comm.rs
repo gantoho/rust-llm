@@ -199,7 +199,7 @@ impl Comm {
     /// 全量拷贝 —— all-reduce 每步 2 GB 量级时，那是一次实打实的 memcpy。
     fn send_frame(&self, dst: usize, group: u32, data: &[f32]) {
         assert!(dst < self.world && dst != self.rank, "非法发送目标 {dst}");
-        let n_bytes = data.len() * std::mem::size_of::<f32>();
+        let n_bytes = std::mem::size_of_val(data);
         assert!(n_bytes <= u32::MAX as usize, "单帧超过 4GiB");
         let mut buf = Vec::with_capacity(HEADER_LEN + n_bytes);
         buf.extend_from_slice(&group.to_be_bytes());
@@ -353,7 +353,7 @@ impl CommGroup<'_> {
     /// 求和 allreduce，返回完整结果，组内各 rank 逐位相同。
     ///
     /// 与 `World::all_reduce_sum` 同构的两阶段环形：
-    /// reduce-scatter（n-1 轮）→ all-gather（n-1 轮）→ [`rotate_chunks`] 块序换算。
+    /// reduce-scatter（n-1 轮）→ all-gather（n-1 轮）→ `rotate_chunks` 块序换算。
     /// 每 rank 总流量 ≈ `2(n-1)/n · len`，与组大小几乎无关。
     pub fn all_reduce_sum(&self, local: &[f32]) -> Vec<f32> {
         let n = self.members.len();
@@ -711,7 +711,6 @@ mod tests {
         let (n, base) = (cfg.world_size(), 47351u16);
         let hs: Vec<_> = (0..n)
             .map(|r| {
-                let cfg = cfg;
                 thread::spawn(move || {
                     let rt = DistRuntime {
                         comm: Comm::new(r, n, "127.0.0.1", base),

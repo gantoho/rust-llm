@@ -7,6 +7,9 @@ edition = "2024"
 # 默认不启用 GPU，保持构建轻量；cargo run --features gpu 时开启 wgpu 加速
 default = []
 gpu = ["dep:wgpu", "dep:pollster"]
+# 图像 IO（PNG/JPEG 编解码、缩放）：只有 VLM 训练 / 生成图片 / serve 的图片输入才需要。
+# 默认关闭 ⇒ 纯文本路径的依赖树里完全没有 image。
+vision-io = ["dep:image"]
 
 [dependencies]
 # 仅用工具库做配置/命令行/序列化；深度学习算法全部为纯手写实现
@@ -17,21 +20,13 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 # `serve` 子命令的 HTTP 服务：同步阻塞模型（一个连接一个线程），API 面小、零异步运行时
 tiny_http = "0.12"
-# 图像编解码/缩放（PNG/JPEG 读写与双线性 resize 属于 IO 工具库，模型与训练算法仍为纯手写）
-image = "0.25"
+# 图像编解码/缩放（PNG/JPEG 读写与双线性 resize 属于 IO 工具库，模型与训练算法仍为纯手写）。
+# 可选：只有 `vision-io` 特性才引入，纯文本构建不装它。
+image = { version = "0.25", optional = true }
 # 可选：GPU 加速（wgpu 计算着色器，支持 NVIDIA / Intel 核显，Windows 走 DX12/Vulkan）
 wgpu = { version = "30", optional = true }
 # wgpu 的异步初始化需要事件循环，pollster 提供最简单的同步阻塞工具（零依赖）
 pollster = { version = "0.4", optional = true }
-
-[target.'cfg(windows)'.dependencies]
-# 仅用于把 Windows 控制台切到 UTF-8（避免中文输出乱码），
-# 以及用 GetLocalTime 取本地时间作为运行日志的时间戳（Windows 文件名不允许 ':')
-windows-sys = { version = "0.59", features = [
-    "Win32_System_Console",
-    "Win32_System_SystemInformation",
-    "Win32_Foundation",
-] }
 
 [profile.release]
 # 训练热路径全在数学算子里，跨 crate 内联（LTO）+ 单 codegen 单元能再挤出几个百分点。

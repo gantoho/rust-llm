@@ -688,4 +688,94 @@ mod tests {
         assert_eq!(m2v, &m[..], "一阶动量未恢复");
         assert_eq!(v2v, &v[..], "二阶动量（占位）未恢复");
     }
+
+    // ==================== SGD / AdamW / 梯度裁剪 ====================
+
+    /// 建一个单元素参数，并写入指定梯度。
+    fn one_param(v: f32, g: f32) -> Tensor {
+        let t = Tensor::from_vec(vec![v], vec![1]);
+        // `from_vec` 默认 requires_grad=false；优化器会跳过冻结参数，这里必须显式打开
+        t.set_requires_grad(true);
+        *t.grad.borrow_mut() = vec![g];
+        t
+    }
+
+    /// SGD：一步后 `p -= lr * g`。
+    #[test]
+    fn test_sgd_step_subtracts_lr_times_grad() {
+        let p = one_param(1.0, 2.0);
+        let mut opt = SGD::new(0.1, vec![p.clone()]);
+        opt.step();
+        assert!(
+            (p.data()[0] - 0.8).abs() < 1e-6,
+            "SGD 一步应为 1.0 - 0.1*2 = 0.8，实际 {}",
+            p.data()[0]
+        );
+    }
+
+    /// AdamW 首步：偏置校正后更新量约为 `lr`（与梯度大小无关，只要非零）。
+    #[test]
+    fn test_adamw_first_step_magnitude_is_lr() {
+        let p = one_param(1.0, 5.0);
+        let mut opt = AdamW::new(0.1, vec![p.clone()], 0.0);
+        opt.step();
+        let moved = 1.0 - p.data()[0];
+        assert!(
+            (moved - 0.1).abs() < 2e-2,
+            "AdamW 首步应约等于 lr=0.1（偏置校正），实际移动 {moved}"
+        );
+    }
+
+    /// AdamW 的权重衰减是**解耦**的：梯度为 0 时参数仍按 `lr*wd` 收缩。
+    #[test]
+    fn test_adamw_decoupled_weight_decay_applies_with_zero_grad() {
+        let p = one_param(1.0, 0.0);
+        let mut opt = AdamW::new(0.1, vec![p.clone()], 0.1);
+        opt.step();
+        // 预期 1.0 - lr*wd*p = 0.99
+        assert!(
+            (p.data()[0] - 0.99).abs() < 5e-3,
+            "梯度为 0 时仍应衰减到 ~0.99，实际 {}",
+            p.data()[0]
+        );
+    }
+
+    /// 梯度裁剪：把范数压到 max_norm 以内（含多参数）。
+    #[test]
+    fn test_clip_grad_norm_bounds_norm() {
+        let a = one_param(0.0, 100.0);
+        let b = one_param(0.0, 100.0);
+        crate::train::clip_grad_norm(&[a.clone(), b.clone()], 1.0);
+        let norm = (a.grad()[0].powi(2) + b.grad()[0].powi(2)).sqrt();
+        assert!(norm <= 1.0 + 1e-5, "裁剪后范数应 <= 1，实际 {norm}");
+        // 方向不变：两个梯度仍相等
+        assert!((a.grad()[0] - b.grad()[0]).abs() < 1e-6);
+    }
+
+    /// state/restore 往返：恢复后继续一步，结果必须与"没快照过"的那个优化器一致。
+    #[test]
+    fn test_adamw_state_restore_continues_identically() {
+        let p1 = one_param(1.0, 1.0);
+        let mut opt1 = AdamW::new(0.1, vec![p1.clone()], 0.0);
+        opt1.step();
+        let (t, m, v) = opt1.state();
+        let snapshot = (t, m.to_vec(), v.to_vec());
+
+        // 两个优化器从同一状态出发，各走一步
+        let p2 = Tensor::from_vec(p1.data(), vec![1]);
+        p2.set_requires_grad(true);
+        *p2.grad.borrow_mut() = vec![1.0];
+        let mut opt2 = AdamW::new(0.1, vec![p2.clone()], 0.0);
+        opt2.restore_state(snapshot.0, snapshot.1.clone(), snapshot.2.clone());
+
+        *p1.grad.borrow_mut() = vec![1.0];
+        opt1.step();
+        opt2.step();
+        assert!(
+            (p1.data()[0] - p2.data()[0]).abs() < 1e-6,
+            "恢复 state 后的一步应与原优化器一致：{} vs {}",
+            p1.data()[0],
+            p2.data()[0]
+        );
+    }
 }

@@ -178,7 +178,10 @@ impl RopeSpec {
     ///
     /// 唯一的调用方是 GPU 常驻注意力路径（`model.rs` 的 `attn_resident`），
     /// 不编 `gpu` feature 时它就是一段没人调用的守卫。
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "唯一调用方是 gpu 常驻注意力路径的守卫")
+    )]
     pub fn is_plain(&self) -> bool {
         self.scaling == RopeScaling::None
             && self.base == ROPE_BASE
@@ -515,7 +518,7 @@ impl Tensor {
     ///
     /// 输入：`[rows, D]`（`D` 必须是 `head_dim` 的整数倍），`positions` 长度 = rows。
     /// `head_dim` 是**单个头**的宽度；`D` 可以是多个头拼接（每 `head_dim` 个元素
-    /// 重复使用同一套头内角度，见 [`rotate_with_tab`]）。
+    /// 重复使用同一套头内角度，见 `rotate_with_tab`）。
     ///
     /// 前向（每对 a, b → a', b'）：
     /// ```text
@@ -531,7 +534,13 @@ impl Tensor {
     /// ```
     /// 频率表由 `spec` 决定：`scaling = None` 时就是原版 RoPE，其余见 [`RopeScaling`]。
     /// 生产代码（attention）用 [`Self::rotary_pair`] 一次旋转 Q/K。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "rotary 是 f32 参考实现；生产走 rotary_pair，单测对拍"
+        )
+    )]
     pub fn rotary(&self, positions: &[usize], head_dim: usize, spec: &RopeSpec) -> Tensor {
         assert_eq!(self.rank(), 2, "rotary 输入应为 [rows, D]");
         assert_eq!(self.shape[0], positions.len(), "positions 数量必须等于行数");
@@ -550,7 +559,7 @@ impl Tensor {
     /// `head_dim` 由调用方给出（两侧必须相同），**允许 Q/K 的总宽不同**：
     /// GQA 下 `n_kv_head < n_head`，K 只有 `n_kv_head·head_dim` 宽；MLA 的 latent
     /// 升维同理。只要角度只由头内下标决定，两种宽度就能共用同一张表——
-    /// 这正是 [`rotate_with_tab`] 的逐头重复写法要保证的事。
+    /// 这正是 `rotate_with_tab` 的逐头重复写法要保证的事。
     pub fn rotary_pair(
         &self,
         other: &Tensor,

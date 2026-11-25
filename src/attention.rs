@@ -539,7 +539,7 @@ pub struct MultiHeadAttention {
     /// K 侧的 QK-Norm（GQA 下 `gamma` 长度仍是 `head_dim`，各 KV 头共用一套参数）。
     pub k_norm: Option<RMSNorm>,
     /// **CSA + HCA 混合注意力开关**（第 49 课）。`block < 2` = 关闭（默认，走 `flash_attention`，
-    /// **逐位不变**）。纯数据、不构造参数，由 [`crate::model::TransformerBlock::new`] 按配置写入。
+    /// **逐位不变**）。纯数据、不构造参数，由 `crate::model::TransformerBlock::new` 按配置写入。
     ///
     /// 只在**无 KV cache 的全量前向**（训练 / 预填）生效；带 cache 的逐步解码回退原路径。
     pub csa: crate::csa::CsaOpts,
@@ -781,6 +781,7 @@ impl MultiHeadAttention {
         };
 
         // 4-8. 拆头 → 注意力 → 合并头 → 输出投影
+
         self.attend(&q, &k, &v, mask, b, t, use_csa)
     }
 
@@ -1441,7 +1442,10 @@ pub fn absorbed_mla_macs(t: usize, n_head: usize, hd_nope: usize, r: usize) -> u
 ///
 /// 唯一调用点在 `model.rs` 的 `#[cfg(feature = "gpu")]` 函数里，
 /// 不带 gpu feature 编译时它是"死代码"——这不是真死代码，别删（单测也在用它）。
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "gpu"),
+    allow(dead_code, reason = "唯一调用点在 model.rs 的 gpu 常驻分支与单测里")
+)]
 pub(crate) fn expand_kv_head(
     src: &[f32],
     rows: usize,
@@ -1468,7 +1472,13 @@ pub(crate) fn expand_kv_head(
 /// 对应 `crate::tensor::fold_repeat_grad` 反向「把 n_rep 个副本的梯度求和回原始头」。
 /// 数学上与「先求和再乘」是同一个结果：展开空间里 `dWk[:, hh] = xnᵀ·dk_pre'[:, hh]`，
 /// 按 `hh / n_rep` 分组相加后正是 `xnᵀ·(Σ_r dk_pre'[:, …])`，也就是未展开时的 `dWk`。
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "gpu"),
+    allow(
+        dead_code,
+        reason = "与 expand_kv_head 配对：K/V 展开后的梯度折叠，gpu 分支与单测用"
+    )
+)]
 pub(crate) fn fold_kv_head_grad(
     g: &[f32],
     rows: usize,
@@ -2315,5 +2325,55 @@ mod tests {
             mla_cache_bytes_per_token(r, n_head, hd_rope) * t,
             "解析账本必须与实测缓存字节一致"
         );
+    }
+
+    /// rollback：截断必须精确（行数、绝对位置、内容），且之后能继续追加。
+    ///
+    /// 注意 `rollback` 的契约是**不允许超额**（超额说明调用方算错了位置，属于 bug，
+    /// 见下一条测试），所以这里只回滚实际存在的行数。
+    #[test]
+    fn test_kv_cache_rollback_truncates_exactly() {
+        let mut cache = KVCache::with_window(0);
+        let row = |i: usize| Tensor::from_vec(vec![i as f32, i as f32 + 0.5], vec![1, 1, 2]);
+        for i in 0..5 {
+            cache.append(&row(i), &row(i));
+        }
+        assert_eq!(cache.seq_len(), 5);
+
+        cache.rollback(3);
+        assert_eq!(cache.seq_len(), 2, "回滚 3 行后应剩 2 行");
+        assert_eq!(cache.positions_seen(), 2, "绝对位置也要跟着回退");
+        assert_eq!(cache.k().data(), vec![0.0, 0.5, 1.0, 1.5]);
+
+        cache.rollback(2);
+        assert_eq!(cache.seq_len(), 0, "回滚到空");
+        assert_eq!(cache.positions_seen(), 0);
+
+        // 回滚后还能继续追加，位置从 0 重新开始
+        cache.append(&row(7), &row(7));
+        assert_eq!(cache.seq_len(), 1);
+        assert_eq!(cache.positions(), vec![0]);
+    }
+
+    /// 超额回滚必须是**显式 panic**：位置算错时要立刻暴露，而不是静默夹到 0。
+    #[test]
+    #[should_panic(expected = "超过缓存里的")]
+    fn test_kv_cache_rollback_over_length_panics() {
+        let mut cache = KVCache::with_window(0);
+        let row = Tensor::from_vec(vec![0.0, 0.5], vec![1, 1, 2]);
+        cache.append(&row, &row);
+        cache.append(&row, &row);
+        cache.rollback(3); // 只有 2 行，超额 → 应 panic
+    }
+
+    /// 空缓存上做回滚/取位置不应 panic（首步 prefill 前后的边界）。
+    #[test]
+    fn test_kv_cache_empty_edges() {
+        let mut cache = KVCache::with_window(4);
+        assert_eq!(cache.seq_len(), 0);
+        assert!(cache.positions().is_empty());
+        cache.rollback(0); // 只允许回滚"存在的那部分"
+        assert_eq!(cache.seq_len(), 0);
+        assert_eq!(cache.positions_seen(), 0);
     }
 }

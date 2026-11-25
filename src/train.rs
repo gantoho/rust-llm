@@ -100,7 +100,7 @@ impl MixedPrecision {
     /// 单进程下这就是全部逻辑；**多进程请拆成 [`Self::detect_overflow`] +
     /// [`Self::note_overflow`]**，中间插入跨 DP 的标志汇总（见那两个方法的说明）。
     /// 训练循环走的正是拆分后的那三步，这一条只作为"等价形式"留给单测与外部调用。
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "拆分三步式训练循环的等价形式：单测与外部调用用")]
     pub fn check_and_update(&mut self, params: &[Tensor]) -> bool {
         let overflow = self.detect_overflow(params);
         self.note_overflow(overflow)
@@ -1016,13 +1016,24 @@ pub fn train_transformer(
                 // 否则最后一次评估会从日志里消失，且 latest.ckpt 停留在上一次评估
                 //（断点续训会拿到落后一个 eval 周期的过期权重）。真正 break 在块末尾。
                 if let (Some(dir), true) = (out_dir, primary) {
-                    checkpoint::save(
-                        &format!("{dir}/latest.ckpt"),
-                        model,
-                        &*opt,
-                        step + 1,
-                        best_val_loss,
-                    );
+                    if model.has_lora() {
+                        // LoRA：主干冻结 ⇒ 动量只对应"永远不更新"的参数，写进存档纯属浪费（3× → 1×）。
+                        // 代价：续训时 Adam 从零动量起步（对短程微调影响可忽略，长程请改回 save）。
+                        checkpoint::save_weights(
+                            &format!("{dir}/latest.ckpt"),
+                            model,
+                            step + 1,
+                            best_val_loss,
+                        );
+                    } else {
+                        checkpoint::save(
+                            &format!("{dir}/latest.ckpt"),
+                            model,
+                            &*opt,
+                            step + 1,
+                            best_val_loss,
+                        );
+                    }
                     if is_best && best_val_loss.is_finite() {
                         // 与 latest 内容完全相同（同一步、同一 best_val_loss）：
                         // 硬链接/复制，别再把 3× 参数量重新序列化一遍（见 checkpoint::link_or_copy）
@@ -1083,13 +1094,22 @@ pub fn train_transformer(
     // 多进程下只有 rank 0 写盘：N 个副本同时写同一个 ckpt 文件会互相覆盖，
     // 最坏情况落下一份"写了一半"的存档（连头都读不出来）。
     if let (Some(dir), true) = (out_dir, primary) {
-        checkpoint::save(
-            &format!("{dir}/final.ckpt"),
-            model,
-            &*opt,
-            last_step_done,
-            best_val_loss,
-        );
+        if model.has_lora() {
+            checkpoint::save_weights(
+                &format!("{dir}/final.ckpt"),
+                model,
+                last_step_done,
+                best_val_loss,
+            );
+        } else {
+            checkpoint::save(
+                &format!("{dir}/final.ckpt"),
+                model,
+                &*opt,
+                last_step_done,
+                best_val_loss,
+            );
+        }
         logln!(
             "[done] checkpoint 已保存到 {dir}/ | 总耗时 {:.0}s | {:.2}s/步（共 {} 步）",
             elapsed,

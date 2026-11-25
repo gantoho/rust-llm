@@ -3,7 +3,8 @@
 > **深度学习算法全部纯手写**：不使用任何深度学习框架（如 tch-rs / candle / burn），
 > 从零手写张量、自动微分、神经网络层、Transformer 架构。
 > 仅引入少量**工具库**（serde_json 做配置/序列化、clap 做命令行、tiny_http 起 HTTP 服务、
-> windows-sys 修控制台编码、rayon 做 CPU 并行、可选的 wgpu 做 GPU 计算后端），它们都不参与任何算法实现。
+> 自研 `src/winutil.rs` 手写 Windows FFI 修控制台编码、rayon 做 CPU 并行、可选的 wgpu 做 GPU 计算后端），
+> 它们都不参与任何算法实现。
 >
 > 每个实现步骤都配套一篇中文教程文档（见 `docs/`），边写代码边学原理。
 
@@ -14,7 +15,7 @@
 
 - **循序渐进**：按 [docs/00-学习计划.md](docs/00-学习计划.md) 划分 12 个阶段、50 课，从张量一路写到现代 LLM 架构，再到前沿技术（MoE、量化、RLHF、分布式训练等），工程化完善并部署成 API 服务，补齐多模态（图片理解 + 图片生成），最后补上训练侧的蒸馏、FP8/FP4 低精度，以及 WSD 学习率调度 / QK-Norm / Muon 优化器 / mHC 流形约束超连接 / CSA+HCA 混合注意力 / MLA 解耦 RoPE + 权重吸收这几项训练稳定性、表达能力与长序列效率改进。
 
-- **工程化完整**：23 个 CLI 子命令（train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling / moe / quant / distributed / align / rag / speculative / distill / fp8 / fp4 / csa / mla / import-hf）、
+- **工程化完整**：24 个 CLI 子命令（train / eval / generate / chat / serve / sft / finetune / preset / demo / bench / scaling / moe / quant / distributed / align / rag / speculative / distill / fp8 / fp4 / csa / mla / import-hf）、
   外部语料、train/val 划分、验证集评估与困惑度、checkpoint 保存/恢复、断点续训。
 - **性能可量化**：内置 `bench` 基准子命令，用固定小模型在秒级内测出训练/推理吞吐（tok/s），
   优化改动前后可同机对比（见 [§10 `bench`](#10-bench--性能基准) 与 [§15 GPU 加速](#15-gpu-加速可选-feature)）。
@@ -87,7 +88,7 @@
 
 | 主题 | 教程文档 | 内容 |
 |------|---------|------|
-| 工程化完善 | `docs/39-工程化完善.md` | 23 个 CLI 子命令（见下文「命令行完整参考」；`import-hf` 可直接导入 HuggingFace 权重）、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
+| 工程化完善 | `docs/39-工程化完善.md` | 24 个 CLI 子命令（见下文「命令行完整参考」；`import-hf` 可直接导入 HuggingFace 权重）、分词器序列化、预设配置、微调工作流、SFT 监督微调、交互式对话、Beam Search CLI、多文件数据加载、CSV 指标日志 |
 | 把模型部署成 API 服务 | `docs/40-把模型部署成API服务.md` | OpenAI 兼容 API（`chat/completions` 非流式 + SSE 流式、`models`、`embeddings`）、生成循环状态机化、断开可中断、API key 鉴权、CORS、请求日志与完整问答记录、`/v1/status` 队列状态、`/openapi.json` 接口规范（`serve` 启动自动写出 [`openapi/openapi.json`](openapi/openapi.json) / [`openapi/openapi.yaml`](openapi/openapi.yaml)）、`web/` 前端测试页随 serve 启动 |
 
 ### 多模态教程（第 41 课，代码+文档）
@@ -188,7 +189,7 @@ cargo run --release -- bench --steps 30
 
 ```
 llm_from_scratch/
-├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / tiny_http / image（仅编解码）/ windows-sys + 可选 wgpu / pollster
+├── Cargo.toml          # 依赖：serde / serde_json / clap / rayon / tiny_http（5 个，均为基础设 施）；可选 image（vision-io）/ wgpu + pollster（gpu）
 ├── README.md           # 本文件
 ├── .cargo/config.toml  # 编译配置：target-cpu=native（AVX2+FMA 向量化）+ /STACK:64MB（MSVC 主线程默认栈仅 1MB，debug 下 clap 解析超大子命令枚举会栈溢出）
 ├── config/             # 配置文件目录
@@ -527,6 +528,30 @@ llm_from_scratch/
 }
 ```
 
+
+**SFT 语料与验证集**（两步才能让微调真正有效）：
+
+1. **语料规模**：仓库自带对话只有 ~1.4 万字，切 10% 验证后每轮评估只覆盖 1.4k token，早停信号噪声极大。
+   `cargo run --release -- sft-gen --dialogues 4000`（纯 Rust 实现，仓库里**没有任何 Python 脚本**）会按"模板 + 槽位"生成 **4000 段合成对话（74 万 token）**
+   到 `data/sft/zh_synth_dialogue.txt` —— `sft_file` 里的 `data/sft/` 是目录，会自动收录，无需改配置。
+   ⚠️ 这是**合成语料**（非真实对话），只能教格式、领域词汇与基本话术；要真的提升对话质量仍需人工语料。
+2. **验证集口径**：`SftLoader` 自动把对话流**末尾 10%** 划作验证区（不是复用预训练的 val），
+   评估走同一套 SFT 掩码（只计回答段），所以 `best.ckpt` 是按"对话能力"选的。语料越大，这 10% 越有意义。
+
+实测（2.1M 模型 / 4000 步预训练 + 900 步 SFT，默认 CPU 构建）：
+
+| | 语料 1.4 万 token（原） | 语料 74 万 token（扩后） |
+|---|---|---|
+| SFT 语料 / 验证区 | 14,233 / 1,423 token | **738,796 / 73,880 token** |
+| best val loss | 6.6907 | **1.3694** |
+| 训练吞吐 | 7.2k tok/s（gpu 构建，含回落） | 5.1k tok/s（CPU 构建） |
+| 输出 | 泛泛而谈、几乎不贴题 | 能吃到领域词与话术（"请怎么称呼您""不客气，欢迎"），但**句子中段仍会乱** |
+
+> ⚠️ 最后一行说明：数据扩充把"学到格式"解决了，但**2.1M 参数的基座本身几乎不会说通顺的话**
+>（预训练 val 6.71 ≈ 困惑度 820）。要真的"会聊"，下一步不是继续加合成语料，而是换更大的基座
+>（例如 `--pretrained checkpoints/qwen05/model.ckpt --tokenizer checkpoints/qwen05/tokenizer.json`，0.5B）。
+
+**别用 `--features gpu` 的构建跑 SFT**：逐位置掩码会让 CPU 常驻输出头路径失效，实测比纯 CPU 更慢
 这是仓库里唯一自带、且**已经跑过完整训练**的配置：中文语料 + BPE 8192 词表 + 4000 步，
 产物落在 `checkpoints/zh/`。上面示例里的 `checkpoints/zh/...` 路径都对应它。
 
@@ -581,9 +606,9 @@ llm_from_scratch/
 > **GPU**（15 GPU 加速）、**性能**（16 优化记录）；最后是 [导入 HuggingFace 权重](#导入-huggingface-权重import-hf)。
 > 只想跑起来看效果，直接看 [§快速开始](#快速开始)。
 
-程序提供 23 个子命令：`train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` / `preset` / `demo` /
-`bench` / `scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative` / `distill` / `fp8` / `fp4` / `csa` / `mla` /
-`import-hf`（HuggingFace 权重导入，见 [导入 HuggingFace 权重](#导入-huggingface-权重import-hf)一节）。
+程序提供 24 个子命令：`train` / `eval` / `generate` / `chat` / `serve` / `sft` / `finetune` / `preset` / `demo` /
+`bench` / `scaling` / `moe` / `quant` / `distributed` / `align` / `rag` / `speculative` / `sft-gen` / `distill` /
+`fp8` / `fp4` / `csa` / `mla` / `import-hf`（HuggingFace 权重导入，见 [导入 HuggingFace 权重](#导入-huggingface-权重import-hf)一节）。
 
 ### 1. `train` —— 训练模型
 
@@ -1895,7 +1920,7 @@ cargo test -- --nocapture
 cargo test test_softmax -- --nocapture
 ```
 
-用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **430 个单元测试**
+用例数量**随代码增长，别把它当常量背**：以 `cargo test --features gpu -- --list` 为准，当前 **504 个单元测试 + 10 个 CLI 冒烟 + 8 个策略（依赖 4 / unsafe 1 / dead_code 1 / TODO 1 / 语言 1）+ 29 个 HTTP 集成（+1 ignored）+ 2 个 smoke**
 （另有 2 个集成冒烟测试 `tests/smoke.rs`：启动真实二进制跑 `--help` 与 `preset`），
 其中 `src/gpu.rs` 20 个（含 3 个 `#[ignore]` 的性能标定探针）；不带 `--features gpu` 时 410 个。
 零外部依赖；全量约十几分钟，开发中按名字过滤跑单模块通常只要几秒。GPU 用例会真实创建 wgpu 设备并逐个形状比对
@@ -2217,6 +2242,7 @@ loss 直接变 NaN，整轮实验作废。
 | `LLM_MM_NO_COLSPLIT` | 调试用：`1` = 关掉 dW 的"列分块补并行度"，回到只按行块并行（同进程 A/B 用） | 空 |
 | `LLM_MM_NO_PACKED` | 调试用：`1` = 关掉 dW 的"打包 + KC 归约分块"内核（`LLM_CPU_FMA=1` 下的快速路径），回到通用 axpy | 空 |
 | `LLM_MM_NO_BATCH_DECODE` | 调试用：`1` = 束搜索回到"每条路径各做一次前向"，用于对比批处理解码（输出应逐字相同） | 空 |
+| `LLM_SERVE_MAX_CONCURRENT` | `serve` 的并发上限：同时在跑的生成/编码请求超过它就回 **429**（`0` = 不限制）。每个在跑的请求独占一份 KV cache（0.5B/512 窗口约 12 MB），无上限时突发并发会打满内存 | `8` |
 | `LLM_QUANT_REPLAY` | `1` = 加载量化档时**按头部参数重放量化**（默认关：既有量化档语义是 f32），配合融合反量化 GEMV，int8 推理同时拿到"内存 1/4 + 更快" | 空 |
 | `LLM_GPU_MATMUL_MIN_FLOPS` | 覆盖分流阈值（FLOPs 低于它走 CPU） | `50000000` |
 | `LLM_GPU_MM_SMALL` | `0` = 强制 128×128 大 tile matmul 内核；其他值 = 64×64 小 tile | 小 tile（标定见 [§15.1](#151-gpu-matmul-内核从-128128-改到-6464)） |
@@ -2445,7 +2471,7 @@ no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输�
 
 ---
 
-#### 16.5 本轮批量优化（2026-11，35 项；未完成项见 [BACKLOG.md](BACKLOG.md)）
+#### 16.5 本轮批量优化（2026-11，35 项）
 
 | 优化 | 做法 | 实测 |
 |---|---|---|
@@ -2463,15 +2489,341 @@ no_grad 下不把反向闭包登进 tape——评估因此能走 GPU 常驻输�
 | 前缀 KV 复用（C9） | `serve` 侧缓存上次 prompt 的前 `n-1` 个 token 的 K/V；命中就 `fork + rollback` 交给 `Generator::with_cache`，跳过那段 prefill（判据必须是"首步 + 缓存非空 + 有增量"） | 同 prompt 二次请求 **301 → 93 ms（3.2×）**；长 system（466 token）**135 → 10 ms**；命中与不命中输出**逐字相同** |
 | 掩码与 bias 快路 | 因果掩码 thread-local 缓存（原来逐层重建）；`Tensor::binary` 按行广播快路 | 每步少建 24 张 `[t,t]` 掩码；bias 加法 **23.0 → 25.2 GB/s** |
 
+#### 16.7 serve 的 OpenAI 兼容性边界（实测口径）
+
+**已支持**：`messages`（system/history/user）、`stream`（SSE）、`max_tokens`（钳到上下文窗口）、
+`temperature` / `top_k` / `top_p` / `stop` / `seed` / `n=1` / `logprobs`、
+**`presence_penalty` / `frequency_penalty`**（见下）、`image_url`（配置了视觉塔时）。
+
+**两项惩罚的语义**：作用在**原始 logit** 上、temperature 之前；每个 token 只减一次 presence 与
+`frequency × 出现次数`，只看**回看窗口**（`repetition_window`）内的 token ——
+OpenAI 看全历史，这是有意的近似（窗口是可配的资源上限）。两者与乘法式的 `repetition_penalty`
+**可共存**：先乘后加。
+
+**并发与限流**：`LLM_SERVE_MAX_CONCURRENT`（缺省 8，0 = 不限）控制同时在跑的请求数，
+超限回 **429** `rate_limit_error`；每个在跑的请求独占一份 KV cache，无上限时突发并发会打满内存。
+`/v1/status` 暴露 `in_flight` / `max_concurrent` / `rejected` / `queued` / `running`。
+
+**已支持**：`max_completion_tokens`（`max_tokens` 的别名，两者只能给一个）、
+`logprobs` / `top_logprobs`（非流式；逐步返回对数概率与 top-k 备选）、
+`/v1/completions`（旧版文本补全端点，**裸续写**、不套对话模板）、
+`response_format: {"type":"json_object"}`（**JSON 约束解码**，见 §16.11i）。
+
+**显式 400 的字段**（语义敏感，静默忽略会让客户端误以为生效）：
+`tools` / `tool_choice` / `parallel_tool_calls`（function calling）、`logit_bias`（词表偏置）、
+`response_format.type = json_schema`（需要把 Schema 编译成语法，明确不做）。其余未知字段（`user`、`metadata` 等）仍然**静默忽略**，保证现成客户端可直连。
+
+**部分支持与边界**：`logprobs` 不支持流式（`stream=true` + `logprobs` → 400，避免"看起来对但不准"）；
+`/v1/completions` 一次只生成一个结果、不支持 `stream`/`logprobs`；`n > 1` 仍明确 400。
+#### 16.10 依赖边界与自研清单
+
+完整清单见 [`DEPENDENCIES.md`](DEPENDENCIES.md)。要点：
+
+- **算法全部自研**（张量/自动微分/注意力/训练/采样/量化/分词器，算法核心约 5.7 万行）；
+- 默认构建只剩 **5 个直接依赖**：`tiny_http`、`clap`、`serde`、`serde_json`、`rayon`
+  （`image` 仅在 `--features vision-io` 时引入，`wgpu`/`pollster` 仅在 `--features gpu` 时引入）；
+- 本轮已**移除 `windows-sys`**：`src/winutil.rs` 手写 2 个 Win32 符号（控制台 UTF-8、本地时间），
+  并带 `SYSTEMTIME` 16 字节布局测试；
+- **依赖边界**：只有参与"把输入变成输出"的数学计算才必须自研；HTTP、CLI、JSON、并行调度、
+  图像编解码都属于基础设施，**明确保留**用成熟库（决策记录见文档第四节）。
+- `image` 已做成**非默认特性** `vision-io`：默认构建的依赖树只剩 **5 个**（clap / rayon / serde /
+  serde_json / tiny_http），纯文本训练与推理完全不含图像依赖；VLM / 生成图片需
+  `--features vision-io`（未启用时相关入口给出可操作的错误，HTTP 侧回 400）。
+- **约束是机器校验的**：`tests/dependency_policy.rs` 会检查依赖白名单、禁止深度学习框架引用、
+  并限制算法模块只能引用 `std` + `rayon` + `serde*`——违反即测试失败。
+
+#### 16.11i `response_format: json_object` 的约束解码（2026-11）
+
+**做法**：`src/json_constraint.rs` 是一个自研的「已输出字节是否为合法 JSON 前缀」增量自动机
+（无第三方语法库），每步采样前把会破坏前缀的 token 掩成 `-inf`。
+因此输出**必然**是合法 JSON 前缀；正常收尾时就是完整合法 JSON。
+
+**自动机状态**（约 400 行含测试）：容器栈（`{}`/`[]`，定长数组防栈爆）、
+期待值 / 期待键 / 期待冒号 / 字符串（含 `\uXXXX` 转义）/ 数字（含前导零、`1.`、指数合法性）/
+字面量 `true|false|null` / 值之后 / 已完成。
+关键区分：`Value`（严格，用于 `:` 后）vs `ValueOrEnd`（`[` 后允许 `]`）、
+`Key`（严格，用于逗号后，拒绝 `{"a":1,}`）vs `KeyOrEnd`（`{` 后允许 `}`）。
+
+**接入点**：掩码放在 `Generator::step_row` 里而不是 `logits_row`——
+批处理路径直接调 `step_row`，放错地方约束会被完全绕过（开发时就是这样发现并修好的）。
+
+**收尾**：自动机一旦 `is_complete()`，`step_row` 直接以 `finish_reason=stop` 结束，
+不浪费算力继续吐空白。数字终态（`1`、`1.5`）用 `can_finish()` 单独判定：
+数字要看到"下一个字节"才知道结束，所以它在内部状态上不算 `Done`。
+
+**代价**：每步一次词表扫描（O(词表 × token 字节)）。char 小词表可忽略；
+15 万词表 BPE 每步约几毫秒，属该特性的固有成本（可后续加前缀树优化）。
+
+**测试**：自动机 5 条（合法/非法文档、前缀语义、掩码、键值推进）；
+serve 解析 1 条（`text`/`json_object`/`json_schema`/未知类型/缺 `type`）；
+HTTP 3 条（非流式输出是合法前缀、`stop` 时是完整 JSON、流式拼接也合法前缀）。
+
+#### 16.11h OpenAI 协议兼容性收口（2026-11）
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| `max_completion_tokens` | ✅ | `max_tokens` 别名；两个都给且不同值 → 400 |
+| `logprobs` / `top_logprobs` | ✅（非流式） | 采样器新增 `sample_token_with_logprobs`，与 `sample_token` **共用同一套预处理**，因此打开记录不改变生成结果（有逐 token 对照测试）；`top_logprobs` 上限 20 |
+| `/v1/completions` | ✅ | 复用 chat 的生成路径，只把模板覆盖为 `Template::Raw`（裸续写） |
+| `tools` / `tool_choice` / `parallel_tool_calls` | ❌ **明确不做** | 自带模型 ≤0.5B，工具调用准确率撑不起来；做了只是幻觉来源 |
+| `response_format`（JSON mode） | ❌ 不做 | 诚实实现需要约束解码（JSON 语法 × 词表前缀树）；只做事后校验等于撒谎 |
+| `logit_bias` | ❌ 不做 | 与自研采样器的惩罚项语义重叠，收益低 |
+
+**行为变更（重要）**：上面标 ❌ 的五个字段现在会返回 **400** 并说明不支持。
+之前是静默忽略——客户端拿到 200 却什么都没发生，比报错更危险。
+其余未知字段仍忽略（`user`、客户端自带统计字段等），否则会破坏"现成客户端直连"。
+
+#### 16.11g `/metrics`：Prometheus 抓取端点（2026-11）
+
+`GET /metrics`（**不鉴权**，与 `/v1/status` 一致）输出 Prometheus 文本格式（version 0.0.4）：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `llm_serve_requests_total{kind}` | counter | 累计请求数，`kind` ∈ `chat` / `stream` / `embeddings` / `errors` |
+| `llm_serve_in_flight` | gauge | 当前在跑（含 prefill / 编码）的请求数 |
+| `llm_serve_queued` / `llm_serve_running` | gauge | 排队数 / 已拿到模型快照在生成的数量 |
+| `llm_serve_max_concurrent` | gauge | 并发上限（0 = 不限） |
+| `llm_serve_rejected_total` | counter | 因并发上限被拒（429）的累计数 |
+| `llm_serve_uptime_seconds` | gauge | 已运行秒数 |
+| `llm_serve_model_info{model,block_size}` | gauge | 模型元信息，值恒为 1（便于 join） |
+
+抓取配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: llm
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+已登记进 OpenAPI（`/metrics` 的 `get`），并由 `test_routes_match_openapi` 强制"路由表 ↔ 文档"一致；
+`dump_openapi_files_writes_both_formats` 里的路径条数也改成与 `ROUTES.len()` 对齐，不再写死。
+
+#### 16.11f `#[ignore]` 清单（13 条，为什么要手动跑）
+
+这些用例不进默认 `cargo test`：它们要么是**性能探针**（依赖机器状态、耗时随硬件变化），
+要么需要**特定环境**。用 `--ignored` 按需运行。
+
+| 测试 | 类型 | 运行方式 |
+|---|---|---|
+| `checkpoint::tests::probe_load_speed` | 存档加载带宽探针 | `cargo test --release checkpoint::tests::probe_load_speed -- --ignored --nocapture` |
+| `model::tests::probe_decode_batch_speed` | 批解码吞吐 | 同上，替换测试名 |
+| `model::tests::probe_decode_bf16_speed` | bf16 解码速度（需 `checkpoints/qwen05`） | 同上 |
+| `model::tests::probe_decode_bytes_per_token` | 每 token 权重流量 | 同上 |
+| `model::tests::probe_decode_shape_profile` | 解码期各形状耗时直方图 | 同上 |
+| `quant::gemv_bit_exact_tests::probe_gemv_speed` | 量化 GEMV 速度 | 同上 |
+| `tensor::tests::probe_bf16_decode_bandwidth` | 内存带宽（判断机器状态） | 同上 |
+| `tensor::tests::probe_bias_add_speed` | bias+add 融合速度 | 同上 |
+| `tensor::tests::probe_matmul_colsplit_speed` | 列切分 matmul | 同上 |
+| `tensor::tests::probe_matmul_fma_speed` | FMA 内核 vs 基线 | 同上（建议 `LLM_CPU_FMA=1`） |
+| `tensor::tests::probe_matmul_packed_speed` | 打包 dW 内核 | 同上 |
+| `tokenizer::tests::probe_bpe_encode_speed` | BPE 编码速度 | 同上 |
+| `serve_http` 的 `http_concurrency_cap_returns_429` | 并发上限的 HTTP 端到端 | `cargo test --release --test serve_http -- --ignored --nocapture` |
+
+> 最后一条是**自诊断**的：如果没能在两个连接间制造出重叠（首个流式请求已结束），它会打印
+> "跳过"并正常返回；429 的逻辑由 `serve::tests::test_permit_cap_is_hard_and_never_exceeded` 兜底。
+
+#### 16.11e OpenAPI 补齐 413 / 429，并加断言防再漏
+
+实现会返回 **413**（请求体 > 16 MiB）与 **429**（并发上限），但 OpenAPI 里原先**一条都没有**——
+客户端按文档写重试逻辑时会漏掉限流。本轮补上：
+
+- `components.responses` 增加 `PayloadTooLarge` / `RateLimited`；
+- `/v1/chat/completions` 与 `/v1/embeddings` 的 `post.responses` 声明 `413` / `429`；
+- 新增 `openapi_documents_payload_and_rate_limits` 断言这两条路径必须声明它们，
+  且组件定义存在（否则 `$ref` 解析不到）。
+
+> 仓库里**没有** `/metrics` 端点（状态信息都在不鉴权的 `/v1/status`），所以没有对应条目可补；
+> 路由表与 OpenAPI 的一一对应已由 `test_routes_match_openapi` 守住。
+
+#### 16.11d 本轮修掉的第二个协议缺陷：方法不匹配返回 404 而非 405
+
+OpenAPI 里 `/v1/chat/completions` 等路径都声明了 `405 MethodNotAllowed`，但路由的兜底分支是：
+
+```rust
+_ if is_get || is_post => 404 未知路径   // ❌ GET /v1/chat/completions 也走这里
+_ => 405 不支持的方法                     // 只有 PUT/DELETE 才 405
+```
+
+于是 `GET /v1/chat/completions` 返回 **404**，与文档不符（客户端会以为"接口不存在"而不是"方法用错"）。
+修法是加一张 `ROUTES` 表，兜底时先判断路径是否已知：
+
+- 路径已知、方法不对 → **405**，并在消息里列出可用方法；
+- 路径不认识 → 404。
+
+同时新增 `test_routes_match_openapi`：路由表与 OpenAPI 的 `paths` 必须一一对应、方法集合一致——
+以后加/删接口忘了同步文档，测试会直接失败。
+
+#### 16.11c GPU 特性下的全量测试（本机实测）
+
+`cargo test --release --features gpu` 在本机（GTX 1060 / DX12）跑通：
+
+| 项 | 结果 |
+|---|---|
+| lib 单元测试 | **479 passed**（比默认构建多 18 个 GPU-only 用例）/ 0 failed / 15 ignored |
+| CLI 冒烟（7 条） | 通过，但耗时 **97.7 s**（默认构建 1.4 s） |
+| HTTP 集成（8 条） | 通过，0.26 s |
+| 总耗时 | lib 61.9 s / smoke 27.2 s |
+
+**为什么带 GPU 时小模型反而慢 70×**：tiny 模型每个算子的计算量远小于一次 GPU
+dispatch + 同步的开销，端到端测试里这种"小算子 × 高频"负载会被同步成本主导。
+所以 CI **只编译** gpu 测试（`--no-run`），不运行——真机验证放在本地做。
+
+#### 16.11b 本轮修掉的一个真实 bug：char 分词器无法重载中文
+
+`CharTokenizer::from_json` 里判断"是不是单个字符"时写成了：
+
+```rust
+assert_eq!(s.len(), s.chars().count(), "chars 元素应为单个字符"); // ❌ 字节数 vs 字符数
+```
+
+`s.len()` 是**字节长度**。任何非 ASCII 字符（中文 3 字节、emoji 4 字节）都会让后两个数不等，
+于是**用中文语料训出来的 char 分词器一加载就 panic**。症状很隐蔽：`train` 存盘正常，
+只有后续命令（如 `quant` 读回分词器）才炸。
+
+修法是只数字符个数：
+
+```rust
+assert_eq!(s.chars().count(), 1, "chars 元素应为单个字符，实际 {s:?}"); // ✅
+```
+
+回归测试：`tokenizer::tests::test_char_tokenizer_roundtrips_non_ascii`（中文字符串 save→load
+后词表与编解码结果必须一致）。这个 bug 是 `cli_quant_roundtrip` 冒烟测试暴露出来的——
+端到端测试的价值正在于此。
+
+#### 16.11a 4000 步收敛回归（2026-11，本轮改动后）
+
+改动集中在测试、依赖边界与 lint，理论上不碰数值路径。为确认这点，用**与基线完全相同的配置**
+（`config/config.json`，2.1M 模型 / 4000 步 / GPU 构建）重跑了一次：
+
+| | 基线（改动前） | 回归（改动后） |
+|---|---|---|
+| 总耗时 | 991 s | 1 016 s（+2.5%，机器噪声内） |
+| 每步 | 0.25 s | 0.25 s |
+| **best val loss** | **6.7119** | **6.7119（逐位相同）** |
+| 末段 train loss | ≈6.5 | ≈6.55 |
+| AMP | 最终 scale 262144 / 0 次溢出 | 同左 |
+
+`best val loss` 四位小数完全一致 ⇒ 固定种子下**数值路径逐位可复现**，这批改动对训练无影响。
+
+#### 16.11 性能数字必须标注构建特性（2026-11 教训）
+
+**同一个模型、同一台机器，`--features gpu` 与默认构建能差 3.6 倍**——把两种构建的 tok/s
+放在一起比较会得出"性能回退了 8 倍"的错误结论（本轮就踩过一次）。
+
+同机实测（i5-13600K + GTX 1060，batch 8 × block 512，20 线程）：
+
+| 模型 | 默认构建（纯 CPU） | `--features gpu` | GPU 加速比 |
+|---|---|---|---|
+| 2.1M（d=128 / 4 层） | **2 116 tok/s**（2.08 s/步） | **7 599 tok/s**（0.61 s/步） | 3.6× |
+| 15.8M（d=384 / 8 层） | **305 tok/s**（14.0 s/步） | **2 205 tok/s**（1.81 s/步） | 7.2× |
+
+另外两条同机基线（用于判断"有没有变慢"）：
+
+- **内存带宽**：`probe_bf16_decode_bandwidth` 纯读 30.8 GB/s、`bf16_dot` **36.8 GB/s**、
+  f32 点积 36.1 GB/s —— 若这三个数掉到个位数，说明机器状态有问题（降频/被占），先查环境；
+- **`bench` 小模型**：训练 **6 265–7 007 tok/s**、KV 推理 829–1 022 tok/s、全量推理 456–512 tok/s，
+  波动 ±10%，与文档记录的 ±13% 测量噪声一致。
+
+#### 16.9 ChatML：直接对话原生 Instruct 基座（2026-11）
+
+> ⚠️ **本节用的是第三方权重，不是本项目训练的模型。**
+> `checkpoints/qwen-native/` 由 `import-hf` 从 `Qwen2.5-0.5B-Instruct` 转换而来（来源见该目录的
+> `PROVENANCE.md`）。它证明的是**导入 / 分词器 / ChatML 模板 / HTTP 服务这几条路径是对的**，
+> **不能**当作"从零训练出会对话的模型"的证据 —— 自研模型（2.1M / 15.8M）目前的对话质量见 §16.8。
+
+原先只有 `sft`（`用户：/助手：`）与 `raw` 两种模板，Qwen / Llama-3 这类 Instruct 基座用不了：
+它们的原生格式是 ChatML（`<|im_start|>user … <|im_end|>`）。本轮补齐了三处，改完**不必微调**就能对话：
+
+| 修复 | 位置 | 说明 |
+|---|---|---|
+| 新增 `Template::{Raw,Sft,ChatMl}` 与 `assemble_tmpl` | `prompt.rs` | ChatML 的 tail / 历史 / system / 停止标记（`<|im_end|>`） |
+| `--prompt-format chatml` | `cli.rs` + `cmd/deploy.rs` | `chat` / `generate` 可用；SFT 与 raw 行为逐位不变 |
+| **EOS/BOS 选择顺序** | `tokenizer.rs` | 原顺序先匹配 `</s>`/`<s>`，把 Qwen 的 EOS 错映射到字节字面量（128247）；现优先 `<|im_end|>` 等真正的首尾标记 |
+| `import-hf --output` 按目录处理 | `cmd/core.rs` | 统一写 `<dir>/model.ckpt`（此前写出的文件名叫 `qwen05-fixed`，`--ckpt` 指不到）；`.ckpt` 结尾仍按文件 |
+
+实测（原生 Qwen2.5-0.5B-Instruct，零微调）：
+
+```bash
+llm_from_scratch import-hf --model-dir checkpoints/Qwen2.5-0.5B-Instruct \
+    --tokenizer checkpoints/Qwen2.5-0.5B-Instruct/tokenizer.json --output checkpoints/qwen-native
+
+llm_from_scratch chat --ckpt checkpoints/qwen-native/model.ckpt \
+    --tokenizer checkpoints/qwen-native/tokenizer.json --prompt-format chatml
+```
+
+```
+[第 1 轮] 输入：你好
+[第 1 轮] 输出：你好！有什么我可以帮助你的吗？（收尾：采到 EOS）
+[第 2 轮] 输入：我想订个位子，两个人，明天晚上七点
+[第 2 轮] 输出：好的，请问您需要在哪个餐厅预订座位呢？…（收尾：采到 EOS）
+[第 3 轮] 输入：你们有什么推荐的菜吗
+[第 3 轮] 输出：当然可以！我们这里有各种口味和类型的菜肴供您选择。…（收尾：采到 EOS）
+```
+
+`serve`（HTTP）同样支持：`split_messages` 已重写为**按 `(user, assistant)` 配对**、用
+`Template::turn` 逐轮拼接，所以 `--prompt-format chatml` 下多轮请求的角色序列也是完整的。
+
+```
+POST /v1/chat/completions  →  {"finish_reason":"stop",
+                               "content":"我是阿里云开发的模型，叫通义千问。很高兴为您服务！",
+                               "usage":{"completion_tokens":24,"prompt_tokens":21}}
+```
+
+（多轮请求同样验证过：带一轮历史时 `prompt_tokens` 从 21 涨到 53，回答能接住上下文。）
+
+注意：`serve` 若不传 `--api-key` 会**自动生成随机 key**并打印到日志；curl 测试要么带
+`Authorization: Bearer <key>`，要么显式 `--api-key`。另一个坑：PowerShell 5.1 会把 JSON 里的
+双引号吞掉，`curl.exe -d` 必须改成 `--data-binary "@body.json"`。
+
+#### 16.8 换更大基座的实测结论（三档对比，2026-11）
+
+| | 2.1M 自研 | 15.8M 自研 | 0.5B + LoRA（**导入权重**） |
+|---|---|---|---|
+| 预训练语料 | 古典小说 3.3M token | 同左 | Qwen 官方预训练（**非本项目**） |
+| 预训练 epoch | **5.5** | **2.2** | — |
+| 预训练 val | **6.7119** | 6.9409 | — |
+| SFT val（同一套 74 万 token 对话） | **1.3694** | 5.3652 | 0.8173 |
+| 对话输出 | 现代词混杂、句子破碎 | **整段古典白话**（襲人/黛玉） | 记忆碎片循环 |
+
+**三条实测结论**：
+
+1. **真正的瓶颈是语料题材与多样性，不是参数规模。** `data/corpus_zh/` 是《红楼梦》《西游记》等六部
+   古典白话小说；15.8M 模型忠实学到的是古典文体，SFT 也扭转不过来。
+2. **合成对话语料不能当预训练语料。** 用 4000 段模板对话直接预训练时，BPE 会把整段模板合成**单个 token**
+   （实测：1.87M 序列长度在 8192 词表内塌缩到 **1.2k**）——重复度太高，只能用于 SFT。
+3. **0.5B 那条路另有阻塞**：`import-hf` 转换后的分词器 `added_tokens = 0`，`<|im_start|>`/`<|im_end|>`
+   不在词表里 ⇒ 模型**不会输出 EOS**，生成必然跑满 `max_new` 后被截断。
+
+**离线环境下的建议**：现代中文语料只有 `data/corpus/` 里 37 篇短文（83 KB），不足以预训练；
+要得到"会聊"的模型需要外部现代中文语料（≥千万 token），或先修好 HF 特殊 token 再对 Qwen 做足量 LoRA（≥1 epoch）。
+
+#### 16.6 已否证的优化方向（别再重复）
+
+下面每条都做过实验、有数据，**不是猜测**：
+
+| 方向 | 结论 |
+|---|---|
+| "权重被读了两遍" | ❌ 是插桩递归造成的假象；实测 `matmul` 每 token 只读 **1.00 遍**权重 |
+| bf16 权重解码慢 | ❌ `bf16_dot` 达 **35 GB/s**（纯读上限 30、f32 点积 35）—— 内核已到带宽上限，无需重写 |
+| `bf16_dot` 改成 4 累加器展开 | ❌ 72.6 vs 68.5 ms/token（更慢，且在 ±13% 噪声内） |
+| 调小分块粒度以提高并行度 | ❌ 896×896 从 0.13 → 0.17 ms/次 |
+| 小形状改串行 / 专用 4 线程子池 | ❌ 前者在噪声内，后者 **87~92 ms**（`install` 的跨界同步成本 × 170 次/token） |
+| 合并提交以减少 GPU 同步 | ❌ `poll(Wait)` 等的是**真实内核时间**（随 dispatch 数线性），整叠常驻只值 1.37× |
+| 输出头物化优化 | ❌ 8.0 ms = 272 MB / 34 GB/s，已是带宽上限 |
+
+**解码 73.7 ms/token 的实测构成**（0.5B bf16，单 token）：输出头 8.2 · MLP 32.9 · 注意力 26.9 · Norm 3.8 · 残差 4.3。
+**测量纪律**：同机连续测同一基线，bf16 解码会在 **71.6 ~ 92.1 ms** 之间波动（±13%），
+所以**小于 15% 的改动无法可靠判定** —— 这类结论需要采样剖析器（`perf`/ETW）而不是埋点。
 > **踩过的坑**：实现 prefix KV 复用时，判据不能写成"缓存比 ids 短"——滑窗缓存下
 > `seq_len()` 封顶在窗口大小、`ids` 继续增长，会每步重复喂 token 直到 `t` 超过窗口
 > （`demo` 端到端自检会 panic 在 `model.rs` 的窗口断言）。正确判据是"**首步 + 缓存非空 + 有增量**"。
 ### 17. 验证状态明细（测试 / 编译 / 逐课覆盖）
 
-- **测试**（**怎么跑见 [§14 `cargo test`](#14-cargo-test--单元测试)**）：`--list` 当前列出 **430 个单元测试**
+- **测试**（**怎么跑见 [§14 `cargo test`](#14-cargo-test--单元测试)**）：`--list` 当前列出 **504 个单元测试 + 10 个 CLI 冒烟 + 8 个策略（依赖 4 / unsafe 1 / dead_code 1 / TODO 1 / 语言 1）+ 29 个 HTTP 集成（+1 ignored）+ 2 个 smoke**（+ 3 个依赖策略测试 + 2 个集成测试）
   （另有 2 个 `tests/smoke.rs`
   集成用例；数量随代码增长，别把它当常量背）。**全量串行**跑
-  最新实测 **421 passed / 0 failed / 9 ignored**（默认与 `LLM_CPU_FMA=1` 两种模式都全过）；ignored 都是性能标定探针（`probe_*`；未完成项见 [BACKLOG.md](BACKLOG.md)）。
+  最新实测 **422 passed / 0 failed / 12 ignored**（默认与 `LLM_CPU_FMA=1` 两种模式都全过）；ignored 都是性能标定探针（`probe_*`，见 §16.6 的测量纪律）。
   ⚠️ **全量并行跑还会有若干条既存失败，甚至可能整进程崩掉**（实测
   `0xC0000005`）：GPU 用例对时序/驱动敏感，几条"两次训练必须逐位一致"的对照用例会被
   同机并行负载影响。**排查改动请两条路都走**：按关键词过滤跑（快）与全量串行跑

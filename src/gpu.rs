@@ -277,7 +277,7 @@ fn mm_ablated(m: usize, k: usize, n: usize, bs: usize) -> bool {
 /// 量的是**按算子**付的固定开销，而训练用的是「整个子层一次提交」，两者不能互相推算。
 fn flush_recorder_diag_log() {
     let log: Vec<RecorderDiag> = {
-        let mut v = RECORDER_DIAG_LOG.lock().unwrap();
+        let mut v = crate::syncutil::lock(&RECORDER_DIAG_LOG);
         std::mem::take(&mut *v)
     };
     if log.is_empty() {
@@ -340,7 +340,7 @@ fn flush_recorder_diag_log() {
     let mut mix: Vec<(usize, usize)> = (0..opk::N)
         .map(|k| (k, log.iter().map(|d| d.kinds[k]).sum()))
         .collect();
-    mix.sort_by(|a, b| b.1.cmp(&a.1));
+    mix.sort_by_key(|x| std::cmp::Reverse(x.1));
     let shown: Vec<String> = mix
         .iter()
         .filter(|(_, c)| *c > 0)
@@ -354,7 +354,7 @@ fn flush_recorder_diag_log() {
         BUF_NEW_US.load(Ordering::Relaxed),
     );
     let (lc, lus) = {
-        let mut g = BUF_NEW_LAST.lock().unwrap();
+        let mut g = crate::syncutil::lock(&BUF_NEW_LAST);
         let prev = *g;
         *g = (c, us);
         prev
@@ -405,7 +405,7 @@ pub fn flush_diag_log() {
     }
     flush_recorder_diag_log();
     let log: Vec<GpuDispatchDiag> = {
-        let mut v = GPU_DIAG_LOG.lock().unwrap();
+        let mut v = crate::syncutil::lock(&GPU_DIAG_LOG);
         std::mem::take(&mut *v)
     };
     if log.is_empty() {
@@ -472,7 +472,7 @@ pub fn flush_diag_log() {
         e.1 += d.total_ms;
     }
     let mut gs: Vec<_> = groups.into_iter().collect();
-    gs.sort_by(|a, b| (b.0.0 as u64 * b.1.0 as u64).cmp(&(a.0.0 as u64 * a.1.0 as u64)));
+    gs.sort_by_key(|g| std::cmp::Reverse(((g.0).0 as u64) * ((g.1).0 as u64)));
     println!("[gpu]   回读量按形状分组（前 8 大）：");
     for ((out_len, x, y, z), (cnt, ms)) in gs.iter().take(8) {
         println!(
@@ -1747,6 +1747,20 @@ pub struct GpuContext {
     resident_budget: usize,
 }
 
+/// GPU 不可用（或曾失败）的原因：初始化失败、回读失败都会记在这里，便于排查
+static GPU_NOTE: OnceLock<String> = OnceLock::new();
+
+/// 记一条 GPU 侧的原因（只记第一次），并发打印到 stderr 便于用户立刻看到
+fn note_gpu(reason: String) {
+    eprintln!("[gpu] {reason}（后续自动回退 CPU）");
+    let _ = GPU_NOTE.set(reason);
+}
+
+/// GPU 不可用的原因（`None` = 初始化成功，或还没尝试初始化）
+pub fn unavailable_reason() -> Option<&'static str> {
+    GPU_NOTE.get().map(|s| s.as_str())
+}
+
 /// 全局 GPU 上下文（初始化一次；None 表示不可用）
 static GPU: OnceLock<Option<GpuContext>> = OnceLock::new();
 
@@ -1756,11 +1770,11 @@ static GPU: OnceLock<Option<GpuContext>> = OnceLock::new();
 pub fn init() {
     // 允许用环境变量覆盖 matmul 分流阈值：盈亏平衡点取决于本机的 CPU 算力与 PCIe 带宽，
     // 无法用编译期常量适配所有机器，标定时在外部设置即可，不必改代码重编。
-    if let Ok(v) = std::env::var("LLM_GPU_MATMUL_MIN_FLOPS") {
-        if let Ok(n) = v.parse::<usize>() {
-            MATMUL_MIN_FLOPS.store(n, Ordering::Relaxed);
-            println!("[gpu] matmul 分流阈值被环境变量覆盖为 {n} FLOPs");
-        }
+    if let Ok(v) = std::env::var("LLM_GPU_MATMUL_MIN_FLOPS")
+        && let Ok(n) = v.parse::<usize>()
+    {
+        MATMUL_MIN_FLOPS.store(n, Ordering::Relaxed);
+        println!("[gpu] matmul 分流阈值被环境变量覆盖为 {n} FLOPs");
     }
     // 强制 matmul 用大/小 tile（标定对照用，见 MM_SMALL_FORCE）
     if let Ok(v) = std::env::var("LLM_GPU_MM_SMALL") {
@@ -1779,9 +1793,16 @@ pub fn init() {
         .name("gpu-init".into())
         .stack_size(8 * 1024 * 1024) // 8 MB 栈，避免驱动栈溢出
         .spawn(create)
-        .ok()
-        .and_then(|h| h.join().ok())
-        .flatten();
+        .map_err(|e| format!("初始化线程无法启动：{e}"))
+        .and_then(|h| h.join().map_err(|_| "初始化线程 panic".to_string()))
+        .and_then(|r| r);
+    let ctx = match ctx {
+        Ok(c) => Some(c),
+        Err(e) => {
+            note_gpu(format!("GPU 不可用：{e}"));
+            None
+        }
+    };
     let _ = GPU.set(ctx);
 }
 
@@ -1871,7 +1892,7 @@ pub fn resident_stats() -> (u64, u64, u64, u64, u64, usize, usize) {
     let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
         return (0, 0, 0, 0, 0, 0, 0);
     };
-    let c = g.resident.lock().unwrap();
+    let c = crate::syncutil::lock(&g.resident);
     (
         c.hits,
         c.misses,
@@ -1891,7 +1912,7 @@ pub fn reset_resident_cache() {
     let Some(g) = GPU.get().and_then(|g| g.as_ref()) else {
         return;
     };
-    let mut c = g.resident.lock().unwrap();
+    let mut c = crate::syncutil::lock(&g.resident);
     let tables: Vec<ResidentTable> = c.map.drain().map(|(_, t)| t).collect();
     c.pending.clear();
     c.bytes = 0;
@@ -1979,7 +2000,7 @@ pub fn softmax_mask_backward(g: &[f32], p: &[f32], rows: usize, d: usize) -> Opt
 
 // ---------------- 内部实现 ----------------
 
-fn create() -> Option<GpuContext> {
+fn create() -> Result<GpuContext, String> {
     // 优先 DX12（Windows 原生更稳定），Vulkan 回退；Intel 核显 Vulkan 驱动有栈溢出 bug
     let backends = if cfg!(windows) {
         wgpu::Backends::DX12
@@ -1997,8 +2018,7 @@ fn create() -> Option<GpuContext> {
     // 枚举所有适配器，优先选择独显（DiscreteGpu），避免选到核显
     let mut adapters: Vec<wgpu::Adapter> = block_on(instance.enumerate_adapters(backends));
     if adapters.is_empty() {
-        eprintln!("[gpu] 未找到任何 GPU 适配器");
-        return None;
+        return Err("未找到任何 GPU 适配器".to_string());
     }
     // 打印所有可用适配器供调试
     for (i, a) in adapters.iter().enumerate() {
@@ -2055,7 +2075,10 @@ fn create() -> Option<GpuContext> {
             pool.len()
         );
     }
-    let adapter = adapters.into_iter().nth(pick)?;
+    let adapter = adapters
+        .into_iter()
+        .nth(pick)
+        .ok_or_else(|| format!("LOCAL_RANK={local_rank} 选出的适配器下标 {pick} 越界"))?;
     let info = adapter.get_info();
     let device_type = match info.device_type {
         wgpu::DeviceType::DiscreteGpu => "DiscreteGpu",
@@ -2093,7 +2116,8 @@ fn create() -> Option<GpuContext> {
         memory_hints: wgpu::MemoryHints::default(),
         trace: wgpu::Trace::Off,
     }))
-    .ok()?;
+    .ok()
+    .ok_or_else(|| "request_device 失败（驱动不支持该限制或显存不足）".to_string())?;
 
     // ---- 设备硬限制：显存护栏的判据（见 [`fits`]）----
     // 池的最小分配单位是 4 KiB（见 `size_class`）。连它都放不下的设备直接判为不可用：
@@ -2104,12 +2128,10 @@ fn create() -> Option<GpuContext> {
     if !fits(dlimits.max_buffer_size, min_bytes)
         || !fits(dlimits.max_storage_buffer_binding_size, min_bytes)
     {
-        eprintln!(
-            "[gpu] 设备上限过小（max_buffer_size = {} B、max_storage_buffer_binding_size = {} B）：\
-             GPU 后端禁用，全部回退 CPU",
+        return Err(format!(
+            "设备上限过小（max_buffer_size = {} B、max_storage_buffer_binding_size = {} B）",
             dlimits.max_buffer_size, dlimits.max_storage_buffer_binding_size
-        );
-        return None;
+        ));
     }
     // 占位 buffer（见 [`GpuContext::placeholder`]）：尺寸已由上面的下限检查保证合法，
     // 创建它不可能触发 wgpu 校验错误。
@@ -2306,7 +2328,7 @@ fn create() -> Option<GpuContext> {
         mapped_at_creation: false,
     });
 
-    Some(GpuContext {
+    Ok(GpuContext {
         device,
         queue,
         info,
@@ -2396,6 +2418,12 @@ impl GpuContext {
     /// 切块、必要时连 batch 一起切，逐块 dispatch 后把结果拼回。真实案例：Qwen2.5-0.5B 的
     /// `[151936, 896]` 输出头整表 519.4 MiB > 本机 256 MiB 上限 —— 分块前这个算子每个 token
     /// 都整单回退 CPU（生成 ~9 s/token），分块后切成 3 块在 GPU 上算。
+    // 调用方目前统一走 `matmul_ident`（要区分"权重常驻"与否）；这里保留不分块/常驻的
+    // 简化入口，供以后按需直接调用，故显式标注允许未使用。
+    #[allow(
+        dead_code,
+        reason = "简化入口：调用方统一走 matmul_ident，保留供以后按需直接调用"
+    )]
     fn matmul(
         &self,
         a: &[f32],
@@ -2460,7 +2488,7 @@ impl GpuContext {
             let layout = ResLayout::new(b.len(), b_t, batch, k, &plan);
             if self.resident_budget > 0 && b.len() * 4 >= RESIDENT_MIN_BYTES && layout.consistent()
             {
-                let mut cache = self.resident.lock().unwrap();
+                let mut cache = crate::syncutil::lock(&self.resident);
                 if let Some(tbl) = self.resident_ensure(&mut cache, id, &layout, b) {
                     return self.matmul_planned(a, b, m, k, n, batch, a_t, b_t, &plan, Some(&tbl));
                 }
@@ -2493,7 +2521,9 @@ impl GpuContext {
                 if !self.resident_write_chunks(layout, b, &tbl.chunks) {
                     return None; // 布局自洽性已查过，这里只是防御
                 }
-                let entry = cache.map.get_mut(&id.cell).unwrap();
+                let Some(entry) = cache.map.get_mut(&id.cell) else {
+                    return None; // 不变量被破坏（刚查过存在）：放弃常驻，退回逐次上传
+                };
                 entry.id.ver = id.ver;
                 entry.id.bf16 = id.bf16;
                 cache.updates += 1;
@@ -2516,7 +2546,12 @@ impl GpuContext {
                 }
                 return None;
             }
-            let old = cache.map.remove(&id.cell).unwrap();
+            let Some(old) = cache.map.remove(&id.cell) else {
+                for buf in chunks {
+                    self.put_buf(buf);
+                }
+                return None; // 同上：不变量被破坏时不静默丢 buffer
+            };
             for buf in old.chunks {
                 self.put_buf(buf);
             }
@@ -2793,7 +2828,7 @@ impl GpuContext {
         // ---- 阶段 3：按列拼回（纯 CPU 拷贝，与逐块 dispatch 时完全相同的搬法）----
         let mut out = vec![0.0f32; batch * m * n];
         for (part, &(b0, c0, w)) in parts.iter().zip(at.iter()) {
-            let bc = if m * w == 0 { 0 } else { part.len() / (m * w) };
+            let bc = part.len().checked_div(m * w).unwrap_or(0);
             // out[(b0+bi)·m + i][c0 .. c0+w] = 块结果[(bi·m + i)][0..w]，分段连续
             for bi in 0..bc {
                 for i in 0..m {
@@ -2830,7 +2865,7 @@ impl GpuContext {
             copy_ms: 0.0,
         };
         {
-            let mut log = GPU_DIAG_LOG.lock().unwrap();
+            let mut log = crate::syncutil::lock(&GPU_DIAG_LOG);
             if log.len() < DIAG_MAX {
                 log.push(diag);
             }
@@ -2884,7 +2919,7 @@ impl GpuContext {
     fn release_planned(&self, bufs: Vec<wgpu::Buffer>, submitted: bool) {
         if submitted {
             // 已提交：GPU 可能仍在读这些 buffer，只能进 PENDING 等下一次 poll 之后入池
-            let mut pending = PENDING.lock().unwrap();
+            let mut pending = crate::syncutil::lock(&PENDING);
             for buf in bufs {
                 pending.push(buf);
             }
@@ -2907,7 +2942,7 @@ impl GpuContext {
             [a.len() as u32, s.to_bits(), 0, 0, 0, 0],
             &buf_out,
             a.len(),
-            ((a.len() + 255) / 256) as u32,
+            a.len().div_ceil(256) as u32,
             1,
             1,
         );
@@ -2928,7 +2963,7 @@ impl GpuContext {
             [a.len() as u32, 0, 0, 0, 0, 0],
             &buf_out,
             a.len(),
-            ((a.len() + 255) / 256) as u32,
+            a.len().div_ceil(256) as u32,
             1,
             1,
         );
@@ -2954,7 +2989,7 @@ impl GpuContext {
             [a.len() as u32, 0, 0, 0, 0, 0],
             &buf_out,
             a.len(),
-            ((a.len() + 255) / 256) as u32,
+            a.len().div_ceil(256) as u32,
             1,
             1,
         );
@@ -3139,13 +3174,16 @@ impl GpuContext {
     /// 归还 buffer 回池。调用点都保证 GPU 已同步完成（poll wait 之后），可安全复用。
     fn put_buf(&self, buf: wgpu::Buffer) {
         let key = (size_class(buf.size()), kind_of(&buf));
-        self.pool.lock().unwrap().entry(key).or_default().push(buf);
+        crate::syncutil::lock(&self.pool)
+            .entry(key)
+            .or_default()
+            .push(buf);
     }
 
     /// 把已析构显存句柄的暂存区批量入池（见 [`PENDING`]）。
     /// **只能在 poll(Wait) 之后调用**：彼时 GPU 已空闲，入池 buffer 才可被再次取用。
     fn drain_pending(&self) {
-        let pending: Vec<wgpu::Buffer> = std::mem::take(&mut *PENDING.lock().unwrap());
+        let pending: Vec<wgpu::Buffer> = std::mem::take(&mut *crate::syncutil::lock(&PENDING));
         for buf in pending {
             self.put_buf(buf);
         }
@@ -3273,6 +3311,8 @@ impl GpuContext {
         };
         let diag_t_view = diag_t.elapsed();
         let result =
+            // SAFETY: `view` 是 wgpu 映射出的 `&[u8]`，长度至少 `out_len * 4`（由上方 readback buffer
+        // 尺寸与 copy_buffer_to_buffer 的拷贝长度保证）；映射起点按 4 字节对齐，f32 读取合法。
             unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, out_len).to_vec() };
         let diag_t_copy = diag_t.elapsed();
         drop(view);
@@ -3283,7 +3323,7 @@ impl GpuContext {
             let total = diag_t.elapsed();
             // 这里的"同步"只覆盖 map+poll+拷回三段，不含随后的 unmap/归还 buffer
             let sync = diag_t_copy - diag_t_submit;
-            GPU_DIAG_LOG.lock().unwrap().push(GpuDispatchDiag {
+            crate::syncutil::lock(&GPU_DIAG_LOG).push(GpuDispatchDiag {
                 x,
                 y,
                 z,
@@ -3384,7 +3424,7 @@ impl ChunkPlan {
     }
 
     /// 一次 matmul 要 dispatch 多少次（batch 档数 × 列块数）——只用于测试与诊断。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "诊断接口：只用于测试与耗时统计"))]
     fn dispatches(&self, batch: usize) -> usize {
         self.cols.len() * batch.div_ceil(self.batch_chunk)
     }
@@ -3711,6 +3751,8 @@ static PENDING: Mutex<Vec<wgpu::Buffer>> = Mutex::new(Vec::new());
 
 /// 把任意 POD 数据当作字节切片（f32/u32 均为 4 字节小端）
 fn bytemuck_bytes<T: Sized>(v: &[T]) -> &[u8] {
+    // SAFETY: 只对 POD 类型调用（`f32`/`u32` 等，任意位模式合法）；`size_of_val` 覆盖整个切片；
+    // `u8` 没有对齐要求，所以把任意 `&[T]` 当字节切片读是安全的。
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
@@ -4008,7 +4050,7 @@ impl Drop for GpuHandle {
     /// [`GpuContext::drain_pending`] 统一完成（保证复用时 GPU 已不再引用这块 buffer）。
     /// 不能 move 字段，故克隆引用计数句柄（开销可忽略）。
     fn drop(&mut self) {
-        PENDING.lock().unwrap().push(self.buf.clone());
+        crate::syncutil::lock(&PENDING).push(self.buf.clone());
     }
 }
 
@@ -4130,8 +4172,13 @@ impl Readback {
         });
         let mut all = vec![0.0f32; total];
         for (stage, slice) in stages.iter().zip(&slices) {
-            let view = slice.get_mapped_range().ok()?;
+            let Some(view) = slice.get_mapped_range().ok() else {
+                note_gpu("回读失败：map_async 未就绪，本次结果作废".to_string());
+                return None;
+            };
             let data =
+                // SAFETY: 映射范围长度至少 `stage.elems * 4`（由 stage buffer 的大小保证）；
+            // 映射起点按 4 字节对齐，按 f32 读取合法。
                 unsafe { std::slice::from_raw_parts(view.as_ptr() as *const f32, stage.elems) };
             for &(i, off) in &stage.items {
                 let (go, len) = spans[i];
@@ -4752,7 +4799,7 @@ impl GpuRecorder {
         let result = rb.collect();
         let sync_ms = t.elapsed().as_secs_f64() * 1000.0;
         {
-            let mut v = RECORDER_DIAG_LOG.lock().unwrap();
+            let mut v = crate::syncutil::lock(&RECORDER_DIAG_LOG);
             if v.len() < DIAG_MAX {
                 v.push(RecorderDiag {
                     upload_bytes,
@@ -4798,7 +4845,7 @@ fn record_attn_fwd(
     // S = Q'·Kᵀ（physical K 是 [B,N,K] → b_t）
     let s = rec.matmul(q, false, k, true, t, head_dim, t_total, bh);
     // P = softmax(S + mask)：中间结果只留在显存
-    let p = rec.softmax_mask(&s, &mask, bh * t, t_total, mask.len);
+    let p = rec.softmax_mask(&s, mask, bh * t, t_total, mask.len);
     rec.keep(s);
     // O = P·V
     let o = rec.matmul(&p, false, v, false, t, t_total, head_dim, bh);
@@ -6039,11 +6086,16 @@ fn record_mlp_sublayer_fwd(
     let act = rec.empty(rows * hid, KIND_OUT);
     let z = rec.empty(rows * hid, KIND_OUT);
     let (act, z, u) = if swiglu {
-        let y_up = rec.matmul(&xn, false, hw3.as_ref().unwrap(), false, rows, d, hid, 1);
+        let hw3 = hw3
+            .as_ref()
+            .expect("不变量：swiglu 分支必有 gate 权重（由上游按 cfg 选择）");
+        let hb3 = hb3.as_ref().expect("不变量：swiglu 分支必有 gate 偏置");
+        let y_up = rec.matmul(&xn, false, hw3, false, rows, d, hid, 1);
         let u = rec.empty(rows * hid, KIND_OUT);
-        rec.add_bias(&y_up, hb3.as_ref().unwrap(), &u, rows * hid, hid);
+        rec.add_bias(&y_up, hb3, &u, rows * hid, hid);
         rec.swiglu_fwd(&y1, &hb1, &u, &act, &z, rows * hid, hid);
-        for h in [y_up] {
+        {
+            let h = y_up;
             rec.keep(h);
         }
         (act, z, Some(u))
@@ -6461,7 +6513,7 @@ static PROBE_SHAPES: Mutex<Vec<(usize, usize, usize, usize, bool, bool)>> = Mute
 pub fn probe_capture(on: bool) {
     PROBE_CAPTURE.store(on, Ordering::Relaxed);
     if on {
-        PROBE_SHAPES.lock().unwrap().clear();
+        crate::syncutil::lock(&PROBE_SHAPES).clear();
     }
 }
 
@@ -6481,7 +6533,7 @@ pub fn probe_active() -> bool {
 /// 测出「一次多少 ms」，两者相乘才是这个形状每步真正吃掉的 GPU 时间。
 pub fn probe_report() {
     PROBE_CAPTURE.store(false, Ordering::Relaxed);
-    let shapes = std::mem::take(&mut *PROBE_SHAPES.lock().unwrap());
+    let shapes = std::mem::take(&mut *crate::syncutil::lock(&PROBE_SHAPES));
     if shapes.is_empty() {
         return;
     }
@@ -7197,7 +7249,7 @@ mod tests {
                 g.put_buf(buf_out);
                 for bi in 0..batch {
                     for i in 0..m {
-                        let dst = ((0 + bi) * m + i) * n + c0;
+                        let dst = (bi * m + i) * n + c0;
                         let src = (bi * m + i) * w;
                         out[dst..dst + w].copy_from_slice(&r[src..src + w]);
                     }
@@ -7397,7 +7449,7 @@ mod tests {
             ver: 0,
             bf16: false,
         };
-        let mut cache = g.resident.lock().unwrap();
+        let mut cache = crate::syncutil::lock(&g.resident);
         // 两次机会：第一次只登记，第二次才建表
         assert!(
             g.resident_ensure(&mut cache, id, &layout, &b).is_none(),
@@ -7605,12 +7657,12 @@ mod tests {
 
     /// GELU（tanh 近似）与解析导数，与 [`Tensor::gelu`] 及 WGSL 实现同式
     fn ref_gelu(x: f32) -> f32 {
-        0.5 * x * (1.0 + (0.797_884_56 * (x + 0.044_715 * x * x * x)).tanh())
+        0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
     }
 
     fn ref_gelu_grad(x: f32) -> f32 {
-        let t = (0.797_884_56 * (x + 0.044_715 * x * x * x)).tanh();
-        let da_dx = 0.797_884_56 * (1.0 + 3.0 * 0.044_715 * x * x);
+        let t = (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh();
+        let da_dx = 0.797_884_6 * (1.0 + 3.0 * 0.044_715 * x * x);
         0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * da_dx
     }
 
@@ -8890,5 +8942,17 @@ mod tests {
         stack_case(2, 4, 128, 32, 4, false, true);
         stack_case(2, 2, 300, 128, 4, false, true);
         stack_case(2, 4, 128, 32, 4, true, true);
+    }
+
+    /// 可用性与其原因必须自洽：可用 ⇒ 没有原因；不可用 ⇒ 必须能说清为什么。
+    /// 这条在有 GPU 与无 GPU 的机器上都成立（CI 无 GPU，本地有）。
+    #[test]
+    fn test_unavailable_reason_consistent_with_is_available() {
+        super::init(); // 幂等
+        match (super::is_available(), super::unavailable_reason()) {
+            (true, None) => {}
+            (false, Some(r)) => assert!(!r.is_empty(), "失败原因不应是空串"),
+            (avail, reason) => panic!("状态自相矛盾：is_available={avail}, reason={reason:?}"),
+        }
     }
 }

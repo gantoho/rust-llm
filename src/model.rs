@@ -64,7 +64,7 @@ pub struct TransformerConfig {
     pub o_bias: bool,
     /// FFN 各投影是否带 bias。默认 `true`（历史行为）；LLaMA / Qwen2 都是 `false`。
     pub mlp_bias: bool,
-    /// 归一化的 eps。默认 `1e-5`（[`LN_EPS`]，历史行为）；Qwen2 用 `1e-6`。
+    /// 归一化的 eps。默认 `1e-5`（`LN_EPS`，历史行为）；Qwen2 用 `1e-6`。
     pub rms_eps: f32,
     /// 输出头（`lm_head`）是否与词嵌入**共享权重**。默认 `true`（本仓库历史行为，
     /// 也是 LLaMA-2/TinyLlama 的做法）；LLaMA-3 / Qwen2 多数是 `false`，此时
@@ -398,7 +398,10 @@ impl Ffn {
     }
 
     /// 稠密分支的 GELU 四元组可走 GPU 常驻显存路径（SwiGLU 走 [`Ffn::swiglu_weights`]，MoE 返回 None）
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "GELU 分支的四元组：gpu 常驻路径取权重用")
+    )]
     fn gelu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             Ffn::Dense(m) => m.gelu_weights(),
@@ -408,7 +411,10 @@ impl Ffn {
 
     /// 稠密 SwiGLU 分支的六元组（gate/up/down 三个投影的权重与偏置），
     /// 供 GPU 常驻显存路径用；GELU 分支与 MoE 返回 None。
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "SwiGLU 分支的六元组：gpu 常驻路径取权重用")
+    )]
     fn swiglu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             Ffn::Dense(m) => m.swiglu_weights(),
@@ -630,6 +636,7 @@ impl TransformerBlock {
         let x = match attn_resident_out {
             Some(out) => out,
             None => {
+                let _tln1 = std::time::Instant::now();
                 let ln1_out = self.ln1.forward(x);
                 let h = self.attn.forward(&ln1_out, mask, kv_cache, base);
                 let h = if self.dropout > 0.0 {
@@ -646,6 +653,7 @@ impl TransformerBlock {
         if let Some(out) = self.mlp_resident(&x, training) {
             return out;
         }
+        let _tln2 = std::time::Instant::now();
         let h = self.ln2.forward(&x);
         let (h, aux) = self.ffn.forward_with_aux(&h);
         *self.aux.borrow_mut() = aux;
@@ -801,7 +809,7 @@ impl TransformerBlock {
         let bp_bwd = cp.bias.clone();
         let gamma_bwd = Tensor::clone(gamma);
         // RMSNorm 没有 β，不接收 dβ（常驻路径仍会算出来，那份残值无处可去）
-        let beta_bwd = beta_opt.map(Tensor::clone);
+        let beta_bwd = beta_opt.cloned();
         Some(Tensor::external(
             out_data,
             vec![b, t, d],
@@ -933,7 +941,7 @@ impl TransformerBlock {
         let x_bwd = x.clone();
         let gamma_bwd = Tensor::clone(gamma);
         // RMSNorm 没有 β，不接收 dβ（常驻路径仍会算出来，那份残值无处可去）
-        let beta_bwd = beta_opt.map(Tensor::clone);
+        let beta_bwd = beta_opt.cloned();
         let (w1_bwd, b1_bwd) = (Tensor::clone(w1), Tensor::clone(b1));
         let (w2_bwd, b2_bwd) = (Tensor::clone(w2), Tensor::clone(b2));
         Some(Tensor::external(
@@ -1401,9 +1409,9 @@ impl Transformer {
 
     /// 逐层量化全部投影，返回本次量化的报告（同时把记录写进 [`Transformer::quant_meta`]）。
     ///
-    /// - `opts` 带全了算法参数：分组方向（默认 [`QAxis::Col`] = **每个输出通道一个
+    /// - `opts` 带全了算法参数：分组方向（默认 `QAxis::Col` = **每个输出通道一个
     ///   scale**，同一列的元素共同决定一个输出通道的贡献，数值尺度最接近，是权重量化的
-    ///   通行口径；[`QAxis::Row`] 是"每个输入通道一个 scale"，本项目留给 KV cache 的 K）、
+    ///   通行口径；`QAxis::Row` 是"每个输入通道一个 scale"，本项目留给 KV cache 的 K）、
     ///   Hessian 量化的 `act_order`/`damp`/`block`、AWQ 的 α（`None` = 逐层在网格上搜索）。
     /// - `calib` 为 `None` 或某层缺统计时，该层**退回 RTN**：量化是部署前的最后一步，
     ///   在这里失败会卡死整条流水线，而"这层没吃到补偿"只是精度略降。
@@ -1639,7 +1647,7 @@ impl Transformer {
 
     /// 前向传播
     ///
-    /// - idx: [B*T] 展平的 token id
+    /// - idx: \[B*T\] 展平的 token id
     /// - b / t：batch 与序列长度
     /// - kv_cache: Some(每层一个缓存) 时启用 KV cache（推理模式）
     /// - training: 是否在训练模式（影响 dropout）
@@ -1662,7 +1670,7 @@ impl Transformer {
     ///
     /// 序列中的 `<|image|>` 必须已由 [`crate::tokenizer::Tokenizer::encode`] 展开成
     /// `[start, ph₀..ph_{P-1}, end]`，本方法用视觉特征**原位覆写**其中 P 个占位符
-    /// （见 [`Transformer::forward_core`] 的注入说明）。`pixels = None` 时与
+    /// （见 `Transformer::forward_core` 的注入说明）。`pixels = None` 时与
     /// [`Transformer::forward`] 完全等价。
     ///
     /// 只在**首段（prefill）**传像素：增量解码那几步没有新图像，传 `None` 即可
@@ -2128,10 +2136,9 @@ impl Transformer {
             && base == 0
             && self.cfg.n_stream == 1
             && std::env::var_os("LLM_GPU_STACK").is_some()
+            && let Some(out) = self.blocks_resident(&x, mask.as_ref(), b, t, training)
         {
-            if let Some(out) = self.blocks_resident(&x, mask.as_ref(), b, t, training) {
-                return self.ln_f.forward(&out).reshape(vec![b * t, d]);
-            }
+            return self.ln_f.forward(&out).reshape(vec![b * t, d]);
         }
 
         // 5. 逐层过 Transformer Block
@@ -3538,6 +3545,187 @@ mod tests {
             la.data(),
             lb.data(),
             "两种 RoPE 配对方式必须给出不同输出（否则 style 开关没接进前向）"
+        );
+    }
+
+    /// 解码一个 token 期间，matmul 到底读了多少字节（对照模型权重体积）。
+    ///
+    /// 判读：读数 / 权重体积 = 「权重被读了几遍」。理论下限是 1.0（每个权重读一次），
+    /// 明显大于 1 说明中间有物化（`contiguous()` / `to_f32()`）把权重多搬了一遍。
+    #[test]
+    #[ignore]
+    fn probe_decode_bytes_per_token() {
+        let cfg = TransformerConfig::tiny(512);
+        let mut rng = Rng::new(3);
+        let model = Transformer::new(cfg, &mut rng);
+        // 权重总体积（f32 与 bf16 两种存储）
+        // 自检：一次 256×256 matmul 必须被计数，否则说明插桩没被走到
+        crate::tensor::mm_bytes_reset();
+        let a_s = crate::tensor::Tensor::param(vec![1.0f32; 256 * 256], vec![256, 256]);
+        let b_s = crate::tensor::Tensor::param(vec![1.0f32; 256 * 256], vec![256, 256]);
+        let _ = a_s.matmul(&b_s);
+        let (sr, sw) = crate::tensor::mm_bytes_take();
+        println!(
+            "  自检 256x256: 读 {:.2} MB 写 {:.2} MB（应为读 0.52 / 写 0.26）",
+            sr as f64 / 1e6,
+            sw as f64 / 1e6
+        );
+        let params: Vec<_> = model.parameters();
+        let f32_bytes: u64 = params.iter().map(|p| (p.numel() * 4) as u64).sum();
+        let run_one = |model: &Transformer, tok: usize| -> (u64, u64) {
+            let mut cache = model.new_kv_cache();
+            crate::tensor::no_grad(|| {
+                model.forward(&[tok], 1, 1, Some(&mut cache), false);
+            });
+            crate::tensor::mm_bytes_take()
+        };
+        crate::tensor::mm_bytes_reset();
+        let (r32, w32) = run_one(&model, 7);
+        println!(
+            "  f32  权重 {:>7.1} MB | 解码读 {:>7.1} MB = {:.2} 遍 | 写 {:.1} MB",
+            f32_bytes as f64 / 1e6,
+            r32 as f64 / 1e6,
+            r32 as f64 / f32_bytes as f64,
+            w32 as f64 / 1e6
+        );
+        for p in &params {
+            p.to_bf16();
+        }
+        let bf16_bytes: u64 = params.iter().map(|p| (p.numel() * 2) as u64).sum();
+        crate::tensor::mm_bytes_reset();
+        let (r16, w16) = run_one(&model, 7);
+        let (t2, t4) = crate::tensor::mm_bytes_typed();
+        println!(
+            "    按宽度拆分：bf16(2B) 读 {:.3} MB | f32(4B) 读 {:.3} MB",
+            t2 as f64 / 1e6,
+            t4 as f64 / 1e6
+        );
+        // （已在上方取过 t2/t4）
+        println!(
+            "  bf16 权重 {:>7.1} MB | 解码读 {:>7.1} MB = {:.2} 遍 | 写 {:.1} MB",
+            bf16_bytes as f64 / 1e6,
+            r16 as f64 / 1e6,
+            r16 as f64 / bf16_bytes as f64,
+            w16 as f64 / 1e6
+        );
+    }
+
+    /// 解码一 token 的**按形状热点直方图**（默认不跑）
+    ///
+    /// ```text
+    /// cargo test --release model::tests::probe_decode_shape_profile -- --ignored --nocapture
+    /// ```
+    /// 目的：0.5B bf16 解码实测 ~70 ms，而按带宽（0.99 GB / 35 GB/s）应 ≈28 ms。
+    /// 这里按 `(m,k,n,b_t)` 聚合 matmul 的耗时，看差距是在某几个形状上、还是在 matmul 之外。
+    #[test]
+    #[ignore]
+    fn probe_decode_shape_profile() {
+        use std::time::Instant;
+        let path = "checkpoints/qwen05/model.ckpt";
+        if !std::path::Path::new(path).exists() {
+            println!("缺少 {path}，跳过");
+            return;
+        }
+        let hdr = crate::checkpoint::load_header(path);
+        let mut rng = Rng::new(1);
+        let model = crate::rng::without_init(|| Transformer::new(hdr.model.clone(), &mut rng));
+        crate::checkpoint::load_params(path, &model);
+        for p in &model.parameters() {
+            p.to_bf16();
+        }
+        // 先做 prefill 把一个 KV cache 填到 8 个 token，再测一步 decode
+        let mut cache = model.new_kv_cache();
+        for i in 0..8 {
+            crate::tensor::no_grad(|| model.forward(&[100 + i], 1, 1, Some(&mut cache), false));
+        }
+        crate::tensor::mm_time_reset();
+        let t = Instant::now();
+        crate::tensor::no_grad(|| model.forward(&[108], 1, 1, Some(&mut cache), false));
+        let total = t.elapsed().as_secs_f64() * 1e3;
+        println!("  单 token forward 总计 {total:.1} ms");
+        crate::tensor::mm_time_dump(10);
+        crate::tensor::op_time_dump(10);
+    }
+
+    /// 权重绑定：`tie_embeddings = true` 时不应有独立输出头，参数差应恰为 `vocab × n_embd`。
+    #[test]
+    fn test_tie_embeddings_saves_exactly_one_head() {
+        let tied_cfg = TransformerConfig {
+            tie_embeddings: true,
+            ..TransformerConfig::tiny(64)
+        };
+        let untied_cfg = TransformerConfig {
+            tie_embeddings: false,
+            ..TransformerConfig::tiny(64)
+        };
+        let count = |cfg: TransformerConfig, seed: u64| {
+            let mut rng = Rng::new(seed);
+            let m = Transformer::new(cfg, &mut rng);
+            m.named_parameters()
+                .iter()
+                .map(|(_, t)| t.numel())
+                .sum::<usize>()
+        };
+        let tied = count(tied_cfg.clone(), 1);
+        let untied = count(untied_cfg.clone(), 1);
+        let expected = untied_cfg.vocab_size * untied_cfg.n_embd;
+        assert_eq!(
+            untied - tied,
+            expected,
+            "不绑定应多出恰好一张 [vocab, n_embd] 的输出头"
+        );
+    }
+
+    /// 合并 LoRA 前后前向必须等价：merge 只是把 `alpha/r · B·A` 并进主干权重。
+    ///
+    /// 初始化时 B = 0（增量恒为 0），测不出合并是否正确，所以先把 B 填成非零。
+    #[test]
+    fn test_lora_merge_preserves_forward_numerics() {
+        let mut rng = Rng::new(7);
+        let mut model = Transformer::new(TransformerConfig::tiny(64), &mut rng);
+        let lora = LoRAConfig {
+            rank: 4,
+            alpha: 8.0,
+            targets: crate::config::LoRATargets {
+                q: true,
+                k: true,
+                v: true,
+                o: true,
+                mlp: true,
+            },
+        };
+        model.apply_lora(&lora, &mut rng);
+        assert!(model.has_lora());
+
+        // 把适配层的 B 矩阵填成非零
+        let mut touched = 0usize;
+        for (name, t) in model.named_parameters() {
+            if name.ends_with(".lora_b") {
+                let n = t.numel();
+                t.set_data((0..n).map(|i| ((i as f32) * 0.017).sin() * 0.05).collect());
+                touched += 1;
+            }
+        }
+        assert!(touched > 0, "没找到任何 lora_b 参数，命名规则可能变了");
+
+        let idx = vec![1usize, 2, 3, 4, 5];
+        let (b, t_len) = (1usize, idx.len());
+        let fused = model.forward(&idx, b, t_len, None, false).data();
+
+        model.merge_lora();
+        assert!(!model.has_lora(), "合并后不应再有适配层");
+        let merged = model.forward(&idx, b, t_len, None, false).data();
+
+        assert_eq!(fused.len(), merged.len());
+        let max_diff = fused
+            .iter()
+            .zip(&merged)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let scale = fused.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
+        assert!(
+            max_diff / scale < 1e-3,
+            "合并前后前向不等价：max_diff={max_diff}，量级={scale}"
         );
     }
 }

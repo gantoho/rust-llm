@@ -6,29 +6,34 @@
 //! - `GET  /v1/models` —— 只有一个模型的模型列表
 //! - `GET  /health` —— 存活探针
 //! - `GET  /v1/status` —— 队列/计数/模型信息（诊断用，不鉴权）
-//! - `GET  /openapi.json` / `/openapi.yaml` —— 本服务的 OpenAPI 规范（不鉴权）
+//! - `GET  /metrics` —— Prometheus 文本指标（不鉴权）\n//! - `GET  /openapi.json` / `/openapi.yaml` —— 本服务的 OpenAPI 规范（不鉴权）
 //!
-//! 并发模型：主线程 accept，每个请求 `spawn` 一个线程；模型是**单份**的，
-//! 所有生成请求共用一把 `Mutex`（`with_core`），因此实际生成是串行排队的，
-//! `/v1/status` 里的 `queued` 就是这条队列的长度。
+//! 并发模型：主线程 accept，每个请求 `spawn` 一个线程；模型是**单份**的（`Arc<Transformer>`）。
 //!
-//! 之所以选"单模型 + 互斥"而不是多副本：单机 CPU 推理时多副本只会互相抢核心，
-//! 排队反而让延迟曲线平稳；要真并发得开多进程（另起端口）或上 GPU。
+//! - **生成不在锁里跑**：锁内只做"排队计数 + 取 `Arc` 快照 + 派生 `Rng`"，随后 `drop(core)`
+//!   再生成 —— 所以多个请求可以真正并行（`with_model`，见 C6 第二步）；
+//! - **批处理引擎**：每个请求的 decode 步会把自己的 KV cache 交出去，由**一个驱动线程**
+//!   凑成一批跑一次 `Transformer::decode_batch`，再逐条回传 logits（C6 第三步）。
+//!   聚合窗口按并发自适应：只有 `active > 1` 才等 5 ms，单请求零等待；
+//! - `/v1/status` 的 `queued` 是"排队计数"，`running` 是已拿到模型快照的请求数。
+//!
+//! 之所以仍是单模型单副本：单机 CPU 推理时多副本只会互相抢核心；要更大吞吐得开多进程
+//! （另起端口）或上 GPU。
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock, Mutex};
-#[cfg(test)] use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-use crate::data::{SFT_ASSISTANT, SFT_USER};
 use crate::model::Transformer;
 use crate::prompt;
 use crate::rng::Rng;
@@ -52,6 +57,9 @@ const MAX_STOP_STRINGS: usize = 1024;
 /// `/v1/embeddings` 单批最多多少条输入
 const MAX_EMBED_BATCH: usize = 32;
 
+/// `top_logprobs` 的上限（OpenAI 也是 20）
+const MAX_TOP_LOGPROBS: usize = 20;
+
 // ==================== 服务状态 ====================
 
 /// 服务的静态配置（启动时定死，请求不可改）
@@ -65,7 +73,10 @@ pub struct ServeCfg {
     /// 服务级 system prompt（请求里的 system 会**接在它后面**）
     pub system: String,
     /// 用 SFT 对话模板还是裸续写（同 `chat --prompt-format`）
+    /// 对话模板用的是 `用户：/助手：`（SFT）还是 ChatML（Qwen / Llama-3 等 Instruct 基座）
     pub use_sft: bool,
+    /// `--prompt-format chatml`：角色标记用 `<|im_start|>…<|im_end|>`
+    pub chatml: bool,
     /// `max_tokens` 缺省时用的生成上限
     pub max_new: usize,
     /// 不带 `seed` 字段时的随机种子
@@ -77,9 +88,29 @@ pub struct ServeCfg {
     pub sample: SampleOpts,
     /// 上下文窗口（用于限制 `max_tokens` 与 embedding 输入长度）
     pub block_size: usize,
+    /// 并发上限：同时在跑的生成/编码请求超过它就回 **429**（`0` = 不限制）。
+    ///
+    /// 每个在跑的请求独占一份 KV cache（0.5B / 512 窗口约 12 MB），无上限时一次突发并发
+    /// 就能把内存打满 —— 所以在**进模型之前**就挡住，而不是等 OOM。
+    ///
+    /// 来源：环境变量 `LLM_SERVE_MAX_CONCURRENT`，缺省 8。
+    pub max_concurrent: usize,
     /// 视觉塔超参（`model.vision`）：`Some` 时 `message.image_url` 可用；
     /// 解码图片要缩放归一化，放配置里让请求线程不占模型锁。纯文本模型为 `None`
     pub vision: Option<crate::vision::VisionConfig>,
+}
+
+impl ServeCfg {
+    /// 三态模板：`chatml` 优先，其次 `sft`，否则 `raw`
+    pub fn template(&self) -> crate::prompt::Template {
+        if self.chatml {
+            crate::prompt::Template::ChatMl
+        } else if self.use_sft {
+            crate::prompt::Template::Sft
+        } else {
+            crate::prompt::Template::Raw
+        }
+    }
 }
 
 /// 模型核心：模型与分词器用 `Arc` 共享，`rng` 仍是独占的。
@@ -104,6 +135,10 @@ struct Stats {
     stream: AtomicUsize,
     embeddings: AtomicUsize,
     errors: AtomicUsize,
+    /// 因并发上限被拒（429）的请求数
+    rejected: AtomicUsize,
+    /// 当前在跑（含 prefill 与编码）的请求数 —— 并发上限用它
+    in_flight: AtomicUsize,
 }
 
 /// 服务的全部运行时状态，`Arc` 共享给每个请求线程
@@ -209,6 +244,30 @@ struct ApiError {
     status: u16,
     kind: &'static str,
     message: String,
+}
+
+/// 并发许可：拿到即占一个并发位，`Drop` 时自动释放；拿不到 = 已达上限（回 429）
+struct Permit<'a>(&'a Stats);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 并发位申请的核心逻辑（与 `State` 解耦，便于单测）
+fn try_permit_raw(cap: usize, stats: &Stats) -> Option<Permit<'_>> {
+    let cur = stats.in_flight.fetch_add(1, Ordering::SeqCst);
+    if cap != 0 && cur >= cap {
+        stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+        stats.rejected.fetch_add(1, Ordering::SeqCst);
+        return None;
+    }
+    Some(Permit(stats))
+}
+
+fn try_permit(state: &State) -> Option<Permit<'_>> {
+    try_permit_raw(state.cfg.max_concurrent, &state.stats)
 }
 
 fn bad(message: impl Into<String>) -> ApiError {
@@ -352,7 +411,22 @@ fn spawn_batch_engine(engine: Arc<BatchEngine>, model: Arc<Transformer>) {
             let mut caches: Vec<Vec<crate::attention::KVCache>> = (0..batch.len())
                 .map(|i| std::mem::take(&mut batch[i].cache))
                 .collect();
-            let logits = crate::tensor::no_grad(|| model.decode_batch(&ids, &mut caches, &bases));
+            // panic 保护：内核一旦 panic，**丢弃本批**（`tx` 随之析构 ⇒ 调用方的 `recv`
+            // 立刻返回错误、请求快速失败），然后继续服务后续批次 —— 绝不能让驱动线程死掉，
+            // 否则之后每个请求都要白等 300 s 超时。
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::tensor::no_grad(|| model.decode_batch(&ids, &mut caches, &bases))
+            }));
+            let logits = match decoded {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!(
+                        "[serve] 批解码 panic：本批作废（{} 条），驱动线程继续",
+                        batch.len()
+                    );
+                    continue;
+                }
+            };
             let v = model.cfg.vocab_size;
             let data = logits.data();
             for (i, s) in batch.into_iter().enumerate() {
@@ -512,6 +586,20 @@ fn reply_json(req: Request, state: &Arc<State>, status: u16, body: &Value) -> u1
 /// 发一个任意文本类型的响应（`/openapi.yaml` 用），返回状态码。
 ///
 /// 与 [`reply_json`] 的差别只在 `Content-Type`；同样给 `Content-Length`。
+/// Prometheus 文本格式的标签值转义：反斜杠、双引号、换行必须转义，否则抓取端解析失败。
+fn escape_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn reply_text(
     req: Request,
     state: &Arc<State>,
@@ -681,17 +769,24 @@ fn prepare_vision(
 }
 
 /// 校验 `Authorization: Bearer <key>`
+/// 从 `Authorization` 头里取出 Bearer token（大小写不敏感、容许首尾空白）。
+///
+/// 独立成纯函数是为了可测：`check_auth` 本身要一个 `tiny_http::Request`，测不了。
+fn bearer_token(raw: &str) -> &str {
+    let raw = raw.trim();
+    if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("bearer ") {
+        raw[7..].trim()
+    } else {
+        ""
+    }
+}
+
 fn check_auth(req: &Request, state: &Arc<State>) -> Result<(), ApiError> {
     let Some(expected) = state.cfg.api_key.as_deref() else {
         return Ok(());
     };
     let raw = header_value(req, "authorization").unwrap_or_default();
-    let raw = raw.trim();
-    let token = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("bearer ") {
-        raw[7..].trim()
-    } else {
-        ""
-    };
+    let token = bearer_token(&raw);
     if token == expected {
         Ok(())
     } else {
@@ -706,6 +801,27 @@ fn check_auth(req: &Request, state: &Arc<State>) -> Result<(), ApiError> {
 // ==================== 路由 ====================
 
 /// 单个请求的入口：分发到具体处理器，返回 HTTP 状态码
+
+/// 路由表：路径 → 允许的方法。用于区分"路径不存在(404)"与"方法不对(405)"。
+///
+/// OpenAPI 里这几条路径都声明了 `405 MethodNotAllowed`，实现必须与之一致。
+const ROUTES: &[(&str, &[&str])] = &[
+    ("/health", &["GET"]),
+    ("/v1/models", &["GET"]),
+    ("/v1/status", &["GET"]),
+    ("/openapi.json", &["GET"]),
+    ("/openapi.yaml", &["GET"]),
+    ("/metrics", &["GET"]),
+    ("/v1/completions", &["POST"]),
+    ("/v1/chat/completions", &["POST"]),
+    ("/v1/embeddings", &["POST"]),
+];
+
+/// 路径已知时返回允许的方法，否则 `None`
+fn allowed_methods(path: &str) -> Option<&'static [&'static str]> {
+    ROUTES.iter().find(|(p, _)| *p == path).map(|(_, m)| *m)
+}
+
 fn route(mut req: Request, state: &Arc<State>) -> u16 {
     // 预检请求：浏览器跨域前先问一句"允许我带 Authorization 吗"
     if matches!(req.method(), Method::Options) {
@@ -745,6 +861,115 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
                 }),
             )
         }
+        "/v1/completions" if is_post => {
+            if let Err(e) = check_auth(&req, state) {
+                return reply_err(req, state, e);
+            }
+            let body = match read_body(&mut req) {
+                Ok(b) => b,
+                Err(e) => return reply_err(req, state, e),
+            };
+            let job = match parse_completions(&body, state) {
+                Ok(j) => j,
+                Err(e) => return reply_err(req, state, e),
+            };
+            let Some(_permit) = try_permit(state) else {
+                return reply_err(
+                    req,
+                    state,
+                    ApiError {
+                        status: 429,
+                        kind: "rate_limit_error",
+                        message: format!(
+                            "并发已达上限 {}（LLM_SERVE_MAX_CONCURRENT=0 可取消限制）",
+                            state.cfg.max_concurrent
+                        ),
+                    },
+                );
+            };
+            state.stats.chat.fetch_add(1, Ordering::SeqCst);
+            match run_chat(state, job) {
+                Ok(v) => reply_json(req, state, 200, &reshape_completion(v)),
+                Err(e) => reply_err(req, state, e),
+            }
+        }
+        // Prometheus 抓取端点：与 `/v1/status` 一样**不鉴权**（只暴露计数，不暴露任何内容）
+        "/metrics" if is_get => {
+            let s = &state.stats;
+            let mut out = String::with_capacity(1024);
+            out.push_str(
+                "# HELP llm_serve_requests_total 累计请求数（按类型）\n\
+                 # TYPE llm_serve_requests_total counter\n",
+            );
+            for (kind, v) in [
+                ("chat", s.chat.load(Ordering::SeqCst)),
+                ("stream", s.stream.load(Ordering::SeqCst)),
+                ("embeddings", s.embeddings.load(Ordering::SeqCst)),
+                ("errors", s.errors.load(Ordering::SeqCst)),
+            ] {
+                out.push_str(&format!(
+                    "llm_serve_requests_total{{kind=\"{kind}\"}} {v}\n"
+                ));
+            }
+            for (name, help, kind, value) in [
+                (
+                    "llm_serve_in_flight",
+                    "当前在跑（含 prefill / 编码）的请求数",
+                    "gauge",
+                    s.in_flight.load(Ordering::SeqCst),
+                ),
+                (
+                    "llm_serve_queued",
+                    "已进队但还没拿到模型的请求数",
+                    "gauge",
+                    s.queued.load(Ordering::SeqCst),
+                ),
+                (
+                    "llm_serve_running",
+                    "已拿到模型快照、正在生成的请求数",
+                    "gauge",
+                    s.running.load(Ordering::SeqCst),
+                ),
+                (
+                    "llm_serve_max_concurrent",
+                    "并发上限（0 = 不限）",
+                    "gauge",
+                    state.cfg.max_concurrent,
+                ),
+                (
+                    "llm_serve_rejected_total",
+                    "因并发上限被拒（429）的累计数",
+                    "counter",
+                    s.rejected.load(Ordering::SeqCst),
+                ),
+                (
+                    "llm_serve_uptime_seconds",
+                    "服务已运行秒数",
+                    "gauge",
+                    state.started.elapsed().as_secs() as usize,
+                ),
+            ] {
+                out.push_str(&format!(
+                    "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
+                ));
+            }
+            out.push_str(
+                "# HELP llm_serve_model_info 模型元信息（值恒为 1，便于按标签聚合）\n\
+                 # TYPE llm_serve_model_info gauge\n",
+            );
+            out.push_str(&format!(
+                "llm_serve_model_info{{model=\"{}\",block_size=\"{}\"}} 1\n",
+                escape_label(&state.cfg.model_name),
+                state.cfg.block_size
+            ));
+            reply_text(
+                req,
+                state,
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                out,
+            )
+        }
         "/v1/status" if is_get => {
             let s = &state.stats;
             reply_json(
@@ -757,6 +982,9 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
                     "queue": {
                         "queued": s.queued.load(Ordering::SeqCst),
                         "running": s.running.load(Ordering::SeqCst),
+                        "in_flight": s.in_flight.load(Ordering::SeqCst),
+                        "max_concurrent": state.cfg.max_concurrent,
+                        "rejected": s.rejected.load(Ordering::SeqCst),
                     },
                     "requests": {
                         "chat": s.chat.load(Ordering::SeqCst),
@@ -768,7 +996,7 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
                         "name": state.cfg.model_name,
                         "block_size": state.cfg.block_size,
                         "max_new": state.cfg.max_new,
-                        "prompt_format": if state.cfg.use_sft { "sft" } else { "raw" },
+                        "prompt_format": if state.cfg.chatml { "chatml" } else if state.cfg.use_sft { "sft" } else { "raw" },
                     },
                 }),
             )
@@ -802,6 +1030,20 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
                 Ok(j) => j,
                 Err(e) => return reply_err(req, state, e),
             };
+            let Some(_permit) = try_permit(state) else {
+                return reply_err(
+                    req,
+                    state,
+                    ApiError {
+                        status: 429,
+                        kind: "rate_limit_error",
+                        message: format!(
+                            "并发已达上限 {}（LLM_SERVE_MAX_CONCURRENT=0 可取消限制）",
+                            state.cfg.max_concurrent
+                        ),
+                    },
+                );
+            };
             state.stats.chat.fetch_add(1, Ordering::SeqCst);
             if job.stream {
                 state.stats.stream.fetch_add(1, Ordering::SeqCst);
@@ -820,6 +1062,20 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
                 Ok(b) => b,
                 Err(e) => return reply_err(req, state, e),
             };
+            let Some(_permit) = try_permit(state) else {
+                return reply_err(
+                    req,
+                    state,
+                    ApiError {
+                        status: 429,
+                        kind: "rate_limit_error",
+                        message: format!(
+                            "并发已达上限 {}（LLM_SERVE_MAX_CONCURRENT=0 可取消限制）",
+                            state.cfg.max_concurrent
+                        ),
+                    },
+                );
+            };
             match run_embeddings(state, &body) {
                 Ok(v) => {
                     state.stats.embeddings.fetch_add(1, Ordering::SeqCst);
@@ -828,15 +1084,31 @@ fn route(mut req: Request, state: &Arc<State>) -> u16 {
                 Err(e) => reply_err(req, state, e),
             }
         }
-        _ if is_get || is_post => reply_err(
-            req,
-            state,
-            ApiError {
-                status: 404,
-                kind: "not_found",
-                message: format!("未知路径 {path}"),
-            },
-        ),
+        _ if is_get || is_post => {
+            // 路径认识但方法不对 → 405（与 OpenAPI 一致）；完全不认识的路径才 404
+            if let Some(allowed) = allowed_methods(&path) {
+                let method = req.method().as_str().to_string();
+                reply_err(
+                    req,
+                    state,
+                    ApiError {
+                        status: 405,
+                        kind: "invalid_request_error",
+                        message: format!("{path} 不支持 {method}（可用：{}）", allowed.join(" / ")),
+                    },
+                )
+            } else {
+                reply_err(
+                    req,
+                    state,
+                    ApiError {
+                        status: 404,
+                        kind: "not_found",
+                        message: format!("未知路径 {path}"),
+                    },
+                )
+            }
+        }
         _ => {
             // 先取方法名再移动 `req`：参数从左到右求值，写在 reply_err 实参里会"先 move 后借用"
             let method = req.method().as_str().to_string();
@@ -924,6 +1196,36 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
             }
         }
     });
+    let completions = json!({
+        "tags": ["completions"],
+        "summary": "文本补全（旧版端点，裸续写）",
+        "description": "OpenAI 旧版 `/v1/completions` 的兼容实现：`prompt` **不套对话模板**，\
+                        直接续写。一次只生成一个结果（`prompt` 数组只能 1 条），不支持 stream / logprobs。",
+        "responses": {
+            "200": {
+                "description": "补全结果",
+                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TextCompletionResponse" } } }
+            },
+            "400": { "$ref": "#/components/responses/BadRequest" },
+            "401": { "$ref": "#/components/responses/Unauthorized" },
+            "405": { "$ref": "#/components/responses/MethodNotAllowed" },
+            "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+            "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+    });
+    let metrics = json!({
+        "tags": ["health"],
+        "summary": "Prometheus 指标（文本格式）",
+        "description": "不鉴权。仅暴露计数与运行时长，不含任何请求内容；\n\
+                        可直接用 Prometheus 的 `scrape_configs` 抓取。",
+        "security": [],
+        "responses": {
+            "200": {
+                "description": "Prometheus text exposition format (version 0.0.4)",
+                "content": { "text/plain": { "schema": { "type": "string" } } }
+            }
+        }
+    });
     let openapi_yaml = json!({
         "tags": ["health"],
         "summary": "OpenAPI 规范（YAML）",
@@ -986,6 +1288,8 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
             },
             "400": { "$ref": "#/components/responses/BadRequest" },
             "401": { "$ref": "#/components/responses/Unauthorized" },
+            "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+            "429": { "$ref": "#/components/responses/RateLimited" },
             "405": { "$ref": "#/components/responses/MethodNotAllowed" },
             "500": { "$ref": "#/components/responses/ServerError" }
         }
@@ -1016,6 +1320,8 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
             },
             "400": { "$ref": "#/components/responses/BadRequest" },
             "401": { "$ref": "#/components/responses/Unauthorized" },
+            "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+            "429": { "$ref": "#/components/responses/RateLimited" },
             "405": { "$ref": "#/components/responses/MethodNotAllowed" },
             "500": { "$ref": "#/components/responses/ServerError" }
         }
@@ -1047,6 +1353,8 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
             "/v1/models": { "get": models },
             "/openapi.json": { "get": openapi_json },
             "/openapi.yaml": { "get": openapi_yaml },
+            "/metrics": { "get": metrics },
+            "/v1/completions": { "post": completions },
             "/v1/chat/completions": { "post": chat },
             "/v1/embeddings": { "post": embeddings }
         },
@@ -1080,6 +1388,14 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                 "ServerError": {
                     "description": "生成/编码过程出错，`error.type` 为 server_error。\
                                     注意：SSE 已经开始下发后只能在流内发一个 error 帧，拿不到本响应。",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+                },
+                "PayloadTooLarge": {
+                    "description": "请求体超过 16 MiB 上限（`LLM_SERVE_MAX_BODY` 之外写死），`error.type` 为 invalid_request_error",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+                },
+                "RateLimited": {
+                    "description": "并发已达上限（`LLM_SERVE_MAX_CONCURRENT`，缺省 8；0 = 不限），`error.type` 为 rate_limit_error",
                     "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
                 }
             },
@@ -1204,6 +1520,10 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                         "top_p": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
                         "repetition_penalty": { "type": "number", "minimum": 0.1, "maximum": 10 },
                         "repetition_window": { "type": "integer", "minimum": 0, "maximum": 100_000 },
+                "presence_penalty": { "type": "number", "minimum": -2.0, "maximum": 2.0,
+                    "description": "出现过的 token 减一个常数（只看回看窗口；与 repetition_penalty 语义不同，可共存）" },
+                "frequency_penalty": { "type": "number", "minimum": -2.0, "maximum": 2.0,
+                    "description": "按回看窗口内的出现次数线性减（OpenAI 语义的近似：窗口而非全历史）" },
                         "stop": {
                             "description": "缺省用服务级停止标记（SFT 模板标记）",
                             "oneOf": [
@@ -1219,9 +1539,76 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                             "type": "integer", "minimum": 1,
                             "description": "缺省用服务级 --max-new；超过 block_size 会被钳到窗口内"
                         },
+                        "max_completion_tokens": {
+                            "type": "integer", "minimum": 1,
+                            "description": "`max_tokens` 的别名（新版 OpenAI 客户端的叫法）；\
+                                            两者只能给一个，同时给会 400"
+                        },
                         "seed": { "type": "integer", "minimum": 0, "description": "不给则用服务级 --seed" },
+                        "logprobs": {
+                            "type": "boolean", "default": false,
+                            "description": "返回每个生成 token 的对数概率；**流式响应暂不支持**（会 400）"
+                        },
+                        "top_logprobs": {
+                            "type": "integer", "minimum": 0, "maximum": 20,
+                            "description": "每步附带的备选数（需同时 logprobs=true）"
+                        },
                         "stream": { "type": "boolean", "default": false },
                         "n": { "type": "integer", "const": 1, "description": "本服务一次只生成一个回答" }
+                    }
+                },
+                "TextCompletionResponse": {
+                    "type": "object",
+                    "required": ["id", "object", "created", "model", "choices", "usage"],
+                    "properties": {
+                        "id": { "type": "string", "examples": ["cmpl-1"] },
+                        "object": { "type": "string", "const": "text_completion" },
+                        "created": { "type": "integer" },
+                        "model": { "type": "string" },
+                        "choices": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["text", "index", "finish_reason"],
+                                "properties": {
+                                    "text": { "type": "string" },
+                                    "index": { "type": "integer", "const": 0 },
+                                    "logprobs": { "type": "null" },
+                                    "finish_reason": { "type": "string", "enum": ["stop", "length"] }
+                                }
+                            }
+                        },
+                        "usage": { "$ref": "#/components/schemas/Usage" }
+                    }
+                },
+                "ChatLogprobs": {
+                    "type": "object",
+                    "required": ["content"],
+                    "properties": {
+                        "content": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["token", "logprob", "top_logprobs"],
+                                "properties": {
+                                    "token": { "type": "string", "description": "该步生成的 token 文本" },
+                                    "logprob": { "type": "number", "description": "其对数概率（≤ 0）" },
+                                    "bytes": { "type": ["array", "null"], "items": { "type": "integer" } },
+                                    "top_logprobs": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["token", "logprob"],
+                                            "properties": {
+                                                "token": { "type": "string" },
+                                                "logprob": { "type": "number" },
+                                                "bytes": { "type": ["array", "null"], "items": { "type": "integer" } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 "ChatCompletionResponse": {
@@ -1250,7 +1637,13 @@ fn openapi_spec(cfg: &ServeCfg) -> Value {
                                         }
                                     },
                                     "finish_reason": { "type": "string", "enum": ["stop", "length"] },
-                                    "logprobs": { "type": "null" }
+                                    "logprobs": {
+                            "description": "没要 logprobs 时为 null",
+                            "oneOf": [
+                                { "type": "null" },
+                                { "$ref": "#/components/schemas/ChatLogprobs" }
+                            ]
+                        }
                                 }
                             }
                         },
@@ -1508,10 +1901,108 @@ struct ChatJob {
     /// 请求指定的种子；`None` = 用服务级 `--seed`
     seed: Option<u64>,
     stream: bool,
+    /// `Some(top_k)` = 请求要 logprobs（`top_k` 是每步附带的备选数，`0` = 只要采样值本身）
+    logprobs: Option<usize>,
+    /// 覆盖服务级对话模板：`/v1/completions` 用 [`crate::prompt::Template::Raw`]（裸续写），
+    /// 其余端点沿用 `ServeCfg` 的配置
+    template_override: Option<crate::prompt::Template>,
+    /// `response_format: {"type":"json_object"}` → 开启 JSON 约束解码
+    json_mode: bool,
 }
 
 /// 单调递增的补全 id 序号（`chatcmpl-1`、`chatcmpl-2`…）
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// `POST /v1/completions` 的补全序号（与 chat 的分开，便于日志区分）
+static CMPL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 解析 `POST /v1/completions`（OpenAI 旧版文本补全）。
+///
+/// 语义与 chat 的区别只有一条：**prompt 是裸续写**，不套 `用户：/助手：` 或 ChatML 模板，
+/// 所以这里把 `template_override` 设成 [`crate::prompt::Template::Raw`]，其余复用同一套生成路径。
+fn parse_completions(body: &str, state: &Arc<State>) -> Result<ChatJob, ApiError> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| bad(format!("请求体不是合法 JSON：{e}")))?;
+    let obj = v.as_object().ok_or_else(|| bad("请求体必须是 JSON 对象"))?;
+
+    // prompt：接受字符串，或"只含一条的字符串数组"（不支持批量，本服务一次只生成一个结果）
+    let prompt = match obj.get("prompt") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => {
+            if a.len() != 1 {
+                return Err(bad("本服务一次只生成一个结果：prompt 数组只能有 1 条"));
+            }
+            a[0].as_str()
+                .ok_or_else(|| bad("prompt 数组的元素必须是字符串"))?
+                .to_string()
+        }
+        Some(_) => return Err(bad("prompt 必须是字符串或只含一条的字符串数组")),
+        None => return Err(bad("缺少 prompt 字段")),
+    };
+    if prompt.is_empty() {
+        return Err(bad("prompt 不能为空"));
+    }
+    if obj.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(bad("`/v1/completions` 暂不支持 stream；请用 stream=false"));
+    }
+    if obj.get("logprobs").is_some_and(|v| !v.is_null()) {
+        // chat 的 logprobs 结构与 completions 的（tokens/token_logprobs/text_offset）不同，
+        // 与其返回半成品，不如明确拒绝。
+        return Err(bad(
+            "`/v1/completions` 暂不支持 logprobs；请用 /v1/chat/completions",
+        ));
+    }
+
+    // 其余采样参数与 chat 同源：直接复用 chat 的解析器构造一份等价请求体
+    let mut chat_body = serde_json::Map::new();
+    chat_body.insert(
+        "messages".to_string(),
+        json!([{ "role": "user", "content": prompt }]),
+    );
+    for key in [
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop",
+        "seed",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "repetition_window",
+    ] {
+        if let Some(val) = obj.get(key) {
+            chat_body.insert(key.to_string(), val.clone());
+        }
+    }
+    let mut job = parse_chat(&Value::Object(chat_body).to_string(), &state.cfg)?;
+    job.id = format!("cmpl-{}", CMPL_SEQ.fetch_add(1, Ordering::Relaxed));
+    // 裸续写：不套对话模板，也不带服务级 system（补全端点没有 system 概念）
+    job.system.clear();
+    job.history.clear();
+    job.history_turns = 0;
+    job.template_override = Some(crate::prompt::Template::Raw);
+    Ok(job)
+}
+
+/// 把内部生成结果（chat 形状）改写成 `text_completion` 形状。
+fn reshape_completion(v: Value) -> Value {
+    let choice = &v["choices"][0];
+    json!({
+        "id": v["id"],
+        "object": "text_completion",
+        "created": v["created"],
+        "model": v["model"],
+        "choices": [{
+            "text": choice["message"]["content"],
+            "index": 0,
+            "logprobs": Value::Null,
+            "finish_reason": choice["finish_reason"],
+        }],
+        "usage": v["usage"],
+    })
+}
 
 /// 解析并校验 `POST /v1/chat/completions` 的请求体。
 ///
@@ -1522,6 +2013,26 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
     let v: Value =
         serde_json::from_str(body).map_err(|e| bad(format!("请求体不是合法 JSON：{e}")))?;
     let obj = v.as_object().ok_or_else(|| bad("请求体必须是 JSON 对象"))?;
+
+    // ---- 语义敏感的未知字段：**显式 400**，而不是静默忽略 ----
+    //
+    // 背景：本服务整体对未知字段宽容（`user` / `metadata` / 客户端自带的统计字段一律忽略），
+    // 这样现成的 OpenAI 客户端才能直连。但下面这些字段如果被忽略，**语义会悄悄改变**：
+    // 客户端以为模型在做 JSON 输出 / 调用了工具 / 偏置了词表，实际什么都没发生。
+    // 与其让调用方拿到"看起来成功"的错误结果，不如当场报 400 并说明不支持。
+    const UNSUPPORTED: &[(&str, &str)] = &[
+        ("tools", "function calling（工具调用）"),
+        ("tool_choice", "function calling（工具选择）"),
+        ("parallel_tool_calls", "function calling（并行工具调用）"),
+        ("logit_bias", "词表偏置"),
+    ];
+    for (field, what) in UNSUPPORTED {
+        if obj.get(*field).is_some_and(|v| !v.is_null()) {
+            return Err(bad(format!(
+                "本服务不支持 `{field}`（{what}）；请去掉该字段。                 兼容性说明见 README §16.7"
+            )));
+        }
+    }
 
     // ---- messages ----
     let msgs_val = obj
@@ -1587,7 +2098,7 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         .filter(|(r, _)| !matches!(r.as_str(), "system" | "developer"))
         .count()
         - 1;
-    let (system, history, input) = split_messages(&msgs, cfg.use_sft);
+    let (system, history, input) = split_messages(&msgs, cfg.template());
 
     // ---- 采样参数（逐个覆盖服务级默认值）----
     let mut sample = cfg.sample;
@@ -1622,6 +2133,26 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         }
         sample.repetition_penalty = r as f32;
     }
+    // ---- OpenAI 的两项加性惩罚：取值范围 [-2, 2]，缺省 0（关闭）----
+    // 语义差别：我们只看"回看窗口"内的 token，OpenAI 看全历史（见 README 的兼容性说明）。
+    if let Some(v) = obj.get("presence_penalty") {
+        let p = v
+            .as_f64()
+            .ok_or_else(|| bad("presence_penalty 必须是数字"))?;
+        if !(-2.0..=2.0).contains(&p) {
+            return Err(bad("presence_penalty 取值范围是 [-2, 2]"));
+        }
+        sample.presence_penalty = p as f32;
+    }
+    if let Some(v) = obj.get("frequency_penalty") {
+        let p = v
+            .as_f64()
+            .ok_or_else(|| bad("frequency_penalty 必须是数字"))?;
+        if !(-2.0..=2.0).contains(&p) {
+            return Err(bad("frequency_penalty 取值范围是 [-2, 2]"));
+        }
+        sample.frequency_penalty = p as f32;
+    }
     if let Some(v) = obj.get("repetition_window") {
         let w = v
             .as_u64()
@@ -1651,15 +2182,34 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
     };
 
     // ---- 其余标量 ----
-    let max_tokens = match obj.get("max_tokens") {
+    //
+    // `max_completion_tokens` 是新版 OpenAI 客户端用的名字（`max_tokens` 的同一个语义）。
+    // 只给一个时直接采用；两个都给且值不同 → 400（避免"到底听哪个"的歧义）。
+    let explicit_max = {
+        let a = obj.get("max_tokens").filter(|v| !v.is_null());
+        let b = obj.get("max_completion_tokens").filter(|v| !v.is_null());
+        match (a, b) {
+            (Some(_), Some(_)) => {
+                return Err(bad(
+                    "`max_tokens` 与 `max_completion_tokens` 只能给一个（语义相同）",
+                ));
+            }
+            (Some(v), None) => Some((v, "max_tokens")),
+            (None, Some(v)) => Some((v, "max_completion_tokens")),
+            (None, None) => None,
+        }
+    };
+    let max_tokens = match explicit_max {
         // 缺省值也要钳到窗口内：显式路径钳、缺省路径不钳的话，`--max-new` 一调到
         // 比 `block_size` 大（默认 1000 vs 自研模型常是 512），「不传 max_tokens」
         // 反而会生成超出窗口预算的长度——两条路径必须对称。
         None => cfg.max_new.min(cfg.block_size.max(1)),
-        Some(v) => {
-            let n = v.as_u64().ok_or_else(|| bad("max_tokens 必须是正整数"))?;
+        Some((v, name)) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| bad(format!("{name} 必须是正整数")))?;
             if n == 0 {
-                return Err(bad("max_tokens 必须大于 0"));
+                return Err(bad(format!("{name} 必须大于 0")));
             }
             // 钳到上下文窗口内：prompt 侧还会再减掉它算预算（见 run_chat）
             (n as usize).min(cfg.block_size.max(1))
@@ -1680,6 +2230,63 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         return Err(bad("本服务只支持 n=1（一次生成一个回答）"));
     }
 
+    // ---- logprobs / top_logprobs ----
+    let want_logprobs = match obj.get("logprobs") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad("logprobs 必须是布尔值"))?,
+    };
+    let top_logprobs = match obj.get("top_logprobs") {
+        None | Some(Value::Null) => 0,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| bad("top_logprobs 必须是非负整数"))?;
+            if n > MAX_TOP_LOGPROBS as u64 {
+                return Err(bad(format!("top_logprobs 最大 {MAX_TOP_LOGPROBS}")));
+            }
+            n as usize
+        }
+    };
+    if top_logprobs > 0 && !want_logprobs {
+        return Err(bad("top_logprobs 需要同时设 logprobs=true"));
+    }
+    if want_logprobs && stream {
+        // 流式下每个 SSE 帧可能打包多个 token，逐 token 对齐要做另一套映射；
+        // 与其给出"看起来对但不准"的数据，不如明确拒绝。
+        return Err(bad("流式响应暂不支持 logprobs；请用 stream=false 获取"));
+    }
+    let logprobs = if want_logprobs {
+        Some(top_logprobs)
+    } else {
+        None
+    };
+
+    // ---- response_format：只支持 text / json_object ----
+    let json_mode = match obj.get("response_format") {
+        None | Some(Value::Null) => false,
+        Some(v) => {
+            let ty = v
+                .get("type")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| bad("response_format 必须是含 type 的对象"))?;
+            match ty {
+                "text" => false,
+                "json_object" => true,
+                "json_schema" => {
+                    return Err(bad(
+                        "暂不支持 response_format.type=json_schema（需要把 Schema 编译成语法）；\
+                         请改用 json_object",
+                    ));
+                }
+                other => {
+                    return Err(bad(format!(
+                        "response_format.type 只能是 text 或 json_object，收到 `{other}`"
+                    )));
+                }
+            }
+        }
+    };
+
     Ok(ChatJob {
         id: format!("chatcmpl-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed)),
         system,
@@ -1691,44 +2298,49 @@ fn parse_chat(body: &str, cfg: &ServeCfg) -> Result<ChatJob, ApiError> {
         sample,
         seed,
         stream,
+        logprobs,
+        template_override: None,
+        json_mode,
     })
 }
 
 /// 把消息列表拆成「system」「历史」「本轮输入」三段。
 ///
 /// - `system` / `developer` 消息无论出现在哪都汇进 system（最后用换行连接）；
-/// - 末条 `user` 是本轮输入，其余按 `use_sft` 套角色模板；
-/// - SFT 模板下历史长这样：`用户：\nq1\n助手：\na1`（与 `prompt::assemble` 的 tail 同形，
-///   拼完整条 prompt 时首尾能自然接上）。
-fn split_messages(msgs: &[(String, String)], use_sft: bool) -> (String, String, String) {
+/// - 末条 `user` 是本轮输入，其余按 `tmpl` 配对成历史；
+/// - 历史由 [`crate::prompt::Template::turn`] 逐轮拼出，与 `assemble_tmpl` 追加的 tail 首尾能接上。
+fn split_messages(
+    msgs: &[(String, String)],
+    tmpl: crate::prompt::Template,
+) -> (String, String, String) {
     let (last_role, last_content) = msgs.last().expect("调用方已保证非空");
     debug_assert_eq!(last_role, "user");
 
     let mut systems: Vec<&str> = Vec::new();
-    let mut history = String::new();
-    // 末条 user 之前的都算历史
+    // 末条 user 之前的历史，先按角色配对成 (user, assistant)
+    let mut pairs: Vec<(&str, Option<&str>)> = Vec::new();
     for (role, content) in &msgs[..msgs.len() - 1] {
         match role.as_str() {
             "system" | "developer" => systems.push(content),
-            "user" => {
-                if !history.is_empty() {
-                    history.push('\n');
-                }
-                if use_sft {
-                    history.push_str(&format!("{SFT_USER}\n{content}\n{SFT_ASSISTANT}"));
-                } else {
-                    history.push_str(content);
-                }
-            }
+            "user" => pairs.push((content, None)),
             _ => {
-                // assistant（校验阶段已挡掉其它 role）
-                if !history.is_empty() {
-                    history.push('\n');
+                // assistant（校验阶段已挡掉其它 role）：挂到最近一个 user 上
+                if let Some(last) = pairs.last_mut()
+                    && last.1.is_none()
+                {
+                    last.1 = Some(content);
+                    continue;
                 }
-                history.push_str(content);
+                // 孤立的 assistant（缺前置 user）：当成一轮"空提问"
+                pairs.push(("", Some(content)));
             }
         }
     }
+    let history = pairs
+        .iter()
+        .map(|(u, a)| tmpl.turn(u, a.unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n");
     (systems.join("\n"), history, last_content.clone())
 }
 
@@ -1899,28 +2511,50 @@ fn b64encode(bytes: &[u8]) -> String {
 }
 
 fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
-    let system = merge_system(&state.cfg.system, &job.system);
+    let mut system = merge_system(&state.cfg.system, &job.system);
     // 输入图先解码（锁外、可回 400）：图解不出来就不进生成队列。
     // 训练格式补全也在完成——`input` 是补过 `图:<|image|>` 的版本，日志仍记原始 `job.input`
     let (input, pixels) =
         prepare_vision(state.cfg.vision.as_ref(), &job.input, job.image.as_deref())?;
     let max_tokens = job.max_tokens;
     // 给生成预留 max_new，剩下的才是输入预算（见 prompt::assemble 的分配顺序）
-    let prompt_budget = state.cfg.block_size.saturating_sub(max_tokens);
-    let use_sft = state.cfg.use_sft;
+    // 同理：生成段要整段留在窗口内，且至少给 prompt 留 1/4 —— 否则预算为 0，
+    // 多轮对话的历史与 system 全被丢掉（`parse_chat` 只把 max_tokens 钳到 block_size，
+    // 钳到"等于窗口"时预算仍是 0）。
+    let max_tokens = max_tokens.min(
+        state
+            .cfg
+            .block_size
+            .saturating_sub(state.cfg.block_size / 4)
+            .max(1),
+    );
+    let prompt_budget = state.cfg.block_size.saturating_sub(max_tokens).max(1);
     let kv = state.cfg.kv;
     let mut owned_rng = job.seed.map(Rng::new);
 
     let produced = with_model(state, |model, tokenizer, shared_rng| {
+        // JSON 模式：给一句指令能显著提高"内容像 JSON"的概率。
+        // **只在分词器能编码这句提示时**才加——char 分词器的词表只含语料字符，
+        // 直接拼进去会让 encode panic（不值得为一个可选提示让请求 500）。
+        if job.json_mode && !system.to_lowercase().contains("json") {
+            let hint = "只输出一个合法的 JSON 对象，不要任何解释文字。";
+            if tokenizer.can_encode(hint) {
+                if !system.is_empty() {
+                    system.push('\n');
+                }
+                system.push_str(hint);
+            }
+        }
         // 拆开字段借用：`Generator` 同时要 `&Transformer` / `&Tokenizer` 和 `&mut Rng`，
         // 直接借 `core` 会因为"一个可变 + 两个共享"打架
         let mut shared_rng = shared_rng;
-        let a = prompt::assemble(
+        let a = prompt::assemble_tmpl(
             tokenizer,
             &system,
             &job.history,
             &input,
-            use_sft,
+            job.template_override
+                .unwrap_or_else(|| state.cfg.template()),
             prompt_budget,
         );
         let rng = match owned_rng.as_mut() {
@@ -1947,17 +2581,61 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
         if let Some(c) = reuse {
             g = g.with_cache(c);
         }
+        // 要 logprobs 时必须逐步采样：批处理引擎的采样在别的行里，拿不到每步分布
+        // （见 `batched_step`）。这里退化为单条 `step()`，只影响该请求的吞吐。
+        if let Some(top_k) = job.logprobs {
+            g = g.with_logprobs(top_k);
+        }
+        if job.json_mode {
+            g = g.with_json_constraint();
+        }
         let n_prompt = g.prompt_tokens();
         // 与 `g.run()` 等价的手写循环：多拿一个「prefill 结束」的计时点（见 DecodeTimer）
         let mut timer = DecodeTimer::new();
-        while batched_step(state, &mut g) {
-            timer.tick();
+        if job.logprobs.is_some() {
+            while g.step() {
+                timer.tick();
+            }
+        } else {
+            while batched_step(state, &mut g) {
+                timer.tick();
+            }
         }
         store_prefix_cache(state, &ids, g.cache_snapshot());
         let n_gen = g.generated_tokens();
         let rate = timer.rate(n_gen);
         // 图片生成：完整的码本段先留下（VQ 解码在锁外做，别占着模型锁）
         let imgs = g.generated_images();
+        // 把逐步 logprobs 变成 OpenAI 的 `logprobs.content` 结构（token 文本用分词器解码）
+        let logprobs_json: Option<Value> = if job.logprobs.is_some() {
+            let content: Vec<Value> = g
+                .logprobs()
+                .iter()
+                .map(|step| {
+                    let tok_text = tokenizer.decode(&[step.token]);
+                    let top: Vec<Value> = step
+                        .top
+                        .iter()
+                        .map(|&(id, lp)| {
+                            json!({
+                                "token": tokenizer.decode(&[id]),
+                                "logprob": lp,
+                                "bytes": Value::Null,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "token": tok_text,
+                        "logprob": step.logprob,
+                        "bytes": Value::Null,
+                        "top_logprobs": top,
+                    })
+                })
+                .collect();
+            Some(json!({ "content": content }))
+        } else {
+            None
+        };
         let out = g.into_output();
         (
             out.generated,
@@ -1967,10 +2645,11 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
             out.reason,
             a.trimmed,
             rate,
+            logprobs_json,
         )
     });
     // 出错也要留一条问答记录：题目在、答案没了，日志里得能查到这条请求的下文
-    let (text, imgs, n_prompt, n_gen, reason, trimmed, rate) = match produced {
+    let (text, imgs, n_prompt, n_gen, reason, trimmed, rate, logprobs_json) = match produced {
         Ok(v) => v,
         Err(e) => {
             let note = format!("生成出错：{}", e.message);
@@ -2023,7 +2702,8 @@ fn run_chat(state: &Arc<State>, job: ChatJob) -> Result<Value, ApiError> {
                 None => json!({ "role": "assistant", "content": text }),
             },
             "finish_reason": finish_of(reason),
-            "logprobs": null,
+            // 请求没要 logprobs 时保持 `null`（与 OpenAI 一致）
+            "logprobs": logprobs_json.unwrap_or(Value::Null),
         }],
         "usage": {
             "prompt_tokens": n_prompt,
@@ -2184,7 +2864,6 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
     let system = merge_system(&state.cfg.system, &job.system);
     let prompt_budget = state.cfg.block_size.saturating_sub(job.max_tokens);
     let max_tokens = job.max_tokens;
-    let use_sft = state.cfg.use_sft;
     let kv = state.cfg.kv;
     let mut owned_rng = job.seed.map(Rng::new);
 
@@ -2214,12 +2893,12 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
 
     let res = with_model(&state, |model, tokenizer, shared_rng| {
         let mut shared_rng = shared_rng;
-        let a = prompt::assemble(
+        let a = prompt::assemble_tmpl(
             tokenizer,
             &system,
             &job.history,
             &input,
-            use_sft,
+            state.cfg.template(),
             prompt_budget,
         );
         let trimmed = a.trimmed;
@@ -2242,6 +2921,9 @@ fn stream_generate(state: Arc<State>, tx: SyncSender<Vec<u8>>, job: ChatJob) {
         }
         let n_prompt = g.prompt_tokens();
 
+        if job.json_mode {
+            g = g.with_json_constraint();
+        }
         let mut timer = DecodeTimer::new();
         while batched_step(&state, &mut g) {
             timer.tick();
@@ -2714,6 +3396,33 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{SFT_ASSISTANT, SFT_USER};
+
+    /// ChatML 下历史必须是成对的 `<|im_start|>user … <|im_end|>` / `assistant … <|im_end|>`，
+    /// 且末尾不能留悬空的 `assistant` 头（否则 tail 会再接一个 user 头，模型看到错位的角色序列）。
+    #[test]
+    fn test_split_messages_chatml_history() {
+        let m = vec![
+            ("system".to_string(), "SYS".to_string()),
+            ("user".to_string(), "q1".to_string()),
+            ("assistant".to_string(), "a1".to_string()),
+            ("user".to_string(), "q2".to_string()),
+            ("assistant".to_string(), "a2".to_string()),
+            ("user".to_string(), "q3".to_string()),
+        ];
+        let (system, history, input) = split_messages(&m, prompt::Template::ChatMl);
+        assert_eq!(system, "SYS");
+        assert_eq!(input, "q3");
+        assert_eq!(
+            history,
+            "<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\na1<|im_end|>\n\
+             <|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\na2<|im_end|>"
+                .replace("\n             ", "")
+        );
+        // 与 tail 拼起来后角色序列完整：末尾是 assistant 头，接着模型写回答
+        let tail = prompt::Template::ChatMl.tail("q3");
+        assert!(tail.starts_with("<|im_start|>user\nq3<|im_end|>\n<|im_start|>assistant\n"));
+    }
 
     fn cfg(use_sft: bool) -> ServeCfg {
         // 与 cmd_serve 同源：SFT 模板下默认带模板停止标记（请求可用 stop 逐次覆盖）
@@ -2728,12 +3437,14 @@ mod tests {
             cors: false,
             system: String::new(),
             use_sft,
+            chatml: false,
             max_new: 200,
             seed: 42,
             kv: KvOpts::off(),
             model_name: "test-model".into(),
             sample,
             block_size: 512,
+            max_concurrent: 8,
             vision: None,
         }
     }
@@ -2773,7 +3484,7 @@ mod tests {
             ("assistant", "a1"),
             ("user", "q2"),
         ]);
-        let (system, history, input) = split_messages(&m, true);
+        let (system, history, input) = split_messages(&m, prompt::Template::Sft);
         assert_eq!(system, "你是助手");
         assert_eq!(history, format!("{SFT_USER}\nq1\n{SFT_ASSISTANT}\na1"));
         assert_eq!(input, "q2");
@@ -2782,7 +3493,7 @@ mod tests {
     #[test]
     fn split_raw_history_shape() {
         let m = msgs(&[("user", "q1"), ("assistant", "a1"), ("user", "q2")]);
-        let (system, history, input) = split_messages(&m, false);
+        let (system, history, input) = split_messages(&m, prompt::Template::Raw);
         assert_eq!(system, "");
         assert_eq!(history, "q1\na1");
         assert_eq!(input, "q2");
@@ -2797,7 +3508,7 @@ mod tests {
             ("assistant", "a2"),
             ("user", "q3"),
         ]);
-        let (_, history, input) = split_messages(&m, true);
+        let (_, history, input) = split_messages(&m, prompt::Template::Sft);
         assert_eq!(
             history,
             format!("{SFT_USER}\nq1\n{SFT_ASSISTANT}\na1\n{SFT_USER}\nq2\n{SFT_ASSISTANT}\na2")
@@ -2808,7 +3519,7 @@ mod tests {
     #[test]
     fn split_merges_multiple_system_messages() {
         let m = msgs(&[("system", "s1"), ("developer", "s2"), ("user", "q")]);
-        let (system, history, input) = split_messages(&m, true);
+        let (system, history, input) = split_messages(&m, prompt::Template::Sft);
         assert_eq!(system, "s1\ns2");
         assert_eq!(history, "");
         assert_eq!(input, "q");
@@ -2935,6 +3646,7 @@ mod tests {
 
     /// 输入图解码：补训练格式、像素归一化、各类坏输入回 400 而不是 panic
     #[test]
+    #[cfg(feature = "vision-io")]
     fn prepare_vision_decodes_and_formats_prompt() {
         // 没带图：原样透传（视觉塔缺席也不碍事）
         let (t, px) = prepare_vision(None, "你好", None).unwrap();
@@ -3369,7 +4081,8 @@ mod tests {
 
         // 落盘的 JSON 能解析回来，且仍是覆盖全部路由的完整规范
         let parsed: Value = serde_json::from_str(&json_txt).unwrap();
-        assert_eq!(parsed["paths"].as_object().unwrap().len(), 7);
+        // 与路由表对齐，而不是写死数字：新增/删除端点时这条断言自动跟上
+        assert_eq!(parsed["paths"].as_object().unwrap().len(), ROUTES.len());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3461,6 +4174,7 @@ mod tests {
     /// 生成图 data URI 端到端：tiny VQ-VAE 解码码本段 → PNG → base64；
     /// 未配 VQ-VAE 或没采出图时必须返回 None（纯文本回包不带 image_url）
     #[test]
+    #[cfg(feature = "vision-io")]
     fn generated_image_uri_decodes_full_segment() {
         let vqcfg = crate::vqvae::VqConfig {
             image_size: 8,
@@ -3486,5 +4200,430 @@ mod tests {
         assert_eq!(generated_image_uri(Some(&vq), &[]), None);
         // 没配 VQ-VAE → None（纯文本模型）
         assert_eq!(generated_image_uri(None, &imgs), None);
+    }
+
+    /// 并发上限：超限返回 429（`None`）、`Drop` 释放、`0` 表示不限
+    #[test]
+    fn test_concurrency_cap_blocks_and_releases() {
+        use std::sync::atomic::Ordering;
+        let s = Stats::default();
+        let a = try_permit_raw(2, &s);
+        assert!(a.is_some(), "第 1 个必须放行");
+        let b = try_permit_raw(2, &s);
+        assert!(b.is_some(), "第 2 个必须放行");
+        assert!(try_permit_raw(2, &s).is_none(), "第 3 个必须被拒（429）");
+        assert_eq!(s.rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(s.in_flight.load(Ordering::SeqCst), 2);
+        drop(a);
+        assert_eq!(s.in_flight.load(Ordering::SeqCst), 1);
+        assert!(try_permit_raw(2, &s).is_some(), "释放后应能再进一个");
+        assert!(try_permit_raw(0, &s).is_some(), "上限 0 = 不限制");
+    }
+
+    /// `Authorization` 头的解析：大小写不敏感、容忍空白，非 Bearer 一律当空 token
+    #[test]
+    fn test_bearer_token_parsing() {
+        assert_eq!(bearer_token("Bearer sk-abc"), "sk-abc");
+        assert_eq!(bearer_token("bearer sk-abc"), "sk-abc");
+        assert_eq!(bearer_token("  BEAER  sk-abc  "), "");
+        assert_eq!(bearer_token("  Bearer   sk-abc  "), "sk-abc");
+        assert_eq!(bearer_token("sk-abc"), "");
+        assert_eq!(bearer_token(""), "");
+        assert_eq!(bearer_token("Bearer "), "");
+    }
+
+    /// 错误响应必须是 OpenAI 兼容形状：`error.message` / `error.type` / `error.code`
+    #[test]
+    fn test_error_json_shape() {
+        let e = bad("参数不对");
+        assert_eq!(e.status, 400);
+        let v = e.to_value();
+        assert_eq!(v["error"]["message"], "参数不对");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], 400);
+
+        let r = ApiError {
+            status: 429,
+            kind: "rate_limit_error",
+            message: "并发已满".into(),
+        };
+        let v = r.to_value();
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["code"], 429);
+    }
+
+    /// OpenAI 的两项加性惩罚：缺省 0、可解析、越界报 400、非数字报 400
+    #[test]
+    fn test_parse_chat_reads_openai_penalties() {
+        let c = cfg(true);
+        let body = r#"{"messages":[{"role":"user","content":"你好"}]}"#;
+        let job = parse_chat(body, &c).unwrap();
+        assert_eq!(job.sample.presence_penalty, 0.0, "缺省必须为 0");
+        assert_eq!(job.sample.frequency_penalty, 0.0);
+
+        let body = r#"{"messages":[{"role":"user","content":"你好"}],
+            "presence_penalty":1.5,"frequency_penalty":-0.5}"#;
+        let job = parse_chat(body, &c).unwrap();
+        assert_eq!(job.sample.presence_penalty, 1.5);
+        assert_eq!(
+            job.sample.frequency_penalty, -0.5,
+            "负值是合法的（鼓励重复）"
+        );
+
+        // 越界与类型错误都必须 400，而不是静默忽略
+        for bad_body in [
+            r#"{"messages":[{"role":"user","content":"x"}],"presence_penalty":2.5}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"frequency_penalty":-3}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"presence_penalty":"high"}"#,
+        ] {
+            match parse_chat(bad_body, &c) {
+                Ok(_) => panic!("应报 400，但解析成功了：{bad_body}"),
+                Err(e) => assert_eq!(e.status, 400, "应报 400：{bad_body}"),
+            }
+        }
+    }
+
+    // ==================== 并发上限（429 的另一半） ====================
+
+    /// cap=1：第一个拿到许可，第二个被拒并计 rejected，释放后可再拿。
+    #[test]
+    fn test_permit_cap_enforces_and_releases() {
+        let stats = Stats::default();
+        let p = try_permit_raw(1, &stats).expect("第一个应拿到许可");
+        assert_eq!(stats.in_flight.load(Ordering::SeqCst), 1);
+        assert!(
+            try_permit_raw(1, &stats).is_none(),
+            "cap=1 时第二个必须被拒"
+        );
+        assert_eq!(stats.rejected.load(Ordering::SeqCst), 1, "被拒要计数");
+        assert_eq!(
+            stats.in_flight.load(Ordering::SeqCst),
+            1,
+            "被拒的申请不能留下计数"
+        );
+
+        drop(p);
+        assert_eq!(stats.in_flight.load(Ordering::SeqCst), 0, "释放后计数归零");
+        let _p2 = try_permit_raw(1, &stats).expect("释放后应能再拿");
+    }
+
+    /// cap=0 表示不限制：拿多少次都成功，且不产生 rejected。
+    #[test]
+    fn test_permit_zero_cap_is_unlimited() {
+        let stats = Stats::default();
+        let mut held = Vec::new();
+        for _ in 0..32 {
+            held.push(try_permit_raw(0, &stats).expect("cap=0 不应拒绝"));
+        }
+        assert_eq!(stats.in_flight.load(Ordering::SeqCst), 32);
+        assert_eq!(stats.rejected.load(Ordering::SeqCst), 0);
+        held.clear();
+        assert_eq!(stats.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// 并发位的两条硬约束：
+    /// 1. **占满后必拒**（确定性）：先拿满 cap 个许可，再用屏障让 8 个线程同时申请 → 全部被拒；
+    /// 2. **任意时刻不超 cap**（竞争下）：释放后 8 线程各抢 200 次，观测到的峰值必须 ≤ cap。
+    #[test]
+    fn test_permit_cap_is_hard_and_never_exceeded() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let cap = 2usize;
+        let stats = Arc::new(Stats::default());
+        let held: Vec<_> = (0..cap)
+            .map(|_| try_permit_raw(cap, &stats).expect("先占满 cap"))
+            .collect();
+        assert_eq!(stats.in_flight.load(Ordering::SeqCst), cap);
+
+        // 8 个线程在同一时刻申请：cap 已被占满，全部必须被拒
+        let barrier = Arc::new(Barrier::new(8));
+        let ok = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let stats = Arc::clone(&stats);
+            let barrier = Arc::clone(&barrier);
+            let ok = Arc::clone(&ok);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                if let Some(p) = try_permit_raw(cap, &stats) {
+                    ok.fetch_add(1, Ordering::SeqCst);
+                    drop(p);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(ok.load(Ordering::SeqCst), 0, "cap 被占满时不应有申请成功");
+        assert_eq!(stats.rejected.load(Ordering::SeqCst), 8, "8 次被拒都要计数");
+        assert_eq!(
+            stats.in_flight.load(Ordering::SeqCst),
+            cap,
+            "被拒的申请不能留下计数"
+        );
+
+        drop(held);
+        assert_eq!(stats.in_flight.load(Ordering::SeqCst), 0);
+
+        // 竞争下的上界：8 线程各抢 200 次，峰值不得超过 cap
+        let peak = Arc::new(AtomicUsize::new(0));
+        let ok2 = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let stats = Arc::clone(&stats);
+            let peak = Arc::clone(&peak);
+            let ok2 = Arc::clone(&ok2);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if let Some(p) = try_permit_raw(cap, &stats) {
+                        ok2.fetch_add(1, Ordering::SeqCst);
+                        peak.fetch_max(stats.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+                        std::hint::spin_loop();
+                        drop(p);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            ok2.load(Ordering::SeqCst) > 0,
+            "一次都没成功，测试没造出竞争"
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) <= cap,
+            "在跑数超过上限：peak={} > {cap}",
+            peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            stats.in_flight.load(Ordering::SeqCst),
+            0,
+            "全部释放后必须归零"
+        );
+    }
+
+    /// 路由表与 OpenAPI 的 `paths` 必须一一对应：
+    /// 漏一条就会出现"文档写了但调用 404"或"能调但没文档"。
+    /// 顺带验证"已知路径的方法集合"与 OpenAPI 的 method 声明一致。
+    #[test]
+    fn test_routes_match_openapi() {
+        let c = cfg(true);
+        let spec = openapi_spec(&c);
+        let paths = spec["paths"].as_object().expect("OpenAPI 应有 paths");
+        for (path, methods) in ROUTES {
+            let item = paths
+                .get(*path)
+                .unwrap_or_else(|| panic!("OpenAPI 缺路径 {path}"));
+            let obj = item.as_object().expect("path item 应是对象");
+            for m in *methods {
+                let key = m.to_ascii_lowercase();
+                assert!(
+                    obj.contains_key(&key),
+                    "OpenAPI 的 {path} 缺方法 {key}（路由表声明了它）"
+                );
+            }
+        }
+        for path in paths.keys() {
+            assert!(
+                ROUTES.iter().any(|(r, _)| r == path),
+                "路由表缺 OpenAPI 里声明的 {path}"
+            );
+        }
+    }
+
+    /// 实现会返回 413/429，OpenAPI 就必须为这两条 POST 路径声明它们（组件里也要有定义，
+    /// 否则 `openapi_spec_every_ref_resolves` 之外没人会发现文档缺项）。
+    #[test]
+    fn openapi_documents_payload_and_rate_limits() {
+        let c = cfg(true);
+        let spec = openapi_spec(&c);
+        for path in ["/v1/chat/completions", "/v1/embeddings"] {
+            // OpenAPI 的 responses 挂在**方法**之下：paths[path]["post"]["responses"]
+            let resp = &spec["paths"][path]["post"]["responses"];
+            assert!(resp.get("413").is_some(), "{path} 缺 413 文档");
+            assert!(resp.get("429").is_some(), "{path} 缺 429 文档");
+        }
+        let comps = &spec["components"]["responses"];
+        assert!(
+            comps.get("PayloadTooLarge").is_some(),
+            "缺 PayloadTooLarge 组件"
+        );
+        assert!(comps.get("RateLimited").is_some(), "缺 RateLimited 组件");
+    }
+
+    // ==================== P4-a：OpenAI 协议字段的边界 ====================
+
+    /// `ChatJob` 内含缓存等非 Debug 类型，`unwrap_err()` 用不了，这里取错误信息
+    fn err_of_chat(r: Result<ChatJob, ApiError>) -> ApiError {
+        match r {
+            Ok(_) => panic!("期望 400，实际解析成功"),
+            Err(e) => e,
+        }
+    }
+
+    /// `max_completion_tokens` 是 `max_tokens` 的别名：单独给时按它钳长度。
+    #[test]
+    fn test_max_completion_tokens_is_alias() {
+        let c = cfg(false);
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"max_completion_tokens":3}"#,
+            &c,
+        )
+        .expect("应接受 max_completion_tokens");
+        assert_eq!(job.max_tokens, 3, "应按别名钳到 3");
+
+        // 两个都给 → 400（避免歧义）
+        let e = err_of_chat(parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"max_tokens":3,"max_completion_tokens":4}"#,
+            &c,
+        ));
+        assert!(
+            e.message.contains("只能给一个"),
+            "错误信息应说明冲突：{}",
+            e.message
+        );
+    }
+
+    /// 语义敏感的字段被显式拒绝；`null` 视为未提供；普通未知字段仍然忽略。
+    #[test]
+    fn test_unsupported_semantic_fields_are_rejected() {
+        let c = cfg(false);
+        for (field, body) in [
+            (
+                "tools",
+                r#"{"messages":[{"role":"user","content":"q"}],"tools":[{"type":"function"}]}"#,
+            ),
+            (
+                "tool_choice",
+                r#"{"messages":[{"role":"user","content":"q"}],"tool_choice":"auto"}"#,
+            ),
+            (
+                "logit_bias",
+                r#"{"messages":[{"role":"user","content":"q"}],"logit_bias":{"5":1.0}}"#,
+            ),
+        ] {
+            let e = err_of_chat(parse_chat(body, &c));
+            assert!(
+                e.message.contains(field) && e.message.contains("不支持"),
+                "字段 {field} 应报「不支持」，实际：{}",
+                e.message
+            );
+        }
+
+        // null 不算"提供"
+        let ok = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"tools":null,"response_format":null}"#,
+            &c,
+        );
+        assert!(ok.is_ok(), "null 应视为未提供");
+
+        // 普通未知字段继续忽略（客户端自带字段不能把请求打挂）
+        let ok = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"user":"u1","metadata":{"trace":"t"}}"#,
+            &c,
+        );
+        assert!(ok.is_ok(), "无关的未知字段应被忽略");
+    }
+
+    // ==================== P4-b：logprobs 的请求校验 ====================
+
+    #[test]
+    fn test_logprobs_request_validation() {
+        let c = cfg(false);
+        // 正常：logprobs=true + top_logprobs=5
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"logprobs":true,"top_logprobs":5}"#,
+            &c,
+        )
+        .expect("应接受 logprobs");
+        assert_eq!(job.logprobs, Some(5));
+
+        // 只要采样值本身
+        let job = parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"logprobs":true}"#,
+            &c,
+        )
+        .expect("top_logprobs 可省略");
+        assert_eq!(job.logprobs, Some(0));
+
+        // 没开 logprobs 却给 top_logprobs → 400
+        let e = err_of_chat(parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"top_logprobs":3}"#,
+            &c,
+        ));
+        assert!(
+            e.message.contains("logprobs=true"),
+            "应提示需要 logprobs=true：{}",
+            e.message
+        );
+
+        // 超过 20 → 400
+        let e = err_of_chat(parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"logprobs":true,"top_logprobs":21}"#,
+            &c,
+        ));
+        assert!(e.message.contains("最大 20"), "应提示上限：{}", e.message);
+
+        // 流式 + logprobs → 400（明确拒绝，不返回不准的数据）
+        let e = err_of_chat(parse_chat(
+            r#"{"messages":[{"role":"user","content":"q"}],"logprobs":true,"stream":true}"#,
+            &c,
+        ));
+        assert!(e.message.contains("流式"), "流式应被拒绝：{}", e.message);
+
+        // false / null 等价于不请求
+        for body in [
+            r#"{"messages":[{"role":"user","content":"q"}],"logprobs":false}"#,
+            r#"{"messages":[{"role":"user","content":"q"}],"logprobs":null}"#,
+        ] {
+            let job = parse_chat(body, &c).expect("false/null 应接受");
+            assert_eq!(job.logprobs, None);
+        }
+    }
+
+    // ==================== P4-d：response_format ====================
+
+    #[test]
+    fn test_response_format_parsing() {
+        let c = cfg(false);
+        let ok = |json: &str| parse_chat(json, &c);
+
+        // 缺省 / text → 不开启
+        assert!(
+            !ok(r#"{"messages":[{"role":"user","content":"q"}]}"#)
+                .unwrap()
+                .json_mode
+        );
+        assert!(
+            !ok(
+                r#"{"messages":[{"role":"user","content":"q"}],"response_format":{"type":"text"}}"#
+            )
+            .unwrap()
+            .json_mode
+        );
+        // json_object → 开启
+        assert!(
+            ok(r#"{"messages":[{"role":"user","content":"q"}],"response_format":{"type":"json_object"}}"#)
+                .unwrap()
+                .json_mode
+        );
+        // json_schema → 明确拒绝（不假装支持）
+        let e = err_of_chat(ok(
+            r#"{"messages":[{"role":"user","content":"q"}],"response_format":{"type":"json_schema"}}"#,
+        ));
+        assert!(e.message.contains("json_schema"), "{}", e.message);
+        // 未知类型 → 400
+        let e = err_of_chat(ok(
+            r#"{"messages":[{"role":"user","content":"q"}],"response_format":{"type":"yaml"}}"#,
+        ));
+        assert!(e.message.contains("只能是"), "{}", e.message);
+        // 缺 type → 400
+        let e = err_of_chat(ok(
+            r#"{"messages":[{"role":"user","content":"q"}],"response_format":{}}"#,
+        ));
+        assert!(e.message.contains("type"), "{}", e.message);
     }
 }

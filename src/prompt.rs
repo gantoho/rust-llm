@@ -17,6 +17,77 @@ use crate::tokenizer::Tokenizer;
 ///   当前 SFT 语料里 `。。` 从未出现过，实际不会命中。
 pub const SFT_STOP: &[&str] = &[SFT_END, SFT_USER];
 
+/// ChatML 模板的停止标记：命中 `<|im_end|>` 就收尾；`<|im_start|>` 防它接着编下一轮。
+pub const CHATML_STOP: &[&str] = &["<|im_end|>", "<|im_start|>"];
+
+/// 对话模板：决定"角色标记怎么写、历史怎么拼、在哪停"。
+///
+/// - [`Template::Sft`]：仓库自带模板（`用户：` / `助手：`），自研模型用它；
+/// - [`Template::ChatMl`]：Qwen / Llama-3 等 Instruct 模型的原生格式
+///   （`<|im_start|>user … <|im_end|>`）——**基座若本来就是 Instruct，套这个模板不必微调就能对话**；
+/// - [`Template::Raw`]：不套模板，纯续写。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Template {
+    Raw,
+    Sft,
+    ChatMl,
+}
+
+impl Template {
+    /// 从 `--prompt-format` 的取值解析（未知值按 `Raw` 处理，与历史行为一致）
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sft" => Template::Sft,
+            "chatml" => Template::ChatMl,
+            _ => Template::Raw,
+        }
+    }
+
+    /// 本轮"轮到模型说话"之前的前缀（模型从这之后开始写回答）
+    pub fn tail(&self, input: &str) -> String {
+        match self {
+            Template::Raw => input.to_string(),
+            Template::Sft => format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n"),
+            Template::ChatMl => {
+                format!("<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n")
+            }
+        }
+    }
+
+    /// 一轮完整对话（用于拼接历史）
+    pub fn turn(&self, user: &str, assistant: &str) -> String {
+        match self {
+            Template::Raw => format!("{user}\n{assistant}"),
+            Template::Sft => format!("{SFT_USER}\n{user}\n{SFT_ASSISTANT}\n{assistant}"),
+            Template::ChatMl => format!(
+                "<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{assistant}<|im_end|>"
+            ),
+        }
+    }
+
+    /// system 段（空 system 返回空串）
+    pub fn system_line(&self, system: &str) -> String {
+        let s = system.trim();
+        if s.is_empty() {
+            return String::new();
+        }
+        match self {
+            Template::Raw => format!("{s}\n"),
+            Template::Sft => format!("{s}\n"),
+            Template::ChatMl => format!("<|im_start|>system\n{s}<|im_end|>\n"),
+        }
+    }
+
+    /// 停止标记
+    pub fn stop(&self) -> &'static [&'static str] {
+        match self {
+            Template::Raw => &[],
+            Template::Sft => SFT_STOP,
+            Template::ChatMl => CHATML_STOP,
+        }
+    }
+}
+
 /// 把对话历史裁剪到不超过 `budget` 个 token：从最老的一行开始丢，保留最近的内容。
 ///
 /// 必须真的调 `encode` 来数 token —— 按"字节数 / 字符数"估算的偏差很大：
@@ -140,6 +211,51 @@ pub struct Assembled {
 ///      丢掉它不只是失忆，还会让整条序列的注意力分布失稳
 ///   2. 本轮生成 —— 调用方已在 `prompt_budget` 里扣掉 `max_new`，让整段生成留在窗口内
 ///   3. 对话历史 —— 剩下的额度都给它，不够就从最老的开始丢
+
+/// 同 [`assemble`]，但用 [`Template`] 三态模板（`chatml` 走这条）。
+pub fn assemble_tmpl(
+    tokenizer: &Tokenizer,
+    system: &str,
+    history: &str,
+    input: &str,
+    tmpl: Template,
+    prompt_budget: usize,
+) -> Assembled {
+    let tail = tmpl.tail(input);
+    let n_tail = tokenizer.encode(&tail).len();
+    let system_line = tmpl.system_line(system);
+    let n_system_prefix = tokenizer.encode(&system_line).len();
+    let history_budget = prompt_budget.saturating_sub(n_system_prefix + n_tail + 1);
+    let kept = match tmpl {
+        Template::Sft => trim_sft_history(tokenizer, history, history_budget),
+        // ChatML 的历史按行裁剪（比按 `<|im_start|>` 切更保守：宁可少留也不切碎一轮）
+        _ => trim_history(tokenizer, history, history_budget),
+    };
+    let trimmed = if kept.len() < history.len() {
+        Some((
+            tokenizer.encode(history).len(),
+            tokenizer.encode(&kept).len(),
+        ))
+    } else {
+        None
+    };
+    let mut prompt = String::new();
+    prompt.push_str(&system_line);
+    if !kept.is_empty() {
+        prompt.push_str(&kept);
+        if !kept.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+    prompt.push_str(&tail);
+    Assembled {
+        prompt,
+        history: kept,
+        history_budget,
+        trimmed,
+    }
+}
+
 pub fn assemble(
     tokenizer: &Tokenizer,
     system: &str,
@@ -315,6 +431,64 @@ mod trim_equivalence {
                     "trim_sft_history 不一致：hist={h:?} budget={budget}"
                 );
             }
+        }
+    }
+
+    // ==================== ChatML 与预算边界 ====================
+
+    /// ChatML 的 system 段必须自带角色包装（否则模型看到的是裸文本）。
+    #[test]
+    fn test_chatml_system_line_is_wrapped() {
+        let tl = Template::ChatMl;
+        assert_eq!(
+            tl.system_line("你是助手"),
+            "<|im_start|>system\n你是助手<|im_end|>\n"
+        );
+        assert_eq!(tl.system_line("   "), "", "空 system 不应产生任何标记");
+    }
+
+    /// ChatML 的 tail 必须停在 assistant 角色标记之后（模型从这里开始写回答）。
+    #[test]
+    fn test_chatml_tail_stops_at_assistant() {
+        let tail = Template::ChatMl.tail("你好");
+        assert_eq!(
+            tail,
+            "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(Template::ChatMl.stop(), CHATML_STOP);
+    }
+
+    /// 预算为 0：历史必须全丢，但 tail（本轮输入）必须保留——否则模型没有输入。
+    #[test]
+    fn test_zero_budget_keeps_tail_only() {
+        let tok = Tokenizer::char("用户：助手：\n你好再见。。");
+        let a = assemble_tmpl(
+            &tok,
+            "",
+            "用户：\n再见\n助手：\n好",
+            "你好",
+            Template::Sft,
+            0,
+        );
+        assert!(a.history.is_empty(), "预算 0 时历史应为空");
+        assert!(
+            a.prompt.ends_with("助手：\n"),
+            "tail 必须保留：{:?}",
+            a.prompt
+        );
+        // 历史非空但预算为 0 → 整段历史被丢弃（`trimmed` 记录 (裁剪前, 裁剪后) token 数）
+        let (_, after) = a.trimmed.expect("历史被丢弃时应报告裁剪信息");
+        assert_eq!(after, 0, "预算 0 时裁剪后应为 0 token");
+    }
+
+    /// 带 history 的裁剪必须落在**轮边界**（以 `用户：` 开头），不能切半轮。
+    #[test]
+    fn test_trimmed_history_starts_at_turn_boundary() {
+        let tok = Tokenizer::char("用户：助手：\n甲乙丙丁");
+        let history = "用户：\n甲\n助手：\n乙\n用户：\n丙\n助手：\n丁";
+        let kept = trim_sft_history(&tok, history, 8);
+        if !kept.is_empty() {
+            assert!(kept.starts_with("用户："), "裁剪后应从整轮开头：{kept:?}");
         }
     }
 }

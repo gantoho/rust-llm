@@ -138,7 +138,7 @@ impl<T> Clone for Shared<T> {
 ///
 /// **decode-at-boundary 约定**：bf16 只存在于存储层。算子入口通过
 /// [`Tensor::decode`] 拿到 f32 视图、算子内全程 f32 计算，
-/// 出口经 [`Tensor::new_like`] 统一 encode 回 bf16 落盘。
+/// 出口经 `Tensor::new_like` 统一 encode 回 bf16 落盘。
 /// 梯度缓冲（`grad`）恒为 f32，不参与该约定。
 ///
 /// **matmul 族例外**：`matmul_data` 不整块 decode 物化（4096×4096 bf16 权重
@@ -196,7 +196,7 @@ impl Buffer {
     }
 
     /// 缓冲元素个数（bf16 下也是逻辑元素数：每元素恰一个 `u16`）。
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "缓冲元素数访问器：供 GPU 常驻与单测使用")]
     pub(crate) fn len(&self) -> usize {
         match self {
             Buffer::F32(v) => v.len(),
@@ -540,12 +540,38 @@ impl SrcIdxView<'_> {
 struct MatOperand<'a> {
     data: MatData<'a>,
     // 只在 GPU 常驻路径被读取（`res_id()` 供权重跨调用复用）；默认构建下不需要
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(
+            dead_code,
+            reason = "只在 gpu 常驻路径读取（权重跨调用复用），默认构建不需要"
+        )
+    )]
     cell: u64,
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "写入代数：gpu 常驻缓存用它判断是否失效")
+    )]
     ver: u64,
 }
 
+impl<'a> MatOperand<'a> {
+    /// 元素个数
+    fn elems(&self) -> usize {
+        match self.data {
+            MatData::F32(v) => v.len(),
+            MatData::Bf16(v) => v.len(),
+        }
+    }
+
+    /// 单元素字节数（bf16 权重 2 B）
+    fn elem_bytes(&self) -> usize {
+        match self.data {
+            MatData::F32(_) => 4,
+            MatData::Bf16(_) => 2,
+        }
+    }
+}
 /// [`MatOperand`] 的数据本体（f32 / bf16 两种存储）
 #[derive(Clone, Copy)]
 enum MatData<'a> {
@@ -687,6 +713,9 @@ fn bf16_vec_enabled() -> bool {
 /// 权重解码慢 4× 的主因（73.8 → 325.4 ms/token）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+// SAFETY: 调用方必须保证 CPU 支持 AVX2（本文件在 `simd_ok()` 里用
+// `is_x86_feature_detected!` 运行期检测后才调用）；`p` 指向至少 8 个 `u16`，
+// 读取用 `_mm_loadu_si128`，允许任意对齐。
 unsafe fn bf16x8_to_f32x8(p: *const u16) -> std::arch::x86_64::__m256 {
     unsafe {
         use std::arch::x86_64::*;
@@ -699,6 +728,7 @@ unsafe fn bf16x8_to_f32x8(p: *const u16) -> std::arch::x86_64::__m256 {
 /// 8 个 f32 的水平求和。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+// SAFETY: 纯寄存器运算（无内存访问）；调用方保证 AVX2 可用（同 `bf16x8_to_f32x8`）。
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     let lo = _mm256_castps256_ps128(v);
@@ -712,6 +742,8 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 /// `Σ_kk a[kk] · bf16(b[kk])`（点积，AVX2 一次 8 个 + 水平求和）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: 调用方保证 AVX2+FMA 可用；`a`/`b` 是切片，长度已用 `min` 取齐，
+// SIMD 读取用 `_mm256_loadu_ps` / `_mm_loadu_si128`（允许非对齐），尾部走标量。
 unsafe fn bf16_dot_f32(a: &[f32], b: &[u16]) -> f32 {
     unsafe {
         use std::arch::x86_64::*;
@@ -734,6 +766,7 @@ unsafe fn bf16_dot_f32(a: &[f32], b: &[u16]) -> f32 {
 /// `acc[j] += a_v · bf16(b[j])`（axpy，AVX2 一次 8 个）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: 同上——AVX2+FMA 由调用方保证，`acc`/`b` 长度已取齐，读用 unaligned 载入。
 unsafe fn bf16_axpy_f32(acc: &mut [f32], a_v: f32, b: &[u16]) {
     unsafe {
         use std::arch::x86_64::*;
@@ -792,6 +825,8 @@ fn bf16_axpy(acc: &mut [f32], a_v: f32, b: &[u16]) {
 /// 累加顺序仍是 `kk` 升序（只是把 `mul`+`add` 融合成 FMA，舍入点不同）。
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: 调用方保证 AVX2+FMA 可用；`a`/`b`/`c` 分别指向至少 8×8 的有效区域
+// （调用点先确认 `rw == 8 && cw == 8`，偏移在各自容量内），且 `c` 与 `a`/`b` 不重叠。
 unsafe fn micro_8x8_fma(
     a: *const f32,
     b: *const f32,
@@ -804,6 +839,7 @@ unsafe fn micro_8x8_fma(
 ) {
     use std::arch::x86_64::*;
     // edition 2024 的 unsafe_op_in_unsafe_fn：`unsafe fn` 体内也要显式开块
+    // SAFETY: 同函数头——AVX2+FMA 由调用方保证，`a`/`b`/`c` 的 8×8 范围有效且不重叠。
     unsafe {
         let mut acc0 = _mm256_setzero_ps();
         let mut acc1 = _mm256_setzero_ps();
@@ -845,6 +881,182 @@ unsafe fn micro_8x8_fma(
     }
 }
 
+// ---- 名称键的算子耗时直方图（仅诊断；`mm_time_reset()` 打开后才记账）----
+thread_local! {
+    static OP_TIME: std::cell::RefCell<std::collections::HashMap<&'static str, (u64, u64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 打印各算子累计耗时（按总时长降序）
+pub fn op_time_dump(top: usize) {
+    OP_TIME.with(|m| {
+        let mut v: Vec<(&'static str, u64, u64)> =
+            m.borrow().iter().map(|(&k, &(c, ns))| (k, c, ns)).collect();
+        v.sort_unstable_by_key(|x| std::cmp::Reverse(x.2));
+        let total: f64 = v.iter().map(|x| x.2 as f64).sum::<f64>() / 1e6;
+        println!("  非 matmul 算子合计 {total:.1} ms");
+        for (name, c, ns) in v.into_iter().take(top) {
+            println!(
+                "    {name:<12} | {c:>5} 次 | {:>7.1} ms 累计 | {:.3} ms/次",
+                ns as f64 / 1e6,
+                ns as f64 / 1e6 / c as f64
+            );
+        }
+    });
+}
+
+/// 记录 `t0` 到现在的耗时（与 `op_scope` 相比不会因作用域/遮蔽而错算）
+pub fn op_record(name: &'static str, t0: std::time::Instant) {
+    if !ms_instrumented() {
+        return;
+    }
+    let ns = t0.elapsed().as_nanos() as u64;
+    OP_TIME.with(|m| {
+        let mut map = m.borrow_mut();
+        let e = map.entry(name).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += ns;
+    });
+}
+
+/// RAII：Drop 时把耗时记到名字上
+struct OpTimer {
+    name: &'static str,
+    t0: std::time::Instant,
+    on: bool,
+}
+
+impl OpTimer {
+    fn new(name: &'static str) -> Self {
+        OpTimer {
+            name,
+            t0: std::time::Instant::now(),
+            on: ms_instrumented(),
+        }
+    }
+}
+
+impl Drop for OpTimer {
+    fn drop(&mut self) {
+        if !self.on {
+            return;
+        }
+        let ns = self.t0.elapsed().as_nanos() as u64;
+        OP_TIME.with(|m| {
+            let mut map = m.borrow_mut();
+            let e = map.entry(self.name).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
+        });
+    }
+}
+// ---- 按形状的耗时直方图（仅诊断；`ms_instrumented()` 为真时才记账）----
+thread_local! {
+    static MM_TIME: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), (u64, u64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn ms_instrumented() -> bool {
+    MM_ON.with(|c| c.get())
+}
+
+/// 清空耗时直方图（并开启插桩）
+pub fn mm_time_reset() {
+    MM_ON.with(|c| c.set(true));
+    MM_TIME.with(|m| m.borrow_mut().clear());
+}
+
+/// 打印耗时最长的前 `top` 个形状（次数 / 累计 / 单次）
+pub fn mm_time_dump(top: usize) {
+    MM_TIME.with(|m| {
+        let mut v: Vec<((usize, usize, usize, bool), u64, u64)> =
+            m.borrow().iter().map(|(&k, &(c, ns))| (k, c, ns)).collect();
+        v.sort_unstable_by_key(|x| std::cmp::Reverse(x.2));
+        let total: f64 = v.iter().map(|x| x.2 as f64).sum::<f64>() / 1e6;
+        println!("  matmul 合计 {total:.1} ms");
+        for ((mm, kk, nn, bt), c, ns) in v.into_iter().take(top) {
+            println!(
+                "    m={mm:<5} k={kk:<5} n={nn:<6} b_t={bt:<5} | {c:>4} 次 | {:>7.1} ms 累计 | {:.2} ms/次",
+                ns as f64 / 1e6,
+                ns as f64 / 1e6 / c as f64
+            );
+        }
+    });
+}
+
+/// RAII 计时器：Drop 时按形状记账（覆盖 `matmul_data` 的所有返回路径）
+struct MmTimer {
+    key: (usize, usize, usize, bool),
+    t0: std::time::Instant,
+    on: bool,
+}
+
+impl MmTimer {
+    fn new(key: (usize, usize, usize, bool), on: bool) -> Self {
+        MmTimer {
+            key,
+            t0: std::time::Instant::now(),
+            on,
+        }
+    }
+}
+
+impl Drop for MmTimer {
+    fn drop(&mut self) {
+        if !self.on {
+            return;
+        }
+        let ns = self.t0.elapsed().as_nanos() as u64;
+        MM_TIME.with(|m| {
+            let mut map = m.borrow_mut();
+            let e = map.entry(self.key).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
+        });
+    }
+}
+// ---- 字节计数（定位"权重被多读一遍"用；默认关闭、零分支开销由调用方决定）----
+thread_local! {
+    static MM_BYTES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    static MM_TYPED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// 计数开关：`mm_bytes_reset()` 打开；默认关 ⇒ 生产路径零计数开销
+    static MM_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 清空本线程的 matmul 字节计数（读, 写）
+pub fn mm_bytes_reset() {
+    MM_BYTES.with(|c| c.set((0, 0)));
+}
+
+/// bf16(2B) 与 f32(4B) 分别累计的读字节
+pub fn mm_bytes_typed() -> (u64, u64) {
+    MM_TYPED.with(|c| c.get())
+}
+
+fn mm_add_bytes_typed(width: u64, bytes: u64) {
+    MM_TYPED.with(|c| {
+        let (b2, b4) = c.get();
+        if width == 2 {
+            c.set((b2 + bytes, b4));
+        } else {
+            c.set((b2, b4 + bytes));
+        }
+    });
+}
+
+/// 取本线程累计的 matmul 字节数（读, 写）
+pub fn mm_bytes_take() -> (u64, u64) {
+    MM_BYTES.with(|c| c.get())
+}
+
+#[inline]
+fn mm_add_bytes(read: u64, write: u64) {
+    MM_BYTES.with(|c| {
+        let (r, w) = c.get();
+        c.set((r + read, w + write));
+    });
+}
+
 /// 矩阵乘数据计算（GPU 优先，失败自动回退 CPU）。
 /// 行优先存储：out[B,M,N] = a[B,M,K] @ b[B,K,N]；batch=1 时即普通 2D 矩阵乘。
 /// `a_t`/`b_t` 为转置访问标志：为 true 时物理 a/b 分别是 [B,K,M]、[B,N,K]。
@@ -861,6 +1073,22 @@ fn matmul_data(
     a_t: bool,
     b_t: bool,
 ) -> Vec<f32> {
+    // 左操作数是 bf16 时先解码成 f32 再重入（激活只有 t×d，代价可忽略）——
+    // 注意：必须在**计数之前**做，否则同一次调用会被计两遍（递归重入）。
+    if let MatData::Bf16(av16) = a.data {
+        let af32: Vec<f32> = av16.iter().map(|&u| bf16_to_f32(u)).collect();
+        return matmul_data(MatOperand::F32(&af32), b, m, k, n, batch, a_t, b_t);
+    }
+    // 按形状的耗时直方图（RAII：所有 return 路径都会记账；默认关闭）
+    let _timer = MmTimer::new((m, k, n, b_t), ms_instrumented()); // 字节计数（定位"权重被多读一遍"用；只加计数器，不改任何计算）
+    // 按元素宽度分开记：bf16(2B) 与 f32(4B) 的读数各自累计
+    let (aw, bw) = (a.elem_bytes(), b.elem_bytes());
+    mm_add_bytes_typed(aw as u64, (a.elems() * aw) as u64);
+    mm_add_bytes_typed(bw as u64, (b.elems() * bw) as u64);
+    mm_add_bytes(
+        (a.elems() * aw + b.elems() * bw) as u64,
+        (m * n * batch * 4) as u64,
+    );
     #[cfg(feature = "gpu")]
     {
         // 只有"这次真有可能走内核"时才为它做 bf16→f32 的整块解码：
@@ -887,13 +1115,6 @@ fn matmul_data(
     //   物化按**原宽度**转（bf16 转 bf16，不借机解码）：转置是纯位搬移，
     //   与「先解码再转」数值逐位一致，bf16 还省一半访存与分配。
     //
-    // 左操作数是 bf16（激活被 dtype 继承污染）时，先把它解码成 f32 再重入：
-    // 激活只有 t×d（几千个元素），解码代价可忽略；而不解码会落进下面的通用路径 ——
-    // 那里对 b_t 要物化整张转置表（0.5B 的输出头每 token 544 MB），实测正是 bf16 解码慢 4~5× 的主因。
-    if let MatData::Bf16(av16) = a.data {
-        let af32: Vec<f32> = av16.iter().map(|&u| bf16_to_f32(u)).collect();
-        return matmul_data(MatOperand::F32(&af32), b, m, k, n, batch, a_t, b_t);
-    }
     // ---- 单行快路：`batch*m == 1`（decode 的每个 Linear / 输出头）----
     // 行并行在只有一个输出行时完全失效（`par_chunks_mut(MC*n)` 里整个输出就一块
     // ⇒ 20 个核只用 1 个）。而且 b_t 的物理 [N,K] 布局对"单行"来说恰好是**行内连续**：
@@ -1023,6 +1244,8 @@ fn matmul_data(
                             let a_off = if a_t { grow } else { grow * k };
                             if rw == 8 && cw == 8 {
                                 #[cfg(target_arch = "x86_64")]
+                                // SAFETY: 外层已确认 CPU 支持 AVX2+FMA；`rw == 8 && cw == 8`（上面刚检查），
+                                // 三个指针的偏移都在各自缓冲容量内。
                                 unsafe {
                                     micro_8x8_fma(
                                         av.as_ptr().add(a_off),
@@ -1275,6 +1498,7 @@ fn gemm_ta_packed(av: &[f32], bv: &[f32], out: &mut [f32], m: usize, k: usize, n
                         let jw = (cols - j0).min(8);
                         if iw == 8 && jw == 8 {
                             #[cfg(target_arch = "x86_64")]
+                            // SAFETY: 同上一处：AVX2+FMA 已确认、块为 8×8、偏移在容量内。
                             unsafe {
                                 micro_8x8_fma(
                                     ap.as_ptr().add(i0),
@@ -1440,7 +1664,10 @@ fn masked_softmax_cpu(x: &[f32], mask: &[f32], rows: usize, d: usize, m_n: usize
 /// 分块前向（`flash_forward_cpu`）已在核内按同一规则屏蔽，CPU 路径不再需要这块
 /// O(T×T_total) 的分配；只有 GPU 常驻路径与 `LLM_GPU_PROBE` 录制（内核按真实
 /// buffer 消费掩码）才在这里真的物化一次。
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "gpu"),
+    allow(dead_code, reason = "因果掩码物化：只有 gpu 常驻与探针录制路径用")
+)]
 /// 同 [`causal_mask_data`]，但按 `(t, t_total)` **缓存**（thread-local，照 `rope.rs` 的 cos/sin 表写法）。
 ///
 /// 掩码只依赖形状，而 `attn_resident` / `mlp_resident` 是**逐层**调用的 —— 原来每层都重建
@@ -1708,7 +1935,13 @@ enum AttnCache {
 /// 现在只服务 `LLM_GPU_PROBE` 形状录制（普通回退已换成 `flash_forward_cpu` 分块核，
 /// 见 `Tensor::flash_attention`）：录制模式下常驻路径整体关闭，这里把前向拆回
 /// 逐算子，让 `matmul` 把真实训练形状记进探针。
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "gpu"),
+    allow(
+        dead_code,
+        reason = "探针录制用的逐算子前向拆分（让 matmul 记录真实形状）"
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 fn attn_forward_ops(
     q_scaled: &[f32],
@@ -1929,7 +2162,7 @@ impl Tensor {
         }
     }
 
-    /// 本参数是否参与训练（no_grad 模式不影响这个"参数属性"，与 [`Tensor::req`] 区分）
+    /// 本参数是否参与训练（no_grad 模式不影响这个"参数属性"，与 `Tensor::req` 区分）
     #[inline]
     pub fn requires_grad(&self) -> bool {
         self.requires_grad.load(Ordering::Relaxed)
@@ -2182,7 +2415,13 @@ impl Tensor {
     ///
     /// 调用点有两处：`model.rs` 的 gpu 常驻路径，以及 [`Tensor::matmul_frozen`]
     /// （LoRA 冻结主干时的部分反向）。不带 gpu feature 时前者是"死代码"，别删。
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(
+            dead_code,
+            reason = "调用点在 gpu 常驻路径与 matmul_frozen（LoRA 部分反向）"
+        )
+    )]
     pub fn external(
         data: Vec<f32>,
         shape: Vec<usize>,
@@ -2467,7 +2706,7 @@ impl Tensor {
         result
     }
 
-    /// 任意维度重排（如 [0,2,1] 把 2、3 维交换）。
+    /// 任意维度重排（如 \[0,2,1\] 把 2、3 维交换）。
     ///
     /// **零拷贝视图**：与源张量共享物理缓冲，只重算 strides
     /// （`new_strides[i] = self.strides[dims[i]]`）并新建梯度缓冲。
@@ -2599,7 +2838,7 @@ impl Tensor {
         result
     }
 
-    /// 2 维转置（permute([1,0]) 的特例）
+    /// 2 维转置（permute(\[1,0\]) 的特例）
     pub fn transpose(&self) -> Tensor {
         assert_eq!(self.rank(), 2, "transpose 只支持 2 维");
         self.permute(&[1, 0])
@@ -2672,7 +2911,7 @@ impl Tensor {
 
     /// 逐元素除法。生产路径无调用点，作为分步参考实现保留给测试
     /// （理由同 [`Tensor::mul`]：用定义式公式与融合算子比对数值）。
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "分步参考实现（除）：与融合算子对拍，单测用")]
     pub fn div(&self, other: &Tensor) -> Tensor {
         // 反向必须与前向 `a / b` 严格对应（∂/∂a = 1/b，∂/∂b = -a/b²）。
         // 给 b 加 `1e-8` 会让梯度与自己的前向不一致——宁可得到 ±inf，
@@ -2904,7 +3143,10 @@ impl Tensor {
     ///
     /// 与 [`Tensor::mul_scalar`] 对称。主路径上需要加常量的地方（如 eps）都并入融合算子，
     /// 非测试构建里没有调用点；测试在分步参考实现里用它补齐公式。
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "分步参考实现（加标量）：主路径并入融合算子，单测补齐公式"
+    )]
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
@@ -2968,8 +3210,10 @@ impl Tensor {
     ///
     /// 逐元素算子集的一员（与 [`Tensor::sub`] 一起构成"求负"语义）。当前训练/推理路径
     /// 没有调用点，因为需要取负的地方都是与别的运算合并成一步算的；保留它是为了让算子集
-    /// 在语义上闭合（有 `sub` 就该有 `neg`），代价只是一个 `allow(dead_code)`。
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "算子集语义闭合（有 sub 就该有 neg）：生产无调用点，单测用"
+    )]
     pub fn neg(&self) -> Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
@@ -2998,7 +3242,10 @@ impl Tensor {
     }
 
     /// ReLU：c = max(0, x)，∂x = g * (x>0)
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "分步参考实现（ReLU）：单测与文档用")
+    )]
     pub fn relu(&self) -> Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
@@ -3033,7 +3280,7 @@ impl Tensor {
     }
 
     /// tanh：c = tanh(x)，∂x = g * (1 - c²)
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "分步参考实现（tanh）：单测与文档用")]
     pub fn tanh(&self) -> Tensor {
         // 非连续先物化，下文按行主序线性读
         let x = self.contiguous();
@@ -3274,9 +3521,12 @@ impl Tensor {
 
     /// log：c = ln(x)，∂x = g / x（cross_entropy 已改用 log_softmax_last_dim，仅测试使用）
     ///
-    /// 前向以 [`EPS`] 为下界再取 ln：与反向的 `g / max(x, EPS)` 保持一致。
+    /// 前向以 `EPS` 为下界再取 ln：与反向的 `g / max(x, EPS)` 保持一致。
     /// 否则 x=0 时前向是 -inf、反向是 g/EPS，两个不一致的奇点相遇容易滚出 NaN。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "分步参考实现（log，前向以 EPS 为下界）：单测用")
+    )]
     pub fn log(&self) -> Tensor {
         // 非连续先物化，前后向均按行主序线性读（反向闭包按缓冲读 sd）
         let x = self.contiguous();
@@ -3341,7 +3591,7 @@ impl Tensor {
     }
 
     /// sqrt：c = sqrt(x)，∂x = g / (2c)
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "分步参考实现（sqrt）：单测与文档用")]
     pub fn sqrt(&self) -> Tensor {
         self.pow(0.5)
     }
@@ -3349,8 +3599,8 @@ impl Tensor {
     // ---------- 矩阵运算 ----------
 
     /// 矩阵乘法，支持：
-    /// - 2D：C[m,n] = A[m,k] @ B[k,n]
-    /// - 3D 批量：C[B,m,n] = A[B,m,k] @ B[B,k,n]
+    /// - 2D：C\[m,n\] = A\[m,k\] @ B\[k,n\]
+    /// - 3D 批量：C\[B,m,n\] = A\[B,m,k\] @ B\[B,k,n\]
     ///
     /// 反向公式（2D）：∂A = g @ Bᵀ，∂B = Aᵀ @ g
     pub fn matmul(&self, other: &Tensor) -> Tensor {
@@ -4215,40 +4465,40 @@ impl Tensor {
                     let g = rg.borrow();
                     // 常驻显存路径：dV/dP/dS/dQ/dK 五个算子录进一次提交，只回读 dQ/dK/dV（各 4.2MB）
                     #[cfg(feature = "gpu")]
-                    if let AttnCache::Gpu(r) = &cache {
-                        if let Some((dq_out, dk_out, dv_out)) = r.backward(&g) {
-                            {
-                                let mut sgm = sq.borrow_mut();
-                                for (i, v) in dq_out.iter().enumerate() {
-                                    sgm[i] += v * scale;
-                                }
+                    if let AttnCache::Gpu(r) = &cache
+                        && let Some((dq_out, dk_out, dv_out)) = r.backward(&g)
+                    {
+                        {
+                            let mut sgm = sq.borrow_mut();
+                            for (i, v) in dq_out.iter().enumerate() {
+                                sgm[i] += v * scale;
                             }
-                            // GQA：GPU 收到的是核外展开后的 dK/dV（bh 组），按 n_rep
-                            // 相邻副本求和折回 kv_bh 组再写父梯度；n_rep==1 直接 move 零拷贝
-                            let dk_final = if n_rep > 1 {
-                                fold_repeat_grad(&dk_out, kv_bh, n_rep)
-                            } else {
-                                dk_out
-                            };
-                            let dv_final = if n_rep > 1 {
-                                fold_repeat_grad(&dv_out, kv_bh, n_rep)
-                            } else {
-                                dv_out
-                            };
-                            {
-                                let mut sgm = sk.borrow_mut();
-                                for (i, v) in dk_final.iter().enumerate() {
-                                    sgm[i] += v;
-                                }
-                            }
-                            {
-                                let mut sgm = sv.borrow_mut();
-                                for (i, v) in dv_final.iter().enumerate() {
-                                    sgm[i] += v;
-                                }
-                            }
-                            return;
                         }
+                        // GQA：GPU 收到的是核外展开后的 dK/dV（bh 组），按 n_rep
+                        // 相邻副本求和折回 kv_bh 组再写父梯度；n_rep==1 直接 move 零拷贝
+                        let dk_final = if n_rep > 1 {
+                            fold_repeat_grad(&dk_out, kv_bh, n_rep)
+                        } else {
+                            dk_out
+                        };
+                        let dv_final = if n_rep > 1 {
+                            fold_repeat_grad(&dv_out, kv_bh, n_rep)
+                        } else {
+                            dv_out
+                        };
+                        {
+                            let mut sgm = sk.borrow_mut();
+                            for (i, v) in dk_final.iter().enumerate() {
+                                sgm[i] += v;
+                            }
+                        }
+                        {
+                            let mut sgm = sv.borrow_mut();
+                            for (i, v) in dv_final.iter().enumerate() {
+                                sgm[i] += v;
+                            }
+                        }
+                        return;
                     }
                     // CPU 路径（也兜底 GPU 常驻反向失败）：前后向之间不保留 P，
                     // 反向用矩阵乘重算 scores = Q'·Kᵀ，再由 `attn_softmax_cpu` 归一化出 P
@@ -4393,11 +4643,17 @@ impl Tensor {
 
     /// 融合"因果掩码相加 + softmax"：out = softmax_last_dim(x + mask)。
     ///
-    /// mask 必须是 x 形状的右后缀（如 x [bh,t,tt] + mask [t,tt]），逐维相等；
+    /// mask 必须是 x 形状的右后缀（如 x \[bh,t,tt\] + mask \[t,tt\]），逐维相等；
     /// 每个元素对应的 mask 下标 = `flat % mask.numel()`。mask 中 -inf 的位置 softmax 后为 0。
     /// 反向与普通 softmax 相同（s=0 的位置梯度自然为 0，且 mask 是常量不需要梯度）。
     /// 一个算子替代 `add` + `softmax_last_dim` 两个算子，训练热路径里每层 block 一次。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "融合算子（masked softmax）：训练热路径用，单测对拍"
+        )
+    )]
     pub fn masked_softmax(&self, mask: &Tensor) -> Tensor {
         // 非连续先物化，前后向均按行主序线性读
         let x = self.contiguous();
@@ -4556,7 +4812,7 @@ impl Tensor {
     /// - `training`：true 时启用随机丢弃，false 时直接返回克隆
     ///
     /// 反转技巧（inverted dropout）：
-    /// - 训练时 `out = mask · x / (1-p)`（mask ∈ {0, 1}），期望 E[out] = E[x]
+    /// - 训练时 `out = mask · x / (1-p)`（mask ∈ {0, 1}），期望 E\[out\] = E\[x\]
     /// - 推理时 `out = x`（无需额外操作）
     /// - 反向：梯度同样乘以 `mask / (1-p)`
     ///
@@ -4652,9 +4908,10 @@ impl Tensor {
 
     // ---------- 索引运算 ----------
 
-    /// 按行索引取值：table [V, D]，indices [N] -> out [N, D]。
+    /// 按行索引取值：table \[V, D\]，indices \[N\] -> out \[N, D\]。
     /// 反向：梯度 scatter-add 回 table 对应行（Embedding 用）。
     pub fn gather_rows(&self, indices: &[usize]) -> Tensor {
+        let _t = OpTimer::new("gather");
         // 非连续先物化，前后向均按行主序线性读
         let x = self.contiguous();
         assert_eq!(x.rank(), 2, "gather_rows 的 table 必须为 2 维");
@@ -4744,7 +5001,7 @@ impl Tensor {
         result
     }
 
-    /// 按行散射相加（`gather_rows` 的转置）：rows [N, D] + indices [N] -> out [M, D]。
+    /// 按行散射相加（`gather_rows` 的转置）：rows \[N, D\] + indices \[N\] -> out \[M, D\]。
     ///
     /// `out[indices[i]] += rows[i]`，其余行保持 0；同一行被多次命中时数值（与梯度）累加。
     /// 反向恰好是 [`Tensor::gather_rows`] 的前向：`d_rows[i] = g[indices[i]]`。
@@ -6069,7 +6326,16 @@ mod tests {
     #[test]
     fn test_bf16_codec_rne_roundtrip() {
         // 普通值：round-to-nearest-even 相对误差 ≤ 半个 bf16 ulp（2^-8，留 1% 余量）
-        for &x in &[1.0f32, -1.0, 0.5, 3.14159, -0.001234, 65504.0, 1e-30, -7.75] {
+        for &x in &[
+            1.0f32,
+            -1.0,
+            0.5,
+            std::f32::consts::PI,
+            -0.001234,
+            65504.0,
+            1e-30,
+            -7.75,
+        ] {
             let r = bf16_to_f32(f32_to_bf16(x));
             let rel = ((r - x) / x).abs();
             assert!(rel <= 2.0f32.powi(-8) * 1.01, "{x} -> {r} 相对误差 {rel}");
@@ -6306,7 +6572,9 @@ mod tests {
         use rayon::prelude::*;
         use std::time::Instant;
         let (n, k) = (151936usize, 896usize); // 0.5B 输出头
-        let x: Vec<f32> = (0..k).map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 37 % 101) as f32) * 0.01 - 0.5)
+            .collect();
         let w16: Vec<u16> = (0..n * k)
             .map(|i| f32_to_bf16(((i % 97) as f32) * 0.01 - 0.3))
             .collect();
@@ -6314,7 +6582,10 @@ mod tests {
         let nt = rayon::current_num_threads().max(1);
         let chunk = n.div_ceil(nt * 4).max(64);
         let idx: Vec<usize> = (0..n).collect();
-        println!("  threads={nt} chunk={chunk} 权重 {:.0} MB (bf16)", (n * k * 2) as f64 / 1e6);
+        println!(
+            "  threads={nt} chunk={chunk} 权重 {:.0} MB (bf16)",
+            (n * k * 2) as f64 / 1e6
+        );
         let bench = |name: &str, bytes: f64, f: &(dyn Fn(usize) -> f32 + Sync)| {
             let t0 = Instant::now();
             let s: f32 = idx
@@ -6347,5 +6618,152 @@ mod tests {
             }
             s
         });
+    }
+
+    // ==================== 边界与不变量 ====================
+
+    /// reshape 只改形状不改顺序：行主序元素序列必须原样保留
+    #[test]
+    fn test_reshape_keeps_row_major_order() {
+        let t = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6.], vec![2, 3]);
+        let r = t.reshape(vec![3, 2]);
+        assert_eq!(r.shape(), &[3, 2]);
+        assert_eq!(r.data_ref().to_vec(), vec![1., 2., 3., 4., 5., 6.]);
+        let flat = r.reshape(vec![6]);
+        let cube = flat.reshape(vec![1, 2, 3]);
+        assert_eq!(cube.data_ref().to_vec(), vec![1., 2., 3., 4., 5., 6.]);
+    }
+
+    #[test]
+    #[should_panic(expected = "元素总数不一致")]
+    fn test_reshape_rejects_wrong_element_count() {
+        let t = Tensor::from_vec(vec![1., 2., 3., 4.], vec![2, 2]);
+        let _ = t.reshape(vec![3, 2]);
+    }
+
+    /// 二维转置两次必须回到原样。
+    ///
+    /// 注意：`t` 与 `tt` 共享同一块 `Arc<Mutex<Buffer>>`（reshape/transpose 都是视图），
+    /// **不能在同一表达式里同时取两个 `data_ref()` 守卫**——那会在同一个 Mutex 上二次加锁而死锁。
+    /// 所以下面先把左边拷成 Vec，再取右边的守卫。
+    #[test]
+    fn test_transpose_twice_is_identity() {
+        let t = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6.], vec![2, 3]);
+        let tt = t.transpose().transpose();
+        assert_eq!(tt.shape(), &[2, 3]);
+        let a = tt.data_ref().to_vec();
+        let b = t.data_ref().to_vec();
+        assert_eq!(a, b);
+    }
+
+    /// 非方阵 matmul 的形状与数值（手算核对）
+    #[test]
+    fn test_matmul_non_square_values() {
+        let a = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6.], vec![2, 3]);
+        let b = Tensor::from_vec((1..=12).map(|v| v as f32).collect(), vec![3, 4]);
+        let c = a.matmul(&b);
+        assert_eq!(c.shape(), &[2, 4]);
+        // 行主序手算：c[0] = [1·1+2·5+3·9, 1·2+2·6+3·10, 1·3+2·7+3·11, 1·4+2·8+3·12]
+        assert_eq!(
+            c.data_ref().to_vec(),
+            vec![38., 44., 50., 56., 83., 98., 113., 128.]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_matmul_rejects_inner_dim_mismatch() {
+        let a = Tensor::from_vec(vec![1., 2., 3., 4.], vec![2, 2]);
+        let b = Tensor::from_vec(vec![1., 2., 3.], vec![3, 1]);
+        let _ = a.matmul(&b);
+    }
+
+    /// 广播：行向量、列向量、单元素形状都要能加
+    #[test]
+    fn test_add_broadcast_rows_cols_and_scalar() {
+        let m = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6.], vec![2, 3]);
+        let row = Tensor::from_vec(vec![10., 20., 30.], vec![1, 3]);
+        let col = Tensor::from_vec(vec![100., 200.], vec![2, 1]);
+        let one = Tensor::from_vec(vec![1.], vec![1, 1]);
+        assert_eq!(
+            m.add(&row).data_ref().to_vec(),
+            vec![11., 22., 33., 14., 25., 36.]
+        );
+        assert_eq!(
+            m.add(&col).data_ref().to_vec(),
+            vec![101., 102., 103., 204., 205., 206.]
+        );
+        assert_eq!(
+            m.add(&one).data_ref().to_vec(),
+            vec![2., 3., 4., 5., 6., 7.]
+        );
+    }
+
+    /// softmax 的不变量：非负、每行和为 1；极端输入必须数值稳定
+    #[test]
+    fn test_softmax_invariants_and_extremes() {
+        let t = Tensor::from_vec(vec![1., 2., 3., -1., 0., 1.], vec![2, 3]);
+        let s = t.softmax_last_dim();
+        let d = s.data_ref();
+        for r in 0..2 {
+            let sum: f32 = d[r * 3..r * 3 + 3].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "第 {r} 行概率和 {sum}");
+        }
+        assert!(d.iter().all(|v| *v >= 0.0));
+
+        let x = Tensor::from_vec(vec![10_000., -10_000., 0.], vec![1, 3]);
+        let sx = x.softmax_last_dim();
+        assert!(
+            sx.data_ref().iter().all(|v| v.is_finite()),
+            "极端输入出现 NaN/inf"
+        );
+        assert!((sx.data_ref()[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// log(0) 被 EPS（1e-8）夹住：必须是**有限**的大负数，而不是 -inf/NaN。
+    ///
+    /// 这是刻意的取舍：-inf 会让下游（KL、log_softmax 的反向）出现 inf−inf = NaN，
+    /// 夹到 EPS 后梯度有界，代价是 log(0) 约等于 −18.4 而非 −∞。
+    #[test]
+    fn test_log_of_zero_is_clamped_not_nan() {
+        let t = Tensor::from_vec(vec![0., 1., std::f32::consts::E], vec![1, 3]);
+        let l = t.log();
+        let d = l.data_ref();
+        assert!(
+            d[0].is_finite(),
+            "log(0) 应为有限值（被 EPS 夹住），实际 {}",
+            d[0]
+        );
+        assert!(d[0] < -10.0, "log(0) 应远小于 -10，实际 {}", d[0]);
+        assert!((d[0] - 1e-8f32.ln()).abs() < 1e-4, "log(0) 应等于 ln(EPS)");
+        assert!(d[1].abs() < 1e-7);
+        assert!((d[2] - 1.0).abs() < 1e-6);
+    }
+
+    /// gather_rows：重复下标保序，形状跟着行数走
+    #[test]
+    fn test_gather_rows_duplicates_keep_order() {
+        let t = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6.], vec![3, 2]);
+        let g = t.gather_rows(&[2, 0, 2]);
+        assert_eq!(g.shape(), &[3, 2]);
+        assert_eq!(g.data_ref().to_vec(), vec![5., 6., 1., 2., 5., 6.]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_gather_rows_out_of_range_panics() {
+        let t = Tensor::from_vec(vec![1., 2., 3., 4.], vec![2, 2]);
+        let _ = t.gather_rows(&[2]);
+    }
+
+    /// sum_last_dim 的和必须等于整体 sum（聚合顺序不影响结果）
+    #[test]
+    fn test_sum_last_dim_matches_total_sum() {
+        let t = Tensor::from_vec((1..=12).map(|v| v as f32).collect(), vec![3, 4]);
+        let total = t.sum().data_ref()[0];
+        let per_row = t.sum_last_dim();
+        assert_eq!(per_row.data_ref().to_vec(), vec![10., 26., 42.]);
+        let s: f32 = per_row.data_ref().iter().sum();
+        assert_eq!(total, s);
     }
 }

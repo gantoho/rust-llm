@@ -58,7 +58,7 @@
 //!
 //! ## 默认关闭，逐位不变
 //!
-//! `n_stream = 1`（默认）时 [`crate::model::TransformerBlock`] **根本不构造**本模块，
+//! `n_stream = 1`（默认）时 `crate::model::TransformerBlock` **根本不构造**本模块，
 //! 残差路径仍是原来那一行 `x.add(&h)`——不消耗随机数、不新增参数、行为与前向逐位一致。
 //! 即便手动构造 `HyperConnection::new(1, _)`，softmax(单元素) 与 Sinkhorn(1×1)
 //! 都精确等于 1，读出/写入也与普通残差**逐位相同**（见本文件单测）。
@@ -81,7 +81,7 @@ const INIT_BIAS: f32 = 4.0;
 /// 增益是"静态宽度连接"的最简形态；`n = 1` 时增益为 1，行为逐位不变。
 const STREAM_GAIN_STEP: f32 = 0.01;
 
-/// 单侧集中的 logit 初始化：首位 [`INIT_BIAS`]、其余为 0。
+/// 单侧集中的 logit 初始化：首位 `INIT_BIAS`、其余为 0。
 ///
 /// softmax 后约为 `[0.982, 0.018, …]`——让首条流充当"主残差流"，其余流轻微耦合，
 /// 起步时整体行为接近普通残差。用于读出 / 写入 / 收敛三处门控。
@@ -101,7 +101,10 @@ pub fn concentrated_logits(n: usize) -> Vec<f32> {
 ///
 /// 这是给文档与单测用的 **f32 参考实现**；训练路径走张量版的
 /// [`HyperConnection::depth`]（同样交替归一化，但每一步都在计算图里，可反向）。
-#[allow(dead_code)] // 生产路径无调用点：作为分步参考实现与数值口径基准保留给单测/文档
+#[allow(
+    dead_code,
+    reason = "Sinkhorn 的 f32 参考实现：单测与文档用，训练走张量版可反向路径"
+)]
 pub fn sinkhorn(raw: &[f32], n: usize, iters: usize) -> Vec<f32> {
     assert_eq!(raw.len(), n * n, "sinkhorn 需要 n×n 输入（n={n}）");
     assert!(n >= 1);
@@ -147,7 +150,7 @@ pub fn sinkhorn(raw: &[f32], n: usize, iters: usize) -> Vec<f32> {
 }
 
 /// 矩阵离"双随机"多远：返回 max(所有 |行和 − 1|、|列和 − 1| 的最大值)。
-#[allow(dead_code)] // 数值口径基准，供单测/文档核对，不进训练路径
+#[allow(dead_code, reason = "数值口径基准（双随机误差）：单测用，不进训练路径")]
 pub fn doubly_stochastic_error(mat: &[f32], n: usize) -> f32 {
     assert_eq!(mat.len(), n * n);
     let mut worst = 0.0f32;
@@ -166,7 +169,10 @@ pub fn doubly_stochastic_error(mat: &[f32], n: usize) -> f32 {
 ///
 /// 双随机矩阵的这个值应当恰好是 1：`≤ 1` 由 Birkhoff 凸性给出、`≥ 1` 由
 /// `A·1 = 1` 给出。单测用它验证 Sinkhorn 真的把混合矩阵钉在了保范流形上。
-#[allow(dead_code)] // 数值口径基准，供单测/文档核对，不进训练路径
+#[allow(
+    dead_code,
+    reason = "数值口径基准（谱范数上界应为 1）：单测用，不进训练路径"
+)]
 pub fn spectral_norm(mat: &[f32], n: usize, iters: usize) -> f32 {
     assert_eq!(mat.len(), n * n);
     if n == 0 {
@@ -215,7 +221,7 @@ pub fn spectral_norm(mat: &[f32], n: usize, iters: usize) -> f32 {
 ///
 /// 用一次 `[n,1] × [1,D]` 的矩阵乘完成复制（每行都是同一份展平输入），
 /// 好处是反向时各流梯度会**自动加和**回输入——正是"多条流同源"该有的梯度语义。
-/// 增益见 [`STREAM_GAIN_STEP`]：`n = 1` 时是 1，逐位不变。
+/// 增益见 `STREAM_GAIN_STEP`：`n = 1` 时是 1，逐位不变。
 pub fn expand_streams(x: &Tensor, n: usize) -> Tensor {
     let d_tot = x.numel();
     let flat = x.reshape(vec![1, d_tot]);

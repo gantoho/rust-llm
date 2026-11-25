@@ -45,6 +45,18 @@ RAG 框架、甚至各家云厂商的网关，都默认会往 `{base_url}/v1/cha
 （否则调用方只能看到 400 干瞪眼）。唯一显式拒绝的是 `n != 1`——本服务一次
 只生成一个回答，硬撑 `n=4` 只会返回四个重复答案，不如早说。
 
+### 2.1 协议的边界：支持什么、拒绝什么
+
+"兼容"不等于"全都实现"。本项目把字段分成三类，**不允许静默降级**：
+
+| 类别 | 字段 | 行为 |
+|---|---|---|
+| 已实现 | `max_tokens` / `max_completion_tokens`、`temperature`、`top_p`、`top_k`、`stop`、`seed`、`n=1`、`logprobs` / `top_logprobs`（非流式）、`response_format: json_object` | 按语义生效 |
+| **显式 400** | `tools` / `tool_choice` / `parallel_tool_calls`（function calling）、`logit_bias`、`response_format: json_schema` | 报错说明不支持——静默忽略会让客户端以为生效 |
+| 静默忽略 | `user`、`metadata`、客户端自带的统计字段 | 保证现成 SDK 能直连 |
+
+完整对照与理由见 README §16.7 / §16.11h。
+
 ---
 
 ## 3. 架构：常驻进程 vs 一次性命令
@@ -111,15 +123,17 @@ cache，总吞吐不变而单条延迟翻倍；排队反而让延迟曲线平稳
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
 | POST | `/v1/chat/completions` | ✅ | 对话补全，`stream=true` 走 SSE |
+| POST | `/v1/completions` | ✅ | 旧版文本补全（**裸续写**，不套对话模板） |
 | POST | `/v1/embeddings` | ✅ | 文本向量化（均值池化） |
 | GET | `/v1/models` | ✅ | 只有一个模型的列表（OpenAI 语义：它会暴露服务上有什么） |
 | GET | `/health` | ❌ | 存活探针 `{"status":"ok","model":…}` |
 | GET | `/v1/status` | ❌ | 队列/计数/模型信息，诊断用 |
+| GET | `/metrics` | ❌ | Prometheus 文本指标（计数 / 在跑请求 / 运行时长） |
 | GET | `/openapi.json` | ❌ | 本服务的 OpenAPI 3.1 规范（JSON），导入 Postman/Apifox/Swagger UI |
 | GET | `/openapi.yaml` | ❌ | 同上，YAML 格式（两份与实际路由同源生成） |
 | OPTIONS | 任意 | ❌ | CORS 预检 → 204 |
 
-**鉴权刻意豁免 `/health`、`/v1/status` 和 `/openapi.*`**：探针和监控系统通常
+**鉴权刻意豁免 `/health`、`/v1/status`、`/metrics` 和 `/openapi.*`**：探针和监控系统通常
 不方便带 `Authorization` 头，且这些端点不泄露模型输出——一个只说"我还活着"，
 一个只说计数器，规范则只描述接口形状。`/v1/models` 则必须鉴权（它暴露服务上
 部署了什么）。
@@ -138,6 +152,10 @@ cache，总吞吐不变而单条延迟翻倍；排队反而让延迟曲线平稳
 | `max_tokens` | 整数 | `--max-new`（1000） | >0；**两者都钳到上下文窗口内**（缺省用服务级 `--max-new` 后再钳） |
 | `stop` | 字符串/数组 | SFT 模板停止标记 | ≤4 个，每个 ≤64 字节 |
 | `seed` | 整数 | 服务级 `--seed` | 非负；给了就用独立 RNG，可复现 |
+| `max_completion_tokens` | 整数 | 同 `max_tokens` | 与 `max_tokens` 只能给一个（同一语义的别名） |
+| `logprobs` | bool | false | 非流式；`stream=true` + `logprobs` → 400 |
+| `top_logprobs` | 整数 | 0 | `≤20`，且需 `logprobs=true` |
+| `response_format` | 对象 | 无 | 只认 `type=text` / `type=json_object`；`json_schema` → 400 |
 | `stream` | bool | false | — |
 | `n` | 整数 | 1 | 只接受 1 |
 | 其余 | — | — | **一律忽略**（`user`/`logit_bias`/`tools`…） |
@@ -510,6 +528,38 @@ cargo run --release -- serve --ckpt checkpoints/zh-sft/best.ckpt --api-key sk-te
 #   [serve] 前端测试页已启动：http://localhost:5173（代理 API → 127.0.0.1:8080）
 ```
 
+### 7.9 `/metrics`：给 Prometheus 抓取（不鉴权）
+
+`GET /metrics` 输出 Prometheus 文本格式（version 0.0.4），指标覆盖：请求计数（按 chat/stream/
+embeddings/errors）、在跑/排队/生成中的请求数、并发上限、被拒数（429）、运行时长、模型元信息。
+
+```yaml
+scrape_configs:
+  - job_name: llm
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+只暴露计数，不含任何请求内容，所以和 `/v1/status` 一样不鉴权。实现上它是 `ROUTES` 表的一项，
+OpenAPI 里同步声明（`test_routes_match_openapi` 强制两边一致）。
+
+### 7.10 `response_format: json_object`：约束解码
+
+只做事后校验等于撒谎——模型照样输出自由文本，只是"可能"恰好是 JSON。本项目的做法是
+**把约束放进采样**：`src/json_constraint.rs` 维护"已输出字节是否为合法 JSON 前缀"的自动机，
+每步把接上后会破坏前缀的 token 掩成 `-inf`。因此输出必然合法；收尾时即完整 JSON
+（`finish_reason=stop`）。
+
+两个容易踩的坑（都已修）：
+
+- **掩码必须放在 `step_row`**，不能放 `logits_row`——批处理路径直接调 `step_row`，
+  放错地方约束会被完全绕过；
+- **数字的终态要单独判**：`1`、`1.5` 内部状态还停在 `Num`（要看到下一个字节才知道结束），
+  所以用 `can_finish()` 而不是 `is_complete()` 判断"能否收尾"。
+
+代价是每步一次词表扫描（O(词表 × token 字节)）：char 小词表可忽略，15 万词表 BPE 约几毫秒/步。
+`json_schema` 明确不做（要把 Schema 编译成语法，另一量级），会返回 400 说明。
+
 ---
 
 ## 8. 错误处理：OpenAI 形状 + 中文原因
@@ -572,7 +622,7 @@ curl.exe -s -N --data-binary "@$env:TEMP\req.json" `
 
 ---
 
-## 10. 单元测试（28 个）
+## 10. 单元测试（41 个）
 
 `src/serve.rs` 底部的 `#[cfg(test)] mod tests`，不启端口、纯函数级：
 

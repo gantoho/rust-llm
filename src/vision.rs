@@ -94,6 +94,7 @@ impl VisionConfig {
 // ==================== 图像 IO ====================
 
 /// 读图 → 缩放到 `size × size` → CHW、[-1,1]
+#[cfg(feature = "vision-io")]
 pub fn load_image(path: &str, size: usize) -> Vec<f32> {
     let img = image::open(path).unwrap_or_else(|e| panic!("打开图片 {path} 失败: {e}"));
     to_chw(&img.to_rgb8(), size)
@@ -103,12 +104,14 @@ pub fn load_image(path: &str, size: usize) -> Vec<f32> {
 ///
 /// `serve` 收客户端上传的 `data:image/...;base64,...` 时用它，解码失败回 400 而不是 panic；
 /// 输出与 [`load_image`] 完全一致（同一套缩放与归一化）。
+#[cfg(feature = "vision-io")]
 pub fn decode_image_bytes(bytes: &[u8], size: usize) -> Result<Vec<f32>, String> {
     let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
     Ok(to_chw(&img.to_rgb8(), size))
 }
 
 /// RGB → 缩放 `size × size` → CHW、[-1,1]（文件与内存两条解码路径共用）
+#[cfg(feature = "vision-io")]
 fn to_chw(rgb: &image::RgbImage, size: usize) -> Vec<f32> {
     let resized = image::imageops::resize(
         rgb,
@@ -127,6 +130,7 @@ fn to_chw(rgb: &image::RgbImage, size: usize) -> Vec<f32> {
 }
 
 /// CHW、[-1,1] → RGB8 图像（[`save_image`] 与 [`encode_png`] 共用的像素搬运）
+#[cfg(feature = "vision-io")]
 fn rgb_image(chw: &[f32], size: usize) -> image::RgbImage {
     assert_eq!(chw.len(), 3 * size * size, "像素数组长度应为 3·size²");
     let mut raw = vec![0u8; 3 * size * size];
@@ -143,6 +147,7 @@ fn rgb_image(chw: &[f32], size: usize) -> image::RgbImage {
 }
 
 /// CHW、[-1,1] → PNG（`image_size` × `image_size`）
+#[cfg(feature = "vision-io")]
 pub fn save_image(chw: &[f32], size: usize, path: &str) {
     let img = rgb_image(chw, size);
     crate::config::ensure_parent_dir(path);
@@ -155,12 +160,49 @@ pub fn save_image(chw: &[f32], size: usize, path: &str) {
 ///
 /// serve 用它把生成图内嵌成 `data:image/png;base64,...` 回给客户端——
 /// 不必为了几张生成图再开一个静态文件端点。
+#[cfg(feature = "vision-io")]
 pub fn encode_png(chw: &[f32], size: usize) -> Vec<u8> {
     let img = image::DynamicImage::ImageRgb8(rgb_image(chw, size));
     let mut buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut buf, image::ImageFormat::Png)
         .expect("PNG 编码失败");
     buf.into_inner()
+}
+
+// ==================== 图像 IO 关闭时的桩 ====================
+//
+// 没有 `vision-io` 特性时，`image` crate 不在依赖树里。这里保留**同名同签名**的桩，
+// 让上层代码（数据集、serve、生成）照常编译，只在真正用到图像功能时给出可操作的错误，
+// 而不是让整个构建失败或抛出一句莫名其妙的 panic。
+
+/// 读图（未启用 `vision-io` 特性时不可用）
+#[cfg(not(feature = "vision-io"))]
+pub fn load_image(path: &str, _size: usize) -> Vec<f32> {
+    panic!(
+        "无法读取图片 {path}：本次构建未启用图像 IO。\
+         请用 `cargo build --release --features vision-io` 重新构建（或改用纯文本流程）"
+    )
+}
+
+/// 内存字节解码（未启用 `vision-io` 特性时返回可展示的错误，供 HTTP 层回 400）
+#[cfg(not(feature = "vision-io"))]
+pub fn decode_image_bytes(_bytes: &[u8], _size: usize) -> Result<Vec<f32>, String> {
+    Err("服务端未启用图像输入：请用 `--features vision-io` 构建".to_string())
+}
+
+/// 存图（未启用 `vision-io` 特性时不可用）
+#[cfg(not(feature = "vision-io"))]
+pub fn save_image(_chw: &[f32], _size: usize, path: &str) {
+    panic!(
+        "无法保存图片 {path}：本次构建未启用图像 IO。\
+         请用 `cargo build --release --features vision-io` 重新构建"
+    )
+}
+
+/// PNG 编码（未启用 `vision-io` 特性时不可用）
+#[cfg(not(feature = "vision-io"))]
+pub fn encode_png(_chw: &[f32], _size: usize) -> Vec<u8> {
+    panic!("无法编码 PNG：本次构建未启用图像 IO（`--features vision-io`）")
 }
 
 /// CHW → `[P, 3·ps²]` 展平（patch 按行主序），返回 `Vec<f32>`。

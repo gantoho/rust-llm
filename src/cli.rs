@@ -227,8 +227,9 @@ pub enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
         /// prompt 模板：`sft` = 与 `sft` 子命令训练时一致的对话模板（模型才会"回答"）；
+        /// `chatml` = Qwen / Llama-3 等 Instruct 基座的原生格式（`<|im_start|>user …`），套上就能对话；
         /// `raw` = 直接把历史拼给模型（只有预训练权重、未做过 SFT 时用）
-        #[arg(long, value_parser = ["sft", "raw"], default_value = "sft")]
+        #[arg(long, value_parser = ["sft", "chatml", "raw"], default_value = "sft")]
         prompt_format: String,
         #[command(flatten)]
         rope: RopeArgs,
@@ -298,7 +299,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
         /// prompt 模板：`sft` / `raw`，含义同 `chat` 子命令
-        #[arg(long, value_parser = ["sft", "raw"], default_value = "sft")]
+        #[arg(long, value_parser = ["sft", "chatml", "raw"], default_value = "sft")]
         prompt_format: String,
         #[command(flatten)]
         rope: RopeArgs,
@@ -319,6 +320,9 @@ pub enum Cmd {
         /// 显式给出就完全按这个数跑，不做任何收敛。
         #[arg(long)]
         steps: Option<usize>,
+        /// 覆盖 checkpoint 的上下文窗口（微调通常要缩短：Qwen2.5 是 32768，逐 token 太贵）
+        #[arg(long)]
+        block_size: Option<usize>,
         /// 峰值学习率（缺省用 config 里 train.max_lr 的 1/10；SFT 要比预训练小一个量级才不冲掉已有能力）
         #[arg(long)]
         lr: Option<f32>,
@@ -359,6 +363,9 @@ pub enum Cmd {
         /// 输出目录（缺省 `{config 的 out_dir}-lora`，避免覆盖预训练权重）
         #[arg(long)]
         out_dir: Option<String>,
+        /// 覆盖 checkpoint 的上下文窗口（Qwen2.5 是 32768，微调时通常缩短）
+        #[arg(long)]
+        block_size: Option<usize>,
     },
     /// 生成预设配置文件（small / medium / large）
     Preset {
@@ -545,6 +552,20 @@ pub enum Cmd {
     Speculative {
         #[command(flatten)]
         spec: SpecArgs,
+    },
+    /// 生成合成 SFT 对话语料（模板 × 槽位；**合成数据**，不能替代真实人工对话）
+    ///
+    /// 与原来的 `tools/gen_sft_corpus.py` 等价，但保持"仓库只有 Rust"。
+    SftGen {
+        /// 生成多少段对话
+        #[arg(long, default_value_t = 4000)]
+        dialogues: usize,
+        /// 随机种子：同种子产物逐字节相同
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// 输出路径（`train.sft_file` 里的 `data/sft/` 目录会自动收录）
+        #[arg(long, default_value = "data/sft/zh_synth_dialogue.txt")]
+        out: String,
     },
     /// 知识蒸馏实验（第 42 课）：温度/top-k 对软标签的影响 + KD 梯度数值自检
     /// + 「软标签 vs 硬标签」同学生同数据对照

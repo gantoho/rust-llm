@@ -2,7 +2,6 @@
 
 use crate::cli::RopeArgs;
 use crate::config::Config;
-use crate::data::{SFT_ASSISTANT, SFT_USER};
 use crate::rng::Rng;
 use crate::sample::{KvOpts, SampleOpts, StopReason, generate_with_reason};
 
@@ -10,7 +9,7 @@ use crate::prompt;
 use crate::runlog;
 use crate::serve;
 
-use super::{describe_kv, describe_stop, resolve_model_spec, stop_label};
+use super::{common_run_fields, describe_kv, describe_stop, resolve_model_spec, stop_label};
 
 /// 把模型部署成 OpenAI 兼容的 HTTP API（`serve` 子命令）
 ///
@@ -49,7 +48,11 @@ pub fn cmd_serve(
     runlog::json(&format!("完整配置（{config_path} 解析后）"), &cfg);
     let tcfg = &cfg.train;
     let use_sft = prompt_format == "sft";
-    if use_sft {
+    let chatml = prompt_format == "chatml";
+    if chatml {
+        // ChatML 基座靠 `<|im_end|>` 收尾；`<|im_start|>` 防它接着编下一轮
+        opts.stop = prompt::CHATML_STOP;
+    } else if use_sft {
         opts.stop = prompt::SFT_STOP;
     }
     // 长度外推必须在下面读 `model.cfg.block_size` **之前**生效（同 cmd_chat），
@@ -63,9 +66,14 @@ pub fn cmd_serve(
         Some(&rope_opt),
     );
     let block_size = model.cfg.block_size;
-    if max_new >= block_size {
+    // 生成段必须整段留在窗口内，且**至少给 prompt 留 1/4 窗口** —— 否则
+    // `prompt_budget = block_size - max_new` 会被挤成 0，多轮对话的历史与 system 全被丢弃
+    //（实测默认 --max-new=1000 + 窗口 512 就是这个结果），输入还会滑出视野。
+    let want_max_new = max_new;
+    let max_new = max_new.min(block_size.saturating_sub(block_size / 4).max(1));
+    if max_new < want_max_new {
         logln!(
-            "[warn] --max-new {max_new} ≥ 上下文窗口 {block_size}，prompt 会被挤到没有空间，建议调小"
+            "[info] --max-new {want_max_new} 已钳到 {max_new}：要给 prompt 留出窗口（窗口 {block_size}）"
         );
     }
     // OpenAI 客户端会拿请求里的 `model` 和 `/v1/models` 的 id 对账，
@@ -76,19 +84,14 @@ pub fn cmd_serve(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "model".to_string());
     let addr = format!("{host}:{port}");
-    runlog::fields(
-        "本次运行参数",
-        &[
-            ("配置文件", config_path.to_string()),
-            ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
-            (
-                "分词器文件",
-                tokenizer_path
-                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
-                    .to_string(),
-            ),
-            ("模型结构", format!("{:?}", ckpt.model)),
-            ("模型名（回给客户端）", model_name.clone()),
+    let mut fields = common_run_fields(
+        config_path,
+        &ckpt_path,
+        ckpt.step,
+        tokenizer_path,
+        &ckpt.model,
+    );
+    fields.extend([            ("模型名（回给客户端）", model_name.clone()),
             (
                 "系统提示",
                 if system.is_empty() {
@@ -164,8 +167,8 @@ pub fn cmd_serve(
                     format!("http://localhost:{web_port}（随 API 一起启动）")
                 },
             ),
-        ],
-    );
+        ]);
+    runlog::fields("本次运行参数", &fields);
     if let Some(note) = &rope_note {
         logln!("[rope] {note}");
     }
@@ -192,11 +195,16 @@ pub fn cmd_serve(
             cors,
             system: system.to_string(),
             use_sft,
+            chatml,
             max_new,
             seed,
             kv,
             model_name,
             sample: opts,
+            max_concurrent: std::env::var("LLM_SERVE_MAX_CONCURRENT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(8),
             block_size,
             vision: model.cfg.vision.clone(),
         },
@@ -244,51 +252,47 @@ pub fn cmd_chat(
         Some(&rope_opt),
     );
     let mut rng = Rng::new(seed);
-    runlog::fields(
-        "本次运行参数",
-        &[
-            ("配置文件", config_path.to_string()),
-            ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
-            (
-                "分词器文件",
-                tokenizer_path
-                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
-                    .to_string(),
-            ),
-            ("模型结构", format!("{:?}", ckpt.model)),
-            (
-                "系统提示",
-                if system.is_empty() {
-                    "无".to_string()
-                } else {
-                    system.to_string()
-                },
-            ),
-            ("prompt 模板", prompt_format.to_string()),
-            ("每轮最大新 token", max_new.to_string()),
-            ("seed", seed.to_string()),
-            ("temperature", opts.temperature.to_string()),
-            ("top_k", opts.top_k.to_string()),
-            ("top_p", opts.top_p.to_string()),
-            (
-                "重复惩罚",
-                format!(
-                    "{}（回看窗口 {}）",
-                    opts.repetition_penalty, opts.repetition_window
-                ),
-            ),
-            ("KV cache", describe_kv(&kv)),
-            (
-                "RoPE / 上下文",
-                rope_note.clone().unwrap_or_else(|| {
-                    format!(
-                        "沿用 checkpoint：窗口 {}，base = {}",
-                        model.cfg.block_size, model.cfg.rope_base
-                    )
-                }),
-            ),
-        ],
+    let mut fields = common_run_fields(
+        config_path,
+        &ckpt_path,
+        ckpt.step,
+        tokenizer_path,
+        &ckpt.model,
     );
+    fields.extend([
+        (
+            "系统提示",
+            if system.is_empty() {
+                "无".to_string()
+            } else {
+                system.to_string()
+            },
+        ),
+        ("prompt 模板", prompt_format.to_string()),
+        ("每轮最大新 token", max_new.to_string()),
+        ("seed", seed.to_string()),
+        ("temperature", opts.temperature.to_string()),
+        ("top_k", opts.top_k.to_string()),
+        ("top_p", opts.top_p.to_string()),
+        (
+            "重复惩罚",
+            format!(
+                "{}（回看窗口 {}）",
+                opts.repetition_penalty, opts.repetition_window
+            ),
+        ),
+        ("KV cache", describe_kv(&kv)),
+        (
+            "RoPE / 上下文",
+            rope_note.clone().unwrap_or_else(|| {
+                format!(
+                    "沿用 checkpoint：窗口 {}，base = {}",
+                    model.cfg.block_size, model.cfg.rope_base
+                )
+            }),
+        ),
+    ]);
+    runlog::fields("本次运行参数", &fields);
     if let Some(note) = &rope_note {
         logln!("[rope] {note}");
     }
@@ -317,13 +321,20 @@ pub fn cmd_chat(
     //      prompt + 生成超过它时，最前面的内容会滑出模型视野（system prompt 与早期历史被"遗忘"）
     //   3. 对话历史 —— 剩下的额度都给它，不够就按 token 数从最老的开始丢
     let block_size = model.cfg.block_size;
-    if max_new >= block_size {
+    // 生成段必须整段留在窗口内，且**至少给 prompt 留 1/4 窗口** —— 否则
+    // `prompt_budget = block_size - max_new` 会被挤成 0，多轮对话的历史与 system 全被丢弃
+    //（实测默认 --max-new=1000 + 窗口 512 就是这个结果），输入还会滑出视野。
+    let want_max_new = max_new;
+    let max_new = max_new.min(block_size.saturating_sub(block_size / 4).max(1));
+    if max_new < want_max_new {
         logln!(
-            "[warn] --max-new={max_new} 不小于上下文窗口 {block_size}：本轮生成到后半程时，\
-             最早的输入已滑出视野（滑动窗口只保留最近 {block_size} 个 token）"
+            "[info] --max-new {want_max_new} 已钳到 {max_new}：要给 prompt 留出窗口（窗口 {block_size}）"
         );
     }
-    let prompt_budget = block_size.saturating_sub(max_new);
+    let prompt_budget = block_size.saturating_sub(max_new).max(1);
+    // 三态模板：sft（自研） / chatml（Qwen、Llama-3 等 Instruct 基座） / raw
+    let tmpl = prompt::Template::parse(prompt_format);
+    opts.stop = tmpl.stop();
 
     let system = system.trim();
     let n_system = tokenizer.encode(system).len();
@@ -364,12 +375,12 @@ pub fn cmd_chat(
 
         // 构造 prompt：system + 历史 + 本轮。预算分配（system 永保 → 生成预留 → 历史）
         // 与 SFT/raw 两种模板都在 `prompt` 模块里，HTTP serve 走同一套代码。
-        let assembled = prompt::assemble(
+        let assembled = prompt::assemble_tmpl(
             &tokenizer,
             system,
             &context_history,
             input,
-            use_sft,
+            tmpl,
             prompt_budget,
         );
         let history = assembled.history;
@@ -448,8 +459,7 @@ pub fn cmd_chat(
                     context_history.push('\n');
                 }
                 // 写成模板形态，下一轮就能被 `trim_sft_history` 按轮切开
-                context_history
-                    .push_str(&format!("{SFT_USER}\n{input}\n{SFT_ASSISTANT}\n{response}"));
+                context_history.push_str(&tmpl.turn(input, response));
             }
         } else {
             if !context_history.is_empty() {

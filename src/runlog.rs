@@ -11,7 +11,7 @@
 //! 3. **运行主体**：该次操作的关键参数与过程输出（训练进度、评估点、生成文本等）
 //! 4. **运行尾部**：结束时间与总耗时
 //!
-//! 过程输出用 [`logln!`] 宏写：它同时打控制台和日志，因此日志是"控制台看到的一切 + 头部与配置"。
+//! 过程输出用 `logln!` 宏写：它同时打控制台和日志，因此日志是"控制台看到的一切 + 头部与配置"。
 //! 需要"走 stderr 而不污染 stdout"的告警（如 stdout 是生成结果、可能被重定向到文件时），
 //! 用 `eprintln!` + [`append`] 手动组合：既不污染 stdout，又能在日志里留痕。
 //! 未调用 [`start`] 的命令（`demo` / `bench` / `preset`）不会产生日志文件，此时所有写入
@@ -332,19 +332,9 @@ fn fmt_time((y, mo, d, h, mi, s, ms): DateTime) -> String {
 /// 取当前时间。Windows 直接问系统要本地时间；其它平台标准库没有时区 API，退化为 UTC。
 #[cfg(windows)]
 fn local_now() -> DateTime {
-    use windows_sys::Win32::Foundation::SYSTEMTIME;
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut st) };
-    (
-        st.wYear,
-        st.wMonth,
-        st.wDay,
-        st.wHour,
-        st.wMinute,
-        st.wSecond,
-        st.wMilliseconds,
-    )
+    // 手写 FFI，见 `crate::winutil`
+    let (y, mo, d, h, mi, s, ms) = crate::winutil::local_time();
+    (y, mo, d, h, mi, s, ms)
 }
 
 #[cfg(not(windows))]

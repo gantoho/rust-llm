@@ -31,7 +31,7 @@ use llm_from_scratch::cmd::core::{
 use llm_from_scratch::cmd::deploy::{cmd_chat, cmd_serve};
 use llm_from_scratch::cmd::experiments::{
     cmd_align, cmd_csa, cmd_distill, cmd_distributed, cmd_fp4, cmd_fp8, cmd_mla, cmd_moe, cmd_rag,
-    cmd_scaling, cmd_speculative, run_demo,
+    cmd_scaling, cmd_sft_gen, cmd_speculative, run_demo,
 };
 use llm_from_scratch::cmd::{init_console_utf8, kv_bits_from_name};
 
@@ -94,6 +94,8 @@ fn main() {
                 top_p,
                 repetition_penalty,
                 repetition_window,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
                 stop: &[],
             },
             seed,
@@ -135,6 +137,8 @@ fn main() {
                 top_p,
                 repetition_penalty,
                 repetition_window,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
                 stop: &[],
             },
             max_new,
@@ -184,6 +188,8 @@ fn main() {
                 top_p,
                 repetition_penalty,
                 repetition_window,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
                 stop: &[],
             },
             max_new,
@@ -199,6 +205,7 @@ fn main() {
             steps,
             lr,
             out_dir,
+            block_size,
         } => cmd_sft(
             &config,
             &pretrained,
@@ -206,6 +213,7 @@ fn main() {
             steps,
             lr,
             out_dir.as_deref(),
+            block_size,
         ),
         Cmd::Finetune {
             config,
@@ -218,6 +226,7 @@ fn main() {
             steps,
             lr,
             out_dir,
+            block_size,
         } => cmd_finetune(
             &config,
             &pretrained,
@@ -229,6 +238,7 @@ fn main() {
             lr,
             sft_file.as_deref(),
             out_dir.as_deref(),
+            block_size,
         ),
         Cmd::Preset { name, output } => cmd_preset(&name, &output),
         Cmd::ImportHf {
@@ -341,6 +351,11 @@ fn main() {
         Cmd::Align { align } => cmd_align(&align),
         Cmd::Rag { rag } => cmd_rag(&rag),
         Cmd::Speculative { spec } => cmd_speculative(&spec),
+        Cmd::SftGen {
+            dialogues,
+            seed,
+            out,
+        } => cmd_sft_gen(dialogues, seed, &out),
         Cmd::Distill { distill } => cmd_distill(&distill),
         Cmd::Fp8 { fp8 } => cmd_fp8(&fp8),
         Cmd::Fp4 { fp4 } => cmd_fp4(&fp4),

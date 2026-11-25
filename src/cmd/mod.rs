@@ -22,6 +22,30 @@ use crate::tokenizer::Tokenizer;
 use crate::checkpoint;
 use crate::config;
 
+/// 各子命令共有的「本次运行参数」前四项：配置文件 / checkpoint / 分词器 / 模型结构。
+///
+/// 抽出来的原因：这段（含"分词器自动查找"的文案）在 `serve` / `chat` / `generate` 里
+/// 被复制了三份，改一处容易漏另外两处。各命令在此基础上追加自己的字段。
+pub(crate) fn common_run_fields(
+    config_path: &str,
+    ckpt_path: &str,
+    ckpt_step: usize,
+    tokenizer_path: Option<&str>,
+    model: &crate::model::TransformerConfig,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("配置文件", config_path.to_string()),
+        ("checkpoint", format!("{ckpt_path}（step {ckpt_step}）")),
+        (
+            "分词器文件",
+            tokenizer_path
+                .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
+                .to_string(),
+        ),
+        ("模型结构", format!("{model:?}")),
+    ]
+}
+
 /// 命令行上的 KV cache 量化位宽名字 -> 枚举（`none` = 不量化）
 pub fn kv_bits_from_name(name: &str) -> Option<QBits> {
     match name {
@@ -95,13 +119,11 @@ pub(crate) fn truncate_chars(s: &str, n: usize) -> &str {
     }
 }
 
-/// Windows 控制台默认 GBK，把输出代码页切到 UTF-8，避免中文乱码
+/// Windows 控制台默认 GBK，把输出代码页切到 UTF-8，避免中文乱码。
+/// 具体 FFI 在 [`crate::winutil`]（手写，不依赖 `windows-sys`）。
 #[cfg(windows)]
 pub fn init_console_utf8() {
-    unsafe {
-        windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
-        windows_sys::Win32::System::Console::SetConsoleCP(65001);
-    }
+    crate::winutil::init_console_utf8();
 }
 
 /// 解析 checkpoint 路径：None 时取 out_dir/latest.ckpt
@@ -168,16 +190,16 @@ pub(crate) fn load_model_and_tokenizer(
     // 才真正省内存。默认关（量化档在重放前的语义是 f32，改变它会让既有产物行为突变）；
     // 显式 `LLM_QUANT_REPLAY=1` 时按头部参数重放，配合 `quant::QMatrix::gemv`
     // 的单行融合内核，int8 推理同时拿到"内存 1/4 + 速度更快"。
-    if std::env::var_os("LLM_QUANT_REPLAY").is_some() {
-        if let Some(meta) = ckpt.quant.as_ref() {
-            checkpoint::requantize_after_load(&mut model, meta);
-            logln!(
-                "[quant] 已按存档头部重放量化（{:?}，{:.2} MB → {:.2} MB）",
-                meta.bits,
-                meta.orig_bytes as f64 / 1e6,
-                meta.quant_bytes as f64 / 1e6
-            );
-        }
+    if std::env::var_os("LLM_QUANT_REPLAY").is_some()
+        && let Some(meta) = ckpt.quant.as_ref()
+    {
+        checkpoint::requantize_after_load(&mut model, meta);
+        logln!(
+            "[quant] 已按存档头部重放量化（{:?}，{:.2} MB → {:.2} MB）",
+            meta.bits,
+            meta.orig_bytes as f64 / 1e6,
+            meta.quant_bytes as f64 / 1e6
+        );
     }
     // 存档头里的量化记录只是"这份权重当初被量化过"的注记：数据块里始终是 f32，
     // 加载出来的模型也是普通 f32 模型（见 [`checkpoint::save`]）。打印出来是为了让
@@ -257,10 +279,13 @@ pub(crate) fn load_tokenizer_for_inference(
     if let Some(ref path) = tcfg.tokenizer_file {
         let loaded = Tokenizer::load(path);
         if expect_vocab != 0 {
-            assert_eq!(
-                loaded.vocab_size(),
-                expect_vocab,
-                "分词器词表（{}）与 checkpoint（{}）不一致",
+            // 与上面的 `tokenizer_path` 分支同一条规则：**只要求分词器不超过模型词表**。
+            // HF 模型常把 vocab_size 补到 128 的倍数（Qwen2.5：真实词表 151665、
+            // config 写 151936），多出的是永不会被采到的占位 id；反过来若分词器更大，
+            // 采样就可能产出越界 id —— 那才必须拦下。
+            assert!(
+                loaded.vocab_size() <= expect_vocab,
+                "分词器词表（{}）大于 checkpoint 词表（{}）：会采出越界 token",
                 loaded.vocab_size(),
                 expect_vocab
             );
@@ -278,10 +303,13 @@ pub(crate) fn load_tokenizer_for_inference(
     if std::path::Path::new(&auto_path).exists() {
         let loaded = Tokenizer::load(&auto_path);
         if expect_vocab != 0 {
-            assert_eq!(
-                loaded.vocab_size(),
-                expect_vocab,
-                "分词器词表（{}）与 checkpoint（{}）不一致",
+            // 与上面的 `tokenizer_path` 分支同一条规则：**只要求分词器不超过模型词表**。
+            // HF 模型常把 vocab_size 补到 128 的倍数（Qwen2.5：真实词表 151665、
+            // config 写 151936），多出的是永不会被采到的占位 id；反过来若分词器更大，
+            // 采样就可能产出越界 id —— 那才必须拦下。
+            assert!(
+                loaded.vocab_size() <= expect_vocab,
+                "分词器词表（{}）大于 checkpoint 词表（{}）：会采出越界 token",
                 loaded.vocab_size(),
                 expect_vocab
             );
@@ -363,7 +391,7 @@ pub(crate) fn describe_stop(reason: StopReason) -> String {
 
 /// 收尾原因的短标签，**每一轮**都写进运行日志。
 ///
-/// 与 [`describe_stop`] 分开写：那句长话是给"空输出"解释用的，
+/// 与 `describe_stop` 分开写：那句长话是给"空输出"解释用的，
 /// "开口就是停止标记「用户：」，没答就转下一轮"套在一段有内容的回答上是错的。
 /// 只记空输出的那几轮时，非空回答究竟是采到 EOS 还是命中停止标记停下的就查不到——
 /// 而这两种收尾写进历史的方式并不相同（见 `cmd_chat` 的历史更新）。

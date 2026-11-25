@@ -34,16 +34,23 @@ jobs:
           LLM_CPU_FMA: "1"
 
       # GPU 后端只保证能编译（CI 机器没有 GPU，真机验证在本地做）
+      # 图像 IO（VLM / 生成图片）走可选依赖，必须验证这条特性路径仍能编译+测试
+      - name: test (vision-io feature)
+        run: cargo test --release --all-targets --features vision-io
+
       - name: check (gpu feature)
         run: cargo check --all-targets --features gpu
 
-  # fmt 已是干净的（`cargo fmt --check` 0 diff）、编译告警也已是 0；
-  # clippy 仍有若干**有意保留**的 lint（见 CODE-AUDIT 的 12 条），故本 job 暂设非阻塞，
-  # 等那些 lint 也清掉后去掉 `continue-on-error` 即可变成硬门禁。
+      # CI 机器没有 GPU，跑不了 gpu 测试；但**编译**它们能立刻发现 API/签名漂移
+      - name: build tests (gpu feature, no run)
+        run: cargo test --release --all-targets --features gpu --no-run
+
+  # fmt 与 clippy 都是硬门禁：`cargo fmt --check` 0 diff、`clippy -D warnings` 0 告警。
+  # 有意保留的 lint 在 `src/lib.rs` 顶部以具名 `#![allow(...)]` 登记（每条都写了理由），
+  # 并且 gpu / vision-io 两条特性路径也要各自过一遍同一道门禁。
   lint:
-    name: fmt & clippy (advisory)
+    name: fmt & clippy (hard gate)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -56,5 +63,17 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
+      # 文档链接也是门禁：私有项/未解析链接在 `-D warnings` 下是硬错误
+      - name: cargo doc (-D warnings)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: cargo clippy (default, -D warnings)
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo clippy (gpu, -D warnings)
+        run: cargo clippy --all-targets --features gpu -- -D warnings
+
+      - name: cargo clippy (vision-io, -D warnings)
+        run: cargo clippy --all-targets --features vision-io -- -D warnings

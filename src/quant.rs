@@ -375,7 +375,7 @@ impl QMatrix {
         if cols == 0 || self.rows == 0 {
             return out;
         }
-        let qmax = self.bits.qmax() as f32;
+        let qmax = self.bits.qmax();
         // 码 → code/qmax 查表：避开逐元素除法，且与 `code as f32 / qmax` 同值
         let n_tab = match self.bits {
             QBits::Int8 => 256usize,
@@ -397,7 +397,7 @@ impl QMatrix {
         let code_at = |m: usize| -> usize {
             if packed {
                 let b = bytes[m / 2];
-                let nib = if m % 2 == 0 {
+                let nib = if m.is_multiple_of(2) {
                     b & 0x0F
                 } else {
                     (b >> 4) & 0x0F
@@ -536,7 +536,7 @@ impl QMatrix {
             for j in 0..n_rem {
                 let m = off + j;
                 let b = self.bytes[m / 2];
-                let nib = if m % 2 == 0 {
+                let nib = if m.is_multiple_of(2) {
                     b & 0x0F
                 } else {
                     (b >> 4) & 0x0F
@@ -2232,7 +2232,7 @@ mod tests {
         // 非正定的矩阵必须被判出来（而不是算出 NaN 或负的 sqrt）
         let mut bad = a.clone();
         bad[0] = -1.0;
-        bad[0 * n + 1] = 0.0;
+        bad[1] = 0.0;
         bad[n] = 0.0;
         // 直接给一个对角为负的矩阵：A = -I
         let neg_i: Vec<f32> = (0..n * n)
@@ -3254,6 +3254,51 @@ mod tests {
                 assert_eq!(q2.bytes(), rtn.bytes(), "维度不符时同样退回 RTN");
             }
         }
+    }
+    // ==================== 反量化误差上界 ====================
+
+    /// 对称量化的重建误差有严格上界：`|x - dequant| <= 0.5 * scale / qmax`
+    #[test]
+    fn test_roundtrip_error_bound_int8_int4() {
+        let x: Vec<f32> = (0..64)
+            .map(|i| ((i as f32) * 0.37 - 9.0).sin() * 5.0)
+            .collect();
+        for bits in [QBits::Int8, QBits::Int4] {
+            for axis in [QAxis::Row, QAxis::Col] {
+                let q = QMatrix::quantize(&x, 4, 16, bits, axis);
+                let d = q.dequantize();
+                assert_eq!(d.len(), x.len(), "反量化长度不对");
+                let qmax = bits.qmax();
+                for (i, (orig, rec)) in x.iter().zip(d.iter()).enumerate() {
+                    let scale = match axis {
+                        QAxis::Row => q.scales[i / 16],
+                        QAxis::Col => q.scales[i % 16],
+                    };
+                    let bound = 0.5 * scale / qmax + 1e-6;
+                    assert!(
+                        (orig - rec).abs() <= bound,
+                        "bits={bits:?} axis={axis:?} i={i}: 原值 {orig} 还原 {rec}，上界 {bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 全零行：scale 必须取 1（避免除零），码值全零，还原也全零
+    #[test]
+    fn test_all_zero_row_is_exact_zero() {
+        let x = vec![0.0f32; 8];
+        let (codes, scale) = quantize_row_sym(&x, QBits::Int8);
+        assert_eq!(scale, 1.0, "全零输入的 scale 必须是 1，否则会出现 0/0");
+        assert!(codes.iter().all(|c| *c == 0));
+        let d = dequantize_with_scales(&codes, 1, 8, QBits::Int8, QAxis::Row, &[scale]);
+        assert!(d.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "量化输入长度与形状不符")]
+    fn test_quantize_rejects_length_mismatch() {
+        let _ = QMatrix::quantize(&[1.0, 2.0, 3.0], 2, 2, QBits::Int8, QAxis::Row);
     }
 }
 

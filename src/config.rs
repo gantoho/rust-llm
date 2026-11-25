@@ -674,4 +674,54 @@ mod tests {
         assert_eq!(new.targets.to_string(), "q,v,o");
         assert_eq!(LoRATargets::default().to_string(), "q,k,v");
     }
+
+    // ==================== 配置校验 ====================
+
+    fn valid() -> Config {
+        Config::preset_small()
+    }
+
+    #[test]
+    fn test_presets_validate() {
+        for c in [
+            Config::preset_small(),
+            Config::preset_medium(),
+            Config::preset_large(),
+        ] {
+            c.validate();
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bpe_vocab")]
+    fn test_bpe_vocab_too_small_panics() {
+        let mut c = valid();
+        c.train.bpe_vocab = 100;
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "warmup_steps")]
+    fn test_warmup_greater_than_steps_panics() {
+        let mut c = valid();
+        c.train.warmup_steps = c.train.steps + 1;
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "min_lr")]
+    fn test_min_lr_greater_than_max_lr_panics() {
+        let mut c = valid();
+        c.train.min_lr = c.train.max_lr + 0.1;
+        c.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "n_head")]
+    fn test_n_embd_not_divisible_by_n_head_panics() {
+        let mut c = valid();
+        c.model.n_embd = 10;
+        c.model.n_head = 3;
+        c.validate();
+    }
 }

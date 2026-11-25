@@ -24,8 +24,8 @@ use crate::sample;
 use crate::train;
 
 use super::{
-    build_tokenizer, describe_kv, load_model_and_tokenizer, maybe_merge_lora, read_text,
-    resolve_ckpt, resolve_model_spec, truncate_chars,
+    build_tokenizer, common_run_fields, describe_kv, load_model_and_tokenizer, maybe_merge_lora,
+    read_text, resolve_ckpt, resolve_model_spec, truncate_chars,
 };
 
 /// 命令行上的权重位宽名字 -> 枚举（`quant` 子命令用；这里不存在"不量化"的选项，
@@ -663,53 +663,49 @@ pub fn cmd_generate(
         Some(&rope_opt),
     );
     let mut rng = Rng::new(seed);
-    runlog::fields(
-        "本次运行参数",
-        &[
-            ("配置文件", config_path.to_string()),
-            ("checkpoint", format!("{ckpt_path}（step {}）", ckpt.step)),
-            (
-                "分词器文件",
-                tokenizer_path
-                    .unwrap_or("自动（config.tokenizer_file → out_dir/tokenizer.json）")
-                    .to_string(),
-            ),
-            ("模型结构", format!("{:?}", ckpt.model)),
-            ("prompt", format!("{prompt:?}")),
-            ("图片理解输入", image.unwrap_or("无（纯文本）").to_string()),
-            ("max_new", max_new.to_string()),
-            ("seed", seed.to_string()),
-            (
-                "生成方式",
-                match beam {
-                    Some(b) => {
-                        format!("Beam Search（beam_size={b}，length_penalty={length_penalty}）")
-                    }
-                    None => "采样".to_string(),
-                },
-            ),
-            ("temperature", opts.temperature.to_string()),
-            ("top_k", opts.top_k.to_string()),
-            ("top_p", opts.top_p.to_string()),
-            (
-                "重复惩罚",
-                format!(
-                    "{}（回看窗口 {}）",
-                    opts.repetition_penalty, opts.repetition_window
-                ),
-            ),
-            ("KV cache", describe_kv(&kv)),
-            (
-                "RoPE / 上下文",
-                rope_note.clone().unwrap_or_else(|| {
-                    format!(
-                        "沿用 checkpoint：窗口 {}，base = {}",
-                        model.cfg.block_size, model.cfg.rope_base
-                    )
-                }),
-            ),
-        ],
+    let mut fields = common_run_fields(
+        config_path,
+        &ckpt_path,
+        ckpt.step,
+        tokenizer_path,
+        &ckpt.model,
     );
+    fields.extend([
+        ("prompt", format!("{prompt:?}")),
+        ("图片理解输入", image.unwrap_or("无（纯文本）").to_string()),
+        ("max_new", max_new.to_string()),
+        ("seed", seed.to_string()),
+        (
+            "生成方式",
+            match beam {
+                Some(b) => {
+                    format!("Beam Search（beam_size={b}，length_penalty={length_penalty}）")
+                }
+                None => "采样".to_string(),
+            },
+        ),
+        ("temperature", opts.temperature.to_string()),
+        ("top_k", opts.top_k.to_string()),
+        ("top_p", opts.top_p.to_string()),
+        (
+            "重复惩罚",
+            format!(
+                "{}（回看窗口 {}）",
+                opts.repetition_penalty, opts.repetition_window
+            ),
+        ),
+        ("KV cache", describe_kv(&kv)),
+        (
+            "RoPE / 上下文",
+            rope_note.clone().unwrap_or_else(|| {
+                format!(
+                    "沿用 checkpoint：窗口 {}，base = {}",
+                    model.cfg.block_size, model.cfg.rope_base
+                )
+            }),
+        ),
+    ]);
+    runlog::fields("本次运行参数", &fields);
     if let Some(note) = &rope_note {
         logln!("[rope] {note}");
     }
@@ -817,7 +813,9 @@ pub fn cmd_generate(
 /// 配置里的 `steps`（4000）和 `eval_every`（200）是配 471.9 万字的预训练语料定的。
 /// SFT 语料常常只有一两万字，`steps_per_epoch` 只有几步，于是那两个数会同时出问题：
 ///
-/// - `steps = 4000` 等于几千个 epoch。本例 SFT 语料 1.4 万字（一个 epoch ≈ 3 步），
+///   注：`tools/gen_sft_corpus.py` 可以把语料扩到 **74 万 token**（4000 段合成对话），
+///   那时一个 epoch ≈ 180 步，下面这条"每 20 个 epoch 评估"的规则才会真正好用。
+/// - `steps = 4000` 等于几千个 epoch。**自带的对话语料只有 1.4 万字**（一个 epoch ≈ 3 步），
 ///   实测 2600 步时 train 2.68 / val 7.77，而 val 早在 600 步就见底了——多出来的步数
 ///   全是过拟合；
 /// - `eval_every` 按"步数的 1/10"收到 200 步，两次评估之间隔了约 80 个 epoch，
@@ -860,6 +858,7 @@ pub fn cmd_sft(
     steps: Option<usize>,
     lr: Option<f32>,
     out_dir: Option<&str>,
+    block_size: Option<usize>,
 ) {
     runlog::announce("sft");
     let mut cfg = Config::load(config_path);
@@ -911,10 +910,18 @@ pub fn cmd_sft(
 
     // 先加载权重与语料：步数 / 评估间隔要按"SFT 语料究竟有多大"推导，而语料有多大
     // 得先编码出来。这几行只借用 `&cfg.train` 读一下，用完立刻还回去，下面才能继续改它。
-    let (model, tokenizer, ckpt) = {
+    let (mut model, tokenizer, mut ckpt) = {
         let t = &cfg.train;
         load_model_and_tokenizer(pretrained_path, t, t.seed, None)
     };
+    // `--block-size`：覆盖 checkpoint 的窗口（Qwen2.5 是 32768，逐 token 微调太贵）。
+    // 只改"看多远的窗口"，不改位置编码本身，所以长窗口权重在短窗口上仍然可用。
+    if let Some(b) = block_size {
+        assert!(b > 0, "--block-size 必须大于 0");
+        model.cfg.block_size = b;
+        ckpt.model.block_size = b;
+        logln!("[info] 上下文窗口已覆盖为 {b}（checkpoint 原值另存）");
+    }
     // 语料可能散在多处，用逗号分隔（支持目录与 `*` 通配）。
     // 按文件加载而不是拼成一份：说话人角色是文件级属性，拼接会让后面文件的角色弄反。
     let sft_texts = load_texts(&sft_paths);
@@ -1045,14 +1052,22 @@ pub fn cmd_finetune(
     lr: f32,
     sft_file: Option<&str>,
     out_dir: Option<&str>,
+    block_size: Option<usize>,
 ) {
     runlog::announce("finetune");
     let mut cfg = Config::load(config_path);
 
     // 先加载基座：该怎么挂适配层，取决于基座本身是不是 LoRA 存档
-    let (mut model, tokenizer, ckpt) =
+    let (mut model, tokenizer, mut ckpt) =
         load_model_and_tokenizer(pretrained_path, &cfg.train, cfg.train.seed, None);
     let mut rng = Rng::new(cfg.train.seed);
+    // `--block-size`：同 `sft`，把窗口从 checkpoint 的 32768 缩到可承受的大小
+    if let Some(b) = block_size {
+        assert!(b > 0, "--block-size 必须大于 0");
+        model.cfg.block_size = b;
+        ckpt.model.block_size = b;
+        logln!("[info] 上下文窗口已覆盖为 {b}");
+    }
 
     // 这两个值只用于日志（运行时结构一律读模型上的实际状态，不做第二本账）
     let (rank_used, alpha_used, targets_used) = if resume_lora {
@@ -1279,15 +1294,24 @@ pub fn cmd_import_hf(
     let model = Transformer::new(hf.cfg.clone(), &mut rng);
     let n =
         crate::hf::assign_named_parameters(&model, &hf.tensors).unwrap_or_else(|e| panic!("{e}"));
-    checkpoint::save_weights(output, &model, 0, f32::INFINITY);
-    let mb = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
-    println!("  已写出 {n} 个参数 → {output}（{mb:.1} MB，权重 only 档）");
+    // `--output` 按**目录**解释（写 `<dir>/model.ckpt`）：与 `--out_dir` 的约定一致，
+    // 也省得用户猜文件名（此前会写出一个名叫 `qwen05-fixed` 的文件，`--ckpt` 根本指不到）。
+    // 显式以 `.ckpt` 结尾时仍按文件路径处理，保持向后兼容。
+    let out_path = if output.ends_with(".ckpt") {
+        output.to_string()
+    } else {
+        std::fs::create_dir_all(output).ok();
+        format!("{}/model.ckpt", output.trim_end_matches(['/', '\\']))
+    };
+    checkpoint::save_weights(&out_path, &model, 0, f32::INFINITY);
+    let mb = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0) as f64 / 1e6;
+    println!("  已写出 {n} 个参数 → {out_path}（{mb:.1} MB，权重 only 档）");
 
     // 分词器（可选）：HF tokenizer.json → 本仓库格式
     if let Some(tk) = tokenizer {
         let out = tokenizer_out.map(|s| s.to_string()).unwrap_or_else(|| {
             // 缺省与存档同目录，约定名 tokenizer.json
-            let dir = std::path::Path::new(output)
+            let dir = std::path::Path::new(&out_path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();

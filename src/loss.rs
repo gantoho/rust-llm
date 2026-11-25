@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 /// 均方误差：loss = mean((pred - target)²)
-#[allow(dead_code)] // 回归任务损失函数 API（测试 test_linear_regression_converges 已验证）
+#[allow(dead_code, reason = "回归任务损失；生产路径未使用，单测作数值口径基准")]
 pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
     pred.sub(target)
         .pow(2.0)
@@ -22,9 +22,9 @@ pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
 ///
 /// 输入：
 /// - logits: [B, D] 未归一化的分数
-/// - targets: [B] 每个样本的真实类别下标
+/// - targets: \[B\] 每个样本的真实类别下标
 ///
-/// 公式：loss = -mean( log_softmax(logits)[i, targets[i]] )
+/// 公式：loss = -mean( log_softmax(logits)[i, targets\[i\]] )
 pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     cross_entropy_loss_masked(logits, targets, None)
 }
@@ -136,4 +136,81 @@ pub fn cross_entropy_loss_masked(
         );
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(data: Vec<f32>, shape: Vec<usize>) -> Tensor {
+        Tensor::from_vec(data, shape)
+    }
+
+    /// 均匀 logits 的交叉熵恒等于 ln(类别数)——这是 CE 最基础的不变量。
+    #[test]
+    fn test_uniform_logits_ce_equals_ln_vocab() {
+        let d = 8usize;
+        let logits = t(vec![0.0; 2 * d], vec![2, d]);
+        let loss = cross_entropy_loss(&logits, &[0, 7]).data()[0];
+        let expect = (d as f32).ln();
+        assert!(
+            (loss - expect).abs() < 1e-6,
+            "均匀分布下 CE 应为 ln({d}) = {expect}，实际 {loss}"
+        );
+    }
+
+    /// 目标位的 logit 远高于其他 → loss 应趋近 0（而不是负数或 NaN）。
+    #[test]
+    fn test_confident_correct_prediction_has_near_zero_loss() {
+        let logits = t(vec![50.0, 0.0, 0.0, 0.0], vec![1, 4]);
+        let loss = cross_entropy_loss(&logits, &[0]).data()[0];
+        assert!(
+            (0.0..1e-4).contains(&loss),
+            "高置信正确预测的 loss 应≈0，实际 {loss}"
+        );
+    }
+
+    /// mask 全 false：loss 恒为 0，且不会因除零出现 NaN。
+    #[test]
+    fn test_all_masked_yields_zero_loss() {
+        let logits = t(vec![0.0, 1.0, 2.0, 3.0], vec![2, 2]);
+        let loss = cross_entropy_loss_masked(&logits, &[1, 0], Some(&[false, false])).data()[0];
+        assert_eq!(loss, 0.0, "全屏蔽时 loss 必须严格为 0");
+    }
+
+    /// 被屏蔽的行不进分母、也不进分子：屏蔽行改成极端 logits 不影响结果。
+    #[test]
+    fn test_masked_rows_do_not_contribute() {
+        let mask = [true, false];
+        let a = t(vec![0.0, 0.0, 0.0, 0.0], vec![2, 2]);
+        let b = t(vec![0.0, 0.0, 100.0, -100.0], vec![2, 2]);
+        let la = cross_entropy_loss_masked(&a, &[0, 0], Some(&mask)).data()[0];
+        let lb = cross_entropy_loss_masked(&b, &[0, 0], Some(&mask)).data()[0];
+        assert_eq!(la, lb, "屏蔽行不应影响 loss（分子分母都不算它）");
+        assert!(
+            (la - 2.0f32.ln()).abs() < 1e-6,
+            "只剩第 0 行：ln(2)，实际 {la}"
+        );
+    }
+
+    /// 目标类别越界必须明确 panic，而不是悄悄读到别的行。
+    #[test]
+    #[should_panic(expected = "目标类别越界")]
+    fn test_target_out_of_range_panics() {
+        let logits = t(vec![0.0, 1.0, 2.0, 3.0], vec![2, 2]);
+        let _ = cross_entropy_loss(&logits, &[0, 2]);
+    }
+
+    /// MSE：完全一致时严格为 0；100 个 1.0 的差 → 4.0；且与逐元素公式对拍。
+    #[test]
+    fn test_mse_zero_and_known_value() {
+        let a = t(vec![1.0, 2.0, 3.0], vec![1, 3]);
+        let b = t(vec![1.0, 2.0, 3.0], vec![1, 3]);
+        assert_eq!(mse_loss(&a, &b).data()[0], 0.0);
+
+        let c = t(vec![3.0, 2.0, 1.0], vec![1, 3]);
+        let mse = mse_loss(&a, &c).data()[0];
+        // (4 + 0 + 4) / 3
+        assert!((mse - 8.0 / 3.0).abs() < 1e-6, "MSE 应为 8/3，实际 {mse}");
+    }
 }

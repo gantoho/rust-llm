@@ -805,7 +805,9 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 1.0,
             repetition_window: 0,
+            presence_penalty: 0.0,
             stop: &[],
+            frequency_penalty: 0.0,
         }
     }
 
@@ -817,7 +819,9 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 1.0,
             repetition_window: 0,
+            presence_penalty: 0.0,
             stop: &[],
+            frequency_penalty: 0.0,
         }
     }
 

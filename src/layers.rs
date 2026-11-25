@@ -30,7 +30,7 @@ pub fn swiglu_hidden(d: usize) -> usize {
 /// 线性层：y = x @ W + b
 ///
 /// - weight: [in_features, out_features]
-/// - bias:   [out_features]
+/// - bias:   \[out_features\]
 ///
 /// 输入可以是 [B, in] 或 [B, T, in]（会自动展平处理）
 ///
@@ -576,7 +576,10 @@ impl NormLayer {
     ///
     /// 唯一调用点都在 `model.rs` 的 `#[cfg(feature = "gpu")]` 函数里，
     /// 所以不带 gpu feature 编译时它是"死代码"——这不是真死代码，别删。
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "调用点都在 model.rs 的 gpu 常驻路径")
+    )]
     pub fn norm_params(&self) -> (&Tensor, Option<&Tensor>, f32, bool) {
         match self {
             NormLayer::LN(ln) => (&ln.gamma, Some(&ln.beta), ln.eps, false),
@@ -737,7 +740,10 @@ impl MLPEnum {
     /// GELU 分支的 `(W₁, b₁, W₂, b₂)`；SwiGLU 分支返回 None（走 [`MLPEnum::swiglu_weights`]）
     ///
     /// 同 [`NormLayer::norm_params`]：调用点只在 gpu feature 下，不带时是"死代码"，别删。
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "取值元组供 gpu 常驻路径与单测核对")
+    )]
     pub fn gelu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             MLPEnum::GELU { linear1, linear2 } => Some((
@@ -752,7 +758,10 @@ impl MLPEnum {
 
     /// SwiGLU 分支的 `(W_gate, b_gate, W_up, b_up, W_down, b_down)`；
     /// GELU 分支返回 None（走 [`MLPEnum::gelu_weights`]）
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "取值元组供 gpu 常驻路径与单测核对")
+    )]
     pub fn swiglu_weights(&self) -> Option<(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor, &Tensor)> {
         match self {
             MLPEnum::SwiGLU(s) => Some((
@@ -928,7 +937,7 @@ impl Embedding {
         }
     }
 
-    /// 前向：ids [N] -> out [N, d_model]（每一行取表里的对应向量）
+    /// 前向：ids \[N\] -> out \[N, d_model\]（每一行取表里的对应向量）
     pub fn forward(&self, ids: &[usize]) -> Tensor {
         self.table.gather_rows(ids)
     }

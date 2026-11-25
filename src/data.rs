@@ -125,7 +125,9 @@ fn read_cached_tokens(path: &std::path::Path) -> Option<Vec<u32>> {
     }
     Some(
         raw[12..]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -145,10 +147,10 @@ fn write_cached_tokens(path: &std::path::Path, tokens: &[u32]) {
 /// 分词（带缓存）：命中缓存直接返回，否则编码后回写。
 fn encode_cached(kind: &str, tokenizer: &Tokenizer, texts: &[&str]) -> Vec<u32> {
     let path = corpus_cache_path(kind, tokenizer, texts);
-    if let Some(p) = path.as_deref() {
-        if let Some(v) = read_cached_tokens(p) {
-            return v;
-        }
+    if let Some(p) = path.as_deref()
+        && let Some(v) = read_cached_tokens(p)
+    {
+        return v;
     }
     let mut out = Vec::new();
     for t in texts {
@@ -223,7 +225,7 @@ fn expand_glob(pattern: &str) -> Vec<String> {
 /// 数据加载器
 ///
 /// 输入 x 是一段长度为 block_size 的 token 序列；
-/// 目标 y 是 x 右移一位（x[i] 的下一个 token 是 y[i]）。
+/// 目标 y 是 x 右移一位（x\[i\] 的下一个 token 是 y\[i\]）。
 ///
 /// token 序列被切为两块：
 /// - `tokens[..val_start]`：训练区（`sample_batch` 在这里随机采样）
@@ -273,7 +275,7 @@ impl DataLoader {
     /// 从多份文档构造加载器（**样本 packing**）：每个文档各自包 `[BOS] … [EOS]` 后
     /// 依次拼进同一条 token 流——短文档不再各自为政，边界由特殊 token 显式标出。
     /// - `val_doc = Some(..)`：使用独立的验证文档；
-    /// - `val_doc = None`：与 [`from_texts`] 相同，自动从末尾切约 10% 作验证集。
+    /// - `val_doc = None`：与 `from_texts` 相同，自动从末尾切约 10% 作验证集。
     pub fn from_documents(
         docs: &[String],
         val_doc: Option<&str>,
@@ -327,7 +329,7 @@ impl DataLoader {
             "验证语料太短，无法切出完整序列"
         );
         DataLoader {
-            tokens: tokens.into_iter().map(|x| x as u32).collect(),
+            tokens: tokens.into_iter().collect(),
             block_size,
             batch_size,
             val_start,
@@ -456,7 +458,7 @@ impl BatchSource for DataLoader {
 pub const SFT_USER: &str = "用户：";
 /// 回答方标记。模型在推理时永远由我们喂给它，所以它本身不需要被监督。
 pub const SFT_ASSISTANT: &str = "助手：";
-/// 回答结束标记，见 [`build_sft_stream`]。
+/// 回答结束标记，见 `build_sft_stream`。
 ///
 /// 必须有：单轮样本如果只是"提问+回答"就结束，模型没地方学"该收尾了"，
 /// 推理时它只好像预训练那样一路续写下去——这正是"只续写不回复"的成因之一。
@@ -634,7 +636,7 @@ pub fn parse_dialogues(text: &str) -> Vec<SftTurns> {
 }
 
 /// 从**多个文件**的文本解析对话。逐文件解析并合并结果——
-/// 说话人角色是文件级属性，不能跨文件共用一张表（见 [`Speakers`]）。
+/// 说话人角色是文件级属性，不能跨文件共用一张表（见 `Speakers`）。
 pub fn parse_dialogue_files(texts: &[String]) -> Vec<SftTurns> {
     texts.iter().flat_map(|t| parse_dialogues(t)).collect()
 }
@@ -892,7 +894,7 @@ impl BatchSource for SftLoader {
 ///
 /// 与 [`SftLoader`] 的两点关键区别：
 /// 1. 样本**不打包、不随机滑窗**——每条样本的像素必须与它的文本窗口对齐，
-///    滑窗会把占位符序列切碎（[`crate::model::Transformer::forward_core`] 断言
+///    滑窗会把占位符序列切碎（`crate::model::Transformer::forward_core` 断言
 ///    每个样本恰好 P 个占位符）。整条序列从头取，尾部用 pad 补齐到 `block_size`，
 ///    补的位置不计 loss；因果掩码保证 pad 只出现在尾部、不会进入任何监督位置的上下文。
 /// 2. 每批多带一份像素（`[B, 3·S·S]` 首尾相接），交给 `forward_mm` 注入 ViT 特征。
@@ -1466,6 +1468,7 @@ mod tests {
 
     /// VLM fixture：`n` 张 8×8 PNG + 同目录 JSONL（`with_literal=false` 时提问里不带图片字面量）。
     /// 语料要覆盖 SFT 模板与回答的全部字符（词表外字符 encode 会 panic），图片字面量除外。
+    #[cfg(feature = "vision-io")]
     fn vlm_fixture(tag: &str, n: usize, with_literal: bool) -> String {
         let dir = std::env::temp_dir().join(format!("llm_vlm_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1495,6 +1498,7 @@ mod tests {
         jsonl.to_str().unwrap().to_string()
     }
 
+    #[cfg(feature = "vision-io")]
     fn vlm_tokenizer() -> Tokenizer {
         let mut tok = Tokenizer::char("用户：助手：\n看图回答纯色");
         tok.attach_image_tokens(4, 0)
@@ -1505,6 +1509,7 @@ mod tests {
     /// VLM 批次：整条采样 + 尾部 pad + 像素透传。掩码的 pad 位必须为 false，
     /// 否则模型会去学"生成 pad"；像素数量必须 = batch·3·S²，否则视觉塔对不上样本。
     #[test]
+    #[cfg(feature = "vision-io")]
     fn vlm_loader_batches_pad_and_carry_pixels() {
         let jsonl = vlm_fixture("ok", 3, true);
         let tok = vlm_tokenizer();
@@ -1554,6 +1559,7 @@ mod tests {
     /// 每条样本必须恰好一个 `<|image|>`：0 个则视觉特征无处注入，多于 1 个会溢出占位符计数。
     #[test]
     #[should_panic(expected = "每条样本必须恰好 1 次")]
+    #[cfg(feature = "vision-io")]
     fn vlm_loader_requires_exactly_one_image_literal() {
         let jsonl = vlm_fixture("no_literal", 2, false);
         let tok = vlm_tokenizer();
@@ -1563,6 +1569,7 @@ mod tests {
     /// 生成序列挂载：占位符段换成 VQ 码本 token 并监督整段；
     /// 训练采样在「理解批（带像素）」与「生成批（纯 token）」之间二选一，整批同构。
     #[test]
+    #[cfg(feature = "vision-io")]
     fn vlm_attach_generation_swaps_codes_and_mixes_batches() {
         let jsonl = vlm_fixture("gen", 6, true);
         let mut tok = Tokenizer::char("用户：助手：\n看图回答纯色");
@@ -1625,5 +1632,95 @@ mod tests {
         assert!(epx.is_some());
 
         let _ = std::fs::remove_dir_all(std::path::Path::new(&jsonl).parent().unwrap());
+    }
+
+    /// 多轮对话：**每一轮**的提问都要被屏蔽，两个答案都要监督（不能只处理第一轮）。
+    #[test]
+    fn build_stream_multi_turn_masks_every_question() {
+        let tok = Tokenizer::char(
+            "用户：你
+助手：好
+用户：再见
+助手：慢走
+。。
+",
+        )
+        .without_specials();
+        let convs = vec![vec![
+            ("你".to_string(), "好".to_string()),
+            ("再见".to_string(), "慢走".to_string()),
+        ]];
+        let (tokens, sup) = build_sft_stream(&tok, &convs);
+
+        let supervised: Vec<usize> = tokens
+            .iter()
+            .zip(&sup)
+            .filter(|(_, b)| **b)
+            .map(|(t, _)| *t)
+            .collect();
+        let text = tok.decode(&supervised);
+        assert!(text.contains('好'), "第一轮答案要监督：{text:?}");
+        assert!(text.contains("慢走"), "第二轮答案要监督：{text:?}");
+        assert!(!text.contains("再见"), "第二轮的提问必须被屏蔽：{text:?}");
+        assert!(
+            text.contains(SFT_END),
+            "结束标记要监督（模型要学会停）：{text:?}"
+        );
+    }
+
+    /// `set_mask_response(false)` 后采样出的批次必须**全监督**（诊断口径，训练不用）。
+    #[test]
+    fn sft_loader_mask_response_off_returns_all_supervised() {
+        let tok =
+            Tokenizer::char("用户：你好\n助手：你也好\n再见\n慢走\n。。\n").without_specials();
+        let texts = vec![
+            "用户：你好
+助手：你也好
+
+用户：再见
+助手：慢走
+"
+            .to_string(),
+        ];
+        let mut loader = SftLoader::from_texts(&texts, &tok, 8, 2);
+        let mut rng = Rng::new(1);
+
+        let (_, _, mask) = loader.sample_batch(&mut rng);
+        let m = mask.expect("默认应带掩码");
+        assert!(m.iter().any(|b| !*b), "默认口径下应有被屏蔽的位置");
+
+        loader.set_mask_response(false);
+        let (_, _, mask) = loader.sample_batch(&mut rng);
+        // 关掉掩码的语义是**返回 None**（"没有掩码" ⇒ 下游按全 token 计 loss），
+        // 不是返回一张全 true 的掩码 —— 两者在训练循环里的含义相同，但 None 少分配一份张量。
+        assert!(mask.is_none(), "mask_response=false 时应返回 None");
+    }
+
+    /// 两种角色格式（`用户：/助手：` 与 `A:/B:`）必须解析成同样的轮次。
+    #[test]
+    fn parse_dialogues_accepts_both_role_formats() {
+        let cn = parse_dialogues(
+            "用户：q1
+助手：a1
+
+用户：q2
+助手：a2
+",
+        );
+        let en = parse_dialogues(
+            "A: q1
+B: a1
+
+A: q2
+B: a2
+",
+        );
+        assert_eq!(cn, en, "两种格式应得到相同的轮次结构");
+        // 空行是**对话分隔符**：两段各一轮
+        assert_eq!(cn.len(), 2, "空行应切成两段对话");
+        assert_eq!(cn[0].len(), 1);
+        assert_eq!(cn[1].len(), 1);
+        assert_eq!(cn[0][0], ("q1".to_string(), "a1".to_string()));
+        assert_eq!(cn[1][0], ("q2".to_string(), "a2".to_string()));
     }
 }
